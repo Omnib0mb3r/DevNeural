@@ -275,6 +275,10 @@ export interface PendingPrompt {
   kind: string;
   received_at: number;
 }
+export interface ContextUsage {
+  tokens: number;
+  max: number;
+}
 export interface SessionSummary {
   session_id: string;
   project_slug: string;
@@ -286,6 +290,7 @@ export interface SessionSummary {
   has_task: boolean;
   phase: SessionPhase;
   pending_prompt: PendingPrompt | null;
+  context: ContextUsage | null;
 }
 export interface IdleProject {
   id: string;

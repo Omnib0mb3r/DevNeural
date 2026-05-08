@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { sessions as sessionsClient } from "@/lib/daemon-client";
 import "@xterm/xterm/css/xterm.css";
 
 interface MirrorState {
@@ -24,6 +26,45 @@ interface BridgeStatusResponse {
   last_seen_ms: number | null;
   age_ms: number | null;
   mirror: MirrorState | null;
+}
+
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+function ContextBadge({ tokens, max }: { tokens: number; max: number }) {
+  const pct = Math.min(100, (tokens / max) * 100);
+  /* Tone thresholds. Below 60% is fine, 60-85 starts warning the
+   * user that /compact is coming, 85+ is the red zone where the
+   * next turn risks a context overflow. */
+  const tone = pct < 60 ? "ok" : pct < 85 ? "warn" : "err";
+  const fillColor =
+    tone === "ok"
+      ? "bg-promoted"
+      : tone === "warn"
+        ? "bg-attn"
+        : "bg-err";
+  const textColor =
+    tone === "ok" ? "text-promoted" : tone === "warn" ? "text-attn" : "text-err";
+  return (
+    <span
+      className="inline-flex items-center gap-2 text-nano font-mono"
+      title={`Context: ${tokens.toLocaleString()} / ${max.toLocaleString()} tokens. /clear to reset, /compact to summarize.`}
+    >
+      <span className="text-txt3">ctx</span>
+      <span className="relative w-20 h-1.5 rounded-pill bg-surface3 overflow-hidden">
+        <span
+          className={`absolute inset-y-0 left-0 ${fillColor} transition-[width]`}
+          style={{ width: `${pct}%` }}
+        />
+      </span>
+      <span className={textColor}>
+        {formatTokens(tokens)}/{formatTokens(max)} ({pct.toFixed(0)}%)
+      </span>
+    </span>
+  );
 }
 
 function describeBridge(
@@ -130,6 +171,18 @@ export function TerminalMirror({ sessionId }: Props) {
   const wsRef = useRef<WebSocket | null>(null);
   const [status, setStatus] = useState<"loading" | "live" | "offline">("loading");
   const [bridge, setBridge] = useState<BridgeStatusResponse | null>(null);
+
+  /* Reuse the SessionsTable's react-query cache so the context bar
+   * updates on the same 5s cadence as the rest of the page without an
+   * extra poll. Find this session's entry by id. */
+  const sessionsQ = useQuery({
+    queryKey: ["sessions"],
+    queryFn: sessionsClient,
+    refetchInterval: 5_000,
+  });
+  const ctx =
+    sessionsQ.data?.sessions?.find((s) => s.session_id === sessionId)?.context ??
+    null;
 
   useEffect(() => {
     let cancelled = false;
@@ -478,6 +531,9 @@ export function TerminalMirror({ sessionId }: Props) {
         >
           {bridgeView.label}
         </span>
+        {ctx && ctx.max > 0 ? (
+          <ContextBadge tokens={ctx.tokens} max={ctx.max} />
+        ) : null}
         <span className="text-nano text-txt3 ml-auto">
           read-only · use Steer / Nav for input
         </span>

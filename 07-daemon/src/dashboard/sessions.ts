@@ -71,6 +71,10 @@ export interface SessionListItem {
    * The dashboard renders this with answer buttons so the user can reply
    * remotely instead of tabbing to the VS Code window. */
   pending_prompt: PendingPrompt | null;
+  /** Context-window usage derived from the most recent assistant turn's
+   * usage object. Lets the dashboard show a fill bar so the user knows
+   * when to /clear or /compact. Null when no usage record yet. */
+  context: { tokens: number; max: number } | null;
 }
 
 /* Derive current phase by reading the last few KB of the jsonl. The
@@ -80,6 +84,76 @@ export interface SessionListItem {
  * cheap (~8KB read, only for active sessions) and reflects ground
  * truth: the last record tells us whether Claude is thinking, running
  * a tool, or idle. */
+/* Context-window usage from the tail of a session jsonl.
+ *
+ * Each assistant turn carries a usage object with input_tokens (new
+ * input this request), cache_creation_input_tokens (new cache writes),
+ * cache_read_input_tokens (cache hits), and output_tokens. The total
+ * tokens sent to the model for the most recent turn is the sum of the
+ * three input variants — that's the number we want to compare against
+ * the model's context window so the user knows when to /clear or
+ * /compact.
+ *
+ * Picking a context limit: jsonl entries record the model name (e.g.
+ * "claude-opus-4-7") but not the 1M extension flag. We fall back to
+ * the DEVNEURAL_CONTEXT_MAX env var (default 1_000_000 since the user
+ * runs Opus with 1M context) so this stays correct without per-message
+ * model lookups. */
+const CONTEXT_MAX = (() => {
+  const raw = process.env.DEVNEURAL_CONTEXT_MAX;
+  const parsed = raw ? Number(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1_000_000;
+})();
+
+interface UsageSnapshot {
+  input_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  output_tokens: number;
+}
+
+function deriveContextFromTail(
+  file: string,
+): { tokens: number; max: number } | null {
+  try {
+    const stat = fs.statSync(file);
+    if (stat.size === 0) return null;
+    const tailLen = Math.min(stat.size, 32 * 1024);
+    const start = stat.size - tailLen;
+    const fd = fs.openSync(file, 'r');
+    let text: string;
+    try {
+      const buf = Buffer.alloc(tailLen);
+      fs.readSync(fd, buf, 0, tailLen, start);
+      text = buf.toString('utf-8');
+    } finally {
+      fs.closeSync(fd);
+    }
+    const lines = text.split('\n').filter((l) => l.trim().length > 0);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]!;
+      if (!line.includes('"usage"')) continue;
+      try {
+        const rec = JSON.parse(line) as {
+          message?: { usage?: UsageSnapshot };
+        };
+        const u = rec.message?.usage;
+        if (!u || typeof u.input_tokens !== 'number') continue;
+        const tokens =
+          (u.input_tokens || 0) +
+          (u.cache_creation_input_tokens || 0) +
+          (u.cache_read_input_tokens || 0);
+        return { tokens, max: CONTEXT_MAX };
+      } catch {
+        continue;
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
 function derivePhaseFromTail(file: string): 'thinking' | 'tool' | 'idle' | 'unknown' {
   try {
     const stat = fs.statSync(file);
@@ -379,6 +453,7 @@ export function listSessions(): SessionListItem[] {
         has_task: Boolean(readCurrentTask(sessionId)),
         phase,
         pending_prompt: pending,
+        context: isActive ? deriveContextFromTail(file) : null,
       });
     }
   }
