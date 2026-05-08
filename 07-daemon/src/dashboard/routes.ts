@@ -323,14 +323,41 @@ export async function registerDashboardRoutes(
         .toLowerCase()
         .replace(/\/$/, '')
         .replace(/[\\/:]/g, '-');
-    const idle = projects
-      .filter((p) => p.root && !liveSlugs.has(rootToSlug(p.root)))
-      .map((p) => ({
+    /* Dedup by normalised root. The registry can carry two ids for
+     * the same folder when the project was first seen as a path-only
+     * entry and later resolved a git remote (different scope, different
+     * hash). Render a single tile per folder, preferring the most
+     * recently seen one so its last_seen timestamp is meaningful. */
+    interface IdleEntry {
+      id: string;
+      name: string;
+      root: string;
+      last_seen: string;
+    }
+    const seenRoots = new Map<string, IdleEntry>();
+    const normRoot = (r: string) =>
+      r.replace(/\\/g, '/').replace(/\/+/g, '/').toLowerCase().replace(/\/$/, '');
+    for (const p of projects) {
+      if (!p.root) continue;
+      if (liveSlugs.has(rootToSlug(p.root))) continue;
+      const key = normRoot(p.root);
+      const existing = seenRoots.get(key);
+      const candidate: IdleEntry = {
         id: p.id,
         name: p.name,
         root: p.root,
         last_seen: p.last_seen,
-      }));
+      };
+      if (
+        !existing ||
+        Date.parse(candidate.last_seen) > Date.parse(existing.last_seen)
+      ) {
+        seenRoots.set(key, candidate);
+      }
+    }
+    const idle = [...seenRoots.values()].sort(
+      (a, b) => Date.parse(b.last_seen) - Date.parse(a.last_seen),
+    );
     return { ok: true, sessions, idle_projects: idle };
   });
 

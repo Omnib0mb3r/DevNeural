@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -17,6 +18,7 @@ const STALE_HIDE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function SessionsTable() {
   const qc = useQueryClient();
+  const router = useRouter();
   const q = useQuery({
     queryKey: ["sessions"],
     queryFn: sessionsClient,
@@ -176,45 +178,66 @@ export function SessionsTable() {
             </tr>
           </thead>
           <tbody>
-            {visible.map((s) => (
-              <tr key={s.session_id} className="border-b border-border2 lift">
-                <td className="px-5 py-3">
-                  <Link
-                    href={`/sessions/detail?id=${encodeURIComponent(s.session_id)}`}
-                    className="text-txt1 hover:text-brandSoft font-emphasized text-sm"
-                  >
-                    {projectFromSlug(s.project_slug)}
-                  </Link>
-                </td>
-                <td className="px-3 py-3 font-mono text-xs text-txt3">
-                  {s.session_id.slice(0, 12)}
-                </td>
-                <td className="px-3 py-3">
-                  <span className="inline-flex items-center gap-1.5 text-xs">
-                    <StatusDot status={s.active ? "live" : "idle"} pulse={s.active} />
-                    {s.active ? "active" : "idle"}
-                  </span>
-                </td>
-                <td className="px-3 py-3 text-xs text-txt2">
-                  <span className="inline-flex items-center gap-2">
-                    {s.has_task && (
-                      <span className="inline-flex items-center gap-1 text-[11px] font-mono text-txt3">
-                        <Icon name="ListTodo" size={12} /> task
-                      </span>
-                    )}
-                    {s.has_summary && (
-                      <span className="inline-flex items-center gap-1 text-[11px] font-mono text-txt3">
-                        <Icon name="ScrollText" size={12} /> summary
-                      </span>
-                    )}
-                    {!s.has_task && !s.has_summary && <span className="text-txt3">—</span>}
-                  </span>
-                </td>
-                <td className="px-5 py-3 text-right text-[11px] font-mono text-txt3">
-                  {relTime(s.last_modified_ms)} ago
-                </td>
-              </tr>
-            ))}
+            {visible.map((s) => {
+              const href = `/sessions/detail?id=${encodeURIComponent(s.session_id)}`;
+              return (
+                <tr
+                  key={s.session_id}
+                  className="border-b border-border2 lift cursor-pointer"
+                  onClick={() => router.push(href)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      router.push(href);
+                    }
+                  }}
+                  tabIndex={0}
+                  role="link"
+                  aria-label={`Open session ${projectFromSlug(s.project_slug)}`}
+                >
+                  <td className="px-5 py-3">
+                    {/* Real link kept inside the cell so keyboard nav, screen
+                     * readers, middle-click "open in new tab", and right-click
+                     * "copy link" all keep working. The row's onClick handles
+                     * tap-anywhere behavior on top of that. */}
+                    <Link
+                      href={href}
+                      onClick={(e) => e.stopPropagation()}
+                      className="text-txt1 hover:text-brandSoft font-emphasized text-sm"
+                    >
+                      {projectFromSlug(s.project_slug)}
+                    </Link>
+                  </td>
+                  <td className="px-3 py-3 font-mono text-xs text-txt3">
+                    {s.session_id.slice(0, 12)}
+                  </td>
+                  <td className="px-3 py-3">
+                    <span className="inline-flex items-center gap-1.5 text-xs">
+                      <StatusDot status={s.active ? "live" : "idle"} pulse={s.active} />
+                      {s.active ? "active" : "idle"}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 text-xs text-txt2">
+                    <span className="inline-flex items-center gap-2">
+                      {s.has_task && (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-mono text-txt3">
+                          <Icon name="ListTodo" size={12} /> task
+                        </span>
+                      )}
+                      {s.has_summary && (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-mono text-txt3">
+                          <Icon name="ScrollText" size={12} /> summary
+                        </span>
+                      )}
+                      {!s.has_task && !s.has_summary && <span className="text-txt3">—</span>}
+                    </span>
+                  </td>
+                  <td className="px-5 py-3 text-right text-[11px] font-mono text-txt3">
+                    {relTime(s.last_modified_ms)} ago
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       )}
