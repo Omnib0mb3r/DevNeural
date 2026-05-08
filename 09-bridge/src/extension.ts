@@ -640,6 +640,137 @@ function tick(): void {
       processFile(path.posix.join(dir, e.name));
     }
   }
+  processWorkspaceInjects();
+}
+
+/* Workspace-targeted command injection. Used by the dashboard's
+ * "Start Claude" buttons: when no Claude session exists yet for a
+ * project the dashboard has no session_id to address, so it writes a
+ * marker keyed by workspace path here. The bridge in the matching
+ * VS Code window picks it up, opens (or reuses) a terminal at that
+ * cwd, types the command, presses Enter, and deletes the marker.
+ *
+ * Markers older than 10 minutes are deleted without firing — they
+ * are stale signals from a previous run that the user is no longer
+ * waiting on, and replaying them would surprise the user with a
+ * Claude window appearing later. */
+const WORKSPACE_INJECT_TTL_MS = 10 * 60_000;
+function getWorkspaceInjectDir(): string {
+  return path.posix.join(getBridgeDir(), '.workspace-inject');
+}
+
+interface WorkspaceInjectMarker {
+  workspace: string;
+  command: string;
+  queued_at: string;
+}
+
+function processWorkspaceInjects(): void {
+  const dir = getWorkspaceInjectDir();
+  if (!fs.existsSync(dir)) return;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  if (folders.length === 0) return;
+  const myWorkspaces = folders.map((f) => normalizePath(f.uri.fsPath));
+
+  for (const e of entries) {
+    if (!e.isFile() || !e.name.endsWith('.json')) continue;
+    const file = path.posix.join(dir, e.name);
+    let marker: WorkspaceInjectMarker;
+    try {
+      marker = JSON.parse(fs.readFileSync(file, 'utf-8')) as WorkspaceInjectMarker;
+    } catch {
+      try {
+        fs.unlinkSync(file);
+      } catch {
+        /* ignore */
+      }
+      continue;
+    }
+
+    const queued = Date.parse(marker.queued_at);
+    if (
+      Number.isFinite(queued) &&
+      Date.now() - queued > WORKSPACE_INJECT_TTL_MS
+    ) {
+      channel.appendLine(
+        `[workspace-inject] skip stale ${marker.workspace} (age ${Math.round(
+          (Date.now() - queued) / 1000,
+        )}s)`,
+      );
+      try {
+        fs.unlinkSync(file);
+      } catch {
+        /* ignore */
+      }
+      continue;
+    }
+
+    const target = normalizePath(marker.workspace);
+    const owns = myWorkspaces.some(
+      (ws) => target === ws || target.startsWith(`${ws}/`),
+    );
+    if (!owns) continue;
+
+    /* Atomically claim the marker by renaming before doing any work,
+     * so two VS Code windows that both contain the workspace don't
+     * both fire the command. The losing rename throws ENOENT and
+     * we move on. */
+    const claim = file + '.claim';
+    try {
+      fs.renameSync(file, claim);
+    } catch {
+      continue;
+    }
+
+    void runWorkspaceInject(marker, claim);
+  }
+}
+
+async function runWorkspaceInject(
+  marker: WorkspaceInjectMarker,
+  claimFile: string,
+): Promise<void> {
+  try {
+    const wsPath = marker.workspace.replace(/\\/g, '/');
+    const wsNormalized = normalizePath(wsPath);
+    /* Always create a fresh terminal at the workspace cwd. We used to
+     * try to reuse the active terminal as an optimization, but that
+     * was unsafe: VS Code's activeTerminal can point at any shell the
+     * user is focused on (an unrelated PowerShell, a build watcher, a
+     * debug REPL), and sendText would type `claude` into it. Creating
+     * a new terminal with explicit cwd guarantees the command lands
+     * in the right place at the cost of one extra tile in the
+     * terminal panel. */
+    const target = vscode.window.createTerminal({
+      name: 'Claude',
+      cwd: vscode.Uri.file(wsPath),
+    });
+    target.show(true);
+    target.sendText(marker.command, false);
+    /* Same trick as queueSessionPrompt: brief delay so the paste is
+     * fully delivered before the carriage return commits the line. */
+    await new Promise((r) => setTimeout(r, 80));
+    target.sendText('\r', false);
+    channel.appendLine(
+      `[workspace-inject] ran "${marker.command}" in ${wsNormalized}`,
+    );
+  } catch (err) {
+    channel.appendLine(
+      `[workspace-inject] failed: ${(err as Error).message}`,
+    );
+  } finally {
+    try {
+      fs.unlinkSync(claimFile);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 function startWatching(): void {

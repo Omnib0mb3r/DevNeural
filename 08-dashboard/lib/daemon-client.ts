@@ -287,8 +287,27 @@ export interface SessionSummary {
   phase: SessionPhase;
   pending_prompt: PendingPrompt | null;
 }
+export interface IdleProject {
+  id: string;
+  name: string;
+  root: string;
+  last_seen: string;
+}
 export const sessions = () =>
-  request<{ ok: boolean; sessions: SessionSummary[] }>("/sessions");
+  request<{
+    ok: boolean;
+    sessions: SessionSummary[];
+    idle_projects?: IdleProject[];
+  }>("/sessions");
+
+export const startClaude = (
+  projectId: string,
+  dangerous: boolean,
+): Promise<{ ok: boolean; project_id?: string; root?: string; command?: string; warnings?: string[]; error?: string }> =>
+  request(`/projects/${encodeURIComponent(projectId)}/start-claude`, {
+    method: "POST",
+    body: JSON.stringify({ dangerous }),
+  });
 
 export interface SessionChunk {
   role: string;

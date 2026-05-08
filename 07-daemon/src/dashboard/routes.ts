@@ -295,7 +295,44 @@ export async function registerDashboardRoutes(
   });
 
   // ── Sessions ─────────────────────────────────────────────────────
-  app.get('/sessions', async () => ({ ok: true, sessions: listSessions() }));
+  app.get('/sessions', async () => {
+    const sessions = listSessions();
+    /* Surface "ready to start" projects so the dashboard's Sessions
+     * page can offer Start Claude buttons for any registered project
+     * that doesn't currently have a live session. Match each project
+     * root against the project_slug Claude Code uses for its jsonl
+     * directory, which is the cwd with `:`, `\`, `/` flattened to `-`. */
+    const { listProjects } = await import('../identity/registry.js');
+    const projects = listProjects();
+    const liveSlugs = new Set(
+      sessions
+        .filter((s) => s.active)
+        .map((s) => s.project_slug.toLowerCase()),
+    );
+    /* Mirror the bridge's path canonicalisation so a registry root
+     * with a trailing slash, doubled separators, or differing drive-
+     * letter case doesn't get mis-classified as idle when its session
+     * is actually live. Steps: backslashes → forward, collapse runs of
+     * slashes, lowercase, strip trailing slash, then convert path
+     * separators + colons to hyphens to match Claude Code's project
+     * directory naming. */
+    const rootToSlug = (root: string): string =>
+      root
+        .replace(/\\/g, '/')
+        .replace(/\/+/g, '/')
+        .toLowerCase()
+        .replace(/\/$/, '')
+        .replace(/[\\/:]/g, '-');
+    const idle = projects
+      .filter((p) => p.root && !liveSlugs.has(rootToSlug(p.root)))
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        root: p.root,
+        last_seen: p.last_seen,
+      }));
+    return { ok: true, sessions, idle_projects: idle };
+  });
 
   app.get('/sessions/:id', async (req, reply) => {
     const id = (req.params as { id: string }).id;
@@ -765,6 +802,76 @@ export async function registerDashboardRoutes(
       return r;
     }
     return r;
+  });
+
+  /* Start Claude in an existing registered project.
+   *
+   * Looks up the project root from the registry, drops a workspace-
+   * inject marker, and (best-effort) opens VS Code on that folder so
+   * the bridge inside that window picks up the marker and types
+   * `claude` into a terminal. The dashboard's Sessions page wires its
+   * Start Claude / Start (skip permissions) buttons to this endpoint.
+   *
+   * Body: { dangerous: boolean }
+   *   dangerous=true  -> claude --dangerously-skip-permissions
+   *   dangerous=false -> claude
+   *
+   * Command is NOT user-supplied. The endpoint only chooses between
+   * two hard-coded strings. An earlier version accepted body.command
+   * which would have given anyone with dashboard auth (or anyone on
+   * the Tailscale tailnet who learned the cookie) a clean RCE primitive
+   * via terminal sendText into the host's VS Code. Removed. */
+  app.post('/projects/:id/start-claude', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { dangerous?: boolean };
+    const { getProject } = await import('../identity/registry.js');
+    const proj = getProject(id);
+    if (!proj || !proj.root) {
+      reply.code(404);
+      return { ok: false, error: `project ${id} not found in registry` };
+    }
+    const command = body.dangerous
+      ? 'claude --dangerously-skip-permissions'
+      : 'claude';
+    const { queueProjectBootstrap } = await import('./projects-new.js');
+    const warnings: string[] = [];
+    try {
+      queueProjectBootstrap(proj.root, command);
+    } catch (err) {
+      reply.code(500);
+      return {
+        ok: false,
+        error: `failed to queue inject: ${(err as Error).message}`,
+      };
+    }
+    /* Also open VS Code if it isn't already on this workspace. We
+     * can't reliably detect that from the daemon, so we always fire
+     * `code <path>` and let VS Code be a no-op when the window is
+     * already focused on the workspace. shell:true for the same
+     * Windows .cmd-shim reason as createProject. */
+    try {
+      const { spawn } = await import('node:child_process');
+      const child = spawn('code', [proj.root], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+        shell: true,
+      });
+      child.on('error', (err) => {
+        warnings.push(`vs code launch failed: ${err.message}`);
+      });
+      child.unref();
+    } catch (err) {
+      warnings.push(`vs code launch failed: ${(err as Error).message}`);
+    }
+    log(`[dashboard] start-claude queued for project ${proj.name} (${id})`);
+    return {
+      ok: true,
+      project_id: id,
+      root: proj.root,
+      command,
+      warnings: warnings.length ? warnings : undefined,
+    };
   });
 
   /* Lightweight screenshot drop.

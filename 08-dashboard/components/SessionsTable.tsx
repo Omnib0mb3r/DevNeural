@@ -2,8 +2,13 @@
 
 import Link from "next/link";
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { sessions as sessionsClient, type SessionSummary } from "@/lib/daemon-client";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  sessions as sessionsClient,
+  startClaude,
+  type IdleProject,
+  type SessionSummary,
+} from "@/lib/daemon-client";
 import { projectFromSlug, relTime } from "@/lib/session-helpers";
 import { Icon } from "./Icon";
 import { StatusDot } from "./StatusDot";
@@ -11,6 +16,7 @@ import { StatusDot } from "./StatusDot";
 const STALE_HIDE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function SessionsTable() {
+  const qc = useQueryClient();
   const q = useQuery({
     queryKey: ["sessions"],
     queryFn: sessionsClient,
@@ -18,8 +24,28 @@ export function SessionsTable() {
   });
   const [showIdle, setShowIdle] = useState(false);
   const [showStale, setShowStale] = useState(false);
+  /* Track in-flight start-claude posts per project so the buttons
+   * disable + show "starting…" until the bridge claims the marker
+   * (visible as a new live session row appearing). Reset on success. */
+  const [pendingStart, setPendingStart] = useState<Record<string, "vanilla" | "skip">>({});
+  const startMutation = useMutation({
+    mutationFn: (vars: { id: string; dangerous: boolean; mode: "vanilla" | "skip" }) =>
+      startClaude(vars.id, vars.dangerous),
+    onMutate: (vars) => {
+      setPendingStart((p) => ({ ...p, [vars.id]: vars.mode }));
+    },
+    onSettled: (_data, _err, vars) => {
+      setPendingStart((p) => {
+        const next = { ...p };
+        delete next[vars.id];
+        return next;
+      });
+      qc.invalidateQueries({ queryKey: ["sessions"] });
+    },
+  });
 
   const list: SessionSummary[] = q.data?.sessions ?? [];
+  const idleProjects: IdleProject[] = q.data?.idle_projects ?? [];
   const now = Date.now();
   const active = list.filter((s) => s.active);
   const idle = list.filter((s) => !s.active && now - s.last_modified_ms < STALE_HIDE_MS);
@@ -72,10 +98,69 @@ export function SessionsTable() {
         </div>
       )}
 
-      {!q.isLoading && visible.length === 0 && (
+      {!q.isLoading && visible.length === 0 && idleProjects.length === 0 && (
         <div className="p-8 text-center text-txt3 text-sm">
           No Claude sessions captured yet. Open a Claude Code terminal in any VS Code window on
           OTLCDEV, type one prompt, then refresh.
+        </div>
+      )}
+
+      {idleProjects.length > 0 && (
+        <div className="border-b border-border1">
+          <div className="px-5 py-2 text-nano text-txt3 uppercase tracking-[0.16em]">
+            Ready to start ({idleProjects.length})
+          </div>
+          <ul className="divide-y divide-border2">
+            {idleProjects.map((p) => {
+              const pending = pendingStart[p.id];
+              return (
+                <li
+                  key={p.id}
+                  className="px-5 py-3 flex items-center justify-between gap-3"
+                >
+                  <div className="min-w-0">
+                    <div className="text-sm text-txt1 font-emphasized truncate">
+                      {p.name}
+                    </div>
+                    <div className="text-nano text-txt3 font-mono truncate">
+                      {p.root}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    <button
+                      type="button"
+                      disabled={Boolean(pending)}
+                      onClick={() =>
+                        startMutation.mutate({
+                          id: p.id,
+                          dangerous: false,
+                          mode: "vanilla",
+                        })
+                      }
+                      className="px-3 py-1.5 text-xs font-emphasized rounded-pill bg-surface2 hairline hover:bg-surface3 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {pending === "vanilla" ? "starting…" : "Start Claude"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={Boolean(pending)}
+                      onClick={() =>
+                        startMutation.mutate({
+                          id: p.id,
+                          dangerous: true,
+                          mode: "skip",
+                        })
+                      }
+                      className="px-3 py-1.5 text-xs font-emphasized rounded-pill bg-attn/15 text-attn hairline hover:bg-attn/25 disabled:opacity-50 disabled:cursor-not-allowed"
+                      title="claude --dangerously-skip-permissions"
+                    >
+                      {pending === "skip" ? "starting…" : "Start (skip permissions)"}
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
         </div>
       )}
 
