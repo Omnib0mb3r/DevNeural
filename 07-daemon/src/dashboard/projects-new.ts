@@ -9,6 +9,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execSync } from 'node:child_process';
 import { spawn } from 'node:child_process';
+import { resolveProjectIdentity } from '../identity/project-id.js';
+import { recordIdentity } from '../identity/registry.js';
 
 const TEMPLATE_REPO =
   process.env.DEVNEURAL_TEMPLATE_REPO ??
@@ -29,6 +31,11 @@ export interface NewProjectResult {
   ok: boolean;
   path?: string;
   error?: string;
+  /* Non-fatal warnings the caller (dashboard) can surface so the user
+   * knows when a step like "open VS Code" failed silently. The
+   * project is still created and registered; only the side-effect
+   * was skipped. */
+  warnings?: string[];
 }
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]+$/;
@@ -96,14 +103,49 @@ export async function createProject(
     fs.writeFileSync(configFile, raw, 'utf-8');
   }
 
-  // Optionally open VS Code (host only)
+  // Seed the project registry so the new project shows up on the
+  // dashboard immediately, before any Claude session writes capture
+  // events to register it. resolveProjectIdentity walks the new
+  // folder's git config (which we just init'd above) and falls back
+  // to a path-based id if no remote is set yet.
+  const warnings: string[] = [];
+  try {
+    const identity = resolveProjectIdentity(target);
+    recordIdentity(identity);
+  } catch (err) {
+    warnings.push(
+      `failed to register project in dashboard: ${(err as Error).message}`,
+    );
+  }
+
+  // Optionally open VS Code (host only). On Windows, `code` ships as
+  // a `.cmd` shim that node's spawn cannot resolve without going
+  // through cmd.exe, so spawn('code', ...) emits an ENOENT and the
+  // window never opens. shell:true routes through cmd.exe which
+  // resolves PATHEXT (.cmd, .bat) the same way an interactive shell
+  // would. We also listen for the spawn error event because shell:true
+  // can mask launcher failures, and surface them as warnings so the
+  // dashboard can show a real reason instead of silent failure.
   if (input.open_vscode !== false) {
     try {
-      spawn('code', [target], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
-    } catch {
-      /* VS Code not on PATH; not fatal */
+      const child = spawn('code', [target], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+        shell: true,
+      });
+      child.on('error', (err) => {
+        warnings.push(
+          `vs code did not launch: ${err.message}. Add VS Code's bin/ directory to PATH or open the folder manually: ${target}`,
+        );
+      });
+      child.unref();
+    } catch (err) {
+      warnings.push(
+        `vs code did not launch: ${(err as Error).message}. Open the folder manually: ${target}`,
+      );
     }
   }
 
-  return { ok: true, path: target };
+  return { ok: true, path: target, warnings: warnings.length ? warnings : undefined };
 }
