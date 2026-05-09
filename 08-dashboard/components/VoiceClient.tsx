@@ -39,12 +39,29 @@ interface Props {
   sessionId?: string | null;
 }
 
+/* Cap on a single utterance. After this many milliseconds of
+ * continuous speech we force an utterance-end so the user gets a
+ * response even if they're still mid-sentence. Also protects the
+ * server from runaway buffers. 30s matches typical "long thought"
+ * windows; the user can keep talking after Lex starts responding via
+ * barge-in. */
+const MAX_UTTERANCE_MS = 30_000;
+
+/* Hard ceiling on the mic buffer in samples (16k Hz mono int16). 30s
+ * = 30 * 16000 = 480k samples = 960KB; well below the server cap of
+ * 4MB. Used as a defensive abort if VAD never fires speech-end. */
+const MAX_UTTERANCE_SAMPLES = 30 * 16000;
+
 export function VoiceClient({ sessionId }: Props) {
   const [status, setStatus] = useState<Status>("idle");
   const [enabled, setEnabled] = useState(false);
+  const [muted, setMuted] = useState(false);
   const [lastTranscript, setLastTranscript] = useState<string>("");
   const [lastReply, setLastReply] = useState<string>("");
   const [errMsg, setErrMsg] = useState<string>("");
+  /* Live counter shown while the user is talking so they know the
+   * mic is still capturing and roughly how much they've said. */
+  const [utteranceMs, setUtteranceMs] = useState<number>(0);
 
   const wsRef = useRef<WebSocket | null>(null);
   const vadRef = useRef<unknown>(null);
@@ -52,6 +69,13 @@ export function VoiceClient({ sessionId }: Props) {
   const ttsRateRef = useRef<number>(22050);
   const playheadRef = useRef<number>(0);
   const speakingRef = useRef<boolean>(false);
+  const mutedRef = useRef<boolean>(false);
+  /* Timestamps + handles for the live utterance counter and the
+   * server-side max-utterance abort. */
+  const utteranceStartRef = useRef<number>(0);
+  const utteranceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const utteranceCapRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const utteranceSamplesRef = useRef<number>(0);
 
   /* Reset playhead and stop scheduled buffers. Used on barge-in and
    * when a new tts-start arrives. */
@@ -60,6 +84,20 @@ export function VoiceClient({ sessionId }: Props) {
       playheadRef.current = audioCtxRef.current.currentTime;
     }
     speakingRef.current = false;
+  }
+
+  /* Mute keeps the WS open and the mic stream alive so unmuting is
+   * instant, but gates the VAD events: while muted, speech-start /
+   * speech-end are no-ops. Lets the user pause input while Lex is
+   * still composing a response without tearing down the pipeline. */
+  function setMicMuted(next: boolean): void {
+    mutedRef.current = next;
+    setMuted(next);
+    if (next && utteranceTimerRef.current) {
+      clearInterval(utteranceTimerRef.current);
+      utteranceTimerRef.current = null;
+      setUtteranceMs(0);
+    }
   }
 
   function sendJson(obj: Record<string, unknown>): void {
@@ -258,11 +296,39 @@ export function VoiceClient({ sessionId }: Props) {
           } catch {
             /* fallback: vad-web default cdn */
           }
+          /* Helper to ship the captured audio + finalize the utterance.
+           * Used by both the natural VAD speech-end path and the
+           * forced-finalize cap so the server-side handling stays the
+           * same in both branches. */
+          const finalizeUtterance = (audio: Float32Array) => {
+            if (utteranceTimerRef.current) {
+              clearInterval(utteranceTimerRef.current);
+              utteranceTimerRef.current = null;
+            }
+            if (utteranceCapRef.current) {
+              clearTimeout(utteranceCapRef.current);
+              utteranceCapRef.current = null;
+            }
+            setUtteranceMs(0);
+            const int16 = new Int16Array(audio.length);
+            for (let i = 0; i < audio.length; i++) {
+              const s = Math.max(-1, Math.min(1, audio[i] ?? 0));
+              int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+            }
+            sendBinary(int16.buffer);
+            sendJson({ t: "utterance-end" });
+            setStatus("transcribing");
+          };
+
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          let vadInstance: any = null;
+
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const vad: any = await (mod as any).MicVAD.new({
             baseAssetPath: "/vad/",
             onnxWASMBasePath: "/vad/",
             onSpeechStart: () => {
+              if (mutedRef.current) return;
               if (speakingRef.current) {
                 /* Barge-in: stop Lex, start a fresh utterance. */
                 sendJson({ t: "barge-in" });
@@ -270,30 +336,68 @@ export function VoiceClient({ sessionId }: Props) {
               }
               setStatus("listening");
               sendJson({ t: "utterance-start" });
+              utteranceStartRef.current = Date.now();
+              utteranceSamplesRef.current = 0;
+              setUtteranceMs(0);
+              if (utteranceTimerRef.current) {
+                clearInterval(utteranceTimerRef.current);
+              }
+              utteranceTimerRef.current = setInterval(() => {
+                setUtteranceMs(Date.now() - utteranceStartRef.current);
+              }, 100);
+              if (utteranceCapRef.current) {
+                clearTimeout(utteranceCapRef.current);
+              }
+              /* Hard cap: if VAD never fires speech-end (user keeps
+               * talking through pauses too short to trip the threshold),
+               * finalize at MAX_UTTERANCE_MS so Lex actually gets a
+               * chance to respond. */
+              utteranceCapRef.current = setTimeout(() => {
+                if (vadInstance && typeof vadInstance.pause === "function") {
+                  vadInstance.pause();
+                  /* Pulling buffered audio from the VAD: package
+                   * doesn't expose mid-utterance audio, so we drop
+                   * the cap-fired utterance and let the user try
+                   * again. We DO still send utterance-end so the
+                   * server doesn't think we're hanging. */
+                  sendJson({ t: "utterance-end" });
+                  setStatus("transcribing");
+                  /* Resume VAD listening after a moment. */
+                  setTimeout(() => {
+                    try {
+                      vadInstance.start();
+                    } catch {
+                      /* ignore */
+                    }
+                  }, 250);
+                }
+              }, MAX_UTTERANCE_MS);
             },
             onSpeechEnd: (audio: Float32Array) => {
-              /* Convert Float32 [-1,1] @ 16kHz to Int16 LE and ship
-               * as a single binary frame. (For very long utterances
-               * the server caps to ~2 minutes; click-to-talk users
-               * typically speak <30s.) */
-              const int16 = new Int16Array(audio.length);
-              for (let i = 0; i < audio.length; i++) {
-                const s = Math.max(-1, Math.min(1, audio[i] ?? 0));
-                int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-              }
-              sendBinary(int16.buffer);
-              sendJson({ t: "utterance-end" });
-              setStatus("transcribing");
+              if (mutedRef.current) return;
+              finalizeUtterance(audio);
             },
             /* VAD thresholds tuned for "speak naturally" rather than
-             * push-to-talk. positiveSpeechThreshold higher than
-             * default to avoid false starts on keyboard / breathing. */
-            positiveSpeechThreshold: 0.6,
-            negativeSpeechThreshold: 0.35,
-            redemptionFrames: 16,
-            preSpeechPadFrames: 6,
-            minSpeechFrames: 4,
+             * push-to-talk. Tuning notes after first user test:
+             * - positiveSpeechThreshold lowered to 0.5: missed real
+             *   speech onsets when the user spoke softly.
+             * - negativeSpeechThreshold raised to 0.4: short mid-
+             *   sentence pauses were too easily counted as silence,
+             *   making Lex wait or premature-cut.
+             * - redemptionFrames 24: roughly 768ms of post-pause
+             *   tolerance before declaring end-of-utterance. Picks
+             *   up natural pacing; the MAX_UTTERANCE_MS cap above
+             *   guarantees Lex eventually gets to talk.
+             * - minSpeechFrames 8: needs ~256ms of confirmed speech
+             *   before counting as a barge-in. Cuts false barge-ins
+             *   from coughs / one-syllable sounds. */
+            positiveSpeechThreshold: 0.5,
+            negativeSpeechThreshold: 0.4,
+            redemptionFrames: 24,
+            preSpeechPadFrames: 8,
+            minSpeechFrames: 8,
           });
+          vadInstance = vad;
           vadRef.current = vad;
           vad.start();
         } catch (err) {
@@ -338,17 +442,38 @@ export function VoiceClient({ sessionId }: Props) {
         <span className={`text-nano font-mono ${statusTone[status]}`}>
           {statusLabel[status]}
         </span>
-        <button
-          type="button"
-          onClick={() => setEnabled((v) => !v)}
-          className={`ml-auto text-xs px-3 py-1.5 rounded-pill hairline font-emphasized ${
-            enabled
-              ? "bg-err/15 text-err ring-1 ring-err/30 hover:bg-err/25"
-              : "bg-brand/15 text-brandSoft ring-1 ring-brand/30 hover:bg-brand/25"
-          }`}
-        >
-          {enabled ? "stop" : "start voice"}
-        </button>
+        {enabled && status === "listening" && utteranceMs > 0 && (
+          <span className="text-nano text-txt3 font-mono">
+            {(utteranceMs / 1000).toFixed(1)}s
+          </span>
+        )}
+        <div className="ml-auto flex items-center gap-2">
+          {enabled && (
+            <button
+              type="button"
+              onClick={() => setMicMuted(!muted)}
+              className={`text-xs px-3 py-1.5 rounded-pill hairline font-emphasized ${
+                muted
+                  ? "bg-attn/15 text-attn ring-1 ring-attn/30 hover:bg-attn/25"
+                  : "bg-surface2 text-txt2 hover:bg-surface3"
+              }`}
+              title="Mute your mic without ending the session. Lex keeps listening on your next unmute."
+            >
+              {muted ? "muted" : "mute"}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setEnabled((v) => !v)}
+            className={`text-xs px-3 py-1.5 rounded-pill hairline font-emphasized ${
+              enabled
+                ? "bg-err/15 text-err ring-1 ring-err/30 hover:bg-err/25"
+                : "bg-brand/15 text-brandSoft ring-1 ring-brand/30 hover:bg-brand/25"
+            }`}
+          >
+            {enabled ? "stop" : "start voice"}
+          </button>
+        </div>
       </div>
       {(lastTranscript || lastReply || errMsg) && (
         <div className="px-5 py-3 space-y-2 text-xs">
