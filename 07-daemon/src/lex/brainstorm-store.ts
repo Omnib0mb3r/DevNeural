@@ -22,6 +22,18 @@ export function setStore(s: Store): void {
   _store = s;
 }
 
+/* Resolver used by session-end-pipeline and other lex/* modules that
+ * need the full store but aren't on a code path the daemon threads
+ * the store reference through (voice WS handler, PTY exit handler,
+ * artifact-parser). The daemon calls setStore() once at boot so this
+ * is always populated by the time these handlers fire. */
+export function getStore(): Store {
+  if (!_store) {
+    throw new Error('brainstorm-store: Store not initialised yet');
+  }
+  return _store;
+}
+
 function db() {
   if (!_store) {
     throw new Error('brainstorm-store: Store not initialised yet');

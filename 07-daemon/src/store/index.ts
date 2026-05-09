@@ -15,6 +15,15 @@ export interface RawChunkMetadata {
   role: string;
   byte_length: number;
   text_preview: string;
+  /* Optional brainstorm-summary fields, populated only on chunks
+   * written by the session-end pipeline. brainstorm_id pins the chunk
+   * to a specific brainstorm_sessions row even after that row is
+   * archived; brainstorm_mode preserves the meeting-vs-chat
+   * distinction (`notes` = meeting recording) for filtered retrieval;
+   * end_reason is debuggability only. */
+  brainstorm_id?: string;
+  brainstorm_mode?: string;
+  end_reason?: string;
 }
 
 export interface WikiPageMetadata {

@@ -49,9 +49,11 @@ import { ptyInject, getPty, getPtyBySession, listPtys } from '../dashboard/pty-h
 import {
   getBrainstormByClaudeSessionId,
   getBrainstormByPty,
+  getStore as getBrainstormStore,
 } from '../lex/brainstorm-store.js';
 import { processAssistantTurn } from '../lex/artifact-parser.js';
 import { buildVoiceSnapshot } from '../lex/snapshot-context.js';
+import { runSessionEndPipeline } from '../lex/session-end-pipeline.js';
 
 /* Voice modes drive whether the daemon synthesizes Lex's response
  * out loud. The browser still receives transcript + assistant-text
@@ -85,6 +87,11 @@ interface ConnState {
   closed: boolean;
   /* Active voice mode set by the client on hello / mode-change. */
   mode: VoiceMode;
+  /* Session-end pipeline guard. Set true on first fire from any path
+   * (voice command, ws close, server eviction) so subsequent paths
+   * no-op instead of running a duplicate force-ingest + summarize +
+   * embed sequence. */
+  sessionEndFired: boolean;
 }
 
 const MIC_BUF_MAX = 4 * 1024 * 1024; // 4 MB ~= 2 minutes of 16k mono pcm
@@ -167,6 +174,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     awaitingResponseSince: 0,
     closed: false,
     mode: 'conversation',
+    sessionEndFired: false,
   };
 
   function send(msg: Record<string, unknown>): void {
@@ -557,6 +565,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * immediate close. */
     if (matchesEndSession(result.text)) {
       send({ t: 'session-end', reason: 'voice-command' });
+      /* Run ingest + summary + RAG embed before the WS close fires.
+       * Fire-and-forget: client teardown happens immediately on the
+       * session-end message, pipeline runs in the background. */
+      void fireSessionEndPipeline('voice-command');
       return;
     }
     if (!state.bindKey) {
@@ -719,6 +731,49 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
   });
 
+  /* End-of-session ingest + summary + RAG embed pipeline. Idempotent
+   * across the multiple end paths (voice command, WS close, server-
+   * detected disconnect): the first call sets sessionEndFired and any
+   * subsequent calls no-op so a brainstorm session never gets a
+   * double-summary or a redundant force-ingest. Best-effort: failures
+   * are logged not thrown so teardown always proceeds. */
+  async function fireSessionEndPipeline(reason: string): Promise<void> {
+    if (state.sessionEndFired) return;
+    state.sessionEndFired = true;
+    try {
+      const handle = state.bindKey
+        ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
+        : null;
+      const claudeSessionId =
+        handle?.sessionId ?? state.watchSessionId ?? null;
+      const ptyId = handle?.ptyId ?? null;
+      const bs =
+        (claudeSessionId && getBrainstormByClaudeSessionId(claudeSessionId)) ||
+        (ptyId && getBrainstormByPty(ptyId)) ||
+        null;
+      if (!bs) {
+        /* Voice WS without a brainstorm row (read-only TTS bind, or
+         * a session that ended before the row was created). Nothing
+         * to summarise; skip silently. */
+        return;
+      }
+      await runSessionEndPipeline(
+        getBrainstormStore(),
+        {
+          brainstormId: bs.id,
+          claudeSessionId: bs.claude_session_id ?? claudeSessionId,
+          mode: bs.mode || state.mode,
+          reason,
+        },
+        (msg) => console.log(msg),
+      );
+    } catch (err) {
+      console.log(
+        `[voice-ws] session-end pipeline failed: ${(err as Error).message}`,
+      );
+    }
+  }
+
   function teardown(): void {
     state.closed = true;
     stopJsonlWatch();
@@ -729,6 +784,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     if (state.bindKey && activeByBindKey.get(state.bindKey) === state) {
       activeByBindKey.delete(state.bindKey);
     }
+    /* Fire-and-forget the end-of-session pipeline. Awaiting here would
+     * block the close handler and Fastify's WS plumbing; the pipeline
+     * does its own best-effort error handling. */
+    void fireSessionEndPipeline('ws-close');
   }
 
   socket.on('close', teardown);

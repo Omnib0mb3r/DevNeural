@@ -288,6 +288,42 @@ export class IndexDb {
     txn();
   }
 
+  /* Project id for a given session, derived from the most recent raw
+   * chunk that mentions this session_id. Used by the session-end
+   * pipeline to find which project's transcripts.jsonl + auto-ingest
+   * cursor to flush when a Lex/voice session closes. Returns null if
+   * the session never wrote a chunk (empty session, ended too fast). */
+  projectIdBySession(sessionId: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT project_id FROM raw_chunks_meta
+         WHERE session_id = ?
+         ORDER BY timestamp_ms DESC
+         LIMIT 1`,
+      )
+      .get(sessionId) as { project_id: string } | undefined;
+    return row?.project_id ?? null;
+  }
+
+  /* Pull the most recent raw chunks for a single session (not whole
+   * project) so the summarizer can produce a session-scoped summary
+   * at end time. Returns rows newest-first; caller reverses for chrono
+   * order before passing to the LLM. */
+  recentRawChunksBySession(
+    sessionId: string,
+    limit: number,
+  ): RawChunkRow[] {
+    return this.db
+      .prepare(
+        `SELECT id, project_id, session_id, timestamp_ms, kind, role, byte_length
+         FROM raw_chunks_meta
+         WHERE session_id = ?
+         ORDER BY timestamp_ms DESC
+         LIMIT ?`,
+      )
+      .all(sessionId, limit) as RawChunkRow[];
+  }
+
   recentRawChunks(
     projectId: string,
     limit: number,

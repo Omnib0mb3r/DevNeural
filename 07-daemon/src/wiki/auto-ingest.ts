@@ -235,3 +235,75 @@ export function stopAutoIngestInterval(): void {
     intervalHandle = null;
   }
 }
+
+/* Force-flush a single project's pending transcript through ingest at
+ * session-end, ignoring the MIN_CONTENT_BYTES floor that the periodic
+ * loop respects. The wiki LLM still has its own internal "this isn't
+ * worth a page" decision (skipped_reason), so a too-short blob just
+ * comes back skipped without a malformed page being written. Returns
+ * the same shape as runAutoIngest but scoped to one project. Used by
+ * src/lex/session-end-pipeline.ts so a brainstorm/voice session that
+ * ends mid-cycle still has its tail content delivered to the wiki
+ * before the row goes to status='ended'. */
+export async function forceIngestProject(
+  store: Store,
+  projectId: string,
+  log: (msg: string) => void = () => undefined,
+): Promise<AutoIngestResult> {
+  const out: AutoIngestResult = {
+    projects_scanned: 0,
+    ingests_triggered: 0,
+    pages_created: 0,
+    pages_updated: 0,
+  };
+  const projects = listProjects();
+  const project = projects.find((p) => p.id === projectId);
+  if (!project) {
+    log(`[auto-ingest:force] project ${projectId} not in registry; skip`);
+    return out;
+  }
+  if (inflight.has(projectId)) {
+    log(`[auto-ingest:force] ${projectId} already inflight; skip`);
+    return out;
+  }
+  out.projects_scanned = 1;
+  const cursor = loadCursor(projectId);
+  const read = readNewTranscriptText(projectId, cursor.byte_offset);
+  if (!read) {
+    log(`[auto-ingest:force] ${project.name}: nothing past cursor`);
+    return out;
+  }
+  inflight.add(projectId);
+  try {
+    log(
+      `[auto-ingest:force] ${project.name}: ${Buffer.byteLength(read.content, 'utf-8')}B from offset ${cursor.byte_offset}`,
+    );
+    const result = await runIngest(
+      store,
+      {
+        source: 'session-end',
+        projectId: project.id,
+        projectName: project.name,
+        newContent: read.content,
+        evidenceHints: [],
+      },
+      log,
+    );
+    out.ingests_triggered++;
+    out.pages_created += result.pages_created.length;
+    out.pages_updated += result.pages_updated.length;
+    if (!result.skipped_reason) {
+      saveCursor(projectId, {
+        byte_offset: read.newOffset,
+        last_run_at: new Date().toISOString(),
+      });
+    } else {
+      log(`[auto-ingest:force] ${project.name}: skipped (${result.skipped_reason})`);
+    }
+  } catch (err) {
+    log(`[auto-ingest:force] ${project.name} failed: ${(err as Error).message}`);
+  } finally {
+    inflight.delete(projectId);
+  }
+  return out;
+}

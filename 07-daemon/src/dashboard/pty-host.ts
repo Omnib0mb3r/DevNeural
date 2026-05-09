@@ -30,7 +30,9 @@ import {
   isBrainstormCwd,
   getBrainstormByPty,
   endBrainstorm,
+  getStore as getBrainstormStore,
 } from '../lex/brainstorm-store.js';
+import { runSessionEndPipeline } from '../lex/session-end-pipeline.js';
 
 interface PtyHandle {
   ptyId: string;
@@ -282,11 +284,38 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
     }
     /* Mark the brainstorm row ended so /lex/sessions?status=active
      * stops returning rows for dead PTYs. Closes the Slice A leak
-     * where killing a PTY left the row stuck at status='active'. */
+     * where killing a PTY left the row stuck at status='active'.
+     * Also fires the session-end pipeline (force-flush wiki ingest,
+     * refresh session summary, embed mode-tagged summary chunk into
+     * raw_chunks) BEFORE the row is closed so subsequent retrieval
+     * still has the active brainstorm row available for source-class
+     * tier-up while the chunk is being written. Best-effort: errors
+     * from the pipeline never block cleanup. */
     try {
       const bs = getBrainstormByPty(handle.ptyId);
       if (bs && bs.status === 'active') {
-        endBrainstorm(bs.id);
+        void runSessionEndPipeline(
+          getBrainstormStore(),
+          {
+            brainstormId: bs.id,
+            claudeSessionId: bs.claude_session_id,
+            mode: bs.mode,
+            reason: 'pty-exit',
+          },
+          (msg) => console.log(msg),
+        )
+          .catch((err) =>
+            console.log(
+              `[pty-host] session-end pipeline failed: ${(err as Error).message}`,
+            ),
+          )
+          .finally(() => {
+            try {
+              endBrainstorm(bs.id);
+            } catch {
+              /* observability: never block exit cleanup */
+            }
+          });
       }
     } catch {
       /* observability: never block exit cleanup */
