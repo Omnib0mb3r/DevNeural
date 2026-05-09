@@ -982,6 +982,7 @@ export async function registerDashboardRoutes(
       top_k?: number;
       limit?: number;
       offset?: number;
+      group_by_session?: boolean;
     };
     if (!body.q) return { ok: false, error: 'q required' };
     const page = await searchAll(
@@ -993,6 +994,7 @@ export async function registerDashboardRoutes(
         ...(body.top_k ? { top_k: body.top_k } : {}),
         ...(typeof body.limit === 'number' ? { limit: body.limit } : {}),
         ...(typeof body.offset === 'number' ? { offset: body.offset } : {}),
+        ...(body.group_by_session ? { group_by_session: true } : {}),
       },
       referenceStore,
     );
@@ -1001,6 +1003,44 @@ export async function registerDashboardRoutes(
       results: page.results,
       total: page.total,
       offset: page.offset,
+      limit: page.limit,
+      ...(page.groups ? { groups: page.groups } : {}),
+    };
+  });
+
+  /* Lex retrieval helper. Wraps /search/all with brainstorm-priority
+   * defaults so Lex can curl one URL and get session-grouped, source-
+   * classified results without having to know the underlying flags.
+   * scope='recent' restricts raw_chunks to the most recent N days
+   * via project filter (omitted for now — recency window lives in
+   * Slice C tagging). scope='all' is the default. */
+  app.post('/lex/recall', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      q?: string;
+      scope?: 'recent' | 'all';
+      project_id?: string;
+      limit?: number;
+    };
+    if (!body.q) {
+      reply.code(400);
+      return { ok: false, error: 'q required' };
+    }
+    const page = await searchAll(
+      store,
+      {
+        query: body.q,
+        ...(body.project_id ? { project_id: body.project_id } : {}),
+        limit: typeof body.limit === 'number' ? body.limit : 12,
+        group_by_session: true,
+      },
+      referenceStore,
+    );
+    return {
+      ok: true,
+      scope: body.scope ?? 'all',
+      results: page.results,
+      groups: page.groups ?? [],
+      total: page.total,
       limit: page.limit,
     };
   });
