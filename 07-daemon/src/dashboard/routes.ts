@@ -1035,6 +1035,16 @@ export async function registerDashboardRoutes(
       },
       referenceStore,
     );
+    /* Slice E conflict signal. When the same query surfaces both a
+     * canonical wiki page and a brainstorm session, Lex must compare
+     * the two before answering (the prompt's retrieval contract). We
+     * don't run a real semantic contradiction check here; we mark
+     * the overlap so Lex knows to look. */
+    const hasCanonical = page.results.some(
+      (r) => r.source_class === 'wiki-canonical',
+    );
+    const hasBrainstorm = (page.groups?.length ?? 0) > 0;
+    const conflictCheckRequired = hasCanonical && hasBrainstorm;
     return {
       ok: true,
       scope: body.scope ?? 'all',
@@ -1042,6 +1052,118 @@ export async function registerDashboardRoutes(
       groups: page.groups ?? [],
       total: page.total,
       limit: page.limit,
+      conflict_check_required: conflictCheckRequired,
+      conflict_overlap: conflictCheckRequired
+        ? {
+            canonical: page.results
+              .filter((r) => r.source_class === 'wiki-canonical')
+              .slice(0, 3)
+              .map((r) => ({
+                id: r.id,
+                title: (r.metadata.title as string) ?? r.id,
+                score: r.score,
+              })),
+            brainstorm_sessions: (page.groups ?? []).slice(0, 3).map((g) => ({
+              id: g.session.id,
+              label: g.session.user_label ?? g.session.derived_label,
+              top_score: g.top_score,
+            })),
+          }
+        : null,
+    };
+  });
+
+  /* Slice E: Lex supervisor primitives. /lex/steer wraps ptyInject
+   * so Lex can direct a worker session by either session_id or
+   * pty_id without going through the lower-level /sessions or /pty
+   * endpoints. /lex/capture is a one-call mid-conversation capture
+   * for reminders / next-actions; if a brainstorm_id is supplied,
+   * the new reminder is also linked into that brainstorm row's
+   * artifact manifest. /lex/snapshot returns a small env+state
+   * envelope so the system prompt can avoid hardcoding GPU/path
+   * facts that drift over time. */
+  app.post('/lex/steer/:sessionOrPty', async (req, reply) => {
+    const target = (req.params as { sessionOrPty: string }).sessionOrPty;
+    const body = (req.body ?? {}) as { text?: string; commit?: boolean };
+    if (typeof body.text !== 'string' || !body.text.trim()) {
+      reply.code(400);
+      return { ok: false, error: 'text required' };
+    }
+    const result = ptyInject(
+      target,
+      body.text,
+      body.commit !== false,
+    );
+    if (!result.ok) {
+      reply.code(404);
+      return result;
+    }
+    return { ok: true, target };
+  });
+
+  app.post('/lex/capture', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      kind?: 'reminder' | 'next-action';
+      title?: string;
+      due_at?: string;
+      project_id?: string;
+      brainstorm_id?: string;
+      tags?: string[];
+    };
+    if (typeof body.title !== 'string' || !body.title.trim()) {
+      reply.code(400);
+      return { ok: false, error: 'title required' };
+    }
+    const tags = ['lex'];
+    if (body.kind === 'next-action') tags.push('next-action');
+    if (Array.isArray(body.tags)) {
+      for (const t of body.tags) {
+        if (typeof t === 'string' && t.trim()) tags.push(t.trim());
+      }
+    }
+    const reminder = createReminder({
+      title: body.title.trim(),
+      ...(body.due_at ? { due_at: body.due_at } : {}),
+      ...(body.project_id ? { project_id: body.project_id } : {}),
+      tags,
+    });
+    if (body.brainstorm_id) {
+      try {
+        appendBrainstormArtifact(body.brainstorm_id, 'reminders', {
+          id: reminder.id,
+          title: reminder.title,
+        });
+      } catch {
+        /* observability */
+      }
+    }
+    return { ok: true, reminder };
+  });
+
+  app.get('/lex/snapshot', async () => {
+    const sessions = listSessions().filter((s) => s.active);
+    const brainstorms = listBrainstorms({ status: 'active', limit: 20 });
+    const ptyInfo = listPtys();
+    const env = process.env;
+    return {
+      ok: true,
+      now_ms: Date.now(),
+      data_root: DATA_ROOT,
+      whisper: {
+        bin: env.DEVNEURAL_WHISPER_BIN ?? null,
+        model: env.DEVNEURAL_WHISPER_MODEL ?? null,
+      },
+      counts: {
+        active_sessions: sessions.length,
+        active_brainstorms: brainstorms.length,
+        live_ptys: ptyInfo.filter((p) => !p.exited).length,
+      },
+      active_brainstorms: brainstorms.map((b) => ({
+        id: b.id,
+        label: b.user_label ?? b.derived_label,
+        mode: b.mode,
+        started_ms: b.started_ms,
+      })),
     };
   });
 
