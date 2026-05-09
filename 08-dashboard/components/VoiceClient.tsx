@@ -93,6 +93,13 @@ export function VoiceClient({ sessionId }: Props) {
   const [pttHolding, setPttHolding] = useState(false);
   const modeRef = useRef<Mode>("conversation");
   modeRef.current = mode;
+  /* Status ref so non-React handlers (mute, finalize) can branch on
+   * the latest status without going through state. Mirrored via the
+   * effect below. */
+  const statusRef = useRef<Status>("idle");
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const vadRef = useRef<unknown>(null);
@@ -107,6 +114,21 @@ export function VoiceClient({ sessionId }: Props) {
   const utteranceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const utteranceCapRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const utteranceSamplesRef = useRef<number>(0);
+  /* Parallel capture rig. Runs alongside silero VAD on its own
+   * MediaStream + AudioContext so we always have raw int16 audio
+   * for the current utterance even when VAD itself never fires
+   * speech-end (e.g. user mutes mid-sentence). VAD still owns the
+   * normal end-of-utterance path; this rig only ships when the
+   * user explicitly mutes while the status is "listening". */
+  const captureStreamRef = useRef<MediaStream | null>(null);
+  const captureCtxRef = useRef<AudioContext | null>(null);
+  const captureProcRef = useRef<ScriptProcessorNode | null>(null);
+  const captureBufRef = useRef<Int16Array[]>([]);
+  const captureCapturingRef = useRef<boolean>(false);
+  /* Notes-mode finalize awaits the next assistant-text before
+   * closing the WS so the user sees the generated summary. */
+  const awaitingFinalizeRef = useRef<boolean>(false);
+  const finalizeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /* Reset playhead and stop scheduled buffers. Used on barge-in and
    * when a new tts-start arrives. */
@@ -117,19 +139,58 @@ export function VoiceClient({ sessionId }: Props) {
     speakingRef.current = false;
   }
 
+  /* Flush the parallel capture buffer to the server as a single
+   * binary utterance and send utterance-end. Used by mute-finalize
+   * when the user mutes mid-utterance and we want Lex to reply
+   * with whatever audio we already captured rather than discarding
+   * it. Returns true when audio was shipped. */
+  function flushParallelCapture(): boolean {
+    if (!captureCapturingRef.current) return false;
+    captureCapturingRef.current = false;
+    const chunks = captureBufRef.current;
+    captureBufRef.current = [];
+    if (utteranceTimerRef.current) {
+      clearInterval(utteranceTimerRef.current);
+      utteranceTimerRef.current = null;
+    }
+    if (utteranceCapRef.current) {
+      clearTimeout(utteranceCapRef.current);
+      utteranceCapRef.current = null;
+    }
+    setUtteranceMs(0);
+    const total = chunks.reduce((sum, c) => sum + c.length, 0);
+    if (total === 0) return false;
+    const merged = new Int16Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      merged.set(c, off);
+      off += c.length;
+    }
+    sendBinary(merged.buffer);
+    sendJson({ t: "utterance-end" });
+    setStatus("transcribing");
+    return true;
+  }
+
   /* Mute keeps the WS open and the mic stream alive so unmuting is
-   * instant, but gates the VAD events: while muted, speech-start /
-   * speech-end are no-ops. Lets the user pause input while Lex is
-   * still composing a response without tearing down the pipeline. */
+   * instant. If the user mutes mid-utterance (status === listening),
+   * flush whatever the parallel capture rig already has so Lex
+   * still gets the audio and replies. Otherwise mute just gates
+   * future VAD events. */
   function setMicMuted(next: boolean): void {
     mutedRef.current = next;
     setMuted(next);
-    if (next && utteranceTimerRef.current) {
-      clearInterval(utteranceTimerRef.current);
-      utteranceTimerRef.current = null;
-      setUtteranceMs(0);
+    if (next) {
+      if (statusRef.current === "listening") {
+        flushParallelCapture();
+      } else if (utteranceTimerRef.current) {
+        clearInterval(utteranceTimerRef.current);
+        utteranceTimerRef.current = null;
+        setUtteranceMs(0);
+      }
     }
   }
+
 
   function sendJson(obj: Record<string, unknown>): void {
     const ws = wsRef.current;
@@ -234,6 +295,35 @@ export function VoiceClient({ sessionId }: Props) {
         /* ignore */
       }
       vadRef.current = null;
+      /* Tear down the parallel capture rig if it was up. */
+      try {
+        captureProcRef.current?.disconnect();
+      } catch {
+        /* ignore */
+      }
+      try {
+        captureStreamRef.current?.getTracks().forEach((t) => t.stop());
+      } catch {
+        /* ignore */
+      }
+      const cctx = captureCtxRef.current;
+      if (cctx && cctx.state !== "closed") {
+        try {
+          void cctx.close();
+        } catch {
+          /* ignore */
+        }
+      }
+      captureProcRef.current = null;
+      captureStreamRef.current = null;
+      captureCtxRef.current = null;
+      captureCapturingRef.current = false;
+      captureBufRef.current = [];
+      if (finalizeTimeoutRef.current) {
+        clearTimeout(finalizeTimeoutRef.current);
+        finalizeTimeoutRef.current = null;
+      }
+      awaitingFinalizeRef.current = false;
       const ctx = audioCtxRef.current;
       if (ctx && ctx.state !== "closed") {
         try {
@@ -310,6 +400,30 @@ export function VoiceClient({ sessionId }: Props) {
             break;
           case "assistant-text":
             setLastReply(String(msg.text ?? ""));
+            /* If the user pressed stop in notes mode and we are
+             * waiting on the finalize summary, this is the turn we
+             * were waiting for. Give the artifact-parser a beat to
+             * persist the fenced block and any reminders, then
+             * tear down. */
+            if (awaitingFinalizeRef.current) {
+              awaitingFinalizeRef.current = false;
+              if (finalizeTimeoutRef.current) {
+                clearTimeout(finalizeTimeoutRef.current);
+                finalizeTimeoutRef.current = null;
+              }
+              setTimeout(() => setEnabled(false), 750);
+            }
+            break;
+          case "finalize-injected":
+            /* Server ack that the notes-summary prompt was injected.
+             * Just surface a status update; the assistant-text turn
+             * is what actually matters. */
+            setStatus("thinking");
+            break;
+          case "artifacts":
+            /* Slice C: server emitted persisted artifact ids. We
+             * don't render them in the panel today; future iteration
+             * can show a chip per artifact. */
             break;
           case "tts-start": {
             const rate = Number(msg.rate) || 22050;
@@ -342,15 +456,61 @@ export function VoiceClient({ sessionId }: Props) {
         }
       }
 
+      async function initParallelCapture(): Promise<void> {
+        /* Open a dedicated mic stream and run a 16 kHz int16 frame
+         * collector in parallel with silero VAD. We only ship from
+         * here on the mute-finalize path; normal end-of-utterance
+         * still uses the audio buffer VAD itself emits. Two parallel
+         * streams is fine on every browser we care about. */
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: true, noiseSuppression: true },
+          });
+          if (cancelled) {
+            stream.getTracks().forEach((t) => t.stop());
+            return;
+          }
+          captureStreamRef.current = stream;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const Cls: any =
+            (window as unknown as { AudioContext?: typeof AudioContext })
+              .AudioContext ??
+            (window as unknown as { webkitAudioContext?: typeof AudioContext })
+              .webkitAudioContext;
+          const ctx = new Cls({ sampleRate: 16000 });
+          captureCtxRef.current = ctx;
+          const src = ctx.createMediaStreamSource(stream);
+          const proc = ctx.createScriptProcessor(4096, 1, 1);
+          captureProcRef.current = proc;
+          proc.onaudioprocess = (e: AudioProcessingEvent) => {
+            if (!captureCapturingRef.current) return;
+            const f = e.inputBuffer.getChannelData(0);
+            const i16 = new Int16Array(f.length);
+            for (let i = 0; i < f.length; i++) {
+              const s = Math.max(-1, Math.min(1, f[i] ?? 0));
+              i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+            }
+            captureBufRef.current.push(i16);
+          };
+          src.connect(proc);
+          proc.connect(ctx.destination);
+        } catch {
+          /* parallel capture failure is non-fatal; mute-finalize just
+           * won't ship audio when this rig isn't up. VAD path keeps
+           * working. */
+        }
+      }
+
       async function initVad(): Promise<void> {
         if (modeRef.current === "push-to-talk") {
           /* Push-to-talk uses raw getUserMedia + AudioWorklet
            * sampling instead of silero VAD. The user controls
            * utterance boundaries with the talk button; no need to
-           * spin up VAD. */
+           * spin up VAD or the parallel capture rig. */
           await initPushToTalk();
           return;
         }
+        await initParallelCapture();
         try {
           /* Dynamic import so the package only loads on /lex. */
           const mod = await import("@ricky0123/vad-web");
@@ -406,6 +566,10 @@ export function VoiceClient({ sessionId }: Props) {
               }
               setStatus("listening");
               sendJson({ t: "utterance-start" });
+              /* Reset + arm the parallel capture so a mute mid-
+               * utterance has audio to flush. */
+              captureBufRef.current = [];
+              captureCapturingRef.current = true;
               utteranceStartRef.current = Date.now();
               utteranceSamplesRef.current = 0;
               setUtteranceMs(0);
@@ -444,6 +608,10 @@ export function VoiceClient({ sessionId }: Props) {
               }, MAX_UTTERANCE_MS);
             },
             onSpeechEnd: (audio: Float32Array) => {
+              /* Disarm parallel capture; VAD's audio is the source
+               * of truth on the normal end-of-utterance path. */
+              captureCapturingRef.current = false;
+              captureBufRef.current = [];
               if (mutedRef.current) return;
               finalizeUtterance(audio);
             },
@@ -628,6 +796,32 @@ export function VoiceClient({ sessionId }: Props) {
     sendJson({ t: "set-mode", mode: next });
   }
 
+  /* Stop button click. In notes mode with a live socket we don't
+   * tear down immediately; we ask Lex to emit a notes-summary
+   * artifact first so the dictation session leaves a durable
+   * record. The assistant-text handler triggers the actual
+   * setEnabled(false) once the summary turn lands. A timeout
+   * guards against a stuck Lex so the user always gets out of
+   * the panel. */
+  function toggleEnabled(): void {
+    if (!enabled) {
+      setEnabled(true);
+      return;
+    }
+    if (mode === "notes" && wsRef.current?.readyState === WebSocket.OPEN) {
+      awaitingFinalizeRef.current = true;
+      sendJson({ t: "finalize-notes" });
+      setStatus("thinking");
+      if (finalizeTimeoutRef.current) clearTimeout(finalizeTimeoutRef.current);
+      finalizeTimeoutRef.current = setTimeout(() => {
+        awaitingFinalizeRef.current = false;
+        setEnabled(false);
+      }, 30_000);
+      return;
+    }
+    setEnabled(false);
+  }
+
   const statusLabel: Record<Status, string> = {
     idle: "off",
     connecting: "connecting…",
@@ -680,14 +874,25 @@ export function VoiceClient({ sessionId }: Props) {
           )}
           <button
             type="button"
-            onClick={() => setEnabled((v) => !v)}
+            onClick={toggleEnabled}
             className={`text-xs px-3 py-1.5 rounded-pill hairline font-emphasized ${
               enabled
                 ? "bg-err/15 text-err ring-1 ring-err/30 hover:bg-err/25"
                 : "bg-brand/15 text-brandSoft ring-1 ring-brand/30 hover:bg-brand/25"
             }`}
+            title={
+              enabled && mode === "notes"
+                ? "End notes session. Lex will emit a notes-summary before closing."
+                : enabled
+                  ? "Stop voice."
+                  : "Start voice."
+            }
           >
-            {enabled ? "stop" : "start voice"}
+            {enabled
+              ? mode === "notes" && awaitingFinalizeRef.current
+                ? "finalising…"
+                : "stop"
+              : "start voice"}
           </button>
         </div>
       </div>

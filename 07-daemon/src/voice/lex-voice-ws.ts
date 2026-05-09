@@ -474,6 +474,39 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           send({ t: 'tts-end' });
         }
         break;
+      case 'finalize-notes': {
+        /* Notes-mode "stop" finalize. The user is ending a dictation
+         * session and wants Lex to emit a notes-summary artifact
+         * before the WS tears down. We inject a synthetic prompt so
+         * the artifact-parser pipeline (Slice C) handles persistence
+         * and reminder fan-out without any extra path. The client
+         * is expected to wait for the next assistant-text before
+         * closing the socket. */
+        if (!state.bindKey) {
+          send({
+            t: 'error',
+            code: 'no-bind',
+            message: 'cannot finalize: not bound to a Lex PTY',
+          });
+          break;
+        }
+        const finalizePrompt =
+          '[notes-mode finalize] Emit a single notes-summary artifact ' +
+          'summarising the dictation session up to this point. Include ' +
+          'summary, action_items, reminders_to_create (with due_at when ' +
+          'a date or time was mentioned), and topics_covered. Use the ' +
+          '```artifact:notes-summary fenced JSON contract. After the ' +
+          'fenced block, write one sentence acknowledging the close.';
+        const ir = ptyInject(state.bindKey, finalizePrompt, true);
+        if (!ir.ok) {
+          send({ t: 'error', code: 'inject', message: ir.error });
+          break;
+        }
+        send({ t: 'finalize-injected' });
+        state.awaitingResponseSince = Date.now();
+        startJsonlWatch();
+        break;
+      }
       case 'ping':
         send({ t: 'pong' });
         break;
