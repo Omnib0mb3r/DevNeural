@@ -716,6 +716,15 @@ export function VoiceClient({ sessionId }: Props) {
             speakingRef.current = false;
             setStatus("ready");
             break;
+          case "session-end":
+            /* Server-side intent match on the transcript flagged a
+             * spoken end-session command ("end session", "stop voice",
+             * "goodbye Lex", etc.). Tear down the same way the Stop
+             * button does in conversation mode: flip enabled off and
+             * the [enabled] effect closes the WS, mic, audio context,
+             * and clears localStorage so the next mount stays idle. */
+            setEnabled(false);
+            break;
           case "error":
             setStatus("error");
             setErrMsg(String(msg.message ?? "voice error"));

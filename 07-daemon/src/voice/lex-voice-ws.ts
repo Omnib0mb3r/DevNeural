@@ -31,6 +31,8 @@
  *     { t: "assistant-text", text }           - final response text Lex emitted
  *     { t: "tts-start", rate }
  *     { t: "tts-end" }
+ *     { t: "session-end", reason }            - spoken end-session command;
+ *                                               client should setEnabled(false)
  *     { t: "error", code, message }
  *     { t: "pong" }
  *   server -> client (binary):
@@ -89,6 +91,30 @@ const MIC_BUF_MAX = 4 * 1024 * 1024; // 4 MB ~= 2 minutes of 16k mono pcm
 
 const SESSION_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/* Spoken end-session command. Matched against the transcript before we
+ * inject into Lex so the user can stop the voice loop hands-free —
+ * "end session", "stop voice", "goodbye Lex" all close the panel
+ * without Lex generating a normal text reply that the user would then
+ * have to interrupt. Conversation mode tears down immediately; notes
+ * mode routes through the existing finalize-notes path so the
+ * dictation summary still ships.
+ *
+ * Whisper transcripts come back lower-cased after our normalize pass
+ * (punctuation stripped, whitespace collapsed). Patterns are matched
+ * with word boundaries so "extend session" doesn't false-fire. */
+const END_SESSION_RE =
+  /\b(?:end|stop|finish|close)\s+(?:the\s+|this\s+|our\s+)?(?:session|chat|conversation|voice|listening)\b|\b(?:goodbye|bye)\s+lex\b|\bstop\s+listening\b/;
+
+function matchesEndSession(text: string): boolean {
+  const norm = text
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!norm) return false;
+  return END_SESSION_RE.test(norm);
+}
 
 /* Find a Claude Code session jsonl by sessionId, scanning every project
  * slug under ~/.claude/projects. Decouples the TTS watcher from pty-host
@@ -524,6 +550,15 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
     send({ t: 'transcript', text: result.text, ms: result.ms });
     if (!result.text.trim()) return;
+    /* Hands-free stop: if the transcript matches a spoken end-session
+     * command, skip the inject path so Lex doesn't reply, and notify
+     * the client to tear down. Notes-mode users who want the dictation
+     * summary should press Stop instead — voice command is an
+     * immediate close. */
+    if (matchesEndSession(result.text)) {
+      send({ t: 'session-end', reason: 'voice-command' });
+      return;
+    }
     if (!state.bindKey) {
       send({ t: 'error', code: 'no-bind', message: 'not bound to a Lex PTY' });
       return;
