@@ -479,6 +479,11 @@ async function main(): Promise<void> {
         root: dashboardOut,
         prefix: '/',
         index: ['index.html'],
+        /* Disable fastify-static's auto cache-control header so the
+         * setHeaders callback below is the single source of truth.
+         * Without this, fastify-static emits `public, max-age=0` and
+         * silently ignores our overrides. */
+        cacheControl: false,
         /* Cache strategy:
          *   - HTML (entry points) MUST NOT be cached. Each dashboard
          *     rebuild rotates the next/static chunk hashes, and the
@@ -493,17 +498,21 @@ async function main(): Promise<void> {
          *     a few minutes without forcing a full revalidation per
          *     request. */
         setHeaders: (res, p) => {
-          if (p.endsWith('.html')) {
+          /* Normalize Windows backslashes so the path checks below
+           * match regardless of host OS. fastify-static hands the
+           * absolute path to the file being served. */
+          const norm = p.replace(/\\/g, '/');
+          if (norm.endsWith('.html')) {
             res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
             res.setHeader('Pragma', 'no-cache');
             res.setHeader('Expires', '0');
             return;
           }
-          if (p.includes('/_next/static/')) {
+          if (norm.includes('/_next/static/')) {
             res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
             return;
           }
-          if (p.endsWith('/sw.js') || p.endsWith('manifest.json')) {
+          if (norm.endsWith('/sw.js') || norm.endsWith('/manifest.json')) {
             res.setHeader('Cache-Control', 'no-cache');
             return;
           }
