@@ -479,6 +479,36 @@ async function main(): Promise<void> {
         root: dashboardOut,
         prefix: '/',
         index: ['index.html'],
+        /* Cache strategy:
+         *   - HTML (entry points) MUST NOT be cached. Each dashboard
+         *     rebuild rotates the next/static chunk hashes, and the
+         *     fresh index.html references the new hashes. iOS Safari
+         *     and home-screen PWAs would otherwise serve a stale
+         *     cached index.html that points at chunks no longer on
+         *     disk → white screen until manual cache clear.
+         *   - /_next/static/** content has hash-based filenames so it
+         *     is safe to cache aggressively (immutable forever).
+         *   - Everything else (manifest.json, sw.js, icons, fonts)
+         *     gets a short cache window so updates propagate within
+         *     a few minutes without forcing a full revalidation per
+         *     request. */
+        setHeaders: (res, p) => {
+          if (p.endsWith('.html')) {
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+            res.setHeader('Pragma', 'no-cache');
+            res.setHeader('Expires', '0');
+            return;
+          }
+          if (p.includes('/_next/static/')) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+            return;
+          }
+          if (p.endsWith('/sw.js') || p.endsWith('manifest.json')) {
+            res.setHeader('Cache-Control', 'no-cache');
+            return;
+          }
+          res.setHeader('Cache-Control', 'public, max-age=300');
+        },
       });
       // SPA fallback. The onRequest hook above already serves <route>.html
       // for HTML browser navigations, so this only catches a small
