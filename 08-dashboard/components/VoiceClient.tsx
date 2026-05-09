@@ -61,6 +61,12 @@ const SPEED_MAX = 1.5;
 const SPEED_STEP = 0.05;
 const SPEED_DEFAULT = 1.0;
 
+const BARGE_STORAGE_KEY = "lex-barge-cooldown-ms";
+const BARGE_MIN = 0;
+const BARGE_MAX = 2000;
+const BARGE_STEP = 50;
+const BARGE_DEFAULT = 250;
+
 interface Props {
   /** Auto-bind to a specific Lex session. When omitted, the daemon
    * resolves the active brainstorm PTY. */
@@ -108,6 +114,22 @@ export function VoiceClient({ sessionId }: Props) {
       : SPEED_DEFAULT;
   });
   const speedSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /* Barge-in cooldown (ms). Suppress VAD-driven barge-in for this long
+   * after each tts-start so Lex's own audio bleeding into the mic does
+   * not trigger a self-interrupt loop. Server-persisted; localStorage
+   * is just optimistic seed so the slider does not snap on remount. */
+  const [bargeCooldownMs, setBargeCooldownMs] = useState<number>(() => {
+    if (typeof window === "undefined") return BARGE_DEFAULT;
+    const raw = window.localStorage.getItem(BARGE_STORAGE_KEY);
+    const n = raw ? Number(raw) : NaN;
+    return Number.isFinite(n) && n >= BARGE_MIN && n <= BARGE_MAX
+      ? n
+      : BARGE_DEFAULT;
+  });
+  const bargeCooldownRef = useRef<number>(BARGE_DEFAULT);
+  bargeCooldownRef.current = bargeCooldownMs;
+  const lastTtsStartAtRef = useRef<number>(0);
+  const bargeSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [pttHolding, setPttHolding] = useState(false);
   const modeRef = useRef<Mode>("conversation");
   modeRef.current = mode;
@@ -331,6 +353,19 @@ export function VoiceClient({ sessionId }: Props) {
             window.localStorage.setItem(SPEED_STORAGE_KEY, String(clamped));
           }
         }
+        if (
+          typeof j.barge_cooldown_ms === "number" &&
+          Number.isFinite(j.barge_cooldown_ms)
+        ) {
+          const clamped = Math.max(
+            BARGE_MIN,
+            Math.min(BARGE_MAX, j.barge_cooldown_ms),
+          );
+          setBargeCooldownMs(clamped);
+          if (typeof window !== "undefined") {
+            window.localStorage.setItem(BARGE_STORAGE_KEY, String(clamped));
+          }
+        }
       })
       .catch(() => undefined);
   }, []);
@@ -351,6 +386,23 @@ export function VoiceClient({ sessionId }: Props) {
         headers: { "Content-Type": "application/json" },
         credentials: "include",
         body: JSON.stringify({ speed: clamped }),
+      }).catch(() => undefined);
+    }, 250);
+  }
+
+  function changeBargeCooldown(next: number): void {
+    const clamped = Math.max(BARGE_MIN, Math.min(BARGE_MAX, Math.round(next)));
+    setBargeCooldownMs(clamped);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(BARGE_STORAGE_KEY, String(clamped));
+    }
+    if (bargeSaveTimerRef.current) clearTimeout(bargeSaveTimerRef.current);
+    bargeSaveTimerRef.current = setTimeout(() => {
+      void fetch("/voice/set-barge-cooldown", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ ms: clamped }),
       }).catch(() => undefined);
     }, 250);
   }
@@ -542,6 +594,10 @@ export function VoiceClient({ sessionId }: Props) {
             }
             playheadRef.current = ctx?.currentTime ?? 0;
             speakingRef.current = true;
+            /* Stamp the moment audio actually started flowing so the
+             * VAD barge-in handler can swallow self-echo within the
+             * configured cooldown window. */
+            lastTtsStartAtRef.current = Date.now();
             setStatus("speaking");
             break;
           }
@@ -660,6 +716,16 @@ export function VoiceClient({ sessionId }: Props) {
             onSpeechStart: () => {
               if (mutedRef.current) return;
               if (speakingRef.current) {
+                /* Self-echo guard: Lex's own audio bleeds into the mic
+                 * (laptop speakers, AirPods leak, etc.) and trips VAD
+                 * milliseconds after tts-start. Swallow VAD events
+                 * within bargeCooldownMs of audio onset so the loop
+                 * does not feedback on itself. The cooldown is user-
+                 * tunable in the voice panel and persisted server-side. */
+                const sinceStart = Date.now() - lastTtsStartAtRef.current;
+                if (sinceStart < bargeCooldownRef.current) {
+                  return;
+                }
                 /* Barge-in: stop Lex, start a fresh utterance. */
                 sendJson({ t: "barge-in" });
                 resetTtsPlayback();
@@ -960,7 +1026,7 @@ export function VoiceClient({ sessionId }: Props) {
         <div className="ml-auto flex items-center gap-2">
           <label
             className="flex items-center gap-2 text-nano font-mono text-txt3"
-            title="Lex speech rate. Persisted globally — applies to every voice consumer until you change it again."
+            title="Lex speech rate. Persisted globally; applies to every voice consumer until you change it again."
           >
             <span>speed</span>
             <input
@@ -974,6 +1040,24 @@ export function VoiceClient({ sessionId }: Props) {
             />
             <span className="text-txt2 tabular-nums w-10 text-right">
               {speed.toFixed(2)}x
+            </span>
+          </label>
+          <label
+            className="flex items-center gap-2 text-nano font-mono text-txt3"
+            title="Suppress mic-driven barge-in for this many ms after Lex starts speaking. Stops self-echo from interrupting Lex when laptop speakers bleed into the mic. 0 disables the guard. Persisted globally."
+          >
+            <span>barge gate</span>
+            <input
+              type="range"
+              min={BARGE_MIN}
+              max={BARGE_MAX}
+              step={BARGE_STEP}
+              value={bargeCooldownMs}
+              onChange={(e) => changeBargeCooldown(Number(e.target.value))}
+              className="w-24 accent-brandSoft"
+            />
+            <span className="text-txt2 tabular-nums w-12 text-right">
+              {bargeCooldownMs}ms
             </span>
           </label>
           {enabled && (

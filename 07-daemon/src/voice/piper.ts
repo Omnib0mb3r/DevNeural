@@ -55,6 +55,16 @@ const VOICE_PREF_FILE = (() => {
 
 let cachedActiveVoice: string | null = null;
 let cachedLengthScale: number | null = null;
+let cachedBargeCooldownMs: number | null = null;
+
+/* Default barge-in cooldown after tts-start. Bedroom-mic feedback was
+ * triggering self-barge: Lex's own audio bled into the mic, VAD fired
+ * speech-start, the client interrupted Lex and re-injected the captured
+ * echo as a new turn. 250ms is enough to swallow the initial chunk
+ * without making barge-in feel sluggish for real interruptions. */
+const DEFAULT_BARGE_COOLDOWN_MS = 250;
+const MIN_BARGE_COOLDOWN_MS = 0;
+const MAX_BARGE_COOLDOWN_MS = 2000;
 
 /* Piper's --length_scale baseline for the dashboard's "1.0x speed".
  * Lower = faster, higher = slower. 0.475 was the previous hardcoded
@@ -65,13 +75,18 @@ const BASE_LENGTH_SCALE = 0.475;
 const MIN_LENGTH_SCALE = 0.25;
 const MAX_LENGTH_SCALE = 1.5;
 
-function readPersistedPrefs(): { voice?: string; length_scale?: number } {
+function readPersistedPrefs(): {
+  voice?: string;
+  length_scale?: number;
+  barge_cooldown_ms?: number;
+} {
   if (!VOICE_PREF_FILE) return {};
   try {
     if (!fs.existsSync(VOICE_PREF_FILE)) return {};
     return JSON.parse(fs.readFileSync(VOICE_PREF_FILE, 'utf-8')) as {
       voice?: string;
       length_scale?: number;
+      barge_cooldown_ms?: number;
     };
   } catch {
     return {};
@@ -90,6 +105,7 @@ function readPersistedLengthScale(): number | null {
 function writePersistedPrefs(patch: {
   voice?: string;
   length_scale?: number;
+  barge_cooldown_ms?: number;
 }): void {
   if (!VOICE_PREF_FILE) return;
   try {
@@ -131,6 +147,40 @@ function clampLengthScale(v: number): number {
  * authoritative even if BASE changes. */
 export function getActiveSpeed(): number {
   return BASE_LENGTH_SCALE / getLengthScale();
+}
+
+function clampBargeCooldownMs(v: number): number {
+  if (!Number.isFinite(v)) return DEFAULT_BARGE_COOLDOWN_MS;
+  if (v < MIN_BARGE_COOLDOWN_MS) return MIN_BARGE_COOLDOWN_MS;
+  if (v > MAX_BARGE_COOLDOWN_MS) return MAX_BARGE_COOLDOWN_MS;
+  return Math.round(v);
+}
+
+function readPersistedBargeCooldownMs(): number | null {
+  const v = Number(readPersistedPrefs().barge_cooldown_ms);
+  return Number.isFinite(v) && v >= 0 ? v : null;
+}
+
+export function getBargeCooldownMs(): number {
+  if (cachedBargeCooldownMs !== null) return cachedBargeCooldownMs;
+  const persisted = readPersistedBargeCooldownMs();
+  cachedBargeCooldownMs = persisted !== null
+    ? clampBargeCooldownMs(persisted)
+    : DEFAULT_BARGE_COOLDOWN_MS;
+  return cachedBargeCooldownMs;
+}
+
+export function setBargeCooldownMs(ms: number): {
+  ok: boolean;
+  barge_cooldown_ms: number;
+} {
+  if (!Number.isFinite(ms) || ms < 0) {
+    return { ok: false, barge_cooldown_ms: getBargeCooldownMs() };
+  }
+  const clamped = clampBargeCooldownMs(ms);
+  cachedBargeCooldownMs = clamped;
+  writePersistedPrefs({ barge_cooldown_ms: clamped });
+  return { ok: true, barge_cooldown_ms: clamped };
 }
 
 export function setActiveSpeed(uiSpeed: number): {
@@ -273,6 +323,7 @@ export interface PiperStatus {
   rate: number;
   speed: number;
   length_scale: number;
+  barge_cooldown_ms: number;
   voices: VoicePack[];
 }
 
@@ -285,6 +336,7 @@ export function piperStatus(): PiperStatus {
     rate: getRate(),
     speed: getActiveSpeed(),
     length_scale: getLengthScale(),
+    barge_cooldown_ms: getBargeCooldownMs(),
     voices: listVoices(),
   };
 }

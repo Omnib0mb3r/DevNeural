@@ -71,6 +71,7 @@ import {
   pcmToWav,
   setActiveVoice,
   setActiveSpeed,
+  setBargeCooldownMs,
 } from '../voice/piper.js';
 import { attachLexVoiceWs } from '../voice/lex-voice-ws.js';
 import { lintQueueStatus } from '../wiki/lint-queue.js';
@@ -954,6 +955,20 @@ export async function registerDashboardRoutes(
     if (!r.ok) {
       reply.code(400);
       return { ok: false, error: 'speed must be a positive number' };
+    }
+    return { ok: true, ...piperStatus() };
+  });
+
+  /* Persisted barge-in cooldown after tts-start. Suppresses VAD
+   * speech-start handlers on the client for this many ms so Lex's own
+   * audio bleeding into the mic does not trigger a self-interrupt.
+   * Body: { ms: number } clamped 0-2000. Stored in voice-preferences.json. */
+  app.post('/voice/set-barge-cooldown', async (req, reply) => {
+    const body = (req.body ?? {}) as { ms?: number };
+    const r = setBargeCooldownMs(Number(body.ms));
+    if (!r.ok) {
+      reply.code(400);
+      return { ok: false, error: 'ms must be a non-negative number' };
     }
     return { ok: true, ...piperStatus() };
   });
