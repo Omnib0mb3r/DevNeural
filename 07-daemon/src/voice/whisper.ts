@@ -51,9 +51,43 @@ const state: ServerState = {
   readyPromise: null,
 };
 
+/* Detect a known misconfiguration: a persistent env var pointing at
+ * `whisper-cli.exe` instead of the persistent `whisper-server.exe`.
+ * The CLI does not understand --host/--port and exits clean, which
+ * looks like a server crash from the daemon's perspective. We log
+ * once, swap to the matching server.exe path, and prefer the cuBLAS
+ * Release sibling if it exists since that is the normal install
+ * layout on this host. Returns the corrected path, never throws;
+ * existence is enforced later by ensureServer(). */
+let warnedAboutCliMisconfig = false;
+function correctIfWhisperCli(raw: string): string {
+  const norm = raw.replace(/\\/g, '/');
+  if (!/whisper-cli\.exe$/i.test(norm)) return norm;
+  const sameDirServer = norm.replace(/whisper-cli\.exe$/i, 'whisper-server.exe');
+  const cublasSibling = sameDirServer.replace(
+    /\/Release\/whisper-server\.exe$/i,
+    '/cublas/Release/whisper-server.exe',
+  );
+  let chosen = sameDirServer;
+  try {
+    if (fs.existsSync(cublasSibling)) chosen = cublasSibling;
+  } catch {
+    /* fall through to same-dir server.exe */
+  }
+  if (!warnedAboutCliMisconfig) {
+    warnedAboutCliMisconfig = true;
+    console.warn(
+      `[whisper] DEVNEURAL_WHISPER_BIN points at whisper-cli.exe (${norm}); ` +
+      `the daemon needs whisper-server.exe. Auto-correcting to ${chosen}. ` +
+      `Update the persistent env var to silence this warning.`,
+    );
+  }
+  return chosen;
+}
+
 function getBin(): string {
   const v = process.env.DEVNEURAL_WHISPER_BIN || DEFAULT_BIN;
-  return v.replace(/\\/g, '/');
+  return correctIfWhisperCli(v.replace(/\\/g, '/'));
 }
 
 function getModel(): string {
