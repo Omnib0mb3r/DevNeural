@@ -122,10 +122,41 @@ const MAX_UTTERANCE_MS = 30_000;
  * 4MB. Used as a defensive abort if VAD never fires speech-end. */
 const MAX_UTTERANCE_SAMPLES = 30 * 16000;
 
+/* Survive in-app navigation and tab eviction. iOS Safari can evict
+ * the page subtree at any time; React state alone resets to defaults
+ * on remount, leaving the button stuck on "Start" while the original
+ * WS + mic stream are still alive in the browser (Lex still hears).
+ * Persisting the two user-facing toggles lets the UI reflect truth on
+ * remount, and the existing useEffect on [enabled] auto-reopens the
+ * pipeline if voice was running. */
+const ENABLED_STORAGE_KEY = "lex-voice-enabled";
+const MUTED_STORAGE_KEY = "lex-voice-muted";
+
+function readStoredFlag(key: string): boolean {
+  if (typeof window === "undefined") return false;
+  return window.localStorage.getItem(key) === "1";
+}
+
 export function VoiceClient({ sessionId }: Props) {
   const [status, setStatus] = useState<Status>("idle");
-  const [enabled, setEnabled] = useState(false);
-  const [muted, setMuted] = useState(false);
+  const [enabled, setEnabledState] = useState<boolean>(() =>
+    readStoredFlag(ENABLED_STORAGE_KEY),
+  );
+  function setEnabled(next: boolean): void {
+    setEnabledState(next);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(ENABLED_STORAGE_KEY, next ? "1" : "0");
+    }
+  }
+  const [muted, setMutedState] = useState<boolean>(() =>
+    readStoredFlag(MUTED_STORAGE_KEY),
+  );
+  function setMuted(next: boolean): void {
+    setMutedState(next);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(MUTED_STORAGE_KEY, next ? "1" : "0");
+    }
+  }
   const [lastTranscript, setLastTranscript] = useState<string>("");
   const [lastReply, setLastReply] = useState<string>("");
   const [errMsg, setErrMsg] = useState<string>("");
