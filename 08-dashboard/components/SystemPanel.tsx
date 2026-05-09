@@ -51,8 +51,16 @@ function DaemonRestartCard() {
     /* Use the public /health probe (not /dashboard/health) so the
      * post-restart wait works even when the dashboard cookie is
      * missing or expired. /dashboard/health is auth-gated and would
-     * 401 until the user re-unlocks, making this loop look stuck. */
-    const deadline = Date.now() + 60_000;
+     * 401 until the user re-unlocks, making this loop look stuck.
+     *
+     * Window is 220s. Cold boot is ~10s on localhost (mostly embedder
+     * warmup) but iPad-over-Tailscale adds relay lag and Safari
+     * background throttling that push the first successful probe
+     * well past a 60s budget. 220s covers a slow respawn (autostart
+     * watchdog tick) plus Tailscale Serve proxy re-binding plus the
+     * ~8s embedder warmup with margin. False "failed" was harmless
+     * but misleading; this just lets the legitimate path finish. */
+    const deadline = Date.now() + 220_000;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 1500));
       try {
@@ -66,7 +74,7 @@ function DaemonRestartCard() {
         /* expected during the gap */
       }
     }
-    setErrorMsg("daemon did not come back within 60s; check daemon.log");
+    setErrorMsg("daemon did not come back within 220s; check daemon.log");
     setPhase("error");
   }
 
