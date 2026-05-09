@@ -1034,11 +1034,12 @@ export function VoiceClient({ sessionId }: Props) {
 
     return () => {
       cancelled = true;
-      /* Component is unmounting (user navigated away) or deps changed.
-       * Either way, the in-flight WS / mic / audio context this effect
-       * owns must be released; otherwise the browser keeps them alive
-       * past the React lifecycle and the next mount cannot see them. */
-      tearDownVoice();
+      /* Deliberately do NOT call tearDownVoice() here. VoiceClient is
+       * rendered at the AppShell level so it survives route changes;
+       * teardown only happens when the user clicks Stop (enabled=false)
+       * or tells Lex to end the session. The cancelled flag is enough
+       * to short-circuit any in-flight async work that has not yet
+       * resolved when deps change (sessionId or mode swap). */
     };
   }, [enabled, sessionId, mode]);
 

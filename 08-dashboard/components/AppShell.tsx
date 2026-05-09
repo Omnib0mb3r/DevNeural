@@ -1,19 +1,35 @@
 "use client";
 
 import { usePathname } from "next/navigation";
+import { useQuery } from "@tanstack/react-query";
 import { TopBar } from "./TopBar";
 import { StreamDeck } from "./StreamDeck";
 import { RightRail } from "./RightRail";
 import { VitalsRibbon } from "./VitalsRibbon";
 import { CommandPalette } from "./CommandPalette";
 import { LexEasterEgg } from "./LexEasterEgg";
+import { VoiceClient } from "./VoiceClient";
 import { Icon } from "./Icon";
+import { listPtys, type PtyEntry } from "@/lib/daemon-client";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() ?? "/";
   // Match the active tab to the topmost path segment.
   const segments = pathname.split("/").filter(Boolean);
   const activeTab = segments.length === 0 ? "/" : `/${segments[0]}`;
+
+  /* Resolve the active Lex brainstorm PTY at the AppShell level so the
+   * lifted VoiceClient stays bound to it across route changes. Same
+   * filter as the /lex page used to use locally. tanstack query dedupes
+   * with the lex page's own ["pty-list"] subscription. */
+  const ptysQ = useQuery({
+    queryKey: ["pty-list"],
+    queryFn: listPtys,
+    refetchInterval: 3_000,
+  });
+  const lexPty: PtyEntry | undefined = (ptysQ.data?.ptys ?? []).find(
+    (p) => !p.exited && /\/brainstorm\/?$/i.test(p.cwd.replace(/\\/g, "/")),
+  );
 
   // Layout is constrained to exactly one viewport (100dvh handles mobile
    // URL-bar shifts) so the VitalsRibbon stays pinned to the visible bottom
@@ -37,6 +53,20 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <CommandPalette />
       <MobileTabBar activeTab={activeTab} />
       <LexEasterEgg />
+      {/* Voice client lifted to AppShell so the WS, mic, and audio
+       * pipeline survive route changes. Only mounts when a Lex PTY
+       * exists (prevents needless WS spawn on cold project state). The
+       * panel renders as a fixed bottom-right floating widget so it
+       * stays visible on /settings, /wiki, etc. without rearranging
+       * the page-specific layout. */}
+      {lexPty && (
+        <div
+          className="fixed bottom-16 right-4 z-30 w-[min(380px,calc(100vw-2rem))] md:bottom-4 md:right-4"
+          aria-label="Voice panel"
+        >
+          <VoiceClient sessionId={lexPty.sessionId ?? null} />
+        </div>
+      )}
     </div>
   );
 }
