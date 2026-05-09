@@ -164,6 +164,12 @@ export function getBrainstormByClaudeSessionId(
   return db().getBrainstormByClaudeSession(claudeSessionId);
 }
 
+export function getBrainstormByPty(
+  ptyId: string,
+): BrainstormSessionRow | null {
+  return db().getBrainstormByPty(ptyId);
+}
+
 export function listBrainstorms(opts: {
   status?: 'active' | 'ended';
   limit?: number;

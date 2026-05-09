@@ -27,6 +27,8 @@ import {
   registerBrainstorm,
   bindBrainstormSessionId,
   isBrainstormCwd,
+  getBrainstormByPty,
+  endBrainstorm,
 } from '../lex/brainstorm-store.js';
 
 interface PtyHandle {
@@ -253,6 +255,17 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
         `\r\n[lex pty exited: code=${exitCode}]\r\n`,
       );
       sessionToPty.delete(handle.sessionId);
+    }
+    /* Mark the brainstorm row ended so /lex/sessions?status=active
+     * stops returning rows for dead PTYs. Closes the Slice A leak
+     * where killing a PTY left the row stuck at status='active'. */
+    try {
+      const bs = getBrainstormByPty(handle.ptyId);
+      if (bs && bs.status === 'active') {
+        endBrainstorm(bs.id);
+      }
+    } catch {
+      /* observability: never block exit cleanup */
     }
     /* Keep the entry around briefly so the dashboard can read final
      * status; reaper sweeps it in 60s. */
