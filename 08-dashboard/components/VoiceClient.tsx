@@ -501,60 +501,71 @@ export function VoiceClient({ sessionId }: Props) {
     }
   }
 
+  /* Hard teardown of every side-effect this component owns: WebSocket,
+   * silero VAD instance, parallel capture rig, audio output context,
+   * and any pending finalize timer. Called both from the enabled=false
+   * branch (user clicked stop) and from the unmount cleanup (user
+   * navigated away). Without the unmount call, the WS and MediaStream
+   * survive component teardown because the browser holds internal
+   * handles to open sockets and active mic tracks; the next VoiceClient
+   * mount shows the "start" button while the old loop is still
+   * silently transcribing every word. */
+  function tearDownVoice(): void {
+    try {
+      wsRef.current?.close();
+    } catch {
+      /* ignore */
+    }
+    wsRef.current = null;
+    const v = vadRef.current as { destroy?: () => void } | null;
+    try {
+      v?.destroy?.();
+    } catch {
+      /* ignore */
+    }
+    vadRef.current = null;
+    try {
+      captureProcRef.current?.disconnect();
+    } catch {
+      /* ignore */
+    }
+    try {
+      captureStreamRef.current?.getTracks().forEach((t) => t.stop());
+    } catch {
+      /* ignore */
+    }
+    const cctx = captureCtxRef.current;
+    if (cctx && cctx.state !== "closed") {
+      try {
+        void cctx.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    captureProcRef.current = null;
+    captureStreamRef.current = null;
+    captureCtxRef.current = null;
+    captureCapturingRef.current = false;
+    captureBufRef.current = [];
+    if (finalizeTimeoutRef.current) {
+      clearTimeout(finalizeTimeoutRef.current);
+      finalizeTimeoutRef.current = null;
+    }
+    awaitingFinalizeRef.current = false;
+    const ctx = audioCtxRef.current;
+    if (ctx && ctx.state !== "closed") {
+      try {
+        void ctx.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    audioCtxRef.current = null;
+  }
+
   useEffect(() => {
     if (!enabled) {
-      /* Tear-down path. */
-      try {
-        wsRef.current?.close();
-      } catch {
-        /* ignore */
-      }
-      wsRef.current = null;
-      const v = vadRef.current as { destroy?: () => void } | null;
-      try {
-        v?.destroy?.();
-      } catch {
-        /* ignore */
-      }
-      vadRef.current = null;
-      /* Tear down the parallel capture rig if it was up. */
-      try {
-        captureProcRef.current?.disconnect();
-      } catch {
-        /* ignore */
-      }
-      try {
-        captureStreamRef.current?.getTracks().forEach((t) => t.stop());
-      } catch {
-        /* ignore */
-      }
-      const cctx = captureCtxRef.current;
-      if (cctx && cctx.state !== "closed") {
-        try {
-          void cctx.close();
-        } catch {
-          /* ignore */
-        }
-      }
-      captureProcRef.current = null;
-      captureStreamRef.current = null;
-      captureCtxRef.current = null;
-      captureCapturingRef.current = false;
-      captureBufRef.current = [];
-      if (finalizeTimeoutRef.current) {
-        clearTimeout(finalizeTimeoutRef.current);
-        finalizeTimeoutRef.current = null;
-      }
-      awaitingFinalizeRef.current = false;
-      const ctx = audioCtxRef.current;
-      if (ctx && ctx.state !== "closed") {
-        try {
-          void ctx.close();
-        } catch {
-          /* ignore */
-        }
-      }
-      audioCtxRef.current = null;
+      tearDownVoice();
       setStatus("idle");
       return;
     }
@@ -1023,6 +1034,11 @@ export function VoiceClient({ sessionId }: Props) {
 
     return () => {
       cancelled = true;
+      /* Component is unmounting (user navigated away) or deps changed.
+       * Either way, the in-flight WS / mic / audio context this effect
+       * owns must be released; otherwise the browser keeps them alive
+       * past the React lifecycle and the next mount cannot see them. */
+      tearDownVoice();
     };
   }, [enabled, sessionId, mode]);
 
