@@ -10,6 +10,7 @@ import type { MultipartFile } from '@fastify/multipart';
 import type { Store } from '../store/index.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { spawn } from 'node:child_process';
 import { DATA_ROOT } from '../paths.js';
 import { authMiddleware, registerAuthRoutes, isPinSet } from './auth.js';
 import { ReferenceStore } from '../reference/store.js';
@@ -43,6 +44,7 @@ import {
   listPtys,
   getPtyOutput,
   startSessionDiscoveryProbe,
+  seedFirstTurn,
 } from './pty-host.js';
 import { buildLexSystemPrompt } from '../lex/system-prompt.js';
 import {
@@ -740,6 +742,150 @@ export async function registerDashboardRoutes(
     return { ok: true, session: row };
   });
 
+  /* List artifacts attached to a brainstorm session.
+   *
+   * Reads the artifacts manifest off the brainstorm row, then walks
+   * each referenced JSON file under <DATA_ROOT>/lex/artifacts/<kind>/.
+   * Returns lightweight metadata + a preview slice so the dashboard
+   * can render a list without slurping every file when the user is
+   * just scrolling. The artifact JSON envelope is { id, kind,
+   * brainstorm_id, created_ms, data } (see artifact-parser.ts). */
+  app.get('/lex/sessions/:id/artifacts', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = getBrainstorm(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'session not found' };
+    }
+    interface ArtifactManifestRef {
+      id: string;
+      title?: string;
+      added_ms?: number;
+    }
+    interface ArtifactManifest {
+      research_notes: ArtifactManifestRef[];
+      wiki_drafts: ArtifactManifestRef[];
+      reminders: ArtifactManifestRef[];
+      spawned_projects: ArtifactManifestRef[];
+    }
+    let manifest: ArtifactManifest;
+    try {
+      const parsed = JSON.parse(row.artifacts_json) as Partial<ArtifactManifest>;
+      manifest = {
+        research_notes: parsed.research_notes ?? [],
+        wiki_drafts: parsed.wiki_drafts ?? [],
+        reminders: parsed.reminders ?? [],
+        spawned_projects: parsed.spawned_projects ?? [],
+      };
+    } catch {
+      manifest = { research_notes: [], wiki_drafts: [], reminders: [], spawned_projects: [] };
+    }
+    const artifactsRoot = path.posix.join(
+      DATA_ROOT.replace(/\\/g, '/'),
+      'lex',
+      'artifacts',
+    );
+    /* Reminders entries point at the reminder system, not at on-disk
+     * artifact JSON, so they're excluded from this listing. The kinds
+     * with files on disk are research-note, wiki-draft, project-intent,
+     * notes-summary; the manifest uses category names so we map back
+     * to the on-disk subdirectory by trying each candidate kind. */
+    const KIND_DIRS_BY_CATEGORY: Record<string, string[]> = {
+      research_notes: ['research-note', 'notes-summary'],
+      wiki_drafts: ['wiki-draft'],
+      spawned_projects: ['project-intent'],
+    };
+    interface ArtifactItem {
+      kind: string;
+      category: string;
+      id: string;
+      title: string;
+      created_ms: number;
+      path: string;
+      preview: string;
+    }
+    const items: ArtifactItem[] = [];
+    const categories: Array<keyof ArtifactManifest> = [
+      'research_notes',
+      'wiki_drafts',
+      'spawned_projects',
+    ];
+    for (const category of categories) {
+      const refs = manifest[category];
+      const candidateKinds = KIND_DIRS_BY_CATEGORY[category] ?? [];
+      for (const ref of refs) {
+        if (!ref?.id) continue;
+        let resolved: { kind: string; file: string } | null = null;
+        for (const kind of candidateKinds) {
+          const file = path.posix.join(artifactsRoot, kind, `${ref.id}.json`);
+          if (fs.existsSync(file)) {
+            resolved = { kind, file };
+            break;
+          }
+        }
+        if (!resolved) continue;
+        try {
+          const raw = fs.readFileSync(resolved.file, 'utf-8');
+          const parsed = JSON.parse(raw) as {
+            id?: string;
+            kind?: string;
+            created_ms?: number;
+            data?: Record<string, unknown>;
+          };
+          /* Build a preview by stringifying the data block. Trim hard
+           * so the list payload stays small when a session has many
+           * artifacts; clients can fetch the file path for the full
+           * body if they need it. */
+          const dataStr = JSON.stringify(parsed.data ?? {}, null, 2);
+          const preview = dataStr.length > 400 ? dataStr.slice(0, 400) : dataStr;
+          items.push({
+            kind: parsed.kind ?? resolved.kind,
+            category,
+            id: ref.id,
+            title: ref.title ?? ref.id,
+            created_ms: parsed.created_ms ?? ref.added_ms ?? 0,
+            path: resolved.file,
+            preview,
+          });
+        } catch {
+          /* Skip unreadable / malformed artifact file. */
+        }
+      }
+    }
+    items.sort((a, b) => b.created_ms - a.created_ms);
+    return { ok: true, artifacts: items };
+  });
+
+  /* Full artifact body. Used by the dashboard when the user expands
+   * an artifact row to read the entire JSON instead of just the
+   * preview slice returned by the list endpoint. */
+  app.get('/lex/artifacts/:kind/:id', async (req, reply) => {
+    const params = req.params as { kind: string; id: string };
+    if (!/^[a-z][a-z-]+$/.test(params.kind) || !/^[a-zA-Z0-9-]+$/.test(params.id)) {
+      reply.code(400);
+      return { ok: false, error: 'invalid kind or id' };
+    }
+    const file = path.posix.join(
+      DATA_ROOT.replace(/\\/g, '/'),
+      'lex',
+      'artifacts',
+      params.kind,
+      `${params.id}.json`,
+    );
+    if (!fs.existsSync(file)) {
+      reply.code(404);
+      return { ok: false, error: 'artifact not found' };
+    }
+    try {
+      const raw = fs.readFileSync(file, 'utf-8');
+      const parsed = JSON.parse(raw);
+      return { ok: true, artifact: parsed };
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, error: `read failed: ${(err as Error).message}` };
+    }
+  });
+
   app.post('/lex/sessions/:id/artifacts', async (req, reply) => {
     const id = (req.params as { id: string }).id;
     const body = (req.body ?? {}) as {
@@ -905,15 +1051,26 @@ export async function registerDashboardRoutes(
     }
     try {
       const systemPrompt = buildLexSystemPrompt();
+      /* Lex's brainstorm cwd is daemon-owned scratch space with no real
+       * project files, so Claude Code's permissions onboarding wizard
+       * just blocks the seed greeting and the SessionStart hook from
+       * firing (which in turn means no identity file, no Stream Deck
+       * tile, and no claude_session_id binding). Skip permissions by
+       * default; callers can override by passing explicit args. */
+      const baseArgs = body.args ?? ['--dangerously-skip-permissions'];
       const r = spawnLex({
         cwd,
         command: body.command,
-        args: body.args,
+        args: baseArgs,
         cols: body.cols,
         rows: body.rows,
         systemPrompt,
       });
       log(`[lex] spawn ptyId=${r.ptyId} pid=${r.pid} cwd=${cwd}`);
+      /* Fresh spawns get an autonomous first-turn greeting via the
+       * [seed] protocol. No resume primitive exists yet so every
+       * spawn-lex is treated as a fresh greeting opportunity. */
+      seedFirstTurn(r.ptyId);
       return { ok: true, ...r, cwd };
     } catch (err) {
       reply.code(500);
@@ -1694,6 +1851,54 @@ export async function registerDashboardRoutes(
     await store.wikiPages.flush();
     log(`[admin] promoted wiki page ${id} to canonical (weight ${fm.weight})`);
     return { ok: true, id, weight: fm.weight, was_already_canonical: alreadyCanonical };
+  });
+
+  /* Daemon self-restart. Spawns a detached PowerShell that sleeps ~2s
+   * (long enough for our process.exit to release the singleton port and
+   * lock files), then runs start-daemon.ps1, which is idempotent and
+   * health-probes before respawning. We exit ~250ms after responding so
+   * the dashboard sees a clean 200 before the connection drops. The
+   * autostart Task Scheduler entry is the safety net if the relauncher
+   * itself fails for any reason — it polls every 5min. */
+  app.post('/admin/daemon/restart', async (_req, reply) => {
+    const startScript = path.posix
+      .join(process.cwd().replace(/\\/g, '/'), 'scripts', 'start-daemon.ps1')
+      .replace(/\//g, '\\');
+    if (!fs.existsSync(startScript)) {
+      reply.code(500);
+      return { ok: false, error: `start-daemon.ps1 not found at ${startScript}` };
+    }
+    /* Direct PowerShell launch: -Command runs an inline script that
+     * sleeps then dot-sources start-daemon.ps1. No cmd.exe, no nested
+     * quoting, no `timeout` shell builtin — keeps the spawn argv clean
+     * and avoids the "bad argument" error path some shells produce when
+     * their builtins see a quoted operand. */
+    const inline = `Start-Sleep -Seconds 2; & '${startScript.replace(/'/g, "''")}'`;
+    try {
+      const child = spawn(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-ExecutionPolicy', 'Bypass',
+          '-WindowStyle', 'Hidden',
+          '-Command', inline,
+        ],
+        {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true,
+        },
+      );
+      child.unref();
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, error: `relauncher spawn failed: ${(err as Error).message}` };
+    }
+    setTimeout(() => {
+      log('[admin] daemon restart requested via /admin/daemon/restart; exiting');
+      process.exit(0);
+    }, 250);
+    return { ok: true, restarting: true };
   });
 
   app.post('/admin/backfill/:mode/cancel', async (req, reply) => {

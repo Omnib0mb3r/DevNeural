@@ -12,9 +12,12 @@ import {
   ptyInject,
   ptyKill,
   uploadScreenshot,
+  lexSessions,
   DaemonError,
   type PtyEntry,
 } from "@/lib/daemon-client";
+import { LexSessionList } from "@/components/LexSessionList";
+import { LexArtifactsPanel } from "@/components/LexArtifactsPanel";
 
 /**
  * Brainstorming with Lex.
@@ -53,13 +56,55 @@ export default function LexPage() {
     mutationFn: (id: string) => ptyKill(id),
     onSettled: () => qc.invalidateQueries({ queryKey: ["pty-list"] }),
   });
+  /* "New session" = end the current Lex (if any) then spawn a fresh
+   * one. Sequenced so the new spawn doesn't race the kill's exit
+   * cleanup. The 400ms gap matches the typical taskkill /F /T tear-down
+   * window on Windows; the daemon's `seedFirstTurn` greeting then fires
+   * 600ms after the new spawn returns. */
+  const newSessionM = useMutation({
+    mutationFn: async () => {
+      if (lexPty) {
+        await ptyKill(lexPty.ptyId);
+        await new Promise((r) => setTimeout(r, 400));
+      }
+      return spawnLex();
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: ["pty-list"] }),
+  });
 
   const [pendingText, setPendingText] = useState("");
-  const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [sendError, setSendError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  /* Inject mutation. Mirrors SendPromptForm on /sessions: route through
+   * useMutation so a failed POST surfaces as a visible error toast
+   * instead of vanishing silently. The previous plain async + try/
+   * finally hid every failure (401, daemon down, ok:false response):
+   * the button blinked "sending..." and reverted with no feedback,
+   * which read as "the send button does nothing". */
+  const injectM = useMutation({
+    mutationFn: (text: string) => {
+      if (!lexPty) throw new Error("no Lex PTY bound yet");
+      const target = lexPty.sessionId ?? lexPty.ptyId;
+      return ptyInject(target, text, true);
+    },
+    onSuccess: (data) => {
+      if (data?.ok === false) {
+        setSendError(data.error ?? "inject refused");
+        return;
+      }
+      setPendingText("");
+      setSendError(null);
+    },
+    onError: (err) => {
+      const e = err as DaemonError;
+      const payload = e.payload as { error?: string } | undefined;
+      setSendError(payload?.error ?? e.message ?? "send failed");
+    },
+  });
 
   function spliceIntoTextarea(p: string) {
     const ta = textareaRef.current;
@@ -128,22 +173,17 @@ export default function LexPage() {
     e.target.value = "";
   }
 
-  /* When the dashboard send-prompt-form fires, route to the PTY
-   * inject endpoint instead of the bridge-mediated /sessions/:id/prompt
-   * since Lex is daemon-hosted. We send to the ptyId before the
-   * session-id binds and to the session-id after; the daemon accepts
-   * either. */
-  async function injectPrompt(text: string) {
-    if (!lexPty || !text.trim()) return;
-    setBusy(true);
-    try {
-      const target = lexPty.sessionId ?? lexPty.ptyId;
-      await ptyInject(target, text, true);
-      setPendingText("");
-    } finally {
-      setBusy(false);
-    }
-  }
+  /* Resolve the active brainstorm row keyed off the live PTY so the
+   * artifacts panel and the session list highlight stay in sync. The
+   * /lex/sessions list is filtered to active rows so the lookup is a
+   * simple match by pty_id. */
+  const activeLexQ = useQuery({
+    queryKey: ["lex-sessions", "active"],
+    queryFn: () => lexSessions({ status: "active", limit: 20 }),
+    refetchInterval: 5_000,
+  });
+  const activeBrainstormId =
+    (activeLexQ.data?.sessions ?? []).find((row) => row.pty_id === lexPty?.ptyId)?.id ?? null;
 
   /* Auto-spawn Lex on first visit if no live brainstorm PTY exists.
    * One-shot so a manual kill doesn't immediately respawn. */
@@ -171,24 +211,28 @@ export default function LexPage() {
               <button
                 type="button"
                 onClick={() => killM.mutate(lexPty.ptyId)}
-                className="text-xs px-3 py-1.5 rounded-pill bg-surface2 hairline hover:bg-surface3 text-txt2"
+                disabled={killM.isPending || newSessionM.isPending}
+                className="text-xs px-3 py-1.5 rounded-pill bg-surface2 hairline hover:bg-surface3 text-txt2 disabled:opacity-40 disabled:cursor-not-allowed"
                 title="End this brainstorm session"
               >
-                end session
+                {killM.isPending ? "ending…" : "end session"}
               </button>
             ) : null}
             <button
               type="button"
-              onClick={() => spawnM.mutate()}
-              disabled={spawnM.isPending || Boolean(lexPty)}
+              onClick={() => (lexPty ? newSessionM.mutate() : spawnM.mutate())}
+              disabled={spawnM.isPending || newSessionM.isPending || killM.isPending}
               className="text-xs px-3 py-1.5 rounded-pill bg-brand/10 hairline ring-1 ring-brand/30 text-brandSoft hover:bg-brand/15 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
+              title={lexPty ? "End the current Lex and start a fresh one" : "Spawn Lex"}
             >
               <Icon name="Plus" size={12} />
-              {spawnM.isPending
-                ? "starting…"
-                : lexPty
-                  ? "running"
-                  : "start lex"}
+              {newSessionM.isPending
+                ? "swapping…"
+                : spawnM.isPending
+                  ? "starting…"
+                  : lexPty
+                    ? "new session"
+                    : "start lex"}
             </button>
           </div>
         </div>
@@ -200,6 +244,11 @@ export default function LexPage() {
           to act. He can scaffold projects, queue prompts to running
           worker sessions, and create reminders.
         </p>
+
+        <LexSessionList
+          activeBrainstormId={activeBrainstormId}
+          activePtyId={lexPty?.ptyId ?? null}
+        />
 
         {!lexPty && !spawnM.isPending && (
           <div className="rounded-panel bg-surface1 hairline p-8 text-center">
@@ -219,6 +268,10 @@ export default function LexPage() {
              * still render the panel; the mirror starts streaming
              * once the session-id appears. */}
             <TerminalMirror sessionId={lexPty?.sessionId ?? ""} />
+            <LexArtifactsPanel
+              brainstormId={activeBrainstormId}
+              active={Boolean(lexPty)}
+            />
             <div className="rounded-panel bg-surface1 hairline">
               <div className="px-5 py-3 border-b border-border1 flex items-center gap-2">
                 <Icon name="MessageSquare" className="text-brandSoft" size={16} />
@@ -234,8 +287,9 @@ export default function LexPage() {
               <form
                 onSubmit={(e) => {
                   e.preventDefault();
-                  if (busy) return;
-                  injectPrompt(pendingText);
+                  if (injectM.isPending) return;
+                  if (!pendingText.trim()) return;
+                  injectM.mutate(pendingText);
                 }}
                 className="p-4 space-y-3"
               >
@@ -248,10 +302,11 @@ export default function LexPage() {
                     if (
                       (e.metaKey || e.ctrlKey) &&
                       e.key === "Enter" &&
-                      !busy
+                      !injectM.isPending &&
+                      pendingText.trim()
                     ) {
                       e.preventDefault();
-                      injectPrompt(pendingText);
+                      injectM.mutate(pendingText);
                     }
                   }}
                   placeholder="What's on your mind? (⌘+Enter to send, paste a screenshot to attach)"
@@ -293,18 +348,23 @@ export default function LexPage() {
                   <button
                     type="submit"
                     disabled={
-                      busy ||
+                      injectM.isPending ||
                       !pendingText.trim() ||
                       (!lexPty?.sessionId && !lexPty?.ptyId)
                     }
                     className="px-4 py-1.5 text-xs font-emphasized rounded-pill bg-brand/15 text-brandSoft hairline ring-1 ring-brand/30 hover:bg-brand/25 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
-                    {busy ? "sending…" : "send"}
+                    {injectM.isPending ? "sending…" : "send"}
                   </button>
                 </div>
                 {uploadError && (
                   <div className="text-xs text-err font-mono">
                     Upload failed: {uploadError}
+                  </div>
+                )}
+                {sendError && (
+                  <div className="text-xs text-err font-mono">
+                    Send failed: {sendError}
                   </div>
                 )}
               </form>

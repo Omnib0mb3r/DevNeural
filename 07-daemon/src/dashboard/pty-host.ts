@@ -21,6 +21,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { randomUUID, createHash } from 'node:crypto';
+import { execSync } from 'node:child_process';
 import { spawn as ptySpawn, type IPty } from 'node-pty';
 import { pushTerminalData } from './terminal-stream.js';
 import {
@@ -380,6 +381,113 @@ export function ptyInject(
   }
 }
 
+/**
+ * Inject a `[seed]` first-turn prompt shortly after spawn so Lex greets
+ * the user without waiting for typed input. The Lex system prompt has a
+ * matching `[seed]` protocol that recognises this marker and produces a
+ * brief Jarvis-voice greeting. 600ms gives Claude Code time to boot and
+ * render its prompt before we paste; \r commits the turn the same way
+ * `ptyInject(..., commit=true)` does.
+ */
+export function seedFirstTurn(ptyId: string): void {
+  /* [seed] is a Lex system-prompt protocol marker; the prompt instructs
+   * the assistant to treat a [seed] line as an autonomous first-turn
+   * trigger and respond with a brief Jarvis-voice greeting.
+   *
+   * Readiness gate. Claude Code's TUI shows multiple cold-start
+   * overlays (bypass-permissions warning, doctor advisory, the
+   * "shift+tab to cycle" picker) that each absorb stray Enter
+   * keypresses. A fixed delay isn't reliable: on a fast box the
+   * overlays clear in ~500ms; on a slow one they hang around for
+   * 6+ seconds. We use the SessionStart hook firing (which only
+   * happens once CC's prompt is fully interactive) as the readiness
+   * signal: handle.sessionId binds to the claude_session_id at that
+   * moment. Poll every 500ms for up to 30s; if the bind never lands,
+   * fall back to a best-effort write so the spawn isn't a total dud.
+   *
+   * Once ready: 250ms idle window + write seed + 250ms gap + \r commit.
+   * The idle window lets any pending overlay-render bytes drain so our
+   * text lands cleanly on the prompt line instead of mid-redraw. */
+  const seedText =
+    '[seed] Greet briefly in Jarvis voice. Ask what we are working on today. Reference live state if relevant.';
+  const startedAt = Date.now();
+  const READINESS_TIMEOUT_MS = 30_000;
+  const POLL_MS = 500;
+  const IDLE_MS = 250;
+
+  /* Pre-dismiss the bypass-permissions / doctor banners that block the
+   * SessionStart hook. CC's TUI shows these overlays on cold start with
+   * --dangerously-skip-permissions and waits for an Enter key to
+   * confirm; without dismissal the prompt never goes interactive,
+   * SessionStart never fires, and the seed never runs. We send two \r
+   * bytes spaced 600ms apart so any second-stage banner also clears. */
+  setTimeout(() => {
+    const handle = ptys.get(ptyId);
+    if (!handle || handle.exited) return;
+    try { handle.pty.write('\r'); } catch { /* swallow */ }
+  }, 1500);
+  setTimeout(() => {
+    const handle = ptys.get(ptyId);
+    if (!handle || handle.exited) return;
+    try { handle.pty.write('\r'); } catch { /* swallow */ }
+  }, 2100);
+
+  function attemptWrite(handle: PtyHandle): void {
+    try {
+      /* Wait for an idle window after the last stdout chunk so we
+       * don't paste mid-redraw. lastActivity advances on every onData
+       * callback so a fresh chunk pushes the deadline forward. */
+      const settle = () => {
+        if (handle.exited) return;
+        const sinceLast = Date.now() - handle.lastActivity;
+        if (sinceLast < IDLE_MS) {
+          setTimeout(settle, IDLE_MS - sinceLast);
+          return;
+        }
+        try {
+          handle.pty.write(seedText);
+          setTimeout(() => {
+            if (!handle.exited) handle.pty.write('\r');
+          }, 250);
+          handle.lastActivity = Date.now();
+        } catch {
+          /* best-effort; do not crash spawn */
+        }
+      };
+      settle();
+    } catch {
+      /* swallow */
+    }
+  }
+
+  function tick(): void {
+    const handle = ptys.get(ptyId);
+    if (!handle || handle.exited) return;
+    if (handle.sessionId) {
+      attemptWrite(handle);
+      return;
+    }
+    /* Discovery is normally driven by pty.onData callbacks. A CC TUI
+     * sitting silent on a banner emits no chunks, so onData never
+     * fires and the session id never binds. Re-probe each tick so a
+     * jsonl that lands during a quiet window is still picked up. */
+    try { tryDiscoverSession(handle); } catch { /* ignore */ }
+    if (handle.sessionId) {
+      attemptWrite(handle);
+      return;
+    }
+    if (Date.now() - startedAt > READINESS_TIMEOUT_MS) {
+      /* Fallback so a session that never produces a SessionStart hook
+       * (rare, e.g. CC build mismatch) still gets a seed try. */
+      attemptWrite(handle);
+      return;
+    }
+    setTimeout(tick, POLL_MS);
+  }
+
+  setTimeout(tick, POLL_MS);
+}
+
 export function ptyResize(
   ptyIdOrSession: string,
   cols: number,
@@ -407,13 +515,69 @@ export function ptyResize(
 export function ptyKill(ptyIdOrSession: string): boolean {
   let handle = ptys.get(ptyIdOrSession);
   if (!handle) handle = getPtyBySession(ptyIdOrSession);
-  if (!handle) return false;
-  try {
-    handle.pty.kill();
-    return true;
-  } catch {
+  if (!handle) {
+    console.warn(`[pty-host] ptyKill: handle not found for ${ptyIdOrSession}`);
     return false;
   }
+  const pid = handle.pty.pid;
+  const ptyId = handle.ptyId;
+  /* On Windows the PTY wraps cmd.exe /c "claude ..." (see spawnLex).
+   * node-pty's kill() closes the ConPTY but the claude.exe grandchild
+   * frequently survives, which means onExit never fires, handle.exited
+   * stays false, and the dashboard's `!p.exited` filter keeps the
+   * session alive forever. taskkill /F /T tears down the whole tree
+   * by PID so the OS reaps every descendant and onExit fires reliably.
+   * The pty.kill() is still attempted first so the SIGHUP-equivalent
+   * gets a chance on non-Windows hosts. */
+  let killed = false;
+  try {
+    handle.pty.kill();
+    killed = true;
+  } catch (err) {
+    console.warn(
+      `[pty-host] ptyKill: pty.kill() threw for ${ptyId} pid=${pid}: ${(err as Error).message}`,
+    );
+  }
+  if (process.platform === 'win32' && pid && pid > 0) {
+    try {
+      execSync(`taskkill /F /T /PID ${pid}`, {
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      killed = true;
+    } catch (err) {
+      /* taskkill exits 128 when the PID is already gone, which is fine.
+       * Anything else is a real failure worth logging. */
+      const msg = (err as Error).message;
+      if (!/not found|not running|128/i.test(msg)) {
+        console.warn(
+          `[pty-host] ptyKill: taskkill failed for ${ptyId} pid=${pid}: ${msg}`,
+        );
+      }
+    }
+  }
+  /* Force the exited flag so the dashboard's filter drops the entry
+   * even if node-pty's onExit handler lags or never fires. The reaper
+   * still removes the map entry after 60s. */
+  if (!handle.exited) {
+    handle.exited = true;
+    if (handle.sessionId) {
+      sessionToPty.delete(handle.sessionId);
+    }
+    try {
+      const bs = getBrainstormByPty(ptyId);
+      if (bs && bs.status === 'active') {
+        endBrainstorm(bs.id);
+      }
+    } catch {
+      /* observability: never block kill */
+    }
+    setTimeout(() => ptys.delete(ptyId), 60_000);
+  }
+  console.log(
+    `[pty-host] ptyKill: ${ptyId} pid=${pid} killed=${killed}`,
+  );
+  return killed;
 }
 
 /**

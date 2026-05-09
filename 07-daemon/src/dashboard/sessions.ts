@@ -29,7 +29,20 @@ const BRIDGE_DIR = path.posix.join(DATA_ROOT, 'session-bridge');
  * The deck app isn't required, though. When the identity directory
  * doesn't exist, fall back to a generous mtime window so users who
  * never installed the deck still see their sessions. */
-const ACTIVE_THRESHOLD_MS = 24 * 60 * 60 * 1000;
+/* Mtime-fallback freshness window. Used when the StreamDeck.App identity
+ * dir is missing/empty so the daemon falls back to jsonl mtime. Keep
+ * short — 24h was wide enough that any session opened in the last day
+ * showed as "active" forever, including post-mortem zombies the deck
+ * never cleaned. 30min covers a normal typing pause; longer gaps mean
+ * the user actually walked away. */
+const ACTIVE_THRESHOLD_MS = 30 * 60 * 1000;
+/* Identity-file freshness window. StreamDeck.App's CleanStaleFiles uses
+ * a 1h identity-mtime threshold (or VS-Code-window match) to decide
+ * dead-vs-alive, but it only runs at app startup, not on the periodic
+ * 60s sweep. Until that ships, the daemon applies its own gate so an
+ * orphaned identity file from a session whose host died ungracefully
+ * doesn't paint a phantom-active tile until the deck app restarts. */
+const IDENTITY_FRESH_MS = 60 * 60 * 1000;
 const STREAMDECK_IDENTITY_DIR = (() => {
   const localAppData =
     process.env.LOCALAPPDATA ??
@@ -45,8 +58,19 @@ function readLiveSessionIds(): Set<string> | null {
   if (!fs.existsSync(STREAMDECK_IDENTITY_DIR)) return null;
   try {
     const ids = new Set<string>();
+    const now = Date.now();
     for (const e of fs.readdirSync(STREAMDECK_IDENTITY_DIR)) {
-      if (e.endsWith('.json')) ids.add(e.slice(0, -'.json'.length));
+      if (!e.endsWith('.json')) continue;
+      const sid = e.slice(0, -'.json'.length);
+      try {
+        const stat = fs.statSync(
+          path.posix.join(STREAMDECK_IDENTITY_DIR, e),
+        );
+        if (now - stat.mtimeMs > IDENTITY_FRESH_MS) continue;
+      } catch {
+        continue;
+      }
+      ids.add(sid);
     }
     /* Empty set means the deck tray app is running but has not (yet)
      * registered any session for this boot. Treat the same as "deck

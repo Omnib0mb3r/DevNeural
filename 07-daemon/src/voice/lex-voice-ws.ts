@@ -536,6 +536,17 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           state.ttsActive = null;
           send({ t: 'tts-end' });
         }
+        /* Send Ctrl+C to the PTY so Claude Code aborts its in-flight
+         * generation. Without this, the next injected user transcript
+         * gets queued behind the old turn and Lex finishes the prior
+         * response before answering the interrupt. */
+        if (state.bindKey) {
+          const bargeHandle =
+            getPty(state.bindKey) || getPtyBySession(state.bindKey);
+          if (bargeHandle && !bargeHandle.exited) {
+            bargeHandle.pty.write('\x03');
+          }
+        }
         break;
       case 'finalize-notes': {
         /* Notes-mode "stop" finalize. The user is ending a dictation

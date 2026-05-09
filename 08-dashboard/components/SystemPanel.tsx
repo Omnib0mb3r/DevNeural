@@ -1,15 +1,121 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { SparkAreaChart } from "@tremor/react";
-import { systemMetrics, services as servicesClient } from "@/lib/daemon-client";
+import {
+  systemMetrics,
+  services as servicesClient,
+  daemonRestart,
+  DaemonError,
+} from "@/lib/daemon-client";
 import { Icon } from "./Icon";
 import { StatusDot } from "./StatusDot";
 import { LogTail } from "./LogTail";
 import { DiagnosticsPanel } from "./DiagnosticsPanel";
 import { BackfillPanel } from "./BackfillPanel";
 import { lexPickStable } from "@/lib/lex";
+
+/* Daemon restart card.
+ *
+ * Calls POST /admin/daemon/restart, then enters a "waiting for new
+ * instance" loop that polls /dashboard/health every 1.5s until it gets
+ * a 200 back. The running daemon exits ~250ms after responding, so the
+ * very next health probe will fail; we keep retrying until the autostart
+ * Task Scheduler safety net (or our own relauncher) brings it back. The
+ * progress message keeps the user informed instead of leaving the page
+ * looking frozen for the ~3-6s gap. */
+function DaemonRestartCard() {
+  const [phase, setPhase] = useState<"idle" | "requesting" | "waiting" | "back" | "error">("idle");
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const restartM = useMutation({
+    mutationFn: () => daemonRestart(),
+    onMutate: () => {
+      setErrorMsg(null);
+      setPhase("requesting");
+    },
+    onSuccess: () => {
+      setPhase("waiting");
+      void waitForBack();
+    },
+    onError: (err) => {
+      const e = err as DaemonError;
+      const payload = e.payload as { error?: string } | undefined;
+      setErrorMsg(payload?.error ?? e.message ?? "restart request failed");
+      setPhase("error");
+    },
+  });
+
+  async function waitForBack() {
+    /* Use the public /health probe (not /dashboard/health) so the
+     * post-restart wait works even when the dashboard cookie is
+     * missing or expired. /dashboard/health is auth-gated and would
+     * 401 until the user re-unlocks, making this loop look stuck. */
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1500));
+      try {
+        const res = await fetch("/health", { credentials: "include" });
+        if (res.ok) {
+          setPhase("back");
+          setTimeout(() => setPhase("idle"), 4_000);
+          return;
+        }
+      } catch {
+        /* expected during the gap */
+      }
+    }
+    setErrorMsg("daemon did not come back within 60s; check daemon.log");
+    setPhase("error");
+  }
+
+  const busy = phase === "requesting" || phase === "waiting";
+  const label =
+    phase === "requesting"
+      ? "requesting…"
+      : phase === "waiting"
+        ? "restarting…"
+        : phase === "back"
+          ? "back online"
+          : phase === "error"
+            ? "failed"
+            : "restart daemon";
+
+  return (
+    <section className="rounded-panel bg-surface1 hairline">
+      <div className="px-5 py-3 border-b border-border1 flex items-center gap-2">
+        <Icon name="RotateCw" className="text-brandSoft" size={16} />
+        <h2 className="font-display text-sm font-emphasized">Daemon controls</h2>
+      </div>
+      <div className="p-5 flex items-center justify-between gap-4">
+        <p className="text-xs text-txt3 max-w-md">
+          Restart the DevNeural daemon to pick up new code. The running
+          process exits and the autostart task brings it back within a
+          few seconds.
+        </p>
+        <button
+          type="button"
+          onClick={() => restartM.mutate()}
+          disabled={busy}
+          className={`px-4 py-1.5 text-xs font-emphasized rounded-pill hairline ring-1 flex items-center gap-2 ${
+            phase === "back"
+              ? "bg-ok/15 text-ok ring-ok/30"
+              : phase === "error"
+                ? "bg-err/15 text-err ring-err/30"
+                : "bg-brand/15 text-brandSoft ring-brand/30 hover:bg-brand/25"
+          } disabled:opacity-60 disabled:cursor-not-allowed`}
+        >
+          {busy && <Icon name="Loader2" className="animate-spin" size={12} />}
+          {label}
+        </button>
+      </div>
+      {errorMsg && (
+        <div className="px-5 pb-4 text-xs text-err font-mono">{errorMsg}</div>
+      )}
+    </section>
+  );
+}
 
 function fmtBytes(bytes: number): string {
   if (!bytes) return "0";
@@ -125,6 +231,7 @@ export function SystemPanel() {
   return (
     <div className="grid grid-cols-3 gap-4">
       <div className="col-span-2 space-y-4">
+        <DaemonRestartCard />
         {/* Vitals card */}
         <section className="rounded-panel bg-surface1 hairline">
           <div className="px-5 py-3 border-b border-border1 flex items-center gap-2">

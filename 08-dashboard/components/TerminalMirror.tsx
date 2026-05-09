@@ -580,8 +580,24 @@ export function TerminalMirror({ sessionId }: Props) {
         {ctx && ctx.max > 0 ? (
           <ContextBadge tokens={ctx.tokens} max={ctx.max} />
         ) : null}
-        <span className="text-nano text-txt3 ml-auto">
-          read-only · use Steer / Nav for input
+        <span className="ml-auto flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => {
+              /* Local-only clear: wipes the xterm view buffer for the
+               * current viewer. Does not touch the daemon's terminal-stream
+               * ring or any other client. Reload re-pulls the replay. */
+              const t = termRef.current as { clear?: () => void } | null;
+              t?.clear?.();
+            }}
+            className="text-nano text-txt3 hover:text-txt1 font-mono px-2 py-0.5 rounded-pill hairline-soft"
+            title="Clear the visible terminal output (local only; reloading restores it from the replay buffer)"
+          >
+            clear
+          </button>
+          <span className="text-nano text-txt3">
+            read-only · use Steer / Nav for input
+          </span>
         </span>
       </div>
       {bridgeView.tone !== "ok" && bridgeView.detail ? (

@@ -249,6 +249,22 @@ export const backfillStart = (mode: "raw" | "wiki", reset = false) =>
 export const backfillCancel = (mode: "raw" | "wiki") =>
   request<{ ok: boolean }>(`/admin/backfill/${mode}/cancel`, { method: "POST" });
 
+/* Trigger a daemon self-restart. The endpoint spawns a detached relauncher
+ * that waits ~2s then runs start-daemon.ps1, and the running daemon exits
+ * shortly after responding 200. The dashboard should treat the immediate
+ * connection drop as expected and poll /health to detect the new instance.
+ *
+ * Pass an empty `{}` body so the Content-Type: application/json header
+ * the request helper sets has matching bytes; Fastify's default JSON
+ * parser rejects "empty body + JSON content-type" with FST_ERR_CTP_
+ * EMPTY_JSON_BODY (HTTP 400 Bad Request) and the UI displays it as the
+ * "Bad Request" failure. */
+export const daemonRestart = () =>
+  request<{ ok: boolean; restarting?: boolean; error?: string }>(
+    "/admin/daemon/restart",
+    { method: "POST", body: {} },
+  );
+
 // ── services ────────────────────────────────────────────────────
 export interface ServiceStatus {
   id: string;
@@ -337,10 +353,82 @@ export const spawnLex = (cwd?: string) =>
 export const ptyInject = (id: string, text: string, commit = true) =>
   request<{ ok: boolean; error?: string }>(
     `/pty/${encodeURIComponent(id)}/inject`,
-    { method: "POST", body: JSON.stringify({ text, commit }) },
+    { method: "POST", body: { text, commit } },
   );
 export const ptyKill = (id: string) =>
   request<{ ok: boolean }>(`/pty/${encodeURIComponent(id)}`, { method: "DELETE" });
+
+// ── Lex brainstorm sessions + artifacts ─────────────────────────
+export interface BrainstormSessionRow {
+  id: string;
+  claude_session_id: string | null;
+  pty_id: string | null;
+  cwd: string;
+  user_label: string | null;
+  derived_label: string | null;
+  mode: string;
+  status: string;
+  started_ms: number;
+  ended_ms: number | null;
+  turn_count: number;
+  topic_tags_json: string;
+  artifacts_json: string;
+  last_summary: string | null;
+  last_summary_ms: number | null;
+}
+export const lexSessions = (opts: { status?: "active" | "ended"; limit?: number } = {}) => {
+  const qs = new URLSearchParams();
+  if (opts.status) qs.set("status", opts.status);
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const q = qs.toString();
+  return request<{ ok: boolean; sessions: BrainstormSessionRow[] }>(
+    `/lex/sessions${q ? `?${q}` : ""}`,
+  );
+};
+export const lexSession = (id: string) =>
+  request<{ ok: boolean; session: BrainstormSessionRow; error?: string }>(
+    `/lex/sessions/${encodeURIComponent(id)}`,
+  );
+export const patchLexSession = (
+  id: string,
+  patch: {
+    user_label?: string | null;
+    derived_label?: string | null;
+    mode?: string;
+    status?: "ended";
+    summary?: string;
+  },
+) =>
+  request<{ ok: boolean; session?: BrainstormSessionRow; error?: string }>(
+    `/lex/sessions/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: patch },
+  );
+
+export interface LexArtifactItem {
+  kind: string;
+  category: string;
+  id: string;
+  title: string;
+  created_ms: number;
+  path: string;
+  preview: string;
+}
+export const lexSessionArtifacts = (id: string) =>
+  request<{ ok: boolean; artifacts: LexArtifactItem[] }>(
+    `/lex/sessions/${encodeURIComponent(id)}/artifacts`,
+  );
+
+export interface LexArtifactDetail {
+  id: string;
+  kind: string;
+  brainstorm_id: string | null;
+  created_ms: number;
+  data: Record<string, unknown>;
+}
+export const lexArtifact = (kind: string, id: string) =>
+  request<{ ok: boolean; artifact: LexArtifactDetail; error?: string }>(
+    `/lex/artifacts/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`,
+  );
 
 export interface SessionChunk {
   role: string;
