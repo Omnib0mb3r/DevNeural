@@ -307,6 +307,8 @@ export interface SessionSummary {
   phase: SessionPhase;
   pending_prompt: PendingPrompt | null;
   context: ContextUsage | null;
+  user_label: string | null;
+  derived_label: string | null;
 }
 export interface IdleProject {
   id: string;

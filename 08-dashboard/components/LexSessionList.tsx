@@ -49,7 +49,14 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
       id: string;
       patch: Parameters<typeof patchLexSession>[1];
     }) => patchLexSession(vars.id, vars.patch),
-    onSettled: () => qc.invalidateQueries({ queryKey: ["lex-sessions"] }),
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ["lex-sessions"] });
+      /* Stream Deck and Nav tiles join brainstorm labels onto the
+       * /sessions response, so a rename also has to refresh that
+       * query for the deck to reflect the new title without a page
+       * reload. */
+      qc.invalidateQueries({ queryKey: ["sessions"] });
+    },
   });
 
   /* Resume note: true conversational resume needs `claude --resume <id>`

@@ -160,7 +160,11 @@ export function StreamDeck() {
       {navSession ? (
         <NavGrid
           sessionId={navSession.session_id}
-          projectLabel={projectFromSlug(navSession.project_slug)}
+          projectLabel={
+            navSession.user_label?.trim() ||
+            navSession.derived_label?.trim() ||
+            projectFromSlug(navSession.project_slug)
+          }
           onClose={() => setNavSessionId(null)}
         />
       ) : (
@@ -251,6 +255,11 @@ function DeckTile({ session: s, onTap }: DeckTileProps) {
   const state = tileState(s);
   const led = ledStatus(state);
   const project = projectFromSlug(s.project_slug);
+  /* Renames in the Past Sessions list set user_label on the brainstorm
+   * row; daemon joins it onto every session item so the deck tile
+   * reflects the user's title. derived_label is the LLM auto-name. */
+  const tileLabel =
+    s.user_label?.trim() || s.derived_label?.trim() || project;
   const ring = ringClass(state);
   const pulseOnLed =
     state === "thinking" ||
@@ -275,11 +284,11 @@ function DeckTile({ session: s, onTap }: DeckTileProps) {
       className={`w-full block text-left p-3 rounded-card bg-surface1 hairline lift transition-shadow ${ring} ${
         focusM.isPending ? "ring-1 ring-brand/60" : ""
       }`}
-      aria-label={`Focus VS Code window for ${project} (${state}). Tap again to enter nav mode.`}
+      aria-label={`Focus VS Code window for ${tileLabel} (${state}). Tap again to enter nav mode.`}
     >
       <div className="flex items-center justify-between mb-1.5">
         <div className="font-display text-sm font-emphasized truncate text-txt1">
-          {project}
+          {tileLabel}
         </div>
         <StatusDot status={led} pulse={pulseOnLed} />
       </div>

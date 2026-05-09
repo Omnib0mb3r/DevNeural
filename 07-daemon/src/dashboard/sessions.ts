@@ -14,6 +14,7 @@ import { readSummary, readCurrentTask } from '../curation/index.js';
 import { getPhase } from './session-phase.js';
 import { getPending, type PendingPrompt } from './pending-prompt.js';
 import { isSuperseded, markSuperseded } from './superseded.js';
+import { getBrainstormByClaudeSessionId } from '../lex/brainstorm-store.js';
 
 const SESSIONS_ROOT = path
   .join(os.homedir(), '.claude', 'projects')
@@ -106,6 +107,15 @@ export interface SessionListItem {
    * usage object. Lets the dashboard show a fill bar so the user knows
    * when to /clear or /compact. Null when no usage record yet. */
   context: { tokens: number; max: number } | null;
+  /** User-set label from the brainstorm sessions table, joined by
+   * claude_session_id. Null for non-Lex sessions and Lex sessions with
+   * no rename applied. Stream Deck tiles prefer this over the project
+   * slug so renames in the Past Sessions list propagate to the deck. */
+  user_label: string | null;
+  /** LLM-derived label from the brainstorm sessions table. Same join
+   * key as user_label. Used as the second-tier fallback before the
+   * project slug. */
+  derived_label: string | null;
 }
 
 /* Derive current phase by reading the last few KB of the jsonl. The
@@ -473,6 +483,10 @@ export function listSessions(): SessionListItem[] {
       // for an answer, the tile / detail must show 'permission' even
       // though the last jsonl record is still the assistant's question.
       if (pending) phase = 'permission';
+      // Optional join with brainstorm_sessions to surface the user's
+      // rename onto Stream Deck and Nav tiles. Returns null for any
+      // Claude session that was never bound to a Lex brainstorm row.
+      const brainstorm = getBrainstormByClaudeSessionId(sessionId);
       out.push({
         session_id: sessionId,
         project_slug: slug.name,
@@ -485,6 +499,8 @@ export function listSessions(): SessionListItem[] {
         phase,
         pending_prompt: pending,
         context: isActive ? deriveContextFromTail(file) : null,
+        user_label: brainstorm?.user_label ?? null,
+        derived_label: brainstorm?.derived_label ?? null,
       });
     }
   }
