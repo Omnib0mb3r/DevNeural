@@ -116,6 +116,21 @@ Starting state at session boundary:
 
 ---
 
+## Outstanding smoke tests
+
+- [ ] **End-session voice command** — say "end session" in a live voice session, verify:
+  - WS closes, button returns to "start voice"
+  - `daemon.log` shows `[session-end] embedded brainstorm-summary mode=<...>`
+  - `wiki/pending/` (or `canonical/`) gains a page if the tail content was insightful
+  - `session-state/<sid>.summary.md` updated
+  - First smoke test on session `7cd8670d` failed because daemon `dist/` and dashboard `out/` were stale (built before Phase 2 even shipped). Both rebuilt + daemon restarted at 16:48-16:49 on 2026-05-09. Browser may still need hard refresh for the Phase 2 `case "session-end"` client handler to load.
+- [ ] **Decay scheduler** — wait 24h or hit `POST /decay`, verify SQLite `wiki_pages_meta` weights drop on rows with `last_touched_ms` past the inactivity threshold.
+- [ ] **Pass 2 Anthropic fallback** — set `DEVNEURAL_PASS2_FALLBACK=anthropic` + `ANTHROPIC_API_KEY`, force a borderline-content ingest, verify `daemon.log` shows `[ingest] pass2 fallback succeeded` at least once.
+- [ ] **Cross-project verifier** — surface a wiki page that has only one project in its `projects` array, run a session in a 2nd project that should add evidence to it, verify either the evidence accepts cleanly OR the page picks up `flag_for_review: true` with a verifier log entry.
+- [ ] **Turn-bounded chunking** — after a long assistant turn, verify `raw_chunks_meta` shows ONE row covering that turn (not N rows), and `byte_length` reflects the merged length.
+
+---
+
 ## Verification gates per item
 
 Before marking complete:
