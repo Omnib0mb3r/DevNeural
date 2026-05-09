@@ -602,6 +602,31 @@ async function main(): Promise<void> {
     Number(process.env.DEVNEURAL_WIKI_PUSH_INTERVAL_MS ?? 5 * 60 * 1000),
   );
 
+  /* Periodic reinforcement decay. decayInactivePages multiplies every
+   * page weight by 0.995 and archives anything that drops below 0.15.
+   * Without a scheduler, weights for pages that are never injected
+   * stay at their last-touched value indefinitely and lint never
+   * reaches the archive threshold. The /decay HTTP route exists for
+   * manual runs, but the audit on 2026-05-09 confirmed decay had
+   * never run automatically — closes that gap.
+   * Default cadence: daily (24h). Tunable via env so sites with very
+   * fast page churn can run every few hours, and a dev box can
+   * disable via 0. The decay is cheap (file rewrite per page); the
+   * 24h default mirrors the daily backup window cadence. */
+  const decayMs = Number(
+    process.env.DEVNEURAL_DECAY_INTERVAL_MS ?? 24 * 60 * 60 * 1000,
+  );
+  if (decayMs > 0) {
+    setInterval(() => {
+      void decayInactivePages(store, logger).catch((err) =>
+        logger(`[decay] periodic run failed: ${(err as Error).message}`),
+      );
+    }, decayMs);
+    logger(`[decay] interval started, every ${Math.round(decayMs / 1000)}s`);
+  } else {
+    logger(`[decay] interval disabled (DEVNEURAL_DECAY_INTERVAL_MS=0)`);
+  }
+
   process.on('SIGUSR1', () => {
     coalescer.trigger('SIGUSR1');
   });
