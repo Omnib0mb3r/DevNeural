@@ -176,3 +176,21 @@ export function listBrainstorms(opts: {
 } = {}): BrainstormSessionRow[] {
   return db().listBrainstorms(opts);
 }
+
+/* Boot reaper. PTY exit handlers in pty-host close active rows, but a
+ * daemon crash (SIGKILL, SqliteError fatal, etc.) skips them, leaving
+ * rows stuck at status='active'. Call this once after the store opens
+ * so the dashboard never starts with orphaned active sessions. */
+export function reapAllActive(reason: string): number {
+  const rows = db().listBrainstorms({ status: 'active', limit: 10_000 });
+  const now = Date.now();
+  for (const row of rows) {
+    db().updateBrainstorm(row.id, {
+      status: 'ended',
+      ended_ms: now,
+      last_summary: reason,
+      last_summary_ms: now,
+    });
+  }
+  return rows.length;
+}

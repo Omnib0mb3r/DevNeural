@@ -54,31 +54,101 @@ const VOICE_PREF_FILE = (() => {
 })();
 
 let cachedActiveVoice: string | null = null;
+let cachedLengthScale: number | null = null;
 
-function readPersistedVoice(): string | null {
-  if (!VOICE_PREF_FILE) return null;
+/* Piper's --length_scale baseline for the dashboard's "1.0x speed".
+ * Lower = faster, higher = slower. 0.475 was the previous hardcoded
+ * value (roughly 2x of piper's own default 1.0). User-facing speed
+ * multiplier is inverted: ui_speed=1.0 keeps this baseline; ui_speed=
+ * 0.5 doubles length_scale (twice as slow). */
+const BASE_LENGTH_SCALE = 0.475;
+const MIN_LENGTH_SCALE = 0.25;
+const MAX_LENGTH_SCALE = 1.5;
+
+function readPersistedPrefs(): { voice?: string; length_scale?: number } {
+  if (!VOICE_PREF_FILE) return {};
   try {
-    if (!fs.existsSync(VOICE_PREF_FILE)) return null;
-    const obj = JSON.parse(fs.readFileSync(VOICE_PREF_FILE, 'utf-8')) as {
+    if (!fs.existsSync(VOICE_PREF_FILE)) return {};
+    return JSON.parse(fs.readFileSync(VOICE_PREF_FILE, 'utf-8')) as {
       voice?: string;
+      length_scale?: number;
     };
-    return obj.voice ?? null;
   } catch {
-    return null;
+    return {};
   }
 }
 
-function writePersistedVoice(voice: string): void {
+function readPersistedVoice(): string | null {
+  return readPersistedPrefs().voice ?? null;
+}
+
+function readPersistedLengthScale(): number | null {
+  const v = Number(readPersistedPrefs().length_scale);
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
+function writePersistedPrefs(patch: {
+  voice?: string;
+  length_scale?: number;
+}): void {
   if (!VOICE_PREF_FILE) return;
   try {
+    const merged = { ...readPersistedPrefs(), ...patch };
     fs.writeFileSync(
       VOICE_PREF_FILE,
-      JSON.stringify({ voice }, null, 2),
+      JSON.stringify(merged, null, 2),
       'utf-8',
     );
   } catch {
     /* ignore */
   }
+}
+
+function writePersistedVoice(voice: string): void {
+  writePersistedPrefs({ voice });
+}
+
+function getLengthScale(): number {
+  if (cachedLengthScale !== null) return cachedLengthScale;
+  const persisted = readPersistedLengthScale();
+  if (persisted !== null) {
+    cachedLengthScale = clampLengthScale(persisted);
+    return cachedLengthScale;
+  }
+  cachedLengthScale = BASE_LENGTH_SCALE;
+  return cachedLengthScale;
+}
+
+function clampLengthScale(v: number): number {
+  if (!Number.isFinite(v)) return BASE_LENGTH_SCALE;
+  if (v < MIN_LENGTH_SCALE) return MIN_LENGTH_SCALE;
+  if (v > MAX_LENGTH_SCALE) return MAX_LENGTH_SCALE;
+  return v;
+}
+
+/* User-facing speed multiplier <-> length_scale. ui_speed = BASE / ls,
+ * so 1.0 = baseline. Persisted as length_scale so the math stays
+ * authoritative even if BASE changes. */
+export function getActiveSpeed(): number {
+  return BASE_LENGTH_SCALE / getLengthScale();
+}
+
+export function setActiveSpeed(uiSpeed: number): {
+  ok: boolean;
+  speed: number;
+  length_scale: number;
+} {
+  if (!Number.isFinite(uiSpeed) || uiSpeed <= 0) {
+    return {
+      ok: false,
+      speed: getActiveSpeed(),
+      length_scale: getLengthScale(),
+    };
+  }
+  const ls = clampLengthScale(BASE_LENGTH_SCALE / uiSpeed);
+  cachedLengthScale = ls;
+  writePersistedPrefs({ length_scale: ls });
+  return { ok: true, speed: BASE_LENGTH_SCALE / ls, length_scale: ls };
 }
 
 function voiceDir(): string {
@@ -201,6 +271,8 @@ export interface PiperStatus {
   voice: string;
   active_voice: string;
   rate: number;
+  speed: number;
+  length_scale: number;
   voices: VoicePack[];
 }
 
@@ -211,6 +283,8 @@ export function piperStatus(): PiperStatus {
     voice: getVoice(),
     active_voice: getActiveVoice(),
     rate: getRate(),
+    speed: getActiveSpeed(),
+    length_scale: getLengthScale(),
     voices: listVoices(),
   };
 }
@@ -247,9 +321,11 @@ export function synthesize(text: string): SynthHandle {
       voice,
       '--output_raw',
       '--quiet',
-      /* Slightly faster than default; tuneable per voice taste. */
+      /* User-tuneable via /voice/set-speed; persisted in
+       * voice-preferences.json. Lower = faster, higher = slower.
+       * Baseline 0.475 ≈ 2x default (current "1.0x" speed). */
       '--length_scale',
-      '0.95',
+      String(getLengthScale()),
     ],
     {
       windowsHide: true,

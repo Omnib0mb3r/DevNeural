@@ -53,6 +53,7 @@ import {
   endBrainstorm,
   appendArtifact as appendBrainstormArtifact,
   setStore as setBrainstormStore,
+  reapAllActive as reapAllActiveBrainstorms,
 } from '../lex/brainstorm-store.js';
 import {
   ensureServer as ensureWhisper,
@@ -66,6 +67,7 @@ import {
   synthesizeToBuffer,
   pcmToWav,
   setActiveVoice,
+  setActiveSpeed,
 } from '../voice/piper.js';
 import { attachLexVoiceWs } from '../voice/lex-voice-ws.js';
 import { lintQueueStatus } from '../wiki/lint-queue.js';
@@ -123,6 +125,20 @@ export async function registerDashboardRoutes(
    * routes, eventually used by voice WS) can talk to SQLite without
    * threading the store through every layer. */
   setBrainstormStore(store);
+
+  /* Boot reaper. PTY exit hook in pty-host closes brainstorm rows on
+   * normal exit; a daemon crash (SIGKILL, fatal SqliteError, etc.)
+   * skips that path and leaves rows stuck at status='active'. Reap
+   * once now so /lex/sessions?status=active returns only the brainstorms
+   * the current daemon will actually re-attach to (which is none, until
+   * the user spawns a new Lex). */
+  try {
+    const reaped = reapAllActiveBrainstorms('daemon restart: orphaned active session');
+    if (reaped > 0) log(`brainstorm reaper: ended ${reaped} orphaned active session(s)`);
+  } catch (err) {
+    log(`brainstorm reaper failed: ${(err as Error).message}`);
+  }
+
   // Auth middleware on every request before route handlers
   app.addHook('preHandler', (req, reply, done) => {
     authMiddleware(req, reply, done);
@@ -777,6 +793,20 @@ export async function registerDashboardRoutes(
     if (!r.ok) {
       reply.code(404);
       return r;
+    }
+    return { ok: true, ...piperStatus() };
+  });
+
+  /* Persisted global speech-rate control. Body: { speed: number } where
+   * 1.0 = baseline (current default), 0.5 = half speed, 1.5 = 1.5x.
+   * Stored as length_scale in voice-preferences.json so it survives
+   * daemon restarts and applies to every voice consumer. */
+  app.post('/voice/set-speed', async (req, reply) => {
+    const body = (req.body ?? {}) as { speed?: number };
+    const r = setActiveSpeed(Number(body.speed));
+    if (!r.ok) {
+      reply.code(400);
+      return { ok: false, error: 'speed must be a positive number' };
     }
     return { ok: true, ...piperStatus() };
   });

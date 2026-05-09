@@ -55,6 +55,12 @@ interface VoicePack {
   sampleRate: number;
 }
 
+const SPEED_STORAGE_KEY = "lex-tts-speed";
+const SPEED_MIN = 0.5;
+const SPEED_MAX = 1.5;
+const SPEED_STEP = 0.05;
+const SPEED_DEFAULT = 1.0;
+
 interface Props {
   /** Auto-bind to a specific Lex session. When omitted, the daemon
    * resolves the active brainstorm PTY. */
@@ -90,6 +96,18 @@ export function VoiceClient({ sessionId }: Props) {
   const [mode, setMode] = useState<Mode>("conversation");
   const [voices, setVoices] = useState<VoicePack[]>([]);
   const [activeVoice, setActiveVoiceState] = useState<string>("");
+  /* Persisted globally: localStorage holds the optimistic UI value so
+   * the slider doesn't snap on remount; the server persists the
+   * authoritative length_scale in voice-preferences.json. */
+  const [speed, setSpeed] = useState<number>(() => {
+    if (typeof window === "undefined") return SPEED_DEFAULT;
+    const raw = window.localStorage.getItem(SPEED_STORAGE_KEY);
+    const n = raw ? Number(raw) : NaN;
+    return Number.isFinite(n) && n >= SPEED_MIN && n <= SPEED_MAX
+      ? n
+      : SPEED_DEFAULT;
+  });
+  const speedSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [pttHolding, setPttHolding] = useState(false);
   const modeRef = useRef<Mode>("conversation");
   modeRef.current = mode;
@@ -108,6 +126,19 @@ export function VoiceClient({ sessionId }: Props) {
   const playheadRef = useRef<number>(0);
   const speakingRef = useRef<boolean>(false);
   const mutedRef = useRef<boolean>(false);
+  /* All currently-scheduled TTS sources for the in-flight reply.
+   * AudioBufferSourceNode.start() commits the buffer to the audio
+   * context's render queue; the only way to silence it is src.stop().
+   * Without this we kept hearing the tail of the previous reply over
+   * the start of the next one (the "two voices at once" symptom on
+   * barge-in). On reset we walk this list, stop+disconnect each, and
+   * empty the array so the next reply starts clean. */
+  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  /* Generation counter so late-arriving binary PCM chunks from a
+   * barged-in TTS stream don't get scheduled into the new reply. Each
+   * barge-in / new tts-start bumps the gen; chunk handlers compare
+   * against a captured value at receive-time. */
+  const ttsGenRef = useRef<number>(0);
   /* Timestamps + handles for the live utterance counter and the
    * server-side max-utterance abort. */
   const utteranceStartRef = useRef<number>(0);
@@ -130,9 +161,29 @@ export function VoiceClient({ sessionId }: Props) {
   const awaitingFinalizeRef = useRef<boolean>(false);
   const finalizeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  /* Reset playhead and stop scheduled buffers. Used on barge-in and
-   * when a new tts-start arrives. */
+  /* Reset playhead, hard-stop every scheduled source, and bump the
+   * generation counter so any in-flight binary chunks from the now-
+   * cancelled reply get discarded instead of scheduled into the next
+   * one. Used on barge-in and on the next tts-start. The bump is what
+   * fixes "two voices at once": the server cancels piper, but TCP
+   * frames already in flight still arrive client-side; without this
+   * gen guard those frames would schedule fresh sources just as the
+   * new reply's chunks start landing. */
   function resetTtsPlayback(): void {
+    ttsGenRef.current += 1;
+    for (const src of activeSourcesRef.current) {
+      try {
+        src.stop();
+      } catch {
+        /* already stopped */
+      }
+      try {
+        src.disconnect();
+      } catch {
+        /* already disconnected */
+      }
+    }
+    activeSourcesRef.current = [];
     if (audioCtxRef.current) {
       playheadRef.current = audioCtxRef.current.currentTime;
     }
@@ -216,8 +267,11 @@ export function VoiceClient({ sessionId }: Props) {
    * playheadRef as the absolute audioContext time at which the next
    * buffer should begin. Each buffer pushes the playhead forward by
    * its own duration, giving gapless playback even if chunks arrive
-   * in bursts. */
-  function schedulePcmChunk(pcm: ArrayBuffer): void {
+   * in bursts. `gen` is the ttsGen value captured when the chunk
+   * arrived; if a barge-in / new tts-start has bumped it since, drop
+   * the chunk so we don't schedule cancelled audio into a fresh reply. */
+  function schedulePcmChunk(pcm: ArrayBuffer, gen: number): void {
+    if (gen !== ttsGenRef.current) return;
     const ctx = audioCtxRef.current;
     if (!ctx) return;
     const int16 = new Int16Array(pcm);
@@ -238,6 +292,13 @@ export function VoiceClient({ sessionId }: Props) {
     }
     src.start(playheadRef.current);
     playheadRef.current += float.length / rate;
+    /* Track so resetTtsPlayback can stop everything on barge-in. Drop
+     * the entry on natural end so the array doesn't grow unbounded. */
+    activeSourcesRef.current.push(src);
+    src.onended = () => {
+      const idx = activeSourcesRef.current.indexOf(src);
+      if (idx >= 0) activeSourcesRef.current.splice(idx, 1);
+    };
   }
 
   /* Prewarm whisper-server as soon as the voice panel mounts so the
@@ -261,9 +322,38 @@ export function VoiceClient({ sessionId }: Props) {
         if (!j) return;
         if (Array.isArray(j.voices)) setVoices(j.voices);
         if (typeof j.active_voice === "string") setActiveVoiceState(j.active_voice);
+        /* Server's persisted speed wins on cold load; localStorage
+         * was just a fast pre-hydration so the slider didn't snap. */
+        if (typeof j.speed === "number" && Number.isFinite(j.speed)) {
+          const clamped = Math.max(SPEED_MIN, Math.min(SPEED_MAX, j.speed));
+          setSpeed(clamped);
+          if (typeof window !== "undefined") {
+            window.localStorage.setItem(SPEED_STORAGE_KEY, String(clamped));
+          }
+        }
       })
       .catch(() => undefined);
   }, []);
+
+  /* Persist speed on every change. Debounce server writes so dragging
+   * the slider doesn't fire 20 POSTs; localStorage updates immediately
+   * because it's free. */
+  function changeSpeed(next: number): void {
+    const clamped = Math.max(SPEED_MIN, Math.min(SPEED_MAX, next));
+    setSpeed(clamped);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(SPEED_STORAGE_KEY, String(clamped));
+    }
+    if (speedSaveTimerRef.current) clearTimeout(speedSaveTimerRef.current);
+    speedSaveTimerRef.current = setTimeout(() => {
+      void fetch("/voice/set-speed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ speed: clamped }),
+      }).catch(() => undefined);
+    }, 250);
+  }
 
   async function changeVoice(name: string): Promise<void> {
     const r = await fetch("/voice/set-voice", {
@@ -374,7 +464,7 @@ export function VoiceClient({ sessionId }: Props) {
           }
         } else if (ev.data instanceof ArrayBuffer) {
           if (speakingRef.current) {
-            schedulePcmChunk(ev.data);
+            schedulePcmChunk(ev.data, ttsGenRef.current);
           }
         }
       };
@@ -868,6 +958,24 @@ export function VoiceClient({ sessionId }: Props) {
           </span>
         )}
         <div className="ml-auto flex items-center gap-2">
+          <label
+            className="flex items-center gap-2 text-nano font-mono text-txt3"
+            title="Lex speech rate. Persisted globally — applies to every voice consumer until you change it again."
+          >
+            <span>speed</span>
+            <input
+              type="range"
+              min={SPEED_MIN}
+              max={SPEED_MAX}
+              step={SPEED_STEP}
+              value={speed}
+              onChange={(e) => changeSpeed(Number(e.target.value))}
+              className="w-24 accent-brandSoft"
+            />
+            <span className="text-txt2 tabular-nums w-10 text-right">
+              {speed.toFixed(2)}x
+            </span>
+          </label>
           {enabled && (
             <button
               type="button"

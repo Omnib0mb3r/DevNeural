@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AppShell } from "@/components/AppShell";
 import { TerminalMirror } from "@/components/TerminalMirror";
@@ -11,6 +11,8 @@ import {
   spawnLex,
   ptyInject,
   ptyKill,
+  uploadScreenshot,
+  DaemonError,
   type PtyEntry,
 } from "@/lib/daemon-client";
 
@@ -54,6 +56,77 @@ export default function LexPage() {
 
   const [pendingText, setPendingText] = useState("");
   const [busy, setBusy] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  function spliceIntoTextarea(p: string) {
+    const ta = textareaRef.current;
+    const pos = ta?.selectionStart ?? pendingText.length;
+    const end = ta?.selectionEnd ?? pos;
+    const before = pendingText.slice(0, pos);
+    const after = pendingText.slice(end);
+    const insert =
+      (before && !before.endsWith(" ") && !before.endsWith("\n") ? " " : "") + p + " ";
+    setPendingText(before + insert + after);
+  }
+
+  async function uploadAndSplice(blob: Blob) {
+    setUploading(true);
+    setUploadError(null);
+    try {
+      const mime = blob.type || "image/png";
+      const ext = (mime.split("/")[1] ?? "png").split("+")[0];
+      const result = await uploadScreenshot(blob, `paste-${Date.now()}.${ext}`);
+      if (!result.ok || !result.path) {
+        setUploadError(result.error ?? "upload failed");
+        return;
+      }
+      spliceIntoTextarea(result.path);
+    } catch (err) {
+      const e = err as DaemonError;
+      const payload = e.payload as { error?: string } | undefined;
+      setUploadError(payload?.error ?? e.message);
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const items = Array.from(e.clipboardData?.items ?? []);
+    const imageItem = items.find((i) => i.kind === "file" && i.type.startsWith("image/"));
+    if (imageItem) {
+      const blob = imageItem.getAsFile();
+      if (blob) {
+        e.preventDefault();
+        await uploadAndSplice(blob);
+        return;
+      }
+    }
+    if (typeof navigator !== "undefined" && navigator.clipboard?.read) {
+      try {
+        const ci = await navigator.clipboard.read();
+        for (const item of ci) {
+          const imgType = item.types.find((t) => t.startsWith("image/"));
+          if (!imgType) continue;
+          const blob = await item.getType(imgType);
+          e.preventDefault();
+          await uploadAndSplice(blob);
+          return;
+        }
+      } catch {
+        /* fall through to default text paste */
+      }
+    }
+  }
+
+  function onFilePicked(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    void uploadAndSplice(f);
+    e.target.value = "";
+  }
 
   /* When the dashboard send-prompt-form fires, route to the PTY
    * inject endpoint instead of the bridge-mediated /sessions/:id/prompt
@@ -167,8 +240,10 @@ export default function LexPage() {
                 className="p-4 space-y-3"
               >
                 <textarea
+                  ref={textareaRef}
                   value={pendingText}
                   onChange={(e) => setPendingText(e.target.value)}
+                  onPaste={handlePaste}
                   onKeyDown={(e) => {
                     if (
                       (e.metaKey || e.ctrlKey) &&
@@ -179,19 +254,42 @@ export default function LexPage() {
                       injectPrompt(pendingText);
                     }
                   }}
-                  placeholder="What's on your mind? (⌘+Enter to send)"
+                  placeholder="What's on your mind? (⌘+Enter to send, paste a screenshot to attach)"
                   rows={3}
                   className="w-full px-3 py-2 rounded-input bg-surface2 hairline text-txt1 outline-none focus:ring-1 focus:ring-brand/60 text-sm font-mono resize-y placeholder:text-txt3"
                   disabled={!lexPty?.sessionId && !lexPty?.ptyId}
                 />
+                {uploading && (
+                  <div className="text-nano text-txt3 font-mono">uploading screenshot…</div>
+                )}
                 <div className="flex items-center justify-between gap-2">
-                  <span className="text-nano text-txt3 font-mono">
-                    {lexPty?.sessionId
-                      ? "ready"
-                      : lexPty
-                        ? "waiting for first turn to bind session id…"
-                        : "no session"}
-                  </span>
+                  <div className="flex items-center gap-2 text-nano text-txt3">
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={uploading}
+                      className="h-9 w-9 rounded-input hairline grid place-items-center text-txt2 hover:text-txt1 disabled:opacity-40"
+                      aria-label="Attach screenshot"
+                      title="Attach a screenshot from camera roll or files"
+                    >
+                      <Icon name="Paperclip" size={16} />
+                    </button>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="image/*"
+                      onChange={onFilePicked}
+                      className="hidden"
+                      aria-hidden="true"
+                    />
+                    <span className="font-mono">
+                      {lexPty?.sessionId
+                        ? "ready"
+                        : lexPty
+                          ? "waiting for first turn to bind session id…"
+                          : "no session"}
+                    </span>
+                  </div>
                   <button
                     type="submit"
                     disabled={
@@ -204,6 +302,11 @@ export default function LexPage() {
                     {busy ? "sending…" : "send"}
                   </button>
                 </div>
+                {uploadError && (
+                  <div className="text-xs text-err font-mono">
+                    Upload failed: {uploadError}
+                  </div>
+                )}
               </form>
             </div>
           </>

@@ -51,7 +51,8 @@ export function pushTerminalData(
   cols?: number,
   rows?: number,
 ): void {
-  if (!sessionId || !data) return;
+  if (!sessionId) return;
+  if (!data && (cols == null || rows == null)) return;
   const r = ensure(sessionId);
   const dimChanged =
     typeof cols === 'number' &&
@@ -63,11 +64,13 @@ export function pushTerminalData(
     r.cols = cols;
     r.rows = rows;
   }
-  r.buf.push(data);
-  r.bytes += data.length;
-  while (r.bytes > RING_BYTES && r.buf.length > 1) {
-    const head = r.buf.shift()!;
-    r.bytes -= head.length;
+  if (data) {
+    r.buf.push(data);
+    r.bytes += data.length;
+    while (r.bytes > RING_BYTES && r.buf.length > 1) {
+      const head = r.buf.shift()!;
+      r.bytes -= head.length;
+    }
   }
   if (dimChanged) {
     const sizeMsg = JSON.stringify({ t: 's', c: cols, r: rows } as Envelope);
@@ -79,12 +82,14 @@ export function pushTerminalData(
       }
     }
   }
-  const dataMsg = JSON.stringify({ t: 'd', d: data } as Envelope);
-  for (const cb of r.subscribers) {
-    try {
-      cb(dataMsg);
-    } catch {
-      /* one bad subscriber doesn't block the others */
+  if (data) {
+    const dataMsg = JSON.stringify({ t: 'd', d: data } as Envelope);
+    for (const cb of r.subscribers) {
+      try {
+        cb(dataMsg);
+      } catch {
+        /* one bad subscriber doesn't block the others */
+      }
     }
   }
 }

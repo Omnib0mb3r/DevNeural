@@ -48,6 +48,13 @@ interface PtyHandle {
    * discover the id we can flush them into the ring in order. */
   preBuffer: string[];
   preBufferBytes: number;
+  /** Live grid dims. The bridge endpoint always reports cols/rows when
+   * pushing CC-bridge bytes, so the mirror's xterm can resize and the
+   * source's ANSI cursor positioning lands on the right cells. Daemon-
+   * spawned PTYs have to do the same or the brainstorm mirror stacks
+   * status-bar redraws instead of overwriting them. */
+  cols: number;
+  rows: number;
 }
 
 const ptys = new Map<string, PtyHandle>();
@@ -125,7 +132,12 @@ function tryDiscoverSession(handle: PtyHandle): void {
   sessionToPty.set(sessionId, handle.ptyId);
   /* Flush pre-binding buffer into the ring. */
   if (handle.preBuffer.length > 0) {
-    pushTerminalData(sessionId, handle.preBuffer.join(''));
+    pushTerminalData(
+      sessionId,
+      handle.preBuffer.join(''),
+      handle.cols,
+      handle.rows,
+    );
     handle.preBuffer = [];
     handle.preBufferBytes = 0;
   }
@@ -190,12 +202,21 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
 
   const pty = ptySpawn(execPath, execArgs, {
     name: 'xterm-256color',
-    cols: opts.cols ?? 200,
-    rows: opts.rows ?? 64,
+    /* Defaults sized to render legibly inside the dashboard's
+     * TerminalMirror panel. The mirror predicts fontSize as
+     * ~panelWidth/cols/0.6; at 200 cols the font collapses to ~5px
+     * and ANSI cursor moves land off-grid, producing the "jumbled"
+     * brainstorm mirror. 110×34 keeps font ~10-12px in a typical
+     * panel and matches what real CC sessions emit when launched
+     * from a normal terminal, so /lex and /sessions render the same. */
+    cols: opts.cols ?? 110,
+    rows: opts.rows ?? 34,
     cwd,
     env: { ...process.env, ...(opts.env ?? {}) } as Record<string, string>,
   });
 
+  const cols = opts.cols ?? 110;
+  const rows = opts.rows ?? 34;
   const handle: PtyHandle = {
     ptyId,
     sessionId: null,
@@ -207,6 +228,8 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
     exited: false,
     preBuffer: [],
     preBufferBytes: 0,
+    cols,
+    rows,
   };
   ptys.set(ptyId, handle);
 
@@ -235,7 +258,7 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
      * running a while, so a slow first turn doesn't keep us probing
      * the filesystem forever. */
     if (handle.sessionId) {
-      pushTerminalData(handle.sessionId, data);
+      pushTerminalData(handle.sessionId, data, handle.cols, handle.rows);
       return;
     }
     handle.preBuffer.push(data);
@@ -367,6 +390,14 @@ export function ptyResize(
   if (!handle || handle.exited) return false;
   try {
     handle.pty.resize(cols, rows);
+    handle.cols = cols;
+    handle.rows = rows;
+    /* Push a zero-data refresh so the ring records the new dims and
+     * fans an `s` envelope to live mirrors. Without this the mirror
+     * keeps using the prior grid until the next stdout chunk arrives. */
+    if (handle.sessionId) {
+      pushTerminalData(handle.sessionId, '', cols, rows);
+    }
     return true;
   } catch {
     return false;
