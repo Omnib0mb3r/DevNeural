@@ -70,6 +70,39 @@ const BARGE_MIN = 0;
 const BARGE_MAX = 2000;
 const BARGE_DEFAULT = 250;
 
+/* Mic VAD sensitivity is edited on the /settings page; VoiceClient only
+ * consumes it. localStorage is the optimistic seed so the very first
+ * VAD init (before piper-status returns) uses the user's last value
+ * rather than the default. Range [0, 1]; 0.5 is the legacy hardcoded
+ * threshold pair. */
+const VAD_SENSITIVITY_STORAGE_KEY = "lex-vad-sensitivity";
+const VAD_SENSITIVITY_MIN = 0;
+const VAD_SENSITIVITY_MAX = 1;
+const VAD_SENSITIVITY_DEFAULT = 0.5;
+
+/* Mic input gain. Multiplier applied to captured float samples right
+ * before the int16 conversion that ships to whisper. 1.0 = passthrough;
+ * <1 attenuates a hot mic; >1 boosts a quiet one. Edited on /settings;
+ * VoiceClient only consumes it. */
+const MIC_GAIN_STORAGE_KEY = "lex-mic-gain";
+const MIC_GAIN_MIN = 0;
+const MIC_GAIN_MAX = 3.0;
+const MIC_GAIN_DEFAULT = 1.0;
+
+/* Map a 0-1 sensitivity knob to silero positive/negative speech
+ * thresholds. Higher knob = more sensitive = lower threshold. The
+ * 0.1 delta between positive and negative matches the legacy tuning
+ * (positive 0.5 / negative 0.4 at sensitivity 0.5). */
+function vadThresholds(sensitivity: number): {
+  positive: number;
+  negative: number;
+} {
+  const s = Math.max(0, Math.min(1, sensitivity));
+  const positive = 0.7 - 0.4 * s;
+  const negative = positive - 0.1;
+  return { positive, negative };
+}
+
 interface Props {
   /** Auto-bind to a specific Lex session. When omitted, the daemon
    * resolves the active brainstorm PTY. */
@@ -131,6 +164,35 @@ export function VoiceClient({ sessionId }: Props) {
   });
   const bargeCooldownRef = useRef<number>(BARGE_DEFAULT);
   bargeCooldownRef.current = bargeCooldownMs;
+  /* Mic VAD sensitivity. Read at VAD init via the ref so that re-
+   * enabling voice after the user moves the slider picks up the new
+   * value without re-rendering the VAD itself (silero VAD does not
+   * support live threshold updates). */
+  const [vadSensitivity, setVadSensitivity] = useState<number>(() => {
+    if (typeof window === "undefined") return VAD_SENSITIVITY_DEFAULT;
+    const raw = window.localStorage.getItem(VAD_SENSITIVITY_STORAGE_KEY);
+    const n = raw ? Number(raw) : NaN;
+    return Number.isFinite(n) &&
+      n >= VAD_SENSITIVITY_MIN &&
+      n <= VAD_SENSITIVITY_MAX
+      ? n
+      : VAD_SENSITIVITY_DEFAULT;
+  });
+  const vadSensitivityRef = useRef<number>(VAD_SENSITIVITY_DEFAULT);
+  vadSensitivityRef.current = vadSensitivity;
+  /* Mic input gain. Read at every audio-buffer flush via the ref so the
+   * /settings slider takes effect on the next utterance without needing
+   * to disable + re-enable voice. */
+  const [micGain, setMicGain] = useState<number>(() => {
+    if (typeof window === "undefined") return MIC_GAIN_DEFAULT;
+    const raw = window.localStorage.getItem(MIC_GAIN_STORAGE_KEY);
+    const n = raw ? Number(raw) : NaN;
+    return Number.isFinite(n) && n >= MIC_GAIN_MIN && n <= MIC_GAIN_MAX
+      ? n
+      : MIC_GAIN_DEFAULT;
+  });
+  const micGainRef = useRef<number>(MIC_GAIN_DEFAULT);
+  micGainRef.current = micGain;
   const lastTtsStartAtRef = useRef<number>(0);
   const [pttHolding, setPttHolding] = useState(false);
   const modeRef = useRef<Mode>("conversation");
@@ -366,6 +428,38 @@ export function VoiceClient({ sessionId }: Props) {
           setBargeCooldownMs(clamped);
           if (typeof window !== "undefined") {
             window.localStorage.setItem(BARGE_STORAGE_KEY, String(clamped));
+          }
+        }
+        if (
+          typeof j.vad_sensitivity === "number" &&
+          Number.isFinite(j.vad_sensitivity)
+        ) {
+          const clamped = Math.max(
+            VAD_SENSITIVITY_MIN,
+            Math.min(VAD_SENSITIVITY_MAX, j.vad_sensitivity),
+          );
+          setVadSensitivity(clamped);
+          if (typeof window !== "undefined") {
+            window.localStorage.setItem(
+              VAD_SENSITIVITY_STORAGE_KEY,
+              String(clamped),
+            );
+          }
+        }
+        if (
+          typeof j.mic_gain === "number" &&
+          Number.isFinite(j.mic_gain)
+        ) {
+          const clamped = Math.max(
+            MIC_GAIN_MIN,
+            Math.min(MIC_GAIN_MAX, j.mic_gain),
+          );
+          setMicGain(clamped);
+          if (typeof window !== "undefined") {
+            window.localStorage.setItem(
+              MIC_GAIN_STORAGE_KEY,
+              String(clamped),
+            );
           }
         }
       })
@@ -627,9 +721,10 @@ export function VoiceClient({ sessionId }: Props) {
           proc.onaudioprocess = (e: AudioProcessingEvent) => {
             if (!captureCapturingRef.current) return;
             const f = e.inputBuffer.getChannelData(0);
+            const gain = micGainRef.current;
             const i16 = new Int16Array(f.length);
             for (let i = 0; i < f.length; i++) {
-              const s = Math.max(-1, Math.min(1, f[i] ?? 0));
+              const s = Math.max(-1, Math.min(1, (f[i] ?? 0) * gain));
               i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
             }
             captureBufRef.current.push(i16);
@@ -682,9 +777,10 @@ export function VoiceClient({ sessionId }: Props) {
               utteranceCapRef.current = null;
             }
             setUtteranceMs(0);
+            const gain = micGainRef.current;
             const int16 = new Int16Array(audio.length);
             for (let i = 0; i < audio.length; i++) {
-              const s = Math.max(-1, Math.min(1, audio[i] ?? 0));
+              const s = Math.max(-1, Math.min(1, (audio[i] ?? 0) * gain));
               int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
             }
             sendBinary(int16.buffer);
@@ -767,13 +863,12 @@ export function VoiceClient({ sessionId }: Props) {
               if (mutedRef.current) return;
               finalizeUtterance(audio);
             },
-            /* VAD thresholds tuned for "speak naturally" rather than
-             * push-to-talk. Tuning notes after first user test:
-             * - positiveSpeechThreshold lowered to 0.5: missed real
-             *   speech onsets when the user spoke softly.
-             * - negativeSpeechThreshold raised to 0.4: short mid-
-             *   sentence pauses were too easily counted as silence,
-             *   making Lex wait or premature-cut.
+            /* VAD thresholds derived from the user-tunable mic
+             * sensitivity (0=ignore noise, 1=fire easily; 0.5 matches
+             * the legacy 0.5/0.4 pair). Edited on /settings, persisted
+             * server-side. silero VAD does not accept live threshold
+             * updates, so the slider only takes effect on the next
+             * VAD start (toggle the mic off and back on).
              * - redemptionFrames 24: roughly 768ms of post-pause
              *   tolerance before declaring end-of-utterance. Picks
              *   up natural pacing; the MAX_UTTERANCE_MS cap above
@@ -781,8 +876,13 @@ export function VoiceClient({ sessionId }: Props) {
              * - minSpeechFrames 8: needs ~256ms of confirmed speech
              *   before counting as a barge-in. Cuts false barge-ins
              *   from coughs / one-syllable sounds. */
-            positiveSpeechThreshold: 0.5,
-            negativeSpeechThreshold: 0.4,
+            ...(() => {
+              const t = vadThresholds(vadSensitivityRef.current);
+              return {
+                positiveSpeechThreshold: t.positive,
+                negativeSpeechThreshold: t.negative,
+              };
+            })(),
             redemptionFrames: 24,
             preSpeechPadFrames: 8,
             minSpeechFrames: 8,
@@ -827,9 +927,10 @@ export function VoiceClient({ sessionId }: Props) {
           proc.onaudioprocess = (e) => {
             if (!pttCapturing) return;
             const f = e.inputBuffer.getChannelData(0);
+            const gain = micGainRef.current;
             const i16 = new Int16Array(f.length);
             for (let i = 0; i < f.length; i++) {
-              const s = Math.max(-1, Math.min(1, f[i] ?? 0));
+              const s = Math.max(-1, Math.min(1, (f[i] ?? 0) * gain));
               i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
             }
             pttBuffer.push(i16);

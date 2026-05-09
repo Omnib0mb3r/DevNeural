@@ -56,6 +56,8 @@ const VOICE_PREF_FILE = (() => {
 let cachedActiveVoice: string | null = null;
 let cachedLengthScale: number | null = null;
 let cachedBargeCooldownMs: number | null = null;
+let cachedVadSensitivity: number | null = null;
+let cachedMicGain: number | null = null;
 
 /* Default barge-in cooldown after tts-start. Bedroom-mic feedback was
  * triggering self-barge: Lex's own audio bled into the mic, VAD fired
@@ -75,10 +77,30 @@ const BASE_LENGTH_SCALE = 0.475;
 const MIN_LENGTH_SCALE = 0.25;
 const MAX_LENGTH_SCALE = 1.5;
 
+/* VAD sensitivity. 0 = least sensitive (high speech threshold, ignores
+ * background noise), 1 = most sensitive (low threshold, fires on any
+ * sound). 0.5 reproduces the legacy hardcoded thresholds
+ * positiveSpeechThreshold=0.5 / negativeSpeechThreshold=0.4. The client
+ * computes the actual silero thresholds from this single knob. */
+const DEFAULT_VAD_SENSITIVITY = 0.5;
+const MIN_VAD_SENSITIVITY = 0;
+const MAX_VAD_SENSITIVITY = 1;
+
+/* Mic input gain. Multiplier applied to captured float samples before
+ * the int16 conversion that ships to whisper. 1.0 = passthrough,
+ * <1 quieter, >1 louder. Cap at 3.0 so a runaway slider can't blow
+ * out the int16 range too aggressively (clipping still occurs above
+ * ~1.5 for already-loud sources). */
+const DEFAULT_MIC_GAIN = 1.0;
+const MIN_MIC_GAIN = 0;
+const MAX_MIC_GAIN = 3.0;
+
 function readPersistedPrefs(): {
   voice?: string;
   length_scale?: number;
   barge_cooldown_ms?: number;
+  vad_sensitivity?: number;
+  mic_gain?: number;
 } {
   if (!VOICE_PREF_FILE) return {};
   try {
@@ -87,6 +109,8 @@ function readPersistedPrefs(): {
       voice?: string;
       length_scale?: number;
       barge_cooldown_ms?: number;
+      vad_sensitivity?: number;
+      mic_gain?: number;
     };
   } catch {
     return {};
@@ -106,6 +130,8 @@ function writePersistedPrefs(patch: {
   voice?: string;
   length_scale?: number;
   barge_cooldown_ms?: number;
+  vad_sensitivity?: number;
+  mic_gain?: number;
 }): void {
   if (!VOICE_PREF_FILE) return;
   try {
@@ -181,6 +207,74 @@ export function setBargeCooldownMs(ms: number): {
   cachedBargeCooldownMs = clamped;
   writePersistedPrefs({ barge_cooldown_ms: clamped });
   return { ok: true, barge_cooldown_ms: clamped };
+}
+
+function clampVadSensitivity(v: number): number {
+  if (!Number.isFinite(v)) return DEFAULT_VAD_SENSITIVITY;
+  if (v < MIN_VAD_SENSITIVITY) return MIN_VAD_SENSITIVITY;
+  if (v > MAX_VAD_SENSITIVITY) return MAX_VAD_SENSITIVITY;
+  return v;
+}
+
+function readPersistedVadSensitivity(): number | null {
+  const v = Number(readPersistedPrefs().vad_sensitivity);
+  return Number.isFinite(v) ? v : null;
+}
+
+export function getVadSensitivity(): number {
+  if (cachedVadSensitivity !== null) return cachedVadSensitivity;
+  const persisted = readPersistedVadSensitivity();
+  cachedVadSensitivity = persisted !== null
+    ? clampVadSensitivity(persisted)
+    : DEFAULT_VAD_SENSITIVITY;
+  return cachedVadSensitivity;
+}
+
+export function setVadSensitivity(value: number): {
+  ok: boolean;
+  vad_sensitivity: number;
+} {
+  if (!Number.isFinite(value)) {
+    return { ok: false, vad_sensitivity: getVadSensitivity() };
+  }
+  const clamped = clampVadSensitivity(value);
+  cachedVadSensitivity = clamped;
+  writePersistedPrefs({ vad_sensitivity: clamped });
+  return { ok: true, vad_sensitivity: clamped };
+}
+
+function clampMicGain(v: number): number {
+  if (!Number.isFinite(v)) return DEFAULT_MIC_GAIN;
+  if (v < MIN_MIC_GAIN) return MIN_MIC_GAIN;
+  if (v > MAX_MIC_GAIN) return MAX_MIC_GAIN;
+  return v;
+}
+
+function readPersistedMicGain(): number | null {
+  const v = Number(readPersistedPrefs().mic_gain);
+  return Number.isFinite(v) && v >= 0 ? v : null;
+}
+
+export function getMicGain(): number {
+  if (cachedMicGain !== null) return cachedMicGain;
+  const persisted = readPersistedMicGain();
+  cachedMicGain = persisted !== null
+    ? clampMicGain(persisted)
+    : DEFAULT_MIC_GAIN;
+  return cachedMicGain;
+}
+
+export function setMicGain(value: number): {
+  ok: boolean;
+  mic_gain: number;
+} {
+  if (!Number.isFinite(value) || value < 0) {
+    return { ok: false, mic_gain: getMicGain() };
+  }
+  const clamped = clampMicGain(value);
+  cachedMicGain = clamped;
+  writePersistedPrefs({ mic_gain: clamped });
+  return { ok: true, mic_gain: clamped };
 }
 
 export function setActiveSpeed(uiSpeed: number): {
@@ -324,6 +418,8 @@ export interface PiperStatus {
   speed: number;
   length_scale: number;
   barge_cooldown_ms: number;
+  vad_sensitivity: number;
+  mic_gain: number;
   voices: VoicePack[];
 }
 
@@ -337,6 +433,8 @@ export function piperStatus(): PiperStatus {
     speed: getActiveSpeed(),
     length_scale: getLengthScale(),
     barge_cooldown_ms: getBargeCooldownMs(),
+    vad_sensitivity: getVadSensitivity(),
+    mic_gain: getMicGain(),
     voices: listVoices(),
   };
 }

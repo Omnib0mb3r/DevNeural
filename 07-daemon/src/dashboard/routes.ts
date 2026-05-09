@@ -72,6 +72,8 @@ import {
   setActiveVoice,
   setActiveSpeed,
   setBargeCooldownMs,
+  setMicGain,
+  setVadSensitivity,
 } from '../voice/piper.js';
 import { attachLexVoiceWs } from '../voice/lex-voice-ws.js';
 import { lintQueueStatus } from '../wiki/lint-queue.js';
@@ -969,6 +971,36 @@ export async function registerDashboardRoutes(
     if (!r.ok) {
       reply.code(400);
       return { ok: false, error: 'ms must be a non-negative number' };
+    }
+    return { ok: true, ...piperStatus() };
+  });
+
+  /* Persisted mic VAD sensitivity. Body: { value: number } in [0, 1].
+   * 0 = least sensitive (high silero threshold, ignores room noise);
+   * 1 = most sensitive (low threshold, fires on any speech-like sound).
+   * 0.5 reproduces the legacy hardcoded thresholds. The client maps
+   * this to silero positive/negative speech thresholds at VAD init. */
+  app.post('/voice/set-vad-sensitivity', async (req, reply) => {
+    const body = (req.body ?? {}) as { value?: number };
+    const r = setVadSensitivity(Number(body.value));
+    if (!r.ok) {
+      reply.code(400);
+      return { ok: false, error: 'value must be a finite number' };
+    }
+    return { ok: true, ...piperStatus() };
+  });
+
+  /* Persisted mic input gain. Body: { value: number } in [0, 3.0].
+   * 1.0 = passthrough; <1 attenuates; >1 amplifies. The client applies
+   * this multiplier to captured float samples before int16 conversion,
+   * so it affects what whisper hears (lets the user turn down a hot
+   * mic or boost a quiet one without touching OS-level controls). */
+  app.post('/voice/set-mic-gain', async (req, reply) => {
+    const body = (req.body ?? {}) as { value?: number };
+    const r = setMicGain(Number(body.value));
+    if (!r.ok) {
+      reply.code(400);
+      return { ok: false, error: 'value must be a non-negative number' };
     }
     return { ok: true, ...piperStatus() };
   });
