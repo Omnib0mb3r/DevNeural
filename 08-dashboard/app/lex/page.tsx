@@ -123,9 +123,9 @@ export default function LexPage() {
         <p className="text-sm text-txt3 max-w-3xl">
           Lex is your supervisory AI for DevNeural. He runs locally on
           OTLCDEV with full access to the wiki, sessions, projects, and
-          web. Brainstorm out loud (voice coming soon), frame projects,
-          take notes, ask him to act. He can scaffold projects, queue
-          prompts to running worker sessions, and create reminders.
+          web. Brainstorm out loud, frame projects, take notes, ask him
+          to act. He can scaffold projects, queue prompts to running
+          worker sessions, and create reminders.
         </p>
 
         {!lexPty && !spawnM.isPending && (
