@@ -45,6 +45,18 @@ import {
   startSessionDiscoveryProbe,
 } from './pty-host.js';
 import { buildLexSystemPrompt } from '../lex/system-prompt.js';
+import {
+  ensureServer as ensureWhisper,
+  transcribeWav,
+  whisperStatus,
+  pcm16ToWav,
+} from '../voice/whisper.js';
+import {
+  piperStatus,
+  synthesize,
+  synthesizeToBuffer,
+  pcmToWav,
+} from '../voice/piper.js';
 import { lintQueueStatus } from '../wiki/lint-queue.js';
 import { providerStatus } from '../llm/index.js';
 import { embedderStats } from '../embedder/index.js';
@@ -642,6 +654,88 @@ export async function registerDashboardRoutes(
    * before claude has written its session-id jsonl) and the bound
    * session-id (after binding). */
   app.get('/pty', async () => ({ ok: true, ptys: listPtys() }));
+
+  /* Voice / STT. Lazy-spawns whisper-server (cuBLAS build, RTX 5080)
+   * on first call; subsequent transcriptions reuse the persistent
+   * process so the model load (~1s) is amortised. Body accepts
+   * either { wav: base64 } or { pcm: base64, sampleRate }.
+   * Used by the Brainstorming voice client; future: stand-alone
+   * transcription endpoint for any consumer. */
+  app.get('/voice/whisper-status', async () => ({
+    ok: true,
+    ...whisperStatus(),
+  }));
+
+  app.post('/voice/whisper-prewarm', async () => {
+    try {
+      await ensureWhisper();
+      return { ok: true, ...whisperStatus() };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+  });
+
+  app.get('/voice/piper-status', async () => ({
+    ok: true,
+    ...piperStatus(),
+  }));
+
+  /* Smoke-test endpoint: returns a WAV. Production voice uses the
+   * streaming WS path which buffers PCM directly into the browser. */
+  app.post('/voice/synthesize', async (req, reply) => {
+    const body = (req.body ?? {}) as { text?: string };
+    if (!body.text || typeof body.text !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'text required' };
+    }
+    try {
+      const r = await synthesizeToBuffer(body.text);
+      const wav = pcmToWav(r.pcm, r.sampleRate);
+      reply.type('audio/wav');
+      reply.header('X-Synth-Ms', String(r.ms));
+      reply.header('X-Synth-Rate', String(r.sampleRate));
+      return reply.send(wav);
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, error: (err as Error).message };
+    }
+  });
+
+  app.post('/voice/transcribe', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      wav?: string;
+      pcm?: string;
+      sampleRate?: number;
+    };
+    let wav: Buffer | null = null;
+    if (typeof body.wav === 'string' && body.wav.length > 0) {
+      try {
+        wav = Buffer.from(body.wav, 'base64');
+      } catch {
+        reply.code(400);
+        return { ok: false, error: 'wav not valid base64' };
+      }
+    } else if (typeof body.pcm === 'string' && body.pcm.length > 0) {
+      const pcm = Buffer.from(body.pcm, 'base64');
+      const int16 = new Int16Array(
+        pcm.buffer,
+        pcm.byteOffset,
+        pcm.byteLength / 2,
+      );
+      wav = pcm16ToWav(int16, body.sampleRate ?? 16000);
+    }
+    if (!wav) {
+      reply.code(400);
+      return { ok: false, error: 'wav or pcm required (base64)' };
+    }
+    try {
+      const r = await transcribeWav(wav);
+      return { ok: true, text: r.text, ms: r.ms };
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, error: (err as Error).message };
+    }
+  });
 
   app.get('/pty/:id/output', async (req, reply) => {
     const id = (req.params as { id: string }).id;
