@@ -260,10 +260,11 @@ export default function LexPage() {
 
         {(lexPty || spawnM.isPending) && (
           <>
-            {/* VoiceClient now lives in AppShell so it survives route
-             * changes (start voice on /lex, navigate to /settings,
-             * voice keeps running). The floating panel anchors to the
-             * bottom-right of the viewport. */}
+            {/* Portal slot for the AppShell-mounted VoiceClient. The
+             * actual component instance lives in AppShell so its WS,
+             * mic, and audio pipeline survive nav to /settings and
+             * back; the portal just paints the panel UI here on /lex. */}
+            <div id="voice-panel-slot" />
             {/* Reuse the existing TerminalMirror — it expects a session
              * id and pulls from the same terminal-stream ring the
              * daemon-PTY pumps into post-binding. Before binding we

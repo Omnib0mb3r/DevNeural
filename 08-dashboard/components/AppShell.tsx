@@ -54,19 +54,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <MobileTabBar activeTab={activeTab} />
       <LexEasterEgg />
       {/* Voice client lifted to AppShell so the WS, mic, and audio
-       * pipeline survive route changes. Only mounts when a Lex PTY
-       * exists (prevents needless WS spawn on cold project state). The
-       * panel renders as a fixed bottom-right floating widget so it
-       * stays visible on /settings, /wiki, etc. without rearranging
-       * the page-specific layout. */}
-      {lexPty && (
-        <div
-          className="fixed bottom-16 right-4 z-30 w-[min(380px,calc(100vw-2rem))] md:bottom-4 md:right-4"
-          aria-label="Voice panel"
-        >
-          <VoiceClient sessionId={lexPty.sessionId ?? null} />
-        </div>
-      )}
+       * pipeline survive route changes. The component renders its DOM
+       * into a portal slot (#voice-panel-slot) which the /lex page
+       * provides; off /lex the slot does not exist so VoiceClient
+       * renders nothing visually but stays alive in the React tree
+       * with its WS/mic intact. Mount-gated on Lex PTY presence to
+       * avoid spawning an idle WS in cold-start state. */}
+      {lexPty && <VoiceClient sessionId={lexPty.sessionId ?? null} />}
     </div>
   );
 }

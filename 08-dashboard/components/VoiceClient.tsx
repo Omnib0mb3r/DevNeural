@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Icon } from "./Icon";
 
 /**
@@ -1114,7 +1115,26 @@ export function VoiceClient({ sessionId }: Props) {
     error: "text-err",
   };
 
-  return (
+  /* Portal target lookup re-runs on every pathname change via the
+   * tick state below. The /lex page renders a div#voice-panel-slot;
+   * other routes do not, so VoiceClient mounts to nothing visible
+   * while keeping its WS/mic/audio pipeline alive in React state. */
+  const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const findSlot = () =>
+      setPortalTarget(document.getElementById("voice-panel-slot"));
+    findSlot();
+    /* MutationObserver catches the slot showing up after a route nav
+     * since Next.js client navigation rerenders the page subtree
+     * asynchronously; without this we would miss the first /lex visit
+     * after a non-/lex initial load. */
+    const obs = new MutationObserver(findSlot);
+    obs.observe(document.body, { childList: true, subtree: true });
+    return () => obs.disconnect();
+  }, []);
+
+  const panel = (
     <section className="rounded-panel bg-surface1 hairline">
       <div className="px-5 py-3 border-b border-border1 flex items-center gap-3">
         <Icon name="Mic" className="text-brandSoft" size={16} />
@@ -1268,4 +1288,6 @@ export function VoiceClient({ sessionId }: Props) {
       )}
     </section>
   );
+
+  return portalTarget ? createPortal(panel, portalTarget) : null;
 }
