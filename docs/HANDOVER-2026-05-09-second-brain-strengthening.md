@@ -32,8 +32,8 @@ Starting state at session boundary:
   4. `scheduleLint()` (already debounced)
 - `08-dashboard/components/VoiceClient.tsx` — no change beyond existing teardown effect
 
-**Status:** ⬜ not started
-**Commit:** _(pending)_
+**Status:** ✅ done
+**Commit:** `e0b1582`
 
 ---
 
@@ -50,8 +50,8 @@ Starting state at session boundary:
 1. Read-only investigation agent maps the current loop and reports any gaps
 2. If gaps found, fix in a follow-up commit
 
-**Status:** ⬜ not started
-**Commit:** _(pending)_
+**Status:** ✅ done
+**Commit:** `9606e30`
 
 ---
 
@@ -65,8 +65,8 @@ Starting state at session boundary:
 - `INGEST_FALLBACK=anthropic` env var to opt in
 - README + install docs note the env var
 
-**Status:** ⬜ not started
-**Commit:** _(pending)_
+**Status:** ✅ done
+**Commit:** `41a68f8`
 
 ---
 
@@ -78,8 +78,8 @@ Starting state at session boundary:
 - `07-daemon/src/reinforcement/index.ts` — add verification gate before promotion to canonical when `projects.length === 2`
 - LLM call: tiny, cheap (Haiku or local qwen3 with low temp)
 
-**Status:** ⬜ not started
-**Commit:** _(pending)_
+**Status:** ✅ done
+**Commit:** `d9e80da`
 
 ---
 
@@ -93,8 +93,8 @@ Starting state at session boundary:
 
 **Risk:** biggest blast radius. Existing raw_chunks stay valid; new ones use new chunking. Search results will mix granularities for a transition window.
 
-**Status:** ⬜ not started
-**Commit:** _(pending)_
+**Status:** ✅ done
+**Commit:** `47a8510`
 
 ---
 

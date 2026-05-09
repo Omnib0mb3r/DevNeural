@@ -339,3 +339,45 @@ The watched dir `C:/dev/data/skill-connections/session-bridge` is created on dem
 Capture is alive. The daemon is reachable. The wiki has been seeded (or is in progress). Claude Code sessions will start being augmented as the wiki accumulates canonical pages.
 
 Next read: `05-coexistence-with-claude-setup.md` (placeholder until Phase 5) and `07-troubleshooting.md`.
+
+---
+
+## Optional: tuning environment variables
+
+DevNeural runs sensibly with no env vars set. The following exist for cases where you want to deviate from defaults. All optional, all read at daemon start.
+
+| Var | Default | Effect |
+|---|---|---|
+| `DEVNEURAL_DATA_ROOT` | `C:/dev/data/skill-connections` | Where the wiki, vector store, SQLite, and session-state live |
+| `DEVNEURAL_PORT` | `3747` | Daemon HTTP/WS bind port |
+| `DEVNEURAL_LLM_PROVIDER` | `ollama` | `ollama` (local), `anthropic` (cloud), or `none` (disable LLM ops) |
+| `DEVNEURAL_AUTO_INGEST_INTERVAL_MS` | `300000` (5 min) | Periodic wiki auto-ingest cadence. Lower = more responsive, more LLM calls |
+| `DEVNEURAL_AUTO_INGEST_MIN` | `600` | Minimum bytes of new transcript before periodic ingest fires. End-of-session pipeline bypasses this floor |
+| `DEVNEURAL_DECAY_INTERVAL_MS` | `86400000` (24h) | Reinforcement decay cadence. `0` to disable (dev boxes that don't want page weights to drift) |
+| `DEVNEURAL_PASS2_FALLBACK` | unset | `anthropic` to retry exhausted Pass 2 LLM calls against Anthropic Haiku. Requires `ANTHROPIC_API_KEY`. Off by default to preserve local-first |
+| `DEVNEURAL_WIKI_PUSH_INTERVAL_MS` | `300000` (5 min) | Off-site wiki git-push cadence. Skipped silently if no remote configured |
+| `DEVNEURAL_SUMMARY_TURNS` | `8` | Turns between rolling session-summary refreshes |
+| `DEVNEURAL_SUMMARY_MIN_MS` | `300000` (5 min) | Minimum time between summary refreshes when turns aren't hitting the threshold |
+| `ANTHROPIC_API_KEY` | unset | Required when using anthropic provider or Pass 2 fallback |
+| `DEVNEURAL_WHISPER_BIN` | auto-detected | Path to `whisper-server.exe` (cuBLAS) for voice STT |
+
+### Recommended for borderline local-LLM hardware
+
+If `qwen3:8b` is slow on your box and the wiki shows fewer pages than you'd expect after several sessions, enable the Pass 2 fallback:
+
+```powershell
+[Environment]::SetEnvironmentVariable("DEVNEURAL_PASS2_FALLBACK", "anthropic", "User")
+[Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", "sk-ant-...", "User")
+```
+
+Restart the daemon. Pass 2 calls that exhaust local retries now retry once against Anthropic Haiku (~$0.004 per fallback, typically a handful per day).
+
+### Disabling decay
+
+A dev box where you don't want page weights to drift while you experiment:
+
+```powershell
+[Environment]::SetEnvironmentVariable("DEVNEURAL_DECAY_INTERVAL_MS", "0", "User")
+```
+
+This stops the daily decay tick. Lint shape-fixes still run; only the weight multiplier is paused.

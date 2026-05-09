@@ -372,3 +372,76 @@ Run, in order:
 3. `curl http://127.0.0.1:3747/health`
 
 These three answer most "is something wrong" questions in 30 seconds.
+
+---
+
+## Session-end pipeline didn't run
+
+**Symptom:** A voice or brainstorm session ended but the rolling session summary at `C:/dev/data/skill-connections/session-state/<sid>.summary.md` is stale, or no `kind:'brainstorm-summary'` chunk shows up in retrieval.
+
+**Diagnose:**
+```powershell
+Get-Content C:/dev/data/skill-connections/daemon.log -Tail 100 | Select-String "session-end"
+```
+
+You should see at least:
+- `[session-end] embedded brainstorm-summary mode=<conversation|notes|push-to-talk> ...`
+
+If you only see `[session-end] ... no claude session id; skipping pipeline`: the session ended before its jsonl was discovered. Expected for very-short sessions.
+
+If you see `[auto-ingest:force] ... nothing past cursor`: the wiki ingest cursor was already caught up; the summary still embeds.
+
+If you see `LLM not configured`: check `npm run status` for the LLM provider line. Either ollama is not reachable or `DEVNEURAL_LLM_PROVIDER` is set to `none`.
+
+---
+
+## Wiki page weights aren't decaying
+
+**Symptom:** `wiki_pages_meta` shows pages with `last_touched_ms` from weeks ago at full weight.
+
+**Check the daily decay tick:**
+```powershell
+Get-Content C:/dev/data/skill-connections/daemon.log -Tail 200 | Select-String "decay"
+```
+
+You should see `[decay] interval started, every 86400s` on daemon boot.
+
+If you see `[decay] interval disabled`: `DEVNEURAL_DECAY_INTERVAL_MS=0` is set. Unset it (or pick a non-zero ms value) and restart the daemon.
+
+For an immediate decay run without waiting for the 24h tick:
+```powershell
+curl -X POST http://127.0.0.1:3747/decay
+```
+
+---
+
+## Wiki Pass 2 keeps failing on borderline hardware
+
+**Symptom:** `daemon.log` shows `[ingest] pass2 failed: pass2 failed after N attempts: ...` repeatedly. `wiki/pending/` has fewer pages than expected.
+
+**Enable the Anthropic fallback:**
+```powershell
+[Environment]::SetEnvironmentVariable("DEVNEURAL_PASS2_FALLBACK", "anthropic", "User")
+[Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", "sk-ant-...", "User")
+```
+
+Restart the daemon. After this, exhausted local Pass 2 calls retry once against Anthropic Haiku. Verify with:
+```powershell
+Get-Content C:/dev/data/skill-connections/daemon.log -Tail 200 | Select-String "fallback"
+```
+
+You should see `[ingest] pass2 fallback to anthropic after local exhaustion` followed by `[ingest] pass2 fallback succeeded`.
+
+---
+
+## Cross-project pages keep getting flagged
+
+**Symptom:** Many wiki pages have `flag_for_review: true` in their frontmatter and `## Log` entries like `verifier: cross-project evidence flagged (project X)`.
+
+**Why:** When a page first gains evidence from a 2nd project, the cross-project verifier asks the LLM whether the new evidence describes the same recurring pattern. False/uncertain → flag instead of silent merge. This is correct behaviour; the goal is to prevent vocabulary collisions ("logging" in two domains) from fusing into one page.
+
+**Resolution:** Open the flagged page, look at the new evidence chunk, decide:
+- Same pattern → set `flag_for_review: false`, `human_edited: true`. The page now ignores future verifier passes.
+- Different pattern → split into a new page, remove the misplaced evidence, set `flag_for_review: false`.
+
+If the verifier is firing too aggressively for your taste (e.g. local LLM is conservative), you can disable it by setting `DEVNEURAL_LLM_PROVIDER=none` for the verifier role only — but that defeats the purpose. Better to lean on the flag and triage manually.
