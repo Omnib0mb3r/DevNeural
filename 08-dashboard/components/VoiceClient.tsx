@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import { Icon } from "./Icon";
 
 /**
@@ -123,65 +122,12 @@ const MAX_UTTERANCE_MS = 30_000;
  * 4MB. Used as a defensive abort if VAD never fires speech-end. */
 const MAX_UTTERANCE_SAMPLES = 30 * 16000;
 
-/* Persistence keys for the user-facing voice state. iOS Safari
- * aggressively evicts backgrounded tabs and the page fully reloads on
- * return, so React state alone is not enough; the button label and the
- * last transcript / reply need to survive a full page reload, not just
- * an in-app route change. Stored under the same prefix as the other
- * voice settings so a single localStorage clear (PWA hard reset) wipes
- * them all together. */
-const ENABLED_STORAGE_KEY = "lex-voice-enabled";
-const MODE_STORAGE_KEY = "lex-voice-mode";
-const LAST_TRANSCRIPT_STORAGE_KEY = "lex-voice-last-transcript";
-const LAST_REPLY_STORAGE_KEY = "lex-voice-last-reply";
-
-function readStoredBool(key: string): boolean {
-  if (typeof window === "undefined") return false;
-  return window.localStorage.getItem(key) === "1";
-}
-function readStoredString(key: string): string {
-  if (typeof window === "undefined") return "";
-  return window.localStorage.getItem(key) ?? "";
-}
-function readStoredMode(): Mode {
-  if (typeof window === "undefined") return "conversation";
-  const v = window.localStorage.getItem(MODE_STORAGE_KEY);
-  return v === "notes" || v === "push-to-talk" ? v : "conversation";
-}
-
 export function VoiceClient({ sessionId }: Props) {
   const [status, setStatus] = useState<Status>("idle");
-  const [enabled, setEnabledState] = useState<boolean>(() =>
-    readStoredBool(ENABLED_STORAGE_KEY),
-  );
-  /* Wrap setEnabled so every flip writes through to localStorage. The
-   * page can be evicted by iOS Safari at any moment; we cannot rely on
-   * a single useEffect-flush at unmount. */
-  function setEnabled(next: boolean): void {
-    setEnabledState(next);
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(ENABLED_STORAGE_KEY, next ? "1" : "0");
-    }
-  }
+  const [enabled, setEnabled] = useState(false);
   const [muted, setMuted] = useState(false);
-  const [lastTranscript, setLastTranscriptState] = useState<string>(() =>
-    readStoredString(LAST_TRANSCRIPT_STORAGE_KEY),
-  );
-  function setLastTranscript(text: string): void {
-    setLastTranscriptState(text);
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(LAST_TRANSCRIPT_STORAGE_KEY, text);
-    }
-  }
-  const [lastReply, setLastReplyState] = useState<string>(() =>
-    readStoredString(LAST_REPLY_STORAGE_KEY),
-  );
-  function setLastReply(text: string): void {
-    setLastReplyState(text);
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(LAST_REPLY_STORAGE_KEY, text);
-    }
-  }
+  const [lastTranscript, setLastTranscript] = useState<string>("");
+  const [lastReply, setLastReply] = useState<string>("");
   const [errMsg, setErrMsg] = useState<string>("");
   /* Live counter shown while the user is talking so they know the
    * mic is still capturing and roughly how much they've said. */
@@ -189,13 +135,7 @@ export function VoiceClient({ sessionId }: Props) {
   /* Conversation mode = full duplex (default).
    * Notes only        = Lex captures + transcribes, no spoken reply.
    * Push-to-talk      = no VAD, hold the button, release to send. */
-  const [mode, setModeState] = useState<Mode>(() => readStoredMode());
-  function setMode(next: Mode): void {
-    setModeState(next);
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(MODE_STORAGE_KEY, next);
-    }
-  }
+  const [mode, setMode] = useState<Mode>("conversation");
   const [voices, setVoices] = useState<VoicePack[]>([]);
   const [activeVoice, setActiveVoiceState] = useState<string>("");
   /* Persisted globally: localStorage holds the optimistic UI value so
@@ -561,71 +501,60 @@ export function VoiceClient({ sessionId }: Props) {
     }
   }
 
-  /* Hard teardown of every side-effect this component owns: WebSocket,
-   * silero VAD instance, parallel capture rig, audio output context,
-   * and any pending finalize timer. Called both from the enabled=false
-   * branch (user clicked stop) and from the unmount cleanup (user
-   * navigated away). Without the unmount call, the WS and MediaStream
-   * survive component teardown because the browser holds internal
-   * handles to open sockets and active mic tracks; the next VoiceClient
-   * mount shows the "start" button while the old loop is still
-   * silently transcribing every word. */
-  function tearDownVoice(): void {
-    try {
-      wsRef.current?.close();
-    } catch {
-      /* ignore */
-    }
-    wsRef.current = null;
-    const v = vadRef.current as { destroy?: () => void } | null;
-    try {
-      v?.destroy?.();
-    } catch {
-      /* ignore */
-    }
-    vadRef.current = null;
-    try {
-      captureProcRef.current?.disconnect();
-    } catch {
-      /* ignore */
-    }
-    try {
-      captureStreamRef.current?.getTracks().forEach((t) => t.stop());
-    } catch {
-      /* ignore */
-    }
-    const cctx = captureCtxRef.current;
-    if (cctx && cctx.state !== "closed") {
-      try {
-        void cctx.close();
-      } catch {
-        /* ignore */
-      }
-    }
-    captureProcRef.current = null;
-    captureStreamRef.current = null;
-    captureCtxRef.current = null;
-    captureCapturingRef.current = false;
-    captureBufRef.current = [];
-    if (finalizeTimeoutRef.current) {
-      clearTimeout(finalizeTimeoutRef.current);
-      finalizeTimeoutRef.current = null;
-    }
-    awaitingFinalizeRef.current = false;
-    const ctx = audioCtxRef.current;
-    if (ctx && ctx.state !== "closed") {
-      try {
-        void ctx.close();
-      } catch {
-        /* ignore */
-      }
-    }
-    audioCtxRef.current = null;
-  }
-
   useEffect(() => {
     if (!enabled) {
-      tearDownVoice();
+      /* Tear-down path. */
+      try {
+        wsRef.current?.close();
+      } catch {
+        /* ignore */
+      }
+      wsRef.current = null;
+      const v = vadRef.current as { destroy?: () => void } | null;
+      try {
+        v?.destroy?.();
+      } catch {
+        /* ignore */
+      }
+      vadRef.current = null;
+      /* Tear down the parallel capture rig if it was up. */
+      try {
+        captureProcRef.current?.disconnect();
+      } catch {
+        /* ignore */
+      }
+      try {
+        captureStreamRef.current?.getTracks().forEach((t) => t.stop());
+      } catch {
+        /* ignore */
+      }
+      const cctx = captureCtxRef.current;
+      if (cctx && cctx.state !== "closed") {
+        try {
+          void cctx.close();
+        } catch {
+          /* ignore */
+        }
+      }
+      captureProcRef.current = null;
+      captureStreamRef.current = null;
+      captureCtxRef.current = null;
+      captureCapturingRef.current = false;
+      captureBufRef.current = [];
+      if (finalizeTimeoutRef.current) {
+        clearTimeout(finalizeTimeoutRef.current);
+        finalizeTimeoutRef.current = null;
+      }
+      awaitingFinalizeRef.current = false;
+      const ctx = audioCtxRef.current;
+      if (ctx && ctx.state !== "closed") {
+        try {
+          void ctx.close();
+        } catch {
+          /* ignore */
+        }
+      }
+      audioCtxRef.current = null;
       setStatus("idle");
       return;
     }
@@ -1094,12 +1023,6 @@ export function VoiceClient({ sessionId }: Props) {
 
     return () => {
       cancelled = true;
-      /* Deliberately do NOT call tearDownVoice() here. VoiceClient is
-       * rendered at the AppShell level so it survives route changes;
-       * teardown only happens when the user clicks Stop (enabled=false)
-       * or tells Lex to end the session. The cancelled flag is enough
-       * to short-circuit any in-flight async work that has not yet
-       * resolved when deps change (sessionId or mode swap). */
     };
   }, [enabled, sessionId, mode]);
 
@@ -1174,26 +1097,7 @@ export function VoiceClient({ sessionId }: Props) {
     error: "text-err",
   };
 
-  /* Portal target lookup re-runs on every pathname change via the
-   * tick state below. The /lex page renders a div#voice-panel-slot;
-   * other routes do not, so VoiceClient mounts to nothing visible
-   * while keeping its WS/mic/audio pipeline alive in React state. */
-  const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null);
-  useEffect(() => {
-    if (typeof document === "undefined") return;
-    const findSlot = () =>
-      setPortalTarget(document.getElementById("voice-panel-slot"));
-    findSlot();
-    /* MutationObserver catches the slot showing up after a route nav
-     * since Next.js client navigation rerenders the page subtree
-     * asynchronously; without this we would miss the first /lex visit
-     * after a non-/lex initial load. */
-    const obs = new MutationObserver(findSlot);
-    obs.observe(document.body, { childList: true, subtree: true });
-    return () => obs.disconnect();
-  }, []);
-
-  const panel = (
+  return (
     <section className="rounded-panel bg-surface1 hairline">
       <div className="px-5 py-3 border-b border-border1 flex items-center gap-3">
         <Icon name="Mic" className="text-brandSoft" size={16} />
@@ -1347,6 +1251,4 @@ export function VoiceClient({ sessionId }: Props) {
       )}
     </section>
   );
-
-  return portalTarget ? createPortal(panel, portalTarget) : null;
 }

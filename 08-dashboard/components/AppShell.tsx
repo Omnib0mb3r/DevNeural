@@ -1,35 +1,19 @@
 "use client";
 
 import { usePathname } from "next/navigation";
-import { useQuery } from "@tanstack/react-query";
 import { TopBar } from "./TopBar";
 import { StreamDeck } from "./StreamDeck";
 import { RightRail } from "./RightRail";
 import { VitalsRibbon } from "./VitalsRibbon";
 import { CommandPalette } from "./CommandPalette";
 import { LexEasterEgg } from "./LexEasterEgg";
-import { VoiceClient } from "./VoiceClient";
 import { Icon } from "./Icon";
-import { listPtys, type PtyEntry } from "@/lib/daemon-client";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() ?? "/";
   // Match the active tab to the topmost path segment.
   const segments = pathname.split("/").filter(Boolean);
   const activeTab = segments.length === 0 ? "/" : `/${segments[0]}`;
-
-  /* Resolve the active Lex brainstorm PTY at the AppShell level so the
-   * lifted VoiceClient stays bound to it across route changes. Same
-   * filter as the /lex page used to use locally. tanstack query dedupes
-   * with the lex page's own ["pty-list"] subscription. */
-  const ptysQ = useQuery({
-    queryKey: ["pty-list"],
-    queryFn: listPtys,
-    refetchInterval: 3_000,
-  });
-  const lexPty: PtyEntry | undefined = (ptysQ.data?.ptys ?? []).find(
-    (p) => !p.exited && /\/brainstorm\/?$/i.test(p.cwd.replace(/\\/g, "/")),
-  );
 
   // Layout is constrained to exactly one viewport (100dvh handles mobile
    // URL-bar shifts) so the VitalsRibbon stays pinned to the visible bottom
@@ -53,14 +37,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <CommandPalette />
       <MobileTabBar activeTab={activeTab} />
       <LexEasterEgg />
-      {/* Voice client lifted to AppShell so the WS, mic, and audio
-       * pipeline survive route changes. The component renders its DOM
-       * into a portal slot (#voice-panel-slot) which the /lex page
-       * provides; off /lex the slot does not exist so VoiceClient
-       * renders nothing visually but stays alive in the React tree
-       * with its WS/mic intact. Mount-gated on Lex PTY presence to
-       * avoid spawning an idle WS in cold-start state. */}
-      {lexPty && <VoiceClient sessionId={lexPty.sessionId ?? null} />}
     </div>
   );
 }

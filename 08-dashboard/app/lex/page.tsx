@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AppShell } from "@/components/AppShell";
 import { TerminalMirror } from "@/components/TerminalMirror";
+import { VoiceClient } from "@/components/VoiceClient";
 import { Icon } from "@/components/Icon";
 import {
   listPtys,
@@ -260,11 +261,7 @@ export default function LexPage() {
 
         {(lexPty || spawnM.isPending) && (
           <>
-            {/* Portal slot for the AppShell-mounted VoiceClient. The
-             * actual component instance lives in AppShell so its WS,
-             * mic, and audio pipeline survive nav to /settings and
-             * back; the portal just paints the panel UI here on /lex. */}
-            <div id="voice-panel-slot" />
+            <VoiceClient sessionId={lexPty?.sessionId ?? null} />
             {/* Reuse the existing TerminalMirror — it expects a session
              * id and pulls from the same terminal-stream ring the
              * daemon-PTY pumps into post-binding. Before binding we
