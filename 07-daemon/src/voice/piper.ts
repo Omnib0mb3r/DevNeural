@@ -24,6 +24,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Readable } from 'node:stream';
+import { DATA_ROOT } from '../paths.js';
 
 const DEFAULT_BIN = 'C:/dev/piper/piper/piper.exe';
 const DEFAULT_VOICE_DIR = 'C:/dev/piper/voices';
@@ -34,24 +35,19 @@ const DEFAULT_VOICE_FILE = 'en_GB-alan-medium.onnx';
 
 /* Active voice override set at runtime by the dashboard. Persists
  * for the lifetime of the daemon process; survives across sessions
- * via the disk file so a daemon restart doesn't reset preference. */
-const VOICE_PREF_FILE = (() => {
-  try {
-    /* Lazy import to avoid circular dep at module-init time. */
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const path = require('node:path') as typeof import('node:path');
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { DATA_ROOT } = require('../paths.js') as {
-      DATA_ROOT: string;
-    };
-    return path.posix.join(
-      DATA_ROOT.replace(/\\/g, '/'),
-      'voice-preferences.json',
-    );
-  } catch {
-    return '';
-  }
-})();
+ * via the disk file so a daemon restart doesn't reset preference.
+ *
+ * Originally wrapped in a try/catch with require() to "avoid circular
+ * deps". The project is `"type": "module"` so require() always threw,
+ * the catch swallowed it, and VOICE_PREF_FILE silently became "".
+ * Every read/write then early-exited as a no-op: setters returned
+ * ok:true but never persisted, getters never re-hydrated, sliders
+ * appeared to work but reset on every daemon restart. Switched to a
+ * plain static ESM import; there is no circular dep here. */
+const VOICE_PREF_FILE = path.posix.join(
+  DATA_ROOT.replace(/\\/g, '/'),
+  'voice-preferences.json',
+);
 
 let cachedActiveVoice: string | null = null;
 let cachedLengthScale: number | null = null;
