@@ -440,7 +440,17 @@ export function VoiceClient({ sessionId }: Props) {
                 /* fallback: no audio */
               }
             }
-            playheadRef.current = audioCtxRef.current?.currentTime ?? 0;
+            /* Chrome / Safari suspend the AudioContext when the tab
+             * loses focus or no user gesture has triggered audio
+             * playback yet on this context. The "start voice" click
+             * is a gesture, but mute/unmute and tab switches can
+             * leave us suspended. Resume defensively on every
+             * tts-start so the scheduled buffers actually play. */
+            const ctx = audioCtxRef.current;
+            if (ctx && ctx.state === "suspended") {
+              void ctx.resume().catch(() => undefined);
+            }
+            playheadRef.current = ctx?.currentTime ?? 0;
             speakingRef.current = true;
             setStatus("speaking");
             break;

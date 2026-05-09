@@ -399,7 +399,16 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       send({ t: 'error', code: 'no-bind', message: 'not bound to a Lex PTY' });
       return;
     }
-    const ir = ptyInject(state.bindKey, result.text, true);
+    /* Tag the turn with the active voice mode so Lex can follow her
+     * voice contract (shorter, conversational, no markdown lists)
+     * without us having to mutate the system prompt mid-session.
+     * The marker is recognised in the system prompt; Lex strips it
+     * before reasoning. */
+    const voiceTag =
+      state.mode === 'notes'
+        ? '[voice mode: notes — silent reply, capture as artifact] '
+        : '[voice mode] ';
+    const ir = ptyInject(state.bindKey, voiceTag + result.text, true);
     if (!ir.ok) {
       send({ t: 'error', code: 'inject', message: ir.error });
       return;
