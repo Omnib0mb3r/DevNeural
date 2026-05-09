@@ -49,6 +49,7 @@ import {
   getBrainstormByPty,
 } from '../lex/brainstorm-store.js';
 import { processAssistantTurn } from '../lex/artifact-parser.js';
+import { buildVoiceSnapshot } from '../lex/snapshot-context.js';
 
 /* Voice modes drive whether the daemon synthesizes Lex's response
  * out loud. The browser still receives transcript + assistant-text
@@ -80,6 +81,13 @@ interface ConnState {
 }
 
 const MIC_BUF_MAX = 4 * 1024 * 1024; // 4 MB ~= 2 minutes of 16k mono pcm
+
+/* One voice WS per PTY. Without this, a user with multiple dashboard
+ * tabs open sees every utterance injected once per tab — same audio,
+ * same transcript, three injects, three Lex replies. We track the
+ * active socket per bindKey and gracefully evict any previous one
+ * whenever a fresh hello binds. */
+const activeByBindKey = new Map<string, ConnState>();
 
 export function attachLexVoiceWs(socket: FastifyWS): void {
   const state: ConnState = {
@@ -140,6 +148,33 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       return;
     }
     state.bindKey = handle.sessionId ?? handle.ptyId;
+    /* Evict any earlier socket bound to the same PTY. Multiple tabs
+     * with the voice panel open would otherwise each hear the user's
+     * utterance, transcribe it, and inject it; Lex sees the same text
+     * three times. We send a soft eviction message so the loser tab
+     * can show "voice taken over by another tab" instead of dropping
+     * silently. */
+    const prior = activeByBindKey.get(state.bindKey);
+    if (prior && prior !== state) {
+      prior.closed = true;
+      try {
+        prior.ws.send(
+          JSON.stringify({
+            t: 'evicted',
+            reason:
+              'another tab opened the voice panel; only one voice client per PTY is allowed',
+          }),
+        );
+      } catch {
+        /* socket already gone */
+      }
+      try {
+        prior.ws.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    activeByBindKey.set(state.bindKey, state);
     if (handle.sessionId) {
       const slug = handle.cwd.replace(/[\\/:]/g, '-');
       const claudeRoot = path.posix.join(
@@ -406,9 +441,28 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * before reasoning. */
     const voiceTag =
       state.mode === 'notes'
-        ? '[voice mode: notes — silent reply, capture as artifact] '
+        ? '[voice mode: notes, silent reply, capture as artifact] '
         : '[voice mode] ';
-    const ir = ptyInject(state.bindKey, voiceTag + result.text, true);
+    /* Prepend a fresh live-state snapshot to every voice turn. The
+     * spawn-time Layer 6 snapshot is stale and Claude Code's harness
+     * injects its own "Working directories" block above it, which Lex
+     * tends to read instead of Layer 6. Putting the snapshot directly
+     * inside the user message (right next to the question) makes it
+     * impossible to ignore. The system prompt has the matching rule
+     * that says "always answer project/session questions from this
+     * block, never from harness cwd lists". */
+    let snapshotBlock = '';
+    try {
+      snapshotBlock = buildVoiceSnapshot() + '\n\n';
+    } catch {
+      /* observability only; fall back to no snapshot rather than
+       * blocking the turn */
+    }
+    const ir = ptyInject(
+      state.bindKey,
+      snapshotBlock + voiceTag + result.text,
+      true,
+    );
     if (!ir.ok) {
       send({ t: 'error', code: 'inject', message: ir.error });
       return;
@@ -525,23 +579,20 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
   });
 
-  socket.on('close', () => {
+  function teardown(): void {
     state.closed = true;
     stopJsonlWatch();
     if (state.ttsActive) {
       state.ttsActive.cancel();
       state.ttsActive = null;
     }
-  });
+    if (state.bindKey && activeByBindKey.get(state.bindKey) === state) {
+      activeByBindKey.delete(state.bindKey);
+    }
+  }
 
-  socket.on('error', () => {
-    state.closed = true;
-    stopJsonlWatch();
-    if (state.ttsActive) {
-      state.ttsActive.cancel();
-      state.ttsActive = null;
-    }
-  });
+  socket.on('close', teardown);
+  socket.on('error', teardown);
 }
 
 /* Heuristic for "is this binary PCM or a JSON text frame?" — fastify-

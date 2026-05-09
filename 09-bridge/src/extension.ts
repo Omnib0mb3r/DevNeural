@@ -894,6 +894,58 @@ function writeMirrorStateDebounced(): void {
   }, 500);
 }
 
+/* Bridge resolver fallback. The Stream Deck identity dir is the
+ * authoritative source for terminal-cwd -> session_id, but if the
+ * tray app isn't running (or hasn't registered yet, or its dir is
+ * empty), the mirror has historically gone silent. We now keep a
+ * lightweight cache of the daemon's own /sessions list (which itself
+ * falls back to mtime-based liveness when the deck dir is missing
+ * or empty) and use it as a second source of truth. Cache key is
+ * the lowercase project_slug so the ancestor walk in
+ * resolveSessionForTerminal can cheaply check each candidate cwd.
+ *
+ * Refreshed every 3 seconds while the mirror is active. Cheap; the
+ * daemon serves /sessions in a few ms. */
+const daemonActiveSessions = new Map<string, string>();
+let daemonSessionsRefreshTimer: NodeJS.Timeout | undefined;
+
+function cwdToSlug(cwd: string): string {
+  /* Match the daemon's project_slug encoding exactly: every backslash,
+   * forward slash, and colon flattens to a hyphen. Case is preserved
+   * here because the slug we cache from /sessions is also lowercased
+   * at insert time, so both sides of the eventual comparison are
+   * lowercase. */
+  return cwd.replace(/[\\/:]/g, '-');
+}
+
+async function refreshDaemonSessions(): Promise<void> {
+  try {
+    const res = await fetch('http://127.0.0.1:3747/sessions', {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) return;
+    const body = (await res.json()) as {
+      ok?: boolean;
+      sessions?: Array<{
+        session_id?: string;
+        project_slug?: string;
+        active?: boolean;
+      }>;
+    };
+    if (!body.sessions) return;
+    daemonActiveSessions.clear();
+    for (const s of body.sessions) {
+      if (!s.active) continue;
+      if (!s.session_id || !s.project_slug) continue;
+      daemonActiveSessions.set(s.project_slug.toLowerCase(), s.session_id);
+    }
+  } catch {
+    /* daemon down or transient: keep stale cache rather than dropping
+     * resolutions we already have */
+  }
+}
+
 function startTerminalMirror(context: vscode.ExtensionContext): void {
   const proposed = vscode.window as unknown as {
     onDidWriteTerminalData?: (
@@ -916,7 +968,7 @@ function startTerminalMirror(context: vscode.ExtensionContext): void {
 
   const buffers = new Map<vscode.Terminal, string>();
   const flushTimers = new Map<vscode.Terminal, NodeJS.Timeout>();
-  const sessionIdCache = new Map<vscode.Terminal, string | null>();
+  const sessionIdCache = new Map<vscode.Terminal, string>();
 
   function localAppData(): string {
     return (
@@ -932,7 +984,15 @@ function startTerminalMirror(context: vscode.ExtensionContext): void {
   }
 
   function resolveSessionForTerminal(t: vscode.Terminal): string | null {
-    if (sessionIdCache.has(t)) return sessionIdCache.get(t) ?? null;
+    /* Only positive resolutions are cached. Caching a null would
+     * permanently shadow a session that the daemon discovers later
+     * (the deck tray app starting up after the terminal opened, or
+     * the daemon's mtime fallback catching up after the session's
+     * first jsonl write). The Stream Deck readdir is one syscall
+     * and the cache lookup is in-memory, so retrying on every flush
+     * (debounced ~16ms) costs nothing. */
+    const cached = sessionIdCache.get(t);
+    if (cached) return cached;
     let cwd: string | undefined;
     const opts = t.creationOptions as { cwd?: vscode.Uri | string };
     if (opts.cwd instanceof vscode.Uri) cwd = opts.cwd.fsPath;
@@ -942,15 +1002,19 @@ function startTerminalMirror(context: vscode.ExtensionContext): void {
       cwd = ws;
     }
     if (!cwd) {
-      sessionIdCache.set(t, null);
       recordResolutionFailure('terminal has no cwd and no workspace folder');
       return null;
     }
     const wantA = normalizePath(cwd);
+    /* Pass 1: Stream Deck identity dir. Fastest and most precise
+     * source when the tray app is running. */
     const identityDir = path.posix.join(localAppData(), 'stream-deck', 'identity');
+    let identityDirReadable = false;
     let identityPresent = false;
     try {
-      for (const f of fs.readdirSync(identityDir)) {
+      const entries = fs.readdirSync(identityDir);
+      identityDirReadable = true;
+      for (const f of entries) {
         if (!f.endsWith('.json')) continue;
         identityPresent = true;
         try {
@@ -972,18 +1036,40 @@ function startTerminalMirror(context: vscode.ExtensionContext): void {
         }
       }
     } catch {
-      sessionIdCache.set(t, null);
-      recordResolutionFailure(
-        'StreamDeck.App identity dir missing; tray app not running',
-      );
-      return null;
+      /* identityDirReadable stays false; fall through to daemon
+       * fallback rather than failing outright. */
     }
-    sessionIdCache.set(t, null);
-    recordResolutionFailure(
-      identityPresent
-        ? `no identity file matches terminal cwd ${wantA}; tray app may not have registered this session yet`
-        : 'StreamDeck.App identity dir empty; no Claude sessions registered',
-    );
+    /* Pass 2: ancestor-walk against the daemon /sessions cache.
+     * For every prefix of the terminal cwd from the leaf up to the
+     * drive root, encode it to a project_slug and look it up. First
+     * active match wins. Covers terminals opened in subdirectories
+     * of the project root, and the entire scenario where the deck
+     * tray app is not running (the daemon's /sessions endpoint
+     * falls back to mtime-based liveness on its own when the deck
+     * identity dir is missing or empty). */
+    const segments = wantA.split('/').filter((s) => s.length > 0);
+    const isAbsolute = wantA.startsWith('/');
+    for (let i = segments.length; i >= 1; i--) {
+      const ancestor = (isAbsolute ? '/' : '') + segments.slice(0, i).join('/');
+      const slug = cwdToSlug(ancestor).toLowerCase();
+      const match = daemonActiveSessions.get(slug);
+      if (match) {
+        sessionIdCache.set(t, match);
+        return match;
+      }
+    }
+    /* Both passes missed. Record the most useful failure message we
+     * can derive without making a runtime decision the user can act
+     * on look pretty. Do NOT cache the miss; next flush retries. */
+    let reason: string;
+    if (!identityDirReadable) {
+      reason = `StreamDeck.App identity dir missing and daemon /sessions has no active session for cwd ${wantA} or any ancestor`;
+    } else if (!identityPresent) {
+      reason = `StreamDeck.App identity dir empty and daemon /sessions has no active session for cwd ${wantA} or any ancestor`;
+    } else {
+      reason = `no identity file matches cwd ${wantA} and daemon /sessions has no active session for it or any ancestor`;
+    }
+    recordResolutionFailure(reason);
     return null;
   }
 
@@ -1065,6 +1151,23 @@ function startTerminalMirror(context: vscode.ExtensionContext): void {
       writeMirrorStateDebounced();
     }),
   );
+
+  /* Kick off the daemon /sessions cache refresh loop. First call is
+   * immediate so the cache is populated before the first flush; the
+   * interval keeps it fresh as sessions come and go. */
+  void refreshDaemonSessions();
+  if (daemonSessionsRefreshTimer) clearInterval(daemonSessionsRefreshTimer);
+  daemonSessionsRefreshTimer = setInterval(() => {
+    void refreshDaemonSessions();
+  }, 3000);
+  context.subscriptions.push({
+    dispose: () => {
+      if (daemonSessionsRefreshTimer) {
+        clearInterval(daemonSessionsRefreshTimer);
+        daemonSessionsRefreshTimer = undefined;
+      }
+    },
+  });
 
   mirrorState.subscribed = true;
   mirrorState.reason = null;

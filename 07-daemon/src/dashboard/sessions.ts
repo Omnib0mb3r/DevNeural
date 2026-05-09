@@ -48,6 +48,13 @@ function readLiveSessionIds(): Set<string> | null {
     for (const e of fs.readdirSync(STREAMDECK_IDENTITY_DIR)) {
       if (e.endsWith('.json')) ids.add(e.slice(0, -'.json'.length));
     }
+    /* Empty set means the deck tray app is running but has not (yet)
+     * registered any session for this boot. Treat the same as "deck
+     * not running" so the mtime fallback kicks in instead of marking
+     * every session inactive. Otherwise a daemon-restart-before-deck-
+     * registers race makes the entire sessions list show inactive
+     * even though jsonls are being appended live. */
+    if (ids.size === 0) return null;
     return ids;
   } catch {
     return null;
