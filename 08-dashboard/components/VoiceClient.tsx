@@ -33,6 +33,28 @@ type Status =
   | "speaking"
   | "error";
 
+type Mode = "conversation" | "notes" | "push-to-talk";
+
+const MODE_LABEL: Record<Mode, string> = {
+  conversation: "conversation",
+  notes: "notes only",
+  "push-to-talk": "push-to-talk",
+};
+
+const MODE_HINT: Record<Mode, string> = {
+  conversation:
+    "Talk freely; Lex listens and replies out loud. Speak again to interrupt him.",
+  notes:
+    "Lex listens and captures everything to brainstorming notes. He stays silent so you can keep dictating without interruption.",
+  "push-to-talk":
+    "Hold the talk button, speak, release. No VAD; ignores background noise. Best for noisy rooms.",
+};
+
+interface VoicePack {
+  name: string;
+  sampleRate: number;
+}
+
 interface Props {
   /** Auto-bind to a specific Lex session. When omitted, the daemon
    * resolves the active brainstorm PTY. */
@@ -62,6 +84,15 @@ export function VoiceClient({ sessionId }: Props) {
   /* Live counter shown while the user is talking so they know the
    * mic is still capturing and roughly how much they've said. */
   const [utteranceMs, setUtteranceMs] = useState<number>(0);
+  /* Conversation mode = full duplex (default).
+   * Notes only        = Lex captures + transcribes, no spoken reply.
+   * Push-to-talk      = no VAD, hold the button, release to send. */
+  const [mode, setMode] = useState<Mode>("conversation");
+  const [voices, setVoices] = useState<VoicePack[]>([]);
+  const [activeVoice, setActiveVoiceState] = useState<string>("");
+  const [pttHolding, setPttHolding] = useState(false);
+  const modeRef = useRef<Mode>("conversation");
+  modeRef.current = mode;
 
   const wsRef = useRef<WebSocket | null>(null);
   const vadRef = useRef<unknown>(null);
@@ -160,6 +191,33 @@ export function VoiceClient({ sessionId }: Props) {
     }).catch(() => undefined);
   }, []);
 
+  /* Load voice list + currently active voice. Ships with the panel
+   * so the picker shows real options instead of guessing. */
+  useEffect(() => {
+    void fetch("/voice/piper-status", { credentials: "include" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (!j) return;
+        if (Array.isArray(j.voices)) setVoices(j.voices);
+        if (typeof j.active_voice === "string") setActiveVoiceState(j.active_voice);
+      })
+      .catch(() => undefined);
+  }, []);
+
+  async function changeVoice(name: string): Promise<void> {
+    const r = await fetch("/voice/set-voice", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ name }),
+    });
+    if (r.ok) {
+      const j = (await r.json()) as { active_voice?: string; rate?: number };
+      if (j.active_voice) setActiveVoiceState(j.active_voice);
+      if (typeof j.rate === "number") ttsRateRef.current = j.rate;
+    }
+  }
+
   useEffect(() => {
     if (!enabled) {
       /* Tear-down path. */
@@ -201,7 +259,11 @@ export function VoiceClient({ sessionId }: Props) {
       wsRef.current = ws;
 
       ws.onopen = () => {
-        sendJson({ t: "hello", session_id: sessionId ?? undefined });
+        sendJson({
+          t: "hello",
+          session_id: sessionId ?? undefined,
+          mode: modeRef.current,
+        });
       };
       ws.onclose = () => {
         if (cancelled) return;
@@ -281,6 +343,14 @@ export function VoiceClient({ sessionId }: Props) {
       }
 
       async function initVad(): Promise<void> {
+        if (modeRef.current === "push-to-talk") {
+          /* Push-to-talk uses raw getUserMedia + AudioWorklet
+           * sampling instead of silero VAD. The user controls
+           * utterance boundaries with the talk button; no need to
+           * spin up VAD. */
+          await initPushToTalk();
+          return;
+        }
         try {
           /* Dynamic import so the package only loads on /lex. */
           const mod = await import("@ricky0123/vad-web");
@@ -405,12 +475,158 @@ export function VoiceClient({ sessionId }: Props) {
           setErrMsg(`mic init failed: ${(err as Error).message}`);
         }
       }
+
+      /* Push-to-talk path. Holds a MediaStream + AudioWorklet that
+       * forwards 16kHz int16 PCM frames into a buffer; flushes the
+       * buffer on talk-button release. No VAD; the user is the gate.
+       * Useful when VAD over-fires on background noise. */
+      let pttCtx: AudioContext | null = null;
+      let pttStream: MediaStream | null = null;
+      let pttBuffer: Int16Array[] = [];
+      let pttCapturing = false;
+
+      async function initPushToTalk(): Promise<void> {
+        try {
+          pttStream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: true, noiseSuppression: true },
+          });
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const Cls: any =
+            (window as unknown as { AudioContext?: typeof AudioContext })
+              .AudioContext ??
+            (window as unknown as { webkitAudioContext?: typeof AudioContext })
+              .webkitAudioContext;
+          pttCtx = new Cls({ sampleRate: 16000 });
+          if (!pttCtx) throw new Error("no AudioContext");
+          const src = pttCtx.createMediaStreamSource(pttStream);
+          /* Use a ScriptProcessorNode for simplicity: it's deprecated
+           * but universally supported and the data path is short.
+           * AudioWorklet would be cleaner but needs an extra worklet
+           * file deployed to /vad/. */
+          const proc = pttCtx.createScriptProcessor(4096, 1, 1);
+          proc.onaudioprocess = (e) => {
+            if (!pttCapturing) return;
+            const f = e.inputBuffer.getChannelData(0);
+            const i16 = new Int16Array(f.length);
+            for (let i = 0; i < f.length; i++) {
+              const s = Math.max(-1, Math.min(1, f[i] ?? 0));
+              i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+            }
+            pttBuffer.push(i16);
+          };
+          src.connect(proc);
+          proc.connect(pttCtx.destination);
+          /* Stash refs on vadRef so the cleanup path tears down. */
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          vadRef.current = {
+            destroy: () => {
+              try {
+                pttStream?.getTracks().forEach((t) => t.stop());
+              } catch {
+                /* ignore */
+              }
+              try {
+                proc.disconnect();
+              } catch {
+                /* ignore */
+              }
+              try {
+                src.disconnect();
+              } catch {
+                /* ignore */
+              }
+              try {
+                if (pttCtx && pttCtx.state !== "closed") void pttCtx.close();
+              } catch {
+                /* ignore */
+              }
+            },
+          } as { destroy: () => void };
+          setStatus("ready");
+        } catch (err) {
+          setStatus("error");
+          setErrMsg(`mic init failed: ${(err as Error).message}`);
+        }
+      }
+
+      /* Push-to-talk wire helpers exposed via a closure so the
+       * top-level component can call them on button mousedown / up.
+       * We hang them on the WS object via a side-channel ref so
+       * React doesn't have to re-bind. */
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (wsRef.current as any).__pttStart = () => {
+        if (modeRef.current !== "push-to-talk") return;
+        if (mutedRef.current) return;
+        if (speakingRef.current) {
+          sendJson({ t: "barge-in" });
+          resetTtsPlayback();
+        }
+        pttBuffer = [];
+        pttCapturing = true;
+        sendJson({ t: "utterance-start" });
+        setStatus("listening");
+        utteranceStartRef.current = Date.now();
+        if (utteranceTimerRef.current) {
+          clearInterval(utteranceTimerRef.current);
+        }
+        utteranceTimerRef.current = setInterval(() => {
+          setUtteranceMs(Date.now() - utteranceStartRef.current);
+        }, 100);
+      };
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (wsRef.current as any).__pttStop = () => {
+        if (modeRef.current !== "push-to-talk") return;
+        if (!pttCapturing) return;
+        pttCapturing = false;
+        if (utteranceTimerRef.current) {
+          clearInterval(utteranceTimerRef.current);
+          utteranceTimerRef.current = null;
+        }
+        setUtteranceMs(0);
+        const total = pttBuffer.reduce((sum, c) => sum + c.length, 0);
+        const merged = new Int16Array(total);
+        let off = 0;
+        for (const c of pttBuffer) {
+          merged.set(c, off);
+          off += c.length;
+        }
+        pttBuffer = [];
+        if (merged.length > 0) {
+          sendBinary(merged.buffer);
+        }
+        sendJson({ t: "utterance-end" });
+        setStatus("transcribing");
+      };
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [enabled, sessionId]);
+  }, [enabled, sessionId, mode]);
+
+  function pttDown(): void {
+    setPttHolding(true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const fn = (wsRef.current as any)?.__pttStart as (() => void) | undefined;
+    fn?.();
+  }
+  function pttUp(): void {
+    setPttHolding(false);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const fn = (wsRef.current as any)?.__pttStop as (() => void) | undefined;
+    fn?.();
+  }
+
+  /* Mode change while voice is active: tear down + bring up the new
+   * pipeline so VAD vs PTT swap cleanly. The dependent useEffect's
+   * deps include mode so this happens automatically; the helper
+   * sends a server-side mode-set so the daemon respects notes-mode
+   * silence. */
+  function changeMode(next: Mode): void {
+    setMode(next);
+    sendJson({ t: "set-mode", mode: next });
+  }
 
   const statusLabel: Record<Status, string> = {
     idle: "off",
@@ -475,6 +691,65 @@ export function VoiceClient({ sessionId }: Props) {
           </button>
         </div>
       </div>
+      <div className="px-5 py-3 border-b border-border1 flex flex-wrap items-center gap-2">
+        <span className="text-nano text-txt3 mr-1">mode</span>
+        {(["conversation", "notes", "push-to-talk"] as Mode[]).map((m) => (
+          <button
+            key={m}
+            type="button"
+            onClick={() => changeMode(m)}
+            className={`text-nano px-2.5 py-1 rounded-pill hairline font-mono ${
+              mode === m
+                ? "bg-brand/20 text-brandSoft ring-1 ring-brand/40"
+                : "bg-surface2 text-txt2 hover:bg-surface3"
+            }`}
+          >
+            {MODE_LABEL[m]}
+          </button>
+        ))}
+        {voices.length > 0 && (
+          <>
+            <span className="text-nano text-txt3 mx-1 ml-3">voice</span>
+            <select
+              value={activeVoice}
+              onChange={(e) => void changeVoice(e.target.value)}
+              className="text-nano bg-surface2 hairline rounded-pill px-2 py-1 text-txt2 font-mono"
+            >
+              {voices.map((v) => (
+                <option key={v.name} value={v.name}>
+                  {v.name}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
+      </div>
+      <div className="px-5 py-3 text-nano text-txt3">{MODE_HINT[mode]}</div>
+      {enabled && mode === "push-to-talk" && (
+        <div className="px-5 pb-4">
+          <button
+            type="button"
+            onMouseDown={pttDown}
+            onMouseUp={pttUp}
+            onMouseLeave={() => pttHolding && pttUp()}
+            onTouchStart={(e) => {
+              e.preventDefault();
+              pttDown();
+            }}
+            onTouchEnd={(e) => {
+              e.preventDefault();
+              pttUp();
+            }}
+            className={`w-full py-4 rounded-card font-emphasized text-sm select-none transition-colors ${
+              pttHolding
+                ? "bg-err/30 text-err ring-2 ring-err/50"
+                : "bg-brand/15 text-brandSoft ring-1 ring-brand/30 hover:bg-brand/25"
+            }`}
+          >
+            {pttHolding ? "release to send" : "hold to talk"}
+          </button>
+        </div>
+      )}
       {(lastTranscript || lastReply || errMsg) && (
         <div className="px-5 py-3 space-y-2 text-xs">
           {lastTranscript && (
@@ -494,9 +769,8 @@ export function VoiceClient({ sessionId }: Props) {
       )}
       {!enabled && (
         <div className="px-5 py-3 text-nano text-txt3">
-          Click <strong>start voice</strong> to grant mic access. Speak when
-          status is <em>ready</em>; Lex hears you when you stop. He&apos;ll
-          talk back. Speak again to interrupt him.
+          Click <strong>start voice</strong> to grant mic access. Pick a mode
+          first if you don&apos;t want default conversation.
         </div>
       )}
     </section>

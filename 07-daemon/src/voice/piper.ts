@@ -26,25 +26,182 @@ import * as path from 'node:path';
 import { Readable } from 'node:stream';
 
 const DEFAULT_BIN = 'C:/dev/piper/piper/piper.exe';
-const DEFAULT_VOICE = 'C:/dev/piper/voices/en_US-ryan-high.onnx';
-const DEFAULT_RATE = 22050;
+const DEFAULT_VOICE_DIR = 'C:/dev/piper/voices';
+/* en_GB-alan-medium is the closest to a "Jarvis" timbre out of the
+ * voices we currently ship: deep British male, calm cadence. We
+ * default to it; the dashboard picker can flip per-conversation. */
+const DEFAULT_VOICE_FILE = 'en_GB-alan-medium.onnx';
+
+/* Active voice override set at runtime by the dashboard. Persists
+ * for the lifetime of the daemon process; survives across sessions
+ * via the disk file so a daemon restart doesn't reset preference. */
+const VOICE_PREF_FILE = (() => {
+  try {
+    /* Lazy import to avoid circular dep at module-init time. */
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const path = require('node:path') as typeof import('node:path');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { DATA_ROOT } = require('../paths.js') as {
+      DATA_ROOT: string;
+    };
+    return path.posix.join(
+      DATA_ROOT.replace(/\\/g, '/'),
+      'voice-preferences.json',
+    );
+  } catch {
+    return '';
+  }
+})();
+
+let cachedActiveVoice: string | null = null;
+
+function readPersistedVoice(): string | null {
+  if (!VOICE_PREF_FILE) return null;
+  try {
+    if (!fs.existsSync(VOICE_PREF_FILE)) return null;
+    const obj = JSON.parse(fs.readFileSync(VOICE_PREF_FILE, 'utf-8')) as {
+      voice?: string;
+    };
+    return obj.voice ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function writePersistedVoice(voice: string): void {
+  if (!VOICE_PREF_FILE) return;
+  try {
+    fs.writeFileSync(
+      VOICE_PREF_FILE,
+      JSON.stringify({ voice }, null, 2),
+      'utf-8',
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
+function voiceDir(): string {
+  return (process.env.DEVNEURAL_PIPER_VOICE_DIR || DEFAULT_VOICE_DIR).replace(
+    /\\/g,
+    '/',
+  );
+}
 
 function getBin(): string {
   return (process.env.DEVNEURAL_PIPER_BIN || DEFAULT_BIN).replace(/\\/g, '/');
 }
-function getVoice(): string {
-  return (process.env.DEVNEURAL_PIPER_VOICE || DEFAULT_VOICE).replace(/\\/g, '/');
+
+function resolveVoiceFile(name: string | null): string {
+  /* Accept either a bare name (en_GB-alan-medium) or full path. */
+  if (!name) name = DEFAULT_VOICE_FILE;
+  const cleaned = name.replace(/\\/g, '/');
+  if (cleaned.endsWith('.onnx') && fs.existsSync(cleaned)) return cleaned;
+  /* Bare name → resolve under voiceDir. */
+  const base = cleaned.replace(/\.onnx$/i, '');
+  return path.posix.join(voiceDir(), `${base}.onnx`);
 }
+
+function getVoice(): string {
+  /* Env var wins (operator-level override), then runtime cache, then
+   * persisted preference, then default. */
+  const env = process.env.DEVNEURAL_PIPER_VOICE;
+  if (env) return resolveVoiceFile(env);
+  if (cachedActiveVoice) return resolveVoiceFile(cachedActiveVoice);
+  const persisted = readPersistedVoice();
+  if (persisted) {
+    cachedActiveVoice = persisted;
+    return resolveVoiceFile(persisted);
+  }
+  return resolveVoiceFile(DEFAULT_VOICE_FILE);
+}
+
 function getRate(): number {
-  const v = Number(process.env.DEVNEURAL_PIPER_RATE || DEFAULT_RATE);
-  return Number.isFinite(v) && v > 0 ? v : DEFAULT_RATE;
+  /* Each Piper voice has its own native sample rate in the .onnx.json
+   * config. We read the active voice's config to surface the correct
+   * rate to the browser; without this the playback would be at the
+   * wrong pitch when switching voices with different rates. */
+  const v = Number(process.env.DEVNEURAL_PIPER_RATE || 0);
+  if (Number.isFinite(v) && v > 0) return v;
+  try {
+    const onnx = getVoice();
+    const cfg = onnx + '.json';
+    if (fs.existsSync(cfg)) {
+      const obj = JSON.parse(fs.readFileSync(cfg, 'utf-8')) as {
+        audio?: { sample_rate?: number };
+      };
+      const r = obj.audio?.sample_rate;
+      if (Number.isFinite(r) && (r as number) > 0) return r as number;
+    }
+  } catch {
+    /* fall through */
+  }
+  return 22050;
+}
+
+export interface VoicePack {
+  /** Bare name without .onnx suffix, e.g. "en_GB-alan-medium". */
+  name: string;
+  /** Absolute path to the .onnx model. */
+  path: string;
+  /** Sample rate from the voice's config. */
+  sampleRate: number;
+}
+
+export function listVoices(): VoicePack[] {
+  const dir = voiceDir();
+  if (!fs.existsSync(dir)) return [];
+  const out: VoicePack[] = [];
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!e.isFile() || !e.name.endsWith('.onnx')) continue;
+    const onnxPath = path.posix.join(dir, e.name);
+    let sr = 22050;
+    try {
+      const cfgPath = onnxPath + '.json';
+      if (fs.existsSync(cfgPath)) {
+        const obj = JSON.parse(fs.readFileSync(cfgPath, 'utf-8')) as {
+          audio?: { sample_rate?: number };
+        };
+        if (Number.isFinite(obj.audio?.sample_rate)) {
+          sr = obj.audio?.sample_rate as number;
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    out.push({
+      name: e.name.replace(/\.onnx$/i, ''),
+      path: onnxPath,
+      sampleRate: sr,
+    });
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function setActiveVoice(name: string): { ok: boolean; error?: string } {
+  const file = resolveVoiceFile(name);
+  if (!fs.existsSync(file)) {
+    return { ok: false, error: `voice not installed: ${name}` };
+  }
+  cachedActiveVoice = name.replace(/\.onnx$/i, '').replace(/\\/g, '/');
+  writePersistedVoice(cachedActiveVoice);
+  return { ok: true };
+}
+
+export function getActiveVoice(): string {
+  return getVoice()
+    .split('/')
+    .pop()!
+    .replace(/\.onnx$/i, '');
 }
 
 export interface PiperStatus {
   configured: boolean;
   bin: string;
   voice: string;
+  active_voice: string;
   rate: number;
+  voices: VoicePack[];
 }
 
 export function piperStatus(): PiperStatus {
@@ -52,7 +209,9 @@ export function piperStatus(): PiperStatus {
     configured: fs.existsSync(getBin()) && fs.existsSync(getVoice()),
     bin: getBin(),
     voice: getVoice(),
+    active_voice: getActiveVoice(),
     rate: getRate(),
+    voices: listVoices(),
   };
 }
 

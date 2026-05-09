@@ -45,6 +45,11 @@ import { transcribeWav, pcm16ToWav } from './whisper.js';
 import { synthesize, piperStatus } from './piper.js';
 import { ptyInject, getPty, getPtyBySession, listPtys } from '../dashboard/pty-host.js';
 
+/* Voice modes drive whether the daemon synthesizes Lex's response
+ * out loud. The browser still receives transcript + assistant-text
+ * events in every mode so the on-screen panel updates regardless. */
+type VoiceMode = 'conversation' | 'notes' | 'push-to-talk';
+
 interface ConnState {
   ws: FastifyWS;
   /* The Lex session/PTY this socket is bound to. We accept either a
@@ -65,6 +70,8 @@ interface ConnState {
   awaitingResponseSince: number;
   /* Hard cap to keep memory bounded on a misbehaving client. */
   closed: boolean;
+  /* Active voice mode set by the client on hello / mode-change. */
+  mode: VoiceMode;
 }
 
 const MIC_BUF_MAX = 4 * 1024 * 1024; // 4 MB ~= 2 minutes of 16k mono pcm
@@ -81,6 +88,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     watchTimer: null,
     awaitingResponseSince: 0,
     closed: false,
+    mode: 'conversation',
   };
 
   function send(msg: Record<string, unknown>): void {
@@ -259,6 +267,19 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     if (!text) return;
     lastSpokenUuid = uuid || null;
     state.awaitingResponseSince = 0;
+    /* Always tell the client the response text, regardless of mode —
+     * the panel renders it on screen. Notes-only mode skips the TTS
+     * synth so Lex stays silent (the user is dictating, doesn't want
+     * audio talkback). Push-to-talk still uses voice talkback by
+     * default; the user can flip mode mid-session if they want
+     * silence. */
+    send({ t: 'assistant-text', text });
+    if (state.mode === 'notes') {
+      /* Surface a short ack so the panel can show "captured" — but
+       * no audio. */
+      send({ t: 'tts-skipped', reason: 'notes-mode' });
+      return;
+    }
     speak(text);
   }
 
@@ -276,7 +297,6 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       .replace(/\s+/g, ' ')
       .trim();
     if (!clean) return;
-    send({ t: 'assistant-text', text: clean });
     let handle: ReturnType<typeof synthesize>;
     try {
       handle = synthesize(clean);
@@ -375,7 +395,24 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
     switch (msg.t) {
       case 'hello':
+        if (
+          msg.mode === 'conversation' ||
+          msg.mode === 'notes' ||
+          msg.mode === 'push-to-talk'
+        ) {
+          state.mode = msg.mode;
+        }
         bind(typeof msg.session_id === 'string' ? msg.session_id : undefined);
+        break;
+      case 'set-mode':
+        if (
+          msg.mode === 'conversation' ||
+          msg.mode === 'notes' ||
+          msg.mode === 'push-to-talk'
+        ) {
+          state.mode = msg.mode;
+          send({ t: 'mode-set', mode: state.mode });
+        }
         break;
       case 'utterance-start':
         state.micBuf = [];

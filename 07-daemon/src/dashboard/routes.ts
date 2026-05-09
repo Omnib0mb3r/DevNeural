@@ -56,6 +56,7 @@ import {
   synthesize,
   synthesizeToBuffer,
   pcmToWav,
+  setActiveVoice,
 } from '../voice/piper.js';
 import { attachLexVoiceWs } from '../voice/lex-voice-ws.js';
 import { lintQueueStatus } from '../wiki/lint-queue.js';
@@ -680,6 +681,20 @@ export async function registerDashboardRoutes(
     ok: true,
     ...piperStatus(),
   }));
+
+  app.post('/voice/set-voice', async (req, reply) => {
+    const body = (req.body ?? {}) as { name?: string };
+    if (!body.name) {
+      reply.code(400);
+      return { ok: false, error: 'name required' };
+    }
+    const r = setActiveVoice(body.name);
+    if (!r.ok) {
+      reply.code(404);
+      return r;
+    }
+    return { ok: true, ...piperStatus() };
+  });
 
   /* Smoke-test endpoint: returns a WAV. Production voice uses the
    * streaming WS path which buffers PCM directly into the browser. */
