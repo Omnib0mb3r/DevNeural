@@ -39,6 +39,7 @@
     "chokidar": "^4.0.0",
     "fastify": "^5.0.0",
     "mammoth": "^1.12.0",
+    "node-pty": "^1.1.0",
     "pdf-parse": "^2.4.5",
     "pdf-to-png-converter": "^4.0.0",
     "tesseract.js": "^7.0.0",

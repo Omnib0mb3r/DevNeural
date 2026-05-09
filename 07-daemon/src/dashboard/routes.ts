@@ -8,6 +8,8 @@
 import type { FastifyInstance } from 'fastify';
 import type { MultipartFile } from '@fastify/multipart';
 import type { Store } from '../store/index.js';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { DATA_ROOT } from '../paths.js';
 import { authMiddleware, registerAuthRoutes, isPinSet } from './auth.js';
 import { ReferenceStore } from '../reference/store.js';
@@ -33,6 +35,16 @@ import {
   getTerminalReplay,
   subscribeTerminal,
 } from './terminal-stream.js';
+import {
+  spawnLex,
+  ptyInject,
+  ptyKill,
+  ptyResize,
+  listPtys,
+  getPtyOutput,
+  startSessionDiscoveryProbe,
+} from './pty-host.js';
+import { buildLexSystemPrompt } from '../lex/system-prompt.js';
 import { lintQueueStatus } from '../wiki/lint-queue.js';
 import { providerStatus } from '../llm/index.js';
 import { embedderStats } from '../embedder/index.js';
@@ -77,6 +89,11 @@ export async function registerDashboardRoutes(
   log: (msg: string) => void = () => undefined,
 ): Promise<void> {
   const referenceStore = await ReferenceStore.open(log);
+
+  /* Background poll that binds a daemon-owned PTY to its claude
+   * session_id once the .jsonl file appears. Single global timer; no
+   * cost when no PTYs are unbound. */
+  startSessionDiscoveryProbe();
   // Auth middleware on every request before route handlers
   app.addHook('preHandler', (req, reply, done) => {
     authMiddleware(req, reply, done);
@@ -617,6 +634,128 @@ export async function registerDashboardRoutes(
     },
   );
 
+  /* Daemon-PTY endpoints. The PTY host owns a `claude` (or any other)
+   * child process directly so the dashboard can mirror + steer
+   * without VS Code or the bridge in the loop. /pty/:id/inject is
+   * the analogue of the bridge-mediated /sessions/:id/prompt; it
+   * accepts both the ephemeral ptyId (returned at spawn time, valid
+   * before claude has written its session-id jsonl) and the bound
+   * session-id (after binding). */
+  app.get('/pty', async () => ({ ok: true, ptys: listPtys() }));
+
+  app.get('/pty/:id/output', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const out = getPtyOutput(id);
+    reply.type('text/plain; charset=utf-8');
+    return out;
+  });
+
+  app.post('/pty/spawn-lex', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      cwd?: string;
+      command?: string;
+      args?: string[];
+      cols?: number;
+      rows?: number;
+    };
+    const cwd =
+      body.cwd ?? path.posix.join(DATA_ROOT.replace(/\\/g, '/'), 'brainstorm');
+    if (!fs.existsSync(cwd)) {
+      try {
+        fs.mkdirSync(cwd, { recursive: true });
+      } catch (err) {
+        reply.code(500);
+        return {
+          ok: false,
+          error: `cannot create cwd: ${(err as Error).message}`,
+        };
+      }
+    }
+    try {
+      const systemPrompt = buildLexSystemPrompt();
+      const r = spawnLex({
+        cwd,
+        command: body.command,
+        args: body.args,
+        cols: body.cols,
+        rows: body.rows,
+        systemPrompt,
+      });
+      log(`[lex] spawn ptyId=${r.ptyId} pid=${r.pid} cwd=${cwd}`);
+      return { ok: true, ...r, cwd };
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, error: (err as Error).message };
+    }
+  });
+
+  app.post('/pty/:id/inject', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { text?: string; commit?: boolean };
+    if (typeof body.text !== 'string' || body.text.length === 0) {
+      reply.code(400);
+      return { ok: false, error: 'text required' };
+    }
+    const commit = body.commit !== false;
+    const r = ptyInject(id, body.text, commit);
+    if (!r.ok) {
+      reply.code(404);
+      return r;
+    }
+    return r;
+  });
+
+  app.post('/pty/:id/resize', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { cols?: number; rows?: number };
+    if (
+      typeof body.cols !== 'number' ||
+      typeof body.rows !== 'number' ||
+      body.cols < 4 ||
+      body.rows < 4
+    ) {
+      reply.code(400);
+      return { ok: false, error: 'cols/rows required (number >= 4)' };
+    }
+    const ok = ptyResize(id, body.cols, body.rows);
+    if (!ok) {
+      reply.code(404);
+      return { ok: false, error: 'pty not found' };
+    }
+    return { ok: true };
+  });
+
+  app.delete('/pty/:id', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const ok = ptyKill(id);
+    if (!ok) {
+      reply.code(404);
+      return { ok: false, error: 'pty not found' };
+    }
+    return { ok: true };
+  });
+
+  /* Session-id-keyed inject. Once a daemon-PTY session has been bound
+   * to its claude session-id, this endpoint is the supported path for
+   * the dashboard's Steer panel to send prompts. Mirror of the
+   * existing /sessions/:id/prompt but writes directly to PTY stdin
+   * instead of dropping a marker for the bridge to pick up. */
+  app.post('/sessions/:id/inject', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { text?: string; commit?: boolean };
+    if (typeof body.text !== 'string' || body.text.length === 0) {
+      reply.code(400);
+      return { ok: false, error: 'text required' };
+    }
+    const commit = body.commit !== false;
+    const r = ptyInject(id, body.text, commit);
+    if (!r.ok) {
+      reply.code(404);
+      return r;
+    }
+    return r;
+  });
+
   app.post('/sessions/clear-supersede', async (req, reply) => {
     const body = (req.body ?? {}) as { session_id?: string; cwd?: string };
     if (!body.session_id || typeof body.session_id !== 'string') {
@@ -871,14 +1010,19 @@ export async function registerDashboardRoutes(
         error: `failed to queue inject: ${(err as Error).message}`,
       };
     }
-    /* Also open VS Code if it isn't already on this workspace. We
-     * can't reliably detect that from the daemon, so we always fire
-     * `code <path>` and let VS Code be a no-op when the window is
-     * already focused on the workspace. shell:true for the same
-     * Windows .cmd-shim reason as createProject. */
+    /* Force a new VS Code window with -n. Without this, `code <path>`
+     * sent to an already-running VS Code IPCs into the existing
+     * instance which often just focuses the most-recently-used window
+     * without actually opening the folder, leaving no window with
+     * proj.root in workspaceFolders for the bridge to claim the
+     * marker. -n unambiguously opens a fresh window with the
+     * workspace, and the bridge there activates and runs the command.
+     * If the user already has the project open in another window,
+     * they'll get a duplicate window — an acceptable trade for
+     * "the button always works." shell:true for the .cmd shim. */
     try {
       const { spawn } = await import('node:child_process');
-      const child = spawn('code', [proj.root], {
+      const child = spawn('code', ['-n', proj.root], {
         detached: true,
         stdio: 'ignore',
         windowsHide: true,

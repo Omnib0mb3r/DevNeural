@@ -314,6 +314,34 @@ export const startClaude = (
     body: JSON.stringify({ dangerous }),
   });
 
+// ── Daemon-PTY (Lex) ─────────────────────────────────────────────
+export interface PtyEntry {
+  ptyId: string;
+  sessionId: string | null;
+  cwd: string;
+  command: string;
+  startedAt: number;
+  lastActivity: number;
+  exited: boolean;
+}
+export const listPtys = () =>
+  request<{ ok: boolean; ptys: PtyEntry[] }>("/pty");
+export const spawnLex = (cwd?: string) =>
+  request<{ ok: boolean; ptyId?: string; pid?: number; cwd?: string; error?: string }>(
+    "/pty/spawn-lex",
+    {
+      method: "POST",
+      body: JSON.stringify(cwd ? { cwd } : {}),
+    },
+  );
+export const ptyInject = (id: string, text: string, commit = true) =>
+  request<{ ok: boolean; error?: string }>(
+    `/pty/${encodeURIComponent(id)}/inject`,
+    { method: "POST", body: JSON.stringify({ text, commit }) },
+  );
+export const ptyKill = (id: string) =>
+  request<{ ok: boolean }>(`/pty/${encodeURIComponent(id)}`, { method: "DELETE" });
+
 export interface SessionChunk {
   role: string;
   text: string;
