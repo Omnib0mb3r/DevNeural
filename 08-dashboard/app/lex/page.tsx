@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AppShell } from "@/components/AppShell";
 import { TerminalMirror } from "@/components/TerminalMirror";
+import { VoiceClient } from "@/components/VoiceClient";
 import { Icon } from "@/components/Icon";
 import {
   listPtys,
@@ -138,6 +139,7 @@ export default function LexPage() {
 
         {(lexPty || spawnM.isPending) && (
           <>
+            <VoiceClient sessionId={lexPty?.sessionId ?? null} />
             {/* Reuse the existing TerminalMirror — it expects a session
              * id and pulls from the same terminal-stream ring the
              * daemon-PTY pumps into post-binding. Before binding we

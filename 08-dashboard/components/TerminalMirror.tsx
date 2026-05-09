@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { sessions as sessionsClient } from "@/lib/daemon-client";
+import { sessions as sessionsClient, listPtys } from "@/lib/daemon-client";
 import "@xterm/xterm/css/xterm.css";
 
 interface MirrorState {
@@ -70,7 +70,15 @@ function ContextBadge({ tokens, max }: { tokens: number; max: number }) {
 function describeBridge(
   bridge: BridgeStatusResponse | null,
   sessionId: string,
+  daemonPtyOwnsSession: boolean,
 ): { label: string; tone: "ok" | "warn" | "err"; detail: string } {
+  if (daemonPtyOwnsSession) {
+    /* When this session is hosted by a daemon-PTY (Lex / Start-Claude
+     * buttons) the bridge isn't in the loop. Bytes flow daemon → ring,
+     * not VS Code → bridge → ring. Bridge state is irrelevant; show
+     * a steady "daemon-hosted" pill so the user understands. */
+    return { label: "host: daemon-pty", tone: "ok", detail: "" };
+  }
   if (!bridge) {
     return { label: "bridge: probing", tone: "warn", detail: "" };
   }
@@ -183,6 +191,21 @@ export function TerminalMirror({ sessionId }: Props) {
   const ctx =
     sessionsQ.data?.sessions?.find((s) => s.session_id === sessionId)?.context ??
     null;
+
+  /* Detect daemon-PTY ownership so the bridge-status pill can show
+   * "host: daemon-pty" instead of misleading bridge-mirror warnings.
+   * Polled less aggressively (8s) since it changes rarely. */
+  const ptysQ = useQuery({
+    queryKey: ["pty-list"],
+    queryFn: listPtys,
+    refetchInterval: 8_000,
+  });
+  const daemonPtyOwnsSession = Boolean(
+    sessionId &&
+      ptysQ.data?.ptys?.some(
+        (p) => !p.exited && p.sessionId === sessionId,
+      ),
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -497,7 +520,7 @@ export function TerminalMirror({ sessionId }: Props) {
     };
   }, [sessionId]);
 
-  const bridgeView = describeBridge(bridge, sessionId);
+  const bridgeView = describeBridge(bridge, sessionId, daemonPtyOwnsSession);
 
   return (
     <section className="rounded-panel bg-surface1 hairline overflow-hidden">

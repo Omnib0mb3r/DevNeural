@@ -57,6 +57,7 @@ import {
   synthesizeToBuffer,
   pcmToWav,
 } from '../voice/piper.js';
+import { attachLexVoiceWs } from '../voice/lex-voice-ws.js';
 import { lintQueueStatus } from '../wiki/lint-queue.js';
 import { providerStatus } from '../llm/index.js';
 import { embedderStats } from '../embedder/index.js';
@@ -699,6 +700,13 @@ export async function registerDashboardRoutes(
       reply.code(500);
       return { ok: false, error: (err as Error).message };
     }
+  });
+
+  /* Lex voice WebSocket. Single bidirectional channel for the full
+   * conversational loop: mic PCM in, transcript + Lex response audio
+   * out. See lex-voice-ws.ts for protocol. */
+  app.get('/voice/lex-ws', { websocket: true }, (socket) => {
+    attachLexVoiceWs(socket as unknown as Parameters<typeof attachLexVoiceWs>[0]);
   });
 
   app.post('/voice/transcribe', async (req, reply) => {
