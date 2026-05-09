@@ -29,6 +29,17 @@ Captured 2026-05-04. Living list. Tick when shipped.
 - Phase 5 settings audit + personalized recovery docs. Mostly documentation.
 - Audio/video binary smoke test post whisper.cpp + ffmpeg install.
 
+## Phase Two queue (2026-05-09)
+
+Full plan in `docs/spec/FUNCTIONAL-SPEC.md` section 17. Tracking in `docs/HANDOVER-2026-05-09-second-brain-strengthening.md` Phase Two section.
+
+- [ ] **P2-0** ⚠ FIRST: Adversarial review of `docs/spec/FUNCTIONAL-SPEC.md` → output at `docs/spec/FUNCTIONAL-SPEC-REVIEW-001.md`. Must catch holes, contradictions, stale claims, missing edge cases, untested assumptions, architectural concerns at 10x scale, security gaps, Phase Two risks. Bullet list grouped by spec section.
+- [ ] **P2-1** Lex personality customization: dials, per-mode few-shot, refusal contract, `SYSTEM_PROMPT_VERSION` versioning, in-prompt comments documenting WHY each block exists.
+- [ ] **P2-2** L1 live awareness broadcaster (`07-daemon/src/lex/awareness-broadcaster.ts`): 5–15s tick, snapshot of active CC sessions + brainstorms + recent artifacts + flagged pages, push as system-message-shaped block to Lex's PTY.
+- [ ] **P2-3** Lex feedback loop: per-turn thumbs up/down inline, regex-detected negative cues, aggregate per `SYSTEM_PROMPT_VERSION`, "worst-rated turns this week" dashboard surface.
+- [ ] **P2-4** UI fine-tuning: brainstorm rows in /sessions, /wiki↔/orb deeplink, "now playing" indicator, mobile PWA polish, brainstorm-as-orb-node.
+- [ ] **P2-5** Documentation refresh after P2-1 through P2-4.
+
 ## Operational
 
 - [x] Audit and prune `~/.claude/settings.json.*.bak.*` backup files. Six stale backups deleted; `settings.json.bak` kept as canonical recovery point.

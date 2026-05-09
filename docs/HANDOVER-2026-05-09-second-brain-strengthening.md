@@ -116,6 +116,109 @@ Starting state at session boundary:
 
 ---
 
+## Phase Two (queued)
+
+Phase Two scope is captured in `docs/spec/FUNCTIONAL-SPEC.md` section 17. Order below is the recommended execution sequence. Do nothing here without first completing the adversarial review (item P2-0).
+
+### P2-0. Adversarial review of FUNCTIONAL-SPEC.md ⚠ DO THIS FIRST
+
+**Goal:** Lex (or future-me) reads `docs/spec/FUNCTIONAL-SPEC.md` end to end with a hostile mindset and writes a follow-up doc at `docs/spec/FUNCTIONAL-SPEC-REVIEW-001.md` listing every:
+
+- **Hole** — claim made without code citation, hand-wave, "and then magic happens"
+- **Contradiction** — two sections that disagree about the same behavior
+- **Stale claim** — something true at write time but already obsoleted by a recent commit
+- **Missing edge case** — what happens when N=0, when the daemon dies mid-pipeline, when the LLM returns empty, when the brainstorm row is missing, when whisper drops the transcript
+- **Untested assumption** — anything stated as fact that has no test, no log, no smoke verification
+- **Architectural concern** — places where the design will hurt at 10x scale (10x sessions, 10x wiki pages, 10x voice traffic)
+- **Security gap** — anything in section 15 that's stated but not actually wired
+- **Phase Two risk** — for each item in section 17, name the specific way it could go wrong
+
+Output format: bulleted list grouped by section number from the spec. Each finding gets a one-line claim + citation + severity (`block`, `flag`, `nit`).
+
+Do not fix anything during the review. Just enumerate. Fixes go into Phase Two items P2-1 through P2-N.
+
+Review must include the four notes I gave at end of Phase One (commit `4e7454d`):
+1. L0-L4 layered Lex awareness model (only L1 is missing)
+2. Lex system prompt versioning + dials + refusal + few-shot
+3. Lex feedback loop (per-turn quality marker)
+4. UI fine-tuning (brainstorm rows, /wiki↔/orb deeplink, "now playing")
+
+Plus the new Phase Two priorities below.
+
+**Status:** ⬜ not started
+**Output:** `docs/spec/FUNCTIONAL-SPEC-REVIEW-001.md`
+
+---
+
+### P2-1. Lex personality customization
+
+**Goal:** Highly customize Lex's system prompt. Today it's generic. Phase Two makes it precise to how Michael actually works.
+
+Includes:
+- Personality dials (verbosity, formality, when to push back, when to defer to user, how to handle "I don't know")
+- Per-mode few-shot examples showing good vs bad responses
+- Refusal contract for off-topic / out-of-scope (so Lex doesn't drift into being a generic assistant)
+- Version field on the system prompt (`SYSTEM_PROMPT_VERSION` constant) bumped on every change so we can roll back if Lex regresses
+- Documentation of WHY each block exists, which rule it enforces, which failure mode it prevents
+
+**Status:** ⬜ not started
+
+---
+
+### P2-2. L1 live awareness broadcaster (the missing layer)
+
+**Goal:** Daemon module that maintains a live "what is everyone doing" snapshot from existing transcript-watcher state, then pushes that snapshot to Lex's PTY as a system message every 5–15s (or on significant change). Closes the gap where Lex has session context (L2) and on-demand recall (L3) but no continuous high-level awareness.
+
+Spec target file: new `07-daemon/src/lex/awareness-broadcaster.ts`.
+
+Snapshot must include (under ~2K tokens total):
+- Active CC sessions across all projects, current phase per session (thinking / tool / idle / permission)
+- Recent user prompt fragments (last N from each active session, truncated)
+- Active brainstorm sessions with mode + last_summary
+- Recently-emitted artifacts in last 30 min
+- Currently-flagged-for-review wiki pages (so Lex can mention to user)
+
+Push mechanism: write to Lex PTY's stdin as a system-message-shaped block that Lex's prompt knows to read on each turn. NOT prepended to every user message (that bloats context); ONE durable block updated in place.
+
+**Status:** ⬜ not started
+
+---
+
+### P2-3. Lex feedback loop
+
+**Goal:** Reinforcement signal for Lex's own responses, parallel to the wiki page reinforcement loop in section 7.
+
+Surfaces:
+- Inline thumbs up / down per turn in `08-dashboard/components/VoiceClient.tsx`
+- Auto-detect strong negative cues in user's next message (regex similar to the curator correction patterns)
+- Aggregate per `SYSTEM_PROMPT_VERSION` so we can A/B variants
+- Dashboard surface: "Lex's worst-rated turns this week" so user catches drift early
+
+**Status:** ⬜ not started
+
+---
+
+### P2-4. UI fine-tuning
+
+Items already known:
+- Brainstorm row visibility in `/sessions` and dedicated `/lex` lifecycle UI (start / end / relabel / archive)
+- `/wiki` modal → orb deeplink (clicking a wiki page opens orb at that node)
+- Dashboard "now playing" indicator (live active CC + brainstorm + Lex states)
+- Mobile-first PWA polish (works on phone but rough edges)
+- Brainstorm-as-orb-node (third node class on graph with edges to spawned wiki pages)
+
+**Status:** ⬜ not started
+
+---
+
+### P2-5. Documentation refresh after P2-1 through P2-4
+
+Update README, install docs, troubleshooting to reflect Phase Two changes.
+
+**Status:** ⬜ not started
+
+---
+
 ## Outstanding smoke tests
 
 - [ ] **End-session voice command** — say "end session" in a live voice session, verify:
