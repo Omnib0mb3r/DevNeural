@@ -760,6 +760,22 @@ export function VoiceClient({ sessionId }: Props) {
           try {
             const ort: any = await import("onnxruntime-web");
             ort.env.wasm.wasmPaths = "/vad/";
+            /* Pin single-threaded SIMD. Multi-threaded ORT wasm needs
+             * SharedArrayBuffer which requires COOP/COEP cross-origin
+             * isolation headers; Tailscale Serve and our daemon do not
+             * send those. The threaded backend grabs a 2GB heap before
+             * failing to spawn workers, leaving the runtime in a sticky
+             * OOM state ("previous call to 'initWasm()' failed"). Single-
+             * thread SIMD has a small footprint and works on every
+             * browser without isolation. */
+            ort.env.wasm.numThreads = 1;
+            ort.env.wasm.simd = true;
+            /* Disable the proxy worker: vad-web's default spins up a
+             * dedicated worker for inference which doubles the wasm
+             * heap. On low-RAM devices that's the difference between
+             * "init succeeds" and "Out of memory". Inline mode is fine;
+             * silero is small (~1MB model) and inference is sub-ms. */
+            ort.env.wasm.proxy = false;
           } catch {
             /* fallback: vad-web default cdn */
           }
