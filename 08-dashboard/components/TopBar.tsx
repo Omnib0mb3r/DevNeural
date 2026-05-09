@@ -258,8 +258,8 @@ export function TopBar({ activeTab }: { activeTab: string }) {
           </div>
 
           <Link
-            href="/system"
-            aria-label="Settings and diagnostics"
+            href="/settings"
+            aria-label="Settings"
             className="lift w-9 h-9 rounded-card hairline grid place-items-center text-txt2 hover:text-txt1"
           >
             <Icon name="Settings" />

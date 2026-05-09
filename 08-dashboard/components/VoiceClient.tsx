@@ -61,10 +61,13 @@ const SPEED_MAX = 1.5;
 const SPEED_STEP = 0.05;
 const SPEED_DEFAULT = 1.0;
 
+/* Barge-in cooldown is edited on the /settings page; VoiceClient just
+ * consumes it. Stored on the server in voice-preferences.json; mirrored
+ * to localStorage as an optimistic seed so the gate works on the very
+ * first reply before piper-status comes back. */
 const BARGE_STORAGE_KEY = "lex-barge-cooldown-ms";
 const BARGE_MIN = 0;
 const BARGE_MAX = 2000;
-const BARGE_STEP = 50;
 const BARGE_DEFAULT = 250;
 
 interface Props {
@@ -129,7 +132,6 @@ export function VoiceClient({ sessionId }: Props) {
   const bargeCooldownRef = useRef<number>(BARGE_DEFAULT);
   bargeCooldownRef.current = bargeCooldownMs;
   const lastTtsStartAtRef = useRef<number>(0);
-  const bargeSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [pttHolding, setPttHolding] = useState(false);
   const modeRef = useRef<Mode>("conversation");
   modeRef.current = mode;
@@ -390,22 +392,6 @@ export function VoiceClient({ sessionId }: Props) {
     }, 250);
   }
 
-  function changeBargeCooldown(next: number): void {
-    const clamped = Math.max(BARGE_MIN, Math.min(BARGE_MAX, Math.round(next)));
-    setBargeCooldownMs(clamped);
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(BARGE_STORAGE_KEY, String(clamped));
-    }
-    if (bargeSaveTimerRef.current) clearTimeout(bargeSaveTimerRef.current);
-    bargeSaveTimerRef.current = setTimeout(() => {
-      void fetch("/voice/set-barge-cooldown", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ ms: clamped }),
-      }).catch(() => undefined);
-    }, 250);
-  }
 
   async function changeVoice(name: string): Promise<void> {
     const r = await fetch("/voice/set-voice", {
@@ -1040,24 +1026,6 @@ export function VoiceClient({ sessionId }: Props) {
             />
             <span className="text-txt2 tabular-nums w-10 text-right">
               {speed.toFixed(2)}x
-            </span>
-          </label>
-          <label
-            className="flex items-center gap-2 text-nano font-mono text-txt3"
-            title="Suppress mic-driven barge-in for this many ms after Lex starts speaking. Stops self-echo from interrupting Lex when laptop speakers bleed into the mic. 0 disables the guard. Persisted globally."
-          >
-            <span>barge gate</span>
-            <input
-              type="range"
-              min={BARGE_MIN}
-              max={BARGE_MAX}
-              step={BARGE_STEP}
-              value={bargeCooldownMs}
-              onChange={(e) => changeBargeCooldown(Number(e.target.value))}
-              className="w-24 accent-brandSoft"
-            />
-            <span className="text-txt2 tabular-nums w-12 text-right">
-              {bargeCooldownMs}ms
             </span>
           </label>
           {enabled && (
