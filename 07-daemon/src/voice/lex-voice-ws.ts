@@ -61,6 +61,11 @@ interface ConnState {
   /* The Lex session/PTY this socket is bound to. We accept either a
    * sessionId (jsonl-bound) or a ptyId (pre-binding). */
   bindKey: string | null;
+  /* Claude Code session UUID whose jsonl we tail for assistant turns to
+   * TTS. Decoupled from bindKey so we can speak responses from any
+   * session — including standalone Claude Code instances that aren't
+   * managed by pty-host (no PTY entry, but jsonl exists on disk). */
+  watchSessionId: string | null;
   /* PCM frames buffered between utterance-start and utterance-end. */
   micBuf: Buffer[];
   micBufBytes: number;
@@ -82,6 +87,39 @@ interface ConnState {
 
 const MIC_BUF_MAX = 4 * 1024 * 1024; // 4 MB ~= 2 minutes of 16k mono pcm
 
+const SESSION_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/* Find a Claude Code session jsonl by sessionId, scanning every project
+ * slug under ~/.claude/projects. Decouples the TTS watcher from pty-host
+ * tracking: if a Claude Code instance is running outside the daemon's
+ * PTY pool but its session jsonl exists on disk, we can still tail it. */
+function findJsonlBySessionId(sessionId: string): string | null {
+  if (!SESSION_UUID_RE.test(sessionId)) return null;
+  const claudeRoot = path.posix.join(
+    os.homedir().replace(/\\/g, '/'),
+    '.claude',
+    'projects',
+  );
+  if (!fs.existsSync(claudeRoot)) return null;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(claudeRoot, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const candidate = path.posix.join(
+      claudeRoot,
+      e.name,
+      `${sessionId}.jsonl`,
+    );
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
 /* One voice WS per PTY. Without this, a user with multiple dashboard
  * tabs open sees every utterance injected once per tab — same audio,
  * same transcript, three injects, three Lex replies. We track the
@@ -93,6 +131,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   const state: ConnState = {
     ws: socket,
     bindKey: null,
+    watchSessionId: null,
     micBuf: [],
     micBufBytes: 0,
     ttsActive: null,
@@ -123,9 +162,26 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   }
 
   function bind(sessionOrPty: string | undefined): void {
-    /* Resolve to a PTY handle so we can pump inject + watch jsonl.
-     * If no key supplied, pick the brainstorm PTY (single global Lex
-     * convention). */
+    /* Resolve a jsonl to tail directly from the supplied session_id, so
+     * we can speak responses from Claude Code instances that aren't
+     * tracked by pty-host (standalone harness instances, IDE-spawned
+     * sessions, etc.). The PTY resolution below is still used for
+     * inject — TTS-watch and inject-target are intentionally decoupled. */
+    if (sessionOrPty && SESSION_UUID_RE.test(sessionOrPty)) {
+      const jsonl = findJsonlBySessionId(sessionOrPty);
+      if (jsonl) {
+        state.watchSessionId = sessionOrPty;
+        state.jsonlPath = jsonl;
+        try {
+          state.jsonlOffset = fs.statSync(jsonl).size;
+        } catch {
+          state.jsonlOffset = 0;
+        }
+      }
+    }
+
+    /* Resolve to a PTY handle so we can pump inject. If no key supplied,
+     * pick the brainstorm PTY (single global Lex convention). */
     let handle = sessionOrPty
       ? getPty(sessionOrPty) || getPtyBySession(sessionOrPty)
       : undefined;
@@ -139,12 +195,27 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       }
     }
     if (!handle) {
+      /* No PTY available for inject. If we already resolved a jsonl from
+       * the session_id, allow the WS to remain connected for TTS-only
+       * (read-only voice talkback). Otherwise this is a hard error. */
+      if (!state.jsonlPath) {
+        send({
+          t: 'error',
+          code: 'no-pty',
+          message:
+            'No Lex PTY active. Start Lex from the Brainstorm tab first.',
+        });
+        return;
+      }
       send({
-        t: 'error',
-        code: 'no-pty',
-        message:
-          'No Lex PTY active. Start Lex from the Brainstorm tab first.',
+        t: 'hello-ack',
+        session_id: state.watchSessionId,
+        pty_id: null,
+        voice_rate: piperStatus().rate,
+        jsonl_bound: true,
+        inject_disabled: true,
       });
+      startJsonlWatch();
       return;
     }
     state.bindKey = handle.sessionId ?? handle.ptyId;
@@ -175,7 +246,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       }
     }
     activeByBindKey.set(state.bindKey, state);
-    if (handle.sessionId) {
+    /* PTY-derived jsonl is the legacy path. Skip it when the caller
+     * already supplied a watchSessionId — that takes precedence so the
+     * watcher tails the session the client actually wants spoken. */
+    if (!state.watchSessionId && handle.sessionId) {
       const slug = handle.cwd.replace(/[\\/:]/g, '-');
       const claudeRoot = path.posix.join(
         os.homedir().replace(/\\/g, '/'),
@@ -198,11 +272,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
     send({
       t: 'hello-ack',
-      session_id: handle.sessionId,
+      session_id: state.watchSessionId ?? handle.sessionId,
       pty_id: handle.ptyId,
       voice_rate: piperStatus().rate,
       jsonl_bound: Boolean(state.jsonlPath),
     });
+    if (state.jsonlPath) startJsonlWatch();
   }
 
   function startJsonlWatch(): void {
@@ -223,6 +298,19 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   let lastSpokenUuid: string | null = null;
 
   function pollJsonl(): void {
+    if (!state.jsonlPath && state.watchSessionId) {
+      /* Late jsonl creation: the file may not have existed at bind
+       * time but was created on first user/assistant turn. */
+      const jsonl = findJsonlBySessionId(state.watchSessionId);
+      if (jsonl) {
+        state.jsonlPath = jsonl;
+        try {
+          state.jsonlOffset = fs.statSync(jsonl).size;
+        } catch {
+          state.jsonlOffset = 0;
+        }
+      }
+    }
     if (!state.jsonlPath) {
       /* Re-resolve the jsonl path if the PTY just bound a session_id. */
       const handle = state.bindKey
@@ -288,7 +376,13 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
 
   function handleJsonlLine(rec: Record<string, unknown>): void {
     if (rec.type !== 'assistant') return;
-    if (!state.awaitingResponseSince) return;
+    /* Read-only watch mode: when the client supplied a watchSessionId
+     * but we have no PTY to inject into, the WS can't drive the request
+     * side, so awaitingResponseSince never gets set. Speak every fresh
+     * end_turn from the watched session instead. lastSpokenUuid still
+     * dedupes against re-reads. */
+    const readOnly = state.watchSessionId && !state.bindKey;
+    if (!readOnly && !state.awaitingResponseSince) return;
     const message = rec.message as
       | {
           content?: Array<{ type?: string; text?: string }>;
