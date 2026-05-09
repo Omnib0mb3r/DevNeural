@@ -23,6 +23,11 @@ import * as fs from 'node:fs';
 import { randomUUID, createHash } from 'node:crypto';
 import { spawn as ptySpawn, type IPty } from 'node-pty';
 import { pushTerminalData } from './terminal-stream.js';
+import {
+  registerBrainstorm,
+  bindBrainstormSessionId,
+  isBrainstormCwd,
+} from '../lex/brainstorm-store.js';
 
 interface PtyHandle {
   ptyId: string;
@@ -122,6 +127,15 @@ function tryDiscoverSession(handle: PtyHandle): void {
     handle.preBuffer = [];
     handle.preBufferBytes = 0;
   }
+  /* Patch the brainstorm_session record (if any) with the just-bound
+   * claude session_id. Subsequent retrieval can join brainstorm_sessions
+   * to raw_chunks_meta on session_id and surface "this is brainstorm
+   * session named X" instead of orphan transcript chunks. */
+  try {
+    bindBrainstormSessionId(handle.ptyId, sessionId);
+  } catch {
+    /* ignore */
+  }
 }
 
 /**
@@ -193,6 +207,23 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
     preBufferBytes: 0,
   };
   ptys.set(ptyId, handle);
+
+  /* Register a first-class brainstorm_session record if this PTY's
+   * cwd matches the brainstorm convention. Lex spawns get a record
+   * the moment they start, with status=active and no claude_session_id
+   * yet. Once the jsonl appears and we bind, we patch the record with
+   * the claude_session_id so retrieval can join the two. */
+  try {
+    if (isBrainstormCwd(cwd)) {
+      registerBrainstorm({
+        ptyId,
+        cwd,
+        startedMs: handle.startedAt,
+      });
+    }
+  } catch {
+    /* brainstorm registration is observability, never block spawn */
+  }
 
   pty.onData((data) => {
     handle.lastActivity = Date.now();

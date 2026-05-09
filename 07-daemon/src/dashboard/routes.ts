@@ -46,6 +46,15 @@ import {
 } from './pty-host.js';
 import { buildLexSystemPrompt } from '../lex/system-prompt.js';
 import {
+  listBrainstorms,
+  getBrainstorm,
+  setLabel as setBrainstormLabel,
+  setMode as setBrainstormMode,
+  endBrainstorm,
+  appendArtifact as appendBrainstormArtifact,
+  setStore as setBrainstormStore,
+} from '../lex/brainstorm-store.js';
+import {
   ensureServer as ensureWhisper,
   transcribeWav,
   whisperStatus,
@@ -108,6 +117,12 @@ export async function registerDashboardRoutes(
    * session_id once the .jsonl file appears. Single global timer; no
    * cost when no PTYs are unbound. */
   startSessionDiscoveryProbe();
+
+  /* Hand the brainstorm-store the live Store reference so its helper
+   * functions (used by pty-host on spawn, used by /lex/sessions
+   * routes, eventually used by voice WS) can talk to SQLite without
+   * threading the store through every layer. */
+  setBrainstormStore(store);
   // Auth middleware on every request before route handlers
   app.addHook('preHandler', (req, reply, done) => {
     authMiddleware(req, reply, done);
@@ -656,6 +671,76 @@ export async function registerDashboardRoutes(
    * before claude has written its session-id jsonl) and the bound
    * session-id (after binding). */
   app.get('/pty', async () => ({ ok: true, ptys: listPtys() }));
+
+  /* Brainstorm session endpoints (Slice A). First-class records so
+   * each Lex spawn gets a label, lifecycle, mode, and artifact list
+   * the dashboard + retrieval can use as a key into the transcript
+   * RAG. See codex review for context. */
+  app.get('/lex/sessions', async (req) => {
+    const q = (req.query ?? {}) as { status?: string; limit?: string };
+    const status =
+      q.status === 'active' || q.status === 'ended' ? q.status : undefined;
+    const limit = q.limit ? Math.min(200, Math.max(1, Number(q.limit))) : 50;
+    return { ok: true, sessions: listBrainstorms({ status, limit }) };
+  });
+
+  app.get('/lex/sessions/:id', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = getBrainstorm(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    return { ok: true, session: row };
+  });
+
+  app.patch('/lex/sessions/:id', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as {
+      user_label?: string | null;
+      derived_label?: string | null;
+      mode?: string;
+      status?: 'ended';
+      summary?: string;
+    };
+    let row;
+    if (
+      body.user_label !== undefined ||
+      body.derived_label !== undefined
+    ) {
+      row = setBrainstormLabel(id, {
+        user_label: body.user_label,
+        derived_label: body.derived_label,
+      });
+    }
+    if (body.mode) row = setBrainstormMode(id, body.mode) ?? row;
+    if (body.status === 'ended') {
+      row = endBrainstorm(id, body.summary) ?? row;
+    }
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    return { ok: true, session: row };
+  });
+
+  app.post('/lex/sessions/:id/artifacts', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as {
+      category?: 'research_notes' | 'wiki_drafts' | 'reminders' | 'spawned_projects';
+      ref?: { id: string; title?: string };
+    };
+    if (!body.category || !body.ref?.id) {
+      reply.code(400);
+      return { ok: false, error: 'category and ref.id required' };
+    }
+    const row = appendBrainstormArtifact(id, body.category, body.ref);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'session not found' };
+    }
+    return { ok: true, session: row };
+  });
 
   /* Voice / STT. Lazy-spawns whisper-server (cuBLAS build, RTX 5080)
    * on first call; subsequent transcriptions reuse the persistent

@@ -38,6 +38,24 @@ export interface WikiPageRow {
   human_edited: number;
 }
 
+export interface BrainstormSessionRow {
+  id: string;
+  claude_session_id: string | null;
+  pty_id: string | null;
+  cwd: string;
+  user_label: string | null;
+  derived_label: string | null;
+  mode: string;
+  status: string;
+  started_ms: number;
+  ended_ms: number | null;
+  turn_count: number;
+  topic_tags_json: string;
+  artifacts_json: string;
+  last_summary: string | null;
+  last_summary_ms: number | null;
+}
+
 export interface FtsHit {
   page_id: string;
   rank: number;
@@ -116,7 +134,113 @@ export class IndexDb {
         value TEXT NOT NULL
       );
       INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '1');
+
+      /* Brainstorm sessions are first-class records, not just claude
+       * jsonl traces. Each Lex spawn creates one; lifecycle moves
+       * through 'active' -> 'ended'. The user_label is what the user
+       * named it ("pricing rethink"); the derived_label is Lex's
+       * later guess if user skipped initially. artifacts_json holds
+       * inline references to research notes / wiki drafts / spawned
+       * projects / reminders captured during this session, so the
+       * brainstorm has a durable knowledge graph instead of just
+       * transcript chunks. */
+      CREATE TABLE IF NOT EXISTS brainstorm_sessions (
+        id TEXT PRIMARY KEY,
+        claude_session_id TEXT,
+        pty_id TEXT,
+        cwd TEXT NOT NULL,
+        user_label TEXT,
+        derived_label TEXT,
+        mode TEXT NOT NULL DEFAULT 'conversation',
+        status TEXT NOT NULL DEFAULT 'active',
+        started_ms INTEGER NOT NULL,
+        ended_ms INTEGER,
+        turn_count INTEGER NOT NULL DEFAULT 0,
+        topic_tags_json TEXT NOT NULL DEFAULT '[]',
+        artifacts_json TEXT NOT NULL DEFAULT '{}',
+        last_summary TEXT,
+        last_summary_ms INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_brainstorm_status
+        ON brainstorm_sessions (status, started_ms DESC);
+      CREATE INDEX IF NOT EXISTS idx_brainstorm_claude
+        ON brainstorm_sessions (claude_session_id);
+      CREATE INDEX IF NOT EXISTS idx_brainstorm_pty
+        ON brainstorm_sessions (pty_id);
     `);
+  }
+
+  // ── brainstorm sessions ────────────────────────────────────────
+  insertBrainstorm(row: BrainstormSessionRow): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO brainstorm_sessions
+         (id, claude_session_id, pty_id, cwd, user_label, derived_label, mode,
+          status, started_ms, ended_ms, turn_count, topic_tags_json, artifacts_json,
+          last_summary, last_summary_ms)
+         VALUES (@id, @claude_session_id, @pty_id, @cwd, @user_label, @derived_label,
+          @mode, @status, @started_ms, @ended_ms, @turn_count, @topic_tags_json,
+          @artifacts_json, @last_summary, @last_summary_ms)`,
+      )
+      .run(row);
+  }
+
+  updateBrainstorm(
+    id: string,
+    patch: Partial<BrainstormSessionRow>,
+  ): BrainstormSessionRow | null {
+    const existing = this.getBrainstorm(id);
+    if (!existing) return null;
+    const merged: BrainstormSessionRow = { ...existing, ...patch, id };
+    this.insertBrainstorm(merged);
+    return merged;
+  }
+
+  getBrainstorm(id: string): BrainstormSessionRow | null {
+    return (
+      (this.db
+        .prepare(`SELECT * FROM brainstorm_sessions WHERE id = ?`)
+        .get(id) as BrainstormSessionRow | undefined) ?? null
+    );
+  }
+
+  getBrainstormByClaudeSession(
+    claudeSessionId: string,
+  ): BrainstormSessionRow | null {
+    return (
+      (this.db
+        .prepare(
+          `SELECT * FROM brainstorm_sessions WHERE claude_session_id = ? LIMIT 1`,
+        )
+        .get(claudeSessionId) as BrainstormSessionRow | undefined) ?? null
+    );
+  }
+
+  getBrainstormByPty(ptyId: string): BrainstormSessionRow | null {
+    return (
+      (this.db
+        .prepare(
+          `SELECT * FROM brainstorm_sessions WHERE pty_id = ? ORDER BY started_ms DESC LIMIT 1`,
+        )
+        .get(ptyId) as BrainstormSessionRow | undefined) ?? null
+    );
+  }
+
+  listBrainstorms(opts: { status?: 'active' | 'ended'; limit?: number } = {}):
+    BrainstormSessionRow[] {
+    const limit = opts.limit ?? 50;
+    if (opts.status) {
+      return this.db
+        .prepare(
+          `SELECT * FROM brainstorm_sessions WHERE status = ? ORDER BY started_ms DESC LIMIT ?`,
+        )
+        .all(opts.status, limit) as BrainstormSessionRow[];
+    }
+    return this.db
+      .prepare(
+        `SELECT * FROM brainstorm_sessions ORDER BY started_ms DESC LIMIT ?`,
+      )
+      .all(limit) as BrainstormSessionRow[];
   }
 
   upsertRawChunk(row: RawChunkRow): void {
