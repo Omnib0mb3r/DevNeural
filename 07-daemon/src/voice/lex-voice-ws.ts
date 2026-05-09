@@ -44,6 +44,11 @@ import type { WebSocket as FastifyWS } from '@fastify/websocket';
 import { transcribeWav, pcm16ToWav } from './whisper.js';
 import { synthesize, piperStatus } from './piper.js';
 import { ptyInject, getPty, getPtyBySession, listPtys } from '../dashboard/pty-host.js';
+import {
+  getBrainstormByClaudeSessionId,
+  getBrainstormByPty,
+} from '../lex/brainstorm-store.js';
+import { processAssistantTurn } from '../lex/artifact-parser.js';
 
 /* Voice modes drive whether the daemon synthesizes Lex's response
  * out loud. The browser still receives transcript + assistant-text
@@ -267,13 +272,54 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     if (!text) return;
     lastSpokenUuid = uuid || null;
     state.awaitingResponseSince = 0;
-    /* Always tell the client the response text, regardless of mode —
-     * the panel renders it on screen. Notes-only mode skips the TTS
+    /* Always tell the client the response text, regardless of mode.
+     * The panel renders it on screen. Notes-only mode skips the TTS
      * synth so Lex stays silent (the user is dictating, doesn't want
      * audio talkback). Push-to-talk still uses voice talkback by
      * default; the user can flip mode mid-session if they want
      * silence. */
     send({ t: 'assistant-text', text });
+    /* Slice C: scan the assistant turn for fenced artifact blocks
+     * (research-note / wiki-draft / project-intent / notes-summary),
+     * persist them, and link the artifact ids into the brainstorm
+     * row. Notes-summary entries also fan out into the reminders
+     * system. Wrapped in try so a malformed artifact never blocks
+     * the turn from speaking. Note: text-mode chats that don't open
+     * this voice WS currently miss extraction. A daemon-wide
+     * brainstorm jsonl watcher is the follow-up. */
+    try {
+      const handle = state.bindKey
+        ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
+        : undefined;
+      let brainstormId: string | null = null;
+      if (handle?.sessionId) {
+        const bs = getBrainstormByClaudeSessionId(handle.sessionId);
+        if (bs) brainstormId = bs.id;
+      }
+      if (!brainstormId && handle) {
+        const bs = getBrainstormByPty(handle.ptyId);
+        if (bs) brainstormId = bs.id;
+      }
+      const persisted = processAssistantTurn(text, {
+        brainstormId,
+        fallbackTitle: text.slice(0, 60),
+        ...(uuid ? { dedupeKey: uuid } : {}),
+      });
+      if (persisted.length > 0) {
+        send({
+          t: 'artifacts',
+          items: persisted.map((p) => ({
+            id: p.id,
+            kind: p.kind,
+            category: p.category,
+            title: p.title,
+            ...(p.reminder_ids ? { reminder_ids: p.reminder_ids } : {}),
+          })),
+        });
+      }
+    } catch {
+      /* artifact extraction is observational; never block speak() */
+    }
     if (state.mode === 'notes') {
       /* Surface a short ack so the panel can show "captured" — but
        * no audio. */
