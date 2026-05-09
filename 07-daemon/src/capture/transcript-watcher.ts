@@ -177,6 +177,89 @@ async function processFile(
 
   let fallbackSession = path.basename(file, '.jsonl');
 
+  /* Turn-bounded chunk accumulator. Per-line writes (transcripts.jsonl,
+   * observations, reinforcement signals, dashboard phase) still happen
+   * once per jsonl line because those are event-shaped. The vector
+   * chunk is what changes: consecutive same-(session, role) lines
+   * merge into one embedding so a single thought is one vector
+   * instead of being split across 20 vectors at the cost of recall.
+   *
+   * When (session, role) changes — which is exactly what a turn
+   * boundary looks like in a Claude Code jsonl, since tool_use /
+   * tool_result blocks share the assistant role with assistant text
+   * but the user→assistant→user transitions flush — the open buffer
+   * is flushed as one chunk. The end of the batch flushes whatever
+   * is still open.
+   *
+   * Across-batch boundary: if a turn straddles a tail-read (rare,
+   * happens when the watcher polls mid-turn) the two halves end up
+   * as two adjacent chunks. Acceptable: most turns are visible in
+   * one read. The 4000-char embed cap also still applies; very long
+   * turns get a single embedding of their first 4000 chars (same as
+   * before) but the metadata byte_length tracks the full merged
+   * length so retrieval can still surface them. */
+  interface TurnBuf {
+    sessionId: string;
+    role: string;
+    projectId: string;
+    parts: string[];
+    /* Sum of scrubbed-text lengths for the merged chunk so the meta
+     * row's byte_length reflects the whole turn, not just the head
+     * line. Used by lint/decay heuristics that look at byte_length. */
+    byteLengthTotal: number;
+    /* uuid + offset of the LAST line that contributed; used to
+     * derive the chunk id. Within-turn, the last line's identifiers
+     * are stable enough for de-duplication on backfill replay. */
+    lastUuid: string | undefined;
+    lastOffset: number;
+    kind: string;
+    tsMs: number;
+  }
+  let openBuf: TurnBuf | null = null;
+  async function flushTurnBuf(): Promise<void> {
+    if (!openBuf || !store) {
+      openBuf = null;
+      return;
+    }
+    const merged = openBuf.parts.join('\n\n');
+    if (!merged.trim()) {
+      openBuf = null;
+      return;
+    }
+    const id = chunkId(file, openBuf.lastUuid, openBuf.lastOffset);
+    try {
+      const vec = await embedOne(merged.slice(0, 4000));
+      await store.rawChunks.add({
+        id,
+        vector: vec,
+        metadata: {
+          project_id: openBuf.projectId,
+          session_id: openBuf.sessionId,
+          timestamp_ms: openBuf.tsMs,
+          kind: openBuf.kind,
+          role: openBuf.role,
+          byte_length: openBuf.byteLengthTotal,
+          text_preview: merged.slice(0, 200),
+        },
+      });
+      store.db.upsertRawChunk({
+        id,
+        project_id: openBuf.projectId,
+        session_id: openBuf.sessionId,
+        timestamp_ms: openBuf.tsMs,
+        kind: openBuf.kind,
+        role: openBuf.role,
+        byte_length: openBuf.byteLengthTotal,
+      });
+      chunkCount++;
+    } catch (err) {
+      log?.(
+        `[transcript-watcher] embed/store failed: ${(err as Error)?.message ?? err}`,
+      );
+    }
+    openBuf = null;
+  }
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] ?? '';
     if (i === lines.length - 1 && !text.endsWith('\n')) break;
@@ -270,43 +353,47 @@ async function processFile(
       }
     }
 
-    // P2: embed and store
+    // P2: append into the turn-bounded buffer. Flush triggers on
+    // (session, role) transition; flushTurnBuf() at end of batch
+    // catches whatever the final lines accumulated.
     if (store) {
-      const id = chunkId(file, parsed.uuid, tail.startOffset + consumed);
       const tsMs = Date.parse(record.timestamp);
-      try {
-        const vec = await embedOne(scrubbed.slice(0, 4000));
-        await store.rawChunks.add({
-          id,
-          vector: vec,
-          metadata: {
-            project_id: identity.id,
-            session_id: session,
-            timestamp_ms: Number.isFinite(tsMs) ? tsMs : Date.now(),
-            kind: record.kind,
-            role,
-            byte_length: scrubbed.length,
-            text_preview: scrubbed.slice(0, 200),
-          },
-        });
-        store.db.upsertRawChunk({
-          id,
-          project_id: identity.id,
-          session_id: session,
-          timestamp_ms: Number.isFinite(tsMs) ? tsMs : Date.now(),
-          kind: record.kind,
+      const stableTs = Number.isFinite(tsMs) ? tsMs : Date.now();
+      if (
+        openBuf &&
+        (openBuf.sessionId !== session || openBuf.role !== role)
+      ) {
+        await flushTurnBuf();
+      }
+      if (!openBuf) {
+        openBuf = {
+          sessionId: session,
           role,
-          byte_length: scrubbed.length,
-        });
-      } catch (err) {
-        log?.(
-          `[transcript-watcher] embed/store failed: ${(err as Error)?.message ?? err}`,
-        );
+          projectId: identity.id,
+          parts: [],
+          byteLengthTotal: 0,
+          lastUuid: parsed.uuid,
+          lastOffset: tail.startOffset + consumed,
+          kind: record.kind,
+          tsMs: stableTs,
+        };
+      }
+      openBuf.parts.push(scrubbed);
+      openBuf.byteLengthTotal += scrubbed.length;
+      openBuf.lastUuid = parsed.uuid;
+      openBuf.lastOffset = tail.startOffset + consumed;
+      openBuf.tsMs = stableTs;
+      /* Cap merged text so a runaway long turn doesn't push the embed
+       * call past its buffer limit silently. We still append for the
+       * meta byte_length but stop growing the parts list. */
+      if (openBuf.parts.join('\n\n').length > 8000) {
+        await flushTurnBuf();
       }
     }
-    chunkCount++;
   }
 
+  /* Flush any final turn buffer that was still open at end-of-batch. */
+  await flushTurnBuf();
   offsets[file] = tail.startOffset + consumed;
   saveOffsets();
   return { chunks: chunkCount, bytes: consumed };
