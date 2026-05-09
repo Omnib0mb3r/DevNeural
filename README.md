@@ -44,8 +44,9 @@ A second brain has six properties. DevNeural has all six.
 | 4 | Orb rebind to wiki data model — force-directed graph + /graph endpoint | done, shipped |
 | 5 | Settings audit + personalized recovery docs + robust backup pipeline | done, shipped |
 | 6 | Notification hook → dashboard permission UI (CC permission/elicitation prompts surface in /sessions with answer buttons) | done, shipped |
+| 7 | Lex supervisory voice loop: daemon-PTY hosts a personality-typed Claude Code session; whisper.cpp cuBLAS STT in, Piper TTS out, silero VAD with mute auto-finalize, three voice modes (conversation / notes / push-to-talk), browser voice picker, barge-in. First-class brainstorm_sessions records, source-classed retrieval (`/lex/recall`), fenced-JSON artifact extraction (research-note, wiki-draft, project-intent, notes-summary), supervisor primitives (`/lex/steer`, `/lex/capture`, `/lex/snapshot`), conflict-overlap signal on retrieval. | shipped Slices A through E, plus voice UX and STT-config defence. See `.continue-here.md` for the residuals list. |
 
-See [docs/SESSION-HANDOVER.md](docs/SESSION-HANDOVER.md) for what state the repo was in at the most recent session boundary.
+See [docs/SESSION-HANDOVER.md](docs/SESSION-HANDOVER.md) for what state the repo was in at the most recent session boundary, and `.continue-here.md` for the most recent in-progress work.
 
 ---
 
@@ -117,6 +118,7 @@ For Tailscale remote access from your phone, follow [docs/install/TAILSCALE.md](
 | **Dashboard** | Central hub on port 3747. Sessions, projects, search, system metrics with sparklines, daily brief, reminders, web push, force-directed wiki graph (Orb), and inline answer UI for CC permission/elicitation prompts so you can reply remotely without tabbing back to VS Code. PWA-installable on phone. Tailscale for remote access. |
 | **Backup pipeline** | Daily scheduled snapshot of the data root with SQLite atomic capture, manifest, integrity verification, and rotation. |
 | **Local-first** | Default LLM is ollama (qwen3:8b). Anthropic API supported as fallback. Zero cost in default config. |
+| **Lex (supervisory voice layer)** | Always-available coworker on top of the active worker sessions. Daemon-PTY hosts a `claude` session with a Lex system prompt (four mode contracts, one invariant voice, synthesis directive). Voice loop: whisper.cpp cuBLAS STT, silero VAD with mute auto-finalize, Piper TTS with picker. Three modes: conversation, notes (silent reply, auto-summarises on stop), push-to-talk. Emits structured artifacts inline as fenced JSON; the daemon persists them and fans notes-summary reminders into the reminder system. Source-classed retrieval at `/lex/recall` so canonical wiki outranks pending drafts outranks brainstorm transcripts outranks generic raw outranks reference. |
 
 ---
 
