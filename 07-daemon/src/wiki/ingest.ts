@@ -199,7 +199,7 @@ export async function runIngest(
     affectedPages,
     pass1Output.new_page_warranted,
   );
-  const pass2Validated = await callValidated(
+  let pass2Validated = await callValidated(
     provider,
     {
       role: 'ingest',
@@ -222,6 +222,65 @@ export async function runIngest(
   result.cost.input_tokens += pass2Validated.totalInputTokens;
   result.cost.output_tokens += pass2Validated.totalOutputTokens;
   result.cost.cache_read += pass2Validated.totalCacheRead;
+
+  /* Anthropic fallback for Pass 2. Local qwen3:8b is borderline for the
+   * strict frontmatter + 80-token-summary discipline DEVNEURAL.md
+   * requires; on validation exhaustion the wiki silently drops a turn
+   * that should have produced a page. When DEVNEURAL_PASS2_FALLBACK
+   * = anthropic and ANTHROPIC_API_KEY is set, retry the call once
+   * against Anthropic Haiku (the AnthropicProvider's default ingest
+   * model). One retry only: an Anthropic failure means a real schema
+   * problem, not a model-quality problem, and looping further would
+   * waste API spend. Off by default to preserve local-first.
+   *
+   * Cost ballpark on a borderline-quality install: ~15-25% of Pass 2
+   * calls fall back, ~$0.004/call. ~$0.10/day at 100 ingests. Cheap
+   * insurance against the wiki's keystone risk. */
+  if (
+    !pass2Validated.value &&
+    process.env.DEVNEURAL_PASS2_FALLBACK?.toLowerCase() === 'anthropic' &&
+    provider.name !== 'anthropic'
+  ) {
+    try {
+      const { AnthropicProvider } = await import('../llm/anthropic.js');
+      const fallback = new AnthropicProvider();
+      if (fallback.isConfigured()) {
+        log(`[ingest] pass2 fallback to anthropic after local exhaustion`);
+        const retry = await callValidated(
+          fallback,
+          {
+            role: 'ingest',
+            systemBlocks: [
+              { text: schemaText, cache: true },
+              { text: pass1Preamble, cache: true },
+            ],
+            user: pass2User,
+            maxTokens: 2500,
+            ...(input.signal ? { signal: input.signal } : {}),
+          },
+          validatePass2,
+          log,
+        );
+        result.cost.input_tokens += retry.totalInputTokens;
+        result.cost.output_tokens += retry.totalOutputTokens;
+        result.cost.cache_read += retry.totalCacheRead;
+        if (retry.value) {
+          pass2Validated = retry;
+          log(`[ingest] pass2 fallback succeeded`);
+        } else {
+          log(
+            `[ingest] pass2 fallback also failed: ${retry.errors.join('; ')}`,
+          );
+        }
+      } else {
+        log(
+          `[ingest] pass2 fallback requested but anthropic not configured: ${fallback.configHint()}`,
+        );
+      }
+    } catch (err) {
+      log(`[ingest] pass2 fallback errored: ${(err as Error).message}`);
+    }
+  }
 
   if (!pass2Validated.value) {
     result.skipped_reason = `pass2 failed after ${pass2Validated.attempts} attempts: ${pass2Validated.errors.join('; ')}`;
