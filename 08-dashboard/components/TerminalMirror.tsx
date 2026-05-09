@@ -71,6 +71,7 @@ function describeBridge(
   bridge: BridgeStatusResponse | null,
   sessionId: string,
   daemonPtyOwnsSession: boolean,
+  daemonPtyPending: boolean,
 ): { label: string; tone: "ok" | "warn" | "err"; detail: string } {
   if (daemonPtyOwnsSession) {
     /* When this session is hosted by a daemon-PTY (Lex / Start-Claude
@@ -78,6 +79,16 @@ function describeBridge(
      * not VS Code → bridge → ring. Bridge state is irrelevant; show
      * a steady "daemon-hosted" pill so the user understands. */
     return { label: "host: daemon-pty", tone: "ok", detail: "" };
+  }
+  if (daemonPtyPending) {
+    /* A daemon-PTY exists but hasn't bound a session-id yet (claude
+     * hasn't written its first jsonl). Suppress bridge state because
+     * the bridge has nothing to do with this session either. */
+    return { label: "host: daemon-pty (binding…)", tone: "warn", detail: "" };
+  }
+  if (!sessionId) {
+    /* No session at all yet. Don't fire bridge warnings. */
+    return { label: "no session", tone: "warn", detail: "" };
   }
   if (!bridge) {
     return { label: "bridge: probing", tone: "warn", detail: "" };
@@ -205,6 +216,13 @@ export function TerminalMirror({ sessionId }: Props) {
       ptysQ.data?.ptys?.some(
         (p) => !p.exited && p.sessionId === sessionId,
       ),
+  );
+  /* A daemon-PTY is alive but hasn't bound a session yet (cold spawn
+   * before the first turn writes the jsonl). Catches the gap right
+   * after auto-spawning Lex on /lex page load. */
+  const daemonPtyPending = Boolean(
+    !daemonPtyOwnsSession &&
+      ptysQ.data?.ptys?.some((p) => !p.exited && !p.sessionId),
   );
 
   useEffect(() => {
@@ -520,7 +538,12 @@ export function TerminalMirror({ sessionId }: Props) {
     };
   }, [sessionId]);
 
-  const bridgeView = describeBridge(bridge, sessionId, daemonPtyOwnsSession);
+  const bridgeView = describeBridge(
+    bridge,
+    sessionId,
+    daemonPtyOwnsSession,
+    daemonPtyPending,
+  );
 
   return (
     <section className="rounded-panel bg-surface1 hairline overflow-hidden">

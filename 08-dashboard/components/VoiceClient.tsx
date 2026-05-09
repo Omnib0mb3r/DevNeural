@@ -110,6 +110,18 @@ export function VoiceClient({ sessionId }: Props) {
     playheadRef.current += float.length / rate;
   }
 
+  /* Prewarm whisper-server as soon as the voice panel mounts so the
+   * first utterance doesn't pay the 3-4s model-load cold start. The
+   * endpoint is idempotent: subsequent calls return the already-loaded
+   * server status. Fire-and-forget; failure here doesn't block the
+   * voice loop, just costs latency on first utterance. */
+  useEffect(() => {
+    void fetch("/voice/whisper-prewarm", {
+      method: "POST",
+      credentials: "include",
+    }).catch(() => undefined);
+  }, []);
+
   useEffect(() => {
     if (!enabled) {
       /* Tear-down path. */
@@ -235,8 +247,21 @@ export function VoiceClient({ sessionId }: Props) {
           /* Dynamic import so the package only loads on /lex. */
           const mod = await import("@ricky0123/vad-web");
           if (cancelled) return;
+          /* Configure ONNX runtime to load wasm + model from our own
+           * /vad/ static path rather than the default CDN, so voice
+           * works on Tailscale-only / offline boxes with no internet
+           * egress. See public/vad/ for the asset bundle. */
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          try {
+            const ort: any = await import("onnxruntime-web");
+            ort.env.wasm.wasmPaths = "/vad/";
+          } catch {
+            /* fallback: vad-web default cdn */
+          }
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const vad: any = await (mod as any).MicVAD.new({
+            baseAssetPath: "/vad/",
+            onnxWASMBasePath: "/vad/",
             onSpeechStart: () => {
               if (speakingRef.current) {
                 /* Barge-in: stop Lex, start a fresh utterance. */
