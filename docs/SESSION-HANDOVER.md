@@ -1,7 +1,9 @@
 # Session handover
 
 > Pick up where the last session left off. Designed to be the first file a new Claude (or you) reads when starting fresh.
-> Last updated: 2026-05-09 (Lex voice loop slices A through E + voice UX fixes + whisper env defence).
+> Last updated: 2026-05-09 (Lex voice loop slices A through E + voice UX fixes + whisper env defence + dashboard daemon-restart cwd fix).
+
+> **State now (2026-05-09 PM):** Dashboard's "Restart Daemon" card was returning `start-daemon.ps1 not found at C:\dev\Projects\DevNeural\scripts\start-daemon.ps1` because `07-daemon/src/dashboard/routes.ts` resolved the script via `process.cwd()`. Task Scheduler launches the daemon with cwd at the project root, not `07-daemon/`, so the lookup missed. Fixed by resolving relative to the compiled module with `fileURLToPath(import.meta.url)` (consistent with how `daemon.ts` and `lifecycle/spawn.ts` already do it). Verified end-to-end: hit `/admin/daemon/restart`, daemon respawned, new PID, /health back to ok=true. Tailscale path now works the same as local.
 
 > **State now (2026-05-09):** Phases 1 through 6 shipped, plus a Lex supervisory voice layer landed across two sessions. This session shipped the post-Slice-A polish (close the active-row leak), Slices B through E (source-classed retrieval at `/lex/recall`, fenced-JSON artifact extraction for research-note / wiki-draft / project-intent / notes-summary, system prompt rewritten as four mode contracts with a synthesis directive, supervisor primitives `/lex/steer` `/lex/capture` `/lex/snapshot`, conflict-overlap signal on retrieval), plus voice UX fixes (mute auto-finalizes the in-progress utterance via a parallel ScriptProcessor capture rig, notes-mode stop emits a `notes-summary` artifact and auto-creates reminders, AudioContext resume on every tts-start), plus a defensive whisper-bin validator that auto-corrects `whisper-cli.exe` to the cuBLAS `whisper-server.exe`. The persistent User-scope `DEVNEURAL_WHISPER_BIN` was corrected at registry level. See `.continue-here.md` for the residuals list and the recommended next-action for tomorrow.
 

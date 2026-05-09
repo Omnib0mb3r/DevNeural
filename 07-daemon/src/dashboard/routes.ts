@@ -11,6 +11,7 @@ import type { Store } from '../store/index.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { DATA_ROOT } from '../paths.js';
 import { authMiddleware, registerAuthRoutes, isPinSet } from './auth.js';
 import { ReferenceStore } from '../reference/store.js';
@@ -1859,18 +1860,21 @@ export async function registerDashboardRoutes(
    * health-probes before respawning. We exit ~250ms after responding so
    * the dashboard sees a clean 200 before the connection drops. The
    * autostart Task Scheduler entry is the safety net if the relauncher
-   * itself fails for any reason — it polls every 5min. */
+   * itself fails for any reason; it polls every 5min.
+   *
+   * Script path resolved relative to this compiled module so cwd does
+   * not matter. Required because Task Scheduler launches the daemon
+   * with cwd at the project root, not 07-daemon/. */
   app.post('/admin/daemon/restart', async (_req, reply) => {
-    const startScript = path.posix
-      .join(process.cwd().replace(/\\/g, '/'), 'scripts', 'start-daemon.ps1')
-      .replace(/\//g, '\\');
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const startScript = path.resolve(here, '..', '..', 'scripts', 'start-daemon.ps1');
     if (!fs.existsSync(startScript)) {
       reply.code(500);
       return { ok: false, error: `start-daemon.ps1 not found at ${startScript}` };
     }
     /* Direct PowerShell launch: -Command runs an inline script that
      * sleeps then dot-sources start-daemon.ps1. No cmd.exe, no nested
-     * quoting, no `timeout` shell builtin — keeps the spawn argv clean
+     * quoting, no `timeout` shell builtin. Keeps the spawn argv clean
      * and avoids the "bad argument" error path some shells produce when
      * their builtins see a quoted operand. */
     const inline = `Start-Sleep -Seconds 2; & '${startScript.replace(/'/g, "''")}'`;

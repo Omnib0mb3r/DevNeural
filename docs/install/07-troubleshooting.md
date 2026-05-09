@@ -305,6 +305,22 @@ Both scripts back up `~/.claude/settings.json` before writing and accept `-DryRu
 
 ---
 
+## Dashboard "Restart Daemon" returns "start-daemon.ps1 not found at C:\dev\Projects\DevNeural\scripts\start-daemon.ps1"
+
+**Cause:** old daemon build (pre 2026-05-09). The restart endpoint resolved the script via `process.cwd()`, which is the project root when launched by Task Scheduler / autostart, not `07-daemon/`. Real path is `07-daemon/scripts/start-daemon.ps1`.
+
+**Fix:** rebuild and restart the daemon.
+```powershell
+cd C:/dev/Projects/DevNeural/07-daemon
+npm run build
+taskkill /F /PID (Get-Content C:/dev/data/skill-connections/daemon.pid) -ErrorAction SilentlyContinue
+powershell -File scripts/start-daemon.ps1
+```
+
+The fix in `src/dashboard/routes.ts` resolves the script relative to the compiled module via `fileURLToPath(import.meta.url)`, so cwd is irrelevant. Affects local browser and Tailscale access equally.
+
+---
+
 ## "I don't know what changed but it's slow"
 
 ```powershell
