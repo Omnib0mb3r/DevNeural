@@ -41,6 +41,8 @@ import type { Validator } from '../llm/validator.js';
 import { appendLog, commitWiki } from './scaffolding.js';
 import * as fs2 from 'node:fs';
 import { wikiSchemaFile } from '../paths.js';
+import { listProjects } from '../identity/registry.js';
+import { isBrainstormCwd } from '../lex/brainstorm-store.js';
 
 /* qwen3:8b routinely emits cross-ref entries as `./name.md`, `name.md`,
  * `name with spaces`, or with stray `#frag` / `?q` suffixes. Templating
@@ -705,6 +707,27 @@ async function writeNewPendingPage(
   const summary = clipString(newPage.summary ?? '', SUMMARY_MAX);
   const patternBody = clipString(newPage.pattern_body ?? '', BODY_MAX);
 
+  /* Brainstorm-derived pages start with a small weight bump. Lex
+   * synthesis is more curated than ambient coding-session noise:
+   * the user explicitly chose to brainstorm, the modes (notes,
+   * conversation, push-to-talk) all shape Lex toward extracting
+   * patterns and decisions. Bumping the starting weight from 0.30
+   * to 0.40 means a brainstorm-derived insight needs one fewer
+   * reinforcement hit to clear the pending → canonical promotion
+   * threshold and starts surfacing in retrieval sooner. Detection
+   * uses the project's registered root cwd against
+   * isBrainstormCwd so we don't have to thread a "source" flag
+   * through the ingest call sites. Pages from coding sessions
+   * keep the 0.30 default. */
+  const isBrainstormSource = (() => {
+    try {
+      const project = listProjects().find((p) => p.id === input.projectId);
+      return project ? isBrainstormCwd(project.root) : false;
+    } catch {
+      return false;
+    }
+  })();
+
   const fm: PageFrontmatter = {
     id: newPage.id,
     title,
@@ -712,7 +735,7 @@ async function writeNewPendingPage(
     insight: newPage.insight,
     summary,
     status: 'pending',
-    weight: 0.3,
+    weight: isBrainstormSource ? 0.4 : 0.3,
     hits: 0,
     corrections: 0,
     created: new Date().toISOString().slice(0, 10),
