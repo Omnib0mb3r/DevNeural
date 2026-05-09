@@ -35,7 +35,9 @@ import {
   callValidated,
   validatePass1,
   validatePass2,
+  type LlmProvider,
 } from '../llm/index.js';
+import type { Validator } from '../llm/validator.js';
 import { appendLog, commitWiki } from './scaffolding.js';
 import * as fs2 from 'node:fs';
 import { wikiSchemaFile } from '../paths.js';
@@ -308,7 +310,48 @@ export async function runIngest(
       }
     }
 
+    const wasCrossProject =
+      target.page.frontmatter.projects.length >= 2 ||
+      target.page.frontmatter.projects.includes(input.projectId);
     const updated = applyPageUpdate(target.page, update, input);
+    /* Cross-project verification gate. DEVNEURAL.md 7.3: a pattern
+     * observed only in project A becomes a cross-project page when
+     * project B's evidence joins it. Without verification, "logging"
+     * in two domains can falsely fuse into a single global page that
+     * misleads retrieval. When this update is the FIRST mention of
+     * input.projectId on a page that already had >=1 different
+     * project, ask the LLM whether the new evidence genuinely
+     * describes the same pattern. On no/uncertain we flip
+     * flag_for_review so a human (or the next lint pass) can sort it
+     * out instead of silently merging. */
+    const becameCrossProject =
+      !wasCrossProject && updated.frontmatter.projects.length >= 2;
+    if (becameCrossProject && (update.evidence_add ?? []).length > 0) {
+      try {
+        const sameSource =
+          await verifyCrossProjectFit(
+            provider,
+            updated.frontmatter,
+            updated.sections.pattern ?? '',
+            update.evidence_add ?? [],
+            input,
+            log,
+          );
+        if (!sameSource) {
+          updated.frontmatter.flag_for_review = true;
+          updated.sections.log.push(
+            `${updated.frontmatter.last_touched} verifier: cross-project evidence flagged (project ${input.projectId})`,
+          );
+          log(
+            `[ingest] ${update.id}: cross-project verifier rejected evidence from ${input.projectId}; flagged`,
+          );
+        }
+      } catch (err) {
+        log(
+          `[ingest] cross-project verifier errored: ${(err as Error).message}; allowing update`,
+        );
+      }
+    }
     await rewritePage(store, updated, target.file);
     result.pages_updated.push(update.id);
   }
@@ -564,6 +607,66 @@ const SUMMARY_MAX = 600;
 const BODY_MAX = 6000;
 const CROSS_REFS_MAX = 8;
 const EVIDENCE_MAX = 20;
+
+/* Cross-project verifier. Cheap LLM call that asks "is this new
+ * evidence chunk describing the same recurring pattern as the
+ * existing page, or are these two unrelated things that just share
+ * vocabulary?" Returns true on confident yes, false on no or
+ * uncertain. Falsing out flips flag_for_review on the caller; we
+ * never silently merge across projects without confidence.
+ *
+ * Prompt is intentionally tiny and self-contained so it works on the
+ * local model without leaning on cached system blocks. The validator
+ * accepts only `{ "same_pattern": boolean }`; anything else fails
+ * closed (treated as not-same so the human/lint sees it). */
+async function verifyCrossProjectFit(
+  provider: LlmProvider,
+  fm: PageFrontmatter,
+  patternBody: string,
+  newEvidence: string[],
+  input: IngestInput,
+  log: (msg: string) => void,
+): Promise<boolean> {
+  const evidenceBlock = newEvidence.slice(0, 5).join('\n  - ');
+  const user =
+    `Existing page:\n` +
+    `  trigger: ${fm.trigger}\n` +
+    `  insight: ${fm.insight}\n` +
+    `  pattern: ${patternBody.slice(0, 1500)}\n\n` +
+    `New evidence from project "${input.projectName}":\n  - ${evidenceBlock}\n\n` +
+    `Question: does the new evidence describe the SAME recurring pattern as the existing page (same trigger condition, same insight applies)? ` +
+    `Or does it just share vocabulary while being a different domain or different problem?\n\n` +
+    `Respond with strict JSON only: {"same_pattern": true} or {"same_pattern": false}`;
+  const verifier: Validator<{ same_pattern: boolean }> = (raw) => {
+    if (!raw || typeof raw !== 'object')
+      return { ok: false, errors: ['not object'] };
+    const v = (raw as { same_pattern?: unknown }).same_pattern;
+    if (typeof v !== 'boolean')
+      return { ok: false, errors: ['same_pattern not bool'] };
+    return { ok: true, value: { same_pattern: v }, errors: [] };
+  };
+  const result = await callValidated(
+    provider,
+    {
+      role: 'self_query',
+      systemBlocks: [
+        {
+          text:
+            'You are a strict pattern verifier for a wiki of [trigger]→[insight] pages. ' +
+            'Reply ONLY with the requested JSON object. No prose.',
+          cache: false,
+        },
+      ],
+      user,
+      maxTokens: 50,
+      ...(input.signal ? { signal: input.signal } : {}),
+    },
+    verifier,
+    log,
+  );
+  if (!result.value) return false; // fail closed
+  return result.value.same_pattern;
+}
 
 function ensureArrowTitle(title: string, trigger: string, insight: string): string {
   if (title.includes('→')) return title;
