@@ -111,8 +111,8 @@ Starting state at session boundary:
 - `docs/SESSION-HANDOVER.md` — point at this handover doc for current state
 - `docs/spec/devneural-v2.md` — only if architecture changed materially
 
-**Status:** ⬜ not started
-**Commit:** _(pending)_
+**Status:** ✅ done
+**Commit:** `842e3d7`
 
 ---
 
