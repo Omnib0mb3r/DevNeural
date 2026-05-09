@@ -123,12 +123,65 @@ const MAX_UTTERANCE_MS = 30_000;
  * 4MB. Used as a defensive abort if VAD never fires speech-end. */
 const MAX_UTTERANCE_SAMPLES = 30 * 16000;
 
+/* Persistence keys for the user-facing voice state. iOS Safari
+ * aggressively evicts backgrounded tabs and the page fully reloads on
+ * return, so React state alone is not enough; the button label and the
+ * last transcript / reply need to survive a full page reload, not just
+ * an in-app route change. Stored under the same prefix as the other
+ * voice settings so a single localStorage clear (PWA hard reset) wipes
+ * them all together. */
+const ENABLED_STORAGE_KEY = "lex-voice-enabled";
+const MODE_STORAGE_KEY = "lex-voice-mode";
+const LAST_TRANSCRIPT_STORAGE_KEY = "lex-voice-last-transcript";
+const LAST_REPLY_STORAGE_KEY = "lex-voice-last-reply";
+
+function readStoredBool(key: string): boolean {
+  if (typeof window === "undefined") return false;
+  return window.localStorage.getItem(key) === "1";
+}
+function readStoredString(key: string): string {
+  if (typeof window === "undefined") return "";
+  return window.localStorage.getItem(key) ?? "";
+}
+function readStoredMode(): Mode {
+  if (typeof window === "undefined") return "conversation";
+  const v = window.localStorage.getItem(MODE_STORAGE_KEY);
+  return v === "notes" || v === "push-to-talk" ? v : "conversation";
+}
+
 export function VoiceClient({ sessionId }: Props) {
   const [status, setStatus] = useState<Status>("idle");
-  const [enabled, setEnabled] = useState(false);
+  const [enabled, setEnabledState] = useState<boolean>(() =>
+    readStoredBool(ENABLED_STORAGE_KEY),
+  );
+  /* Wrap setEnabled so every flip writes through to localStorage. The
+   * page can be evicted by iOS Safari at any moment; we cannot rely on
+   * a single useEffect-flush at unmount. */
+  function setEnabled(next: boolean): void {
+    setEnabledState(next);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(ENABLED_STORAGE_KEY, next ? "1" : "0");
+    }
+  }
   const [muted, setMuted] = useState(false);
-  const [lastTranscript, setLastTranscript] = useState<string>("");
-  const [lastReply, setLastReply] = useState<string>("");
+  const [lastTranscript, setLastTranscriptState] = useState<string>(() =>
+    readStoredString(LAST_TRANSCRIPT_STORAGE_KEY),
+  );
+  function setLastTranscript(text: string): void {
+    setLastTranscriptState(text);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(LAST_TRANSCRIPT_STORAGE_KEY, text);
+    }
+  }
+  const [lastReply, setLastReplyState] = useState<string>(() =>
+    readStoredString(LAST_REPLY_STORAGE_KEY),
+  );
+  function setLastReply(text: string): void {
+    setLastReplyState(text);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(LAST_REPLY_STORAGE_KEY, text);
+    }
+  }
   const [errMsg, setErrMsg] = useState<string>("");
   /* Live counter shown while the user is talking so they know the
    * mic is still capturing and roughly how much they've said. */
@@ -136,7 +189,13 @@ export function VoiceClient({ sessionId }: Props) {
   /* Conversation mode = full duplex (default).
    * Notes only        = Lex captures + transcribes, no spoken reply.
    * Push-to-talk      = no VAD, hold the button, release to send. */
-  const [mode, setMode] = useState<Mode>("conversation");
+  const [mode, setModeState] = useState<Mode>(() => readStoredMode());
+  function setMode(next: Mode): void {
+    setModeState(next);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(MODE_STORAGE_KEY, next);
+    }
+  }
   const [voices, setVoices] = useState<VoicePack[]>([]);
   const [activeVoice, setActiveVoiceState] = useState<string>("");
   /* Persisted globally: localStorage holds the optimistic UI value so
