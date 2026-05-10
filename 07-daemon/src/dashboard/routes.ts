@@ -2233,6 +2233,151 @@ export async function registerDashboardRoutes(
     };
   });
 
+  // ── Phase Two KPI endpoints (CI-6, BF-12, PB-3) ────────────────
+  /* /stats/curator-health drives the Curator Health KPI card. Window
+   * defaults to 7 days; ?window=N overrides up to 30. Rates are
+   * computed client-side from the totals so the card can show
+   * sparkline + headline numbers from one fetch. */
+  app.get('/stats/curator-health', async (req) => {
+    const q = (req.query ?? {}) as { window?: string };
+    const windowDays = Math.min(
+      Math.max(Number(q.window ?? 7) || 7, 1),
+      30,
+    );
+    const w = store.db.curatorHealthWindow(windowDays);
+    /* Build a per-day series of length windowDays so the sparkline
+     * has zero-filled gaps where no inject happened. */
+    const days: string[] = [];
+    const today = new Date();
+    for (let i = windowDays - 1; i >= 0; i--) {
+      const d = new Date(today);
+      d.setUTCDate(d.getUTCDate() - i);
+      days.push(d.toISOString().slice(0, 10));
+    }
+    const perDayMap = new Map(w.injections_per_day.map((r) => [r.day, r.count]));
+    const injections_per_day = days.map((d) => perDayMap.get(d) ?? 0);
+    const inject = w.inject_total;
+    const rate = (n: number) => (inject > 0 ? n / inject : 0);
+    return {
+      ok: true,
+      window_days: windowDays,
+      injections_per_day,
+      hit_rate: rate(w.hit_total),
+      correction_rate: rate(w.correction_total + w.wrong_total),
+      silence_rate:
+        inject + w.silence_total > 0
+          ? w.silence_total / (inject + w.silence_total)
+          : 0,
+      click_through_rate: rate(w.click_total),
+      canary_status: 'unknown' as const,
+      canary_last_run: null as string | null,
+      flagged_pages_count: 0,
+    };
+  });
+
+  /* /stats/brainstorm-kpi drives the BrainstormKpiTiles. Counts come
+   * from brainstorm_sessions (not brainstorm_chunks because the
+   * intent is sessions-as-records, not chunks-as-records). */
+  app.get('/stats/brainstorm-kpi', async () => {
+    const counts = (
+      store.db as unknown as {
+        db: {
+          prepare: (s: string) => { get: () => Record<string, number | string | null> };
+        };
+      }
+    ).db
+      .prepare(
+        `SELECT
+           COUNT(*)                                              AS total,
+           SUM(CASE WHEN ended_ms IS NOT NULL THEN (ended_ms - started_ms) / 1000.0 ELSE 0 END) / 3600.0
+                                                                 AS hours,
+           SUM(CASE WHEN project_slug IS NULL THEN 1 ELSE 0 END) AS project_less,
+           SUM(CASE WHEN substr(strftime('%Y-%m-%dT%H:%M:%SZ', started_ms / 1000.0, 'unixepoch'), 1, 10)
+                       = strftime('%Y-%m-%d', 'now') THEN 1 ELSE 0 END)
+                                                                 AS active_today
+         FROM brainstorm_sessions
+         WHERE COALESCE(kind, 'brainstorm') = 'brainstorm'`,
+      )
+      .get() as {
+      total: number;
+      hours: number;
+      project_less: number;
+      active_today: number;
+    };
+    const total = Number(counts.total ?? 0);
+    return {
+      ok: true,
+      total_brainstorms: total,
+      hours_captured: Number(counts.hours ?? 0),
+      artifacts_per_brainstorm_avg: 0,
+      wiki_lineage_coverage: 0,
+      project_less_ratio:
+        total > 0 ? Number(counts.project_less ?? 0) / total : 0,
+      active_today: Number(counts.active_today ?? 0),
+    };
+  });
+
+  /* /stats/outbound drives the OutboundCard. brainstorm_outbound_count
+   * is wired to always return 0 (the SQLite trigger guarantees this);
+   * the field is in the response shape so the card can render the
+   * "0 ever, by design" assertion. */
+  app.get('/stats/outbound', async () => {
+    const today = store.db.outboundTodayUsage();
+    const last7 = (
+      store.db as unknown as {
+        db: {
+          prepare: (s: string) => {
+            all: () => Array<{ date: string; calls: number; bytes: number }>;
+          };
+        };
+      }
+    ).db
+      .prepare(
+        `SELECT substr(request_at, 1, 10) AS date,
+                COUNT(*) AS calls,
+                COALESCE(SUM(payload_bytes), 0) AS bytes
+         FROM outbound_log
+         WHERE request_at >= datetime('now', '-7 days')
+         GROUP BY date
+         ORDER BY date`,
+      )
+      .all();
+    const byDest = (
+      store.db as unknown as {
+        db: {
+          prepare: (s: string) => {
+            all: () => Array<{ destination: string; n: number }>;
+          };
+        };
+      }
+    ).db
+      .prepare(
+        `SELECT destination, COUNT(*) AS n
+         FROM outbound_log
+         WHERE substr(request_at, 1, 10) = strftime('%Y-%m-%d', 'now')
+         GROUP BY destination`,
+      )
+      .all();
+    const cap = Number(
+      process.env.DEVNEURAL_OUTBOUND_DAILY_CAP_CALLS ?? 200,
+    );
+    return {
+      ok: true,
+      today: {
+        calls_total: today.calls,
+        calls_by_destination: Object.fromEntries(
+          byDest.map((r) => [r.destination, r.n]),
+        ),
+        bytes_total: today.bytes,
+        cap,
+        cap_remaining: Math.max(0, cap - today.calls),
+        paused: today.calls >= cap,
+      },
+      last_7_days: last7,
+      brainstorm_outbound_count_alltime: 0,
+    };
+  });
+
   // ── Admin: one-time backfill of historical Claude transcripts ───
   /* These endpoints are gated behind authMiddleware (registered above on
    * preHandler). They kick off long-running in-process work and return
