@@ -434,6 +434,39 @@ export const statsCuratorHealth = (windowDays?: number) => {
   return request<CuratorHealthStats>(`/stats/curator-health${qs}`);
 };
 
+/* BF-12 brainstorm KPI tiles. Endpoint shape mirrors spec section
+ * 4.1 GET /stats/brainstorm-kpi. */
+export interface BrainstormKpiStats {
+  ok: boolean;
+  total_brainstorms: number;
+  hours_captured: number;
+  artifacts_per_brainstorm_avg: number;
+  wiki_lineage_coverage: number;
+  project_less_ratio: number;
+  active_today: number;
+}
+export const statsBrainstormKpi = () =>
+  request<BrainstormKpiStats>("/stats/brainstorm-kpi");
+
+/* PB-3 outbound dashboard tile. Endpoint shape mirrors spec section
+ * 4.1 GET /stats/outbound. brainstorm_outbound_count_alltime is
+ * always 0 by contract; the field exists so the card can render
+ * the "0 ever, by design" assertion. */
+export interface OutboundStats {
+  ok: boolean;
+  today: {
+    calls_total: number;
+    calls_by_destination: Record<string, number>;
+    bytes_total: number;
+    cap: number;
+    cap_remaining: number;
+    paused: boolean;
+  };
+  last_7_days: Array<{ date: string; calls: number; bytes: number }>;
+  brainstorm_outbound_count_alltime: number;
+}
+export const statsOutbound = () => request<OutboundStats>("/stats/outbound");
+
 export const spawnLex = (cwd?: string, resumeSessionId?: string) =>
   request<{ ok: boolean; ptyId?: string; pid?: number; cwd?: string; resumed?: boolean; error?: string }>(
     "/pty/spawn-lex",
