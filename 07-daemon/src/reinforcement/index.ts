@@ -590,10 +590,42 @@ export function evaluateCorrection(
   commitWiki(`reinforce correction ${p.pageId}`);
 }
 
+/* WI-5 pause mode. Reads DEVNEURAL_PAUSE_MODE on every call so the
+ * env var can be flipped at runtime without daemon restart.
+ *   on   - decay always frozen
+ *   off  - decay always runs
+ *   auto - decay runs unless the daemon has seen no activity for
+ *          DEVNEURAL_PAUSE_INACTIVITY_DAYS days. Activity is defined
+ *          as any reinforcement-log line in that window.
+ *
+ * The auto branch falls back to "not paused" when the activity
+ * timestamp file is missing or unreadable so a fresh install never
+ * silently freezes its own decay loop. */
+function isPauseModeActive(): boolean {
+  const mode = (process.env.DEVNEURAL_PAUSE_MODE ?? 'auto').toLowerCase();
+  if (mode === 'on') return true;
+  if (mode === 'off') return false;
+  // auto
+  const days = Number(process.env.DEVNEURAL_PAUSE_INACTIVITY_DAYS ?? 21);
+  if (!Number.isFinite(days) || days <= 0) return false;
+  try {
+    if (!fs.existsSync(reinforcementLog)) return false;
+    const stat = fs.statSync(reinforcementLog);
+    const ageMs = Date.now() - stat.mtimeMs;
+    return ageMs > days * 24 * 60 * 60 * 1000;
+  } catch {
+    return false;
+  }
+}
+
 export async function decayInactivePages(
   store: Store,
   log: (msg: string) => void = () => undefined,
 ): Promise<{ decayed: number; archived: number }> {
+  if (isPauseModeActive()) {
+    log('[reinforce] pause mode active; decay skipped');
+    return { decayed: 0, archived: 0 };
+  }
   let decayed = 0;
   let archived = 0;
   const dirs = [wikiPagesDir(), wikiPendingDir()];
