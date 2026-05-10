@@ -693,6 +693,125 @@ export interface RuntimeConfigRow {
 }
 export const listRuntimeConfig = () =>
   request<{ ok: boolean; config: RuntimeConfigRow[] }>(`/runtime-config`);
+/* Wave 2 day 5: meetings + lex feedback + lex prompts + lex replay
+ * + lex awareness. */
+export interface MeetingRow extends BrainstormSessionRow {
+  project_slug?: string | null;
+  audio_path?: string | null;
+  consent_acked?: number;
+  consent_acked_at?: string | null;
+  consent_acked_by?: string | null;
+  keep_audio?: number;
+  attendees?: string | null;
+  meeting_topic?: string | null;
+  kind?: "brainstorm" | "meeting";
+}
+export interface MeetingActionItem {
+  id: string;
+  meeting_id: string;
+  text: string;
+  assignee: string | null;
+  due: string | null;
+  reminder_id: string | null;
+  status: "open" | "done" | "dismissed" | "superseded";
+  source_turn_index: number | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+export const listMeetings = (
+  opts: { project?: string; date?: string; consent?: "acked" | "pending"; limit?: number } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.project) qs.set("project", opts.project);
+  if (opts.date) qs.set("date", opts.date);
+  if (opts.consent) qs.set("consent", opts.consent);
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const q = qs.toString();
+  return request<{ ok: boolean; meetings: MeetingRow[] }>(
+    `/meetings${q ? `?${q}` : ""}`,
+  );
+};
+export const getMeeting = (id: string) =>
+  request<{
+    ok: boolean;
+    meeting: MeetingRow;
+    action_items: MeetingActionItem[];
+    audio_purges_at: string | null;
+    error?: string;
+  }>(`/meetings/${encodeURIComponent(id)}`);
+export const consentAckMeeting = (id: string, acked_by?: string) =>
+  request<{ ok: boolean; meeting?: MeetingRow; error?: string }>(
+    `/meetings/${encodeURIComponent(id)}/consent-ack`,
+    { method: "POST", body: { acked_by } },
+  );
+export const setMeetingKeepAudio = (id: string, keep: boolean) =>
+  request<{ ok: boolean; meeting?: MeetingRow; error?: string }>(
+    `/meetings/${encodeURIComponent(id)}/keep-audio`,
+    { method: "POST", body: { keep } },
+  );
+export const addMeetingActionItem = (
+  id: string,
+  body: { text: string; assignee?: string; due?: string },
+) =>
+  request<{ ok: boolean; action_items: MeetingActionItem[]; error?: string }>(
+    `/meetings/${encodeURIComponent(id)}/action-items`,
+    { method: "POST", body },
+  );
+export const updateMeetingActionItem = (
+  meetingId: string,
+  itemId: string,
+  status: MeetingActionItem["status"],
+) =>
+  request<{ ok: boolean; action_item?: MeetingActionItem; error?: string }>(
+    `/meetings/${encodeURIComponent(meetingId)}/action-items/${encodeURIComponent(itemId)}`,
+    { method: "PATCH", body: { status } },
+  );
+export const promoteMeetingToWiki = (
+  id: string,
+  body: { slug?: string; title?: string } = {},
+) =>
+  request<{ ok: boolean; wiki_page_id?: string; error?: string }>(
+    `/meetings/${encodeURIComponent(id)}/promote-to-wiki`,
+    { method: "POST", body },
+  );
+
+export const lexFeedback = (body: {
+  turn_id: string;
+  prompt_version: string;
+  vote: "up" | "down";
+  reason?: string;
+  brainstorm_id?: string | null;
+}) =>
+  request<{ ok: boolean; id?: string; error?: string }>(`/lex/feedback`, {
+    method: "POST",
+    body,
+  });
+
+export const listLexPromptVersions = () =>
+  request<{ ok: boolean; versions: string[] }>(`/lex/prompts/versions`);
+
+export interface LexAwarenessEvent {
+  ts: string;
+  kind: string;
+  label: string;
+  brainstorm_id?: string | null;
+  detail?: Record<string, unknown>;
+}
+export const lexAwarenessRecent = (limit = 20, detail = false) =>
+  request<{ ok: boolean; mode: string; events: LexAwarenessEvent[]; budget_remaining_tokens: number }>(
+    `/lex/awareness/recent?limit=${limit}${detail ? "&detail=true" : ""}`,
+  );
+
+export const triggerLexReplay = (body: {
+  input_path: string;
+  version_a: string;
+  version_b: string;
+}) =>
+  request<{ ok: boolean; result?: unknown; error?: string }>(
+    `/admin/lex-replay`,
+    { method: "POST", body },
+  );
+
 export const setRuntimeConfig = (key: string, value: string) =>
   request<{ ok: boolean; key?: string; value?: string; error?: string }>(
     `/runtime-config/${encodeURIComponent(key)}`,

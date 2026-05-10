@@ -16,6 +16,7 @@ import { lexPickStable } from "@/lib/lex";
 const TABS = [
   { href: "/",            label: "Home",           icon: "Home" as const },
   { href: "/brainstorms", label: "Brainstorms",    icon: "Sparkles" as const },
+  { href: "/meetings",    label: "Meetings",       icon: "Mic" as const },
   { href: "/sessions",    label: "Sessions",       icon: "Terminal" as const },
   { href: "/wiki",        label: "Wiki",           icon: "BookOpen" as const },
   { href: "/drafts",      label: "Drafts",         icon: "FilePen" as const },

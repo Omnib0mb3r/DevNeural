@@ -2697,6 +2697,338 @@ export async function registerDashboardRoutes(
     return reply.send(fs.createReadStream(wavPath, { start, end }));
   });
 
+  /* ── /meetings (Wave 2 day 5 step 24a / BF-15 / BF-17 / 5.1) ─────
+   * Meeting-kind brainstorm rows surface here; the route family
+   * mirrors /brainstorms but adds the consent gate, action items,
+   * and the explicit promote-to-wiki path that meetings require
+   * (BF-15: no auto-distillation). */
+  app.get('/meetings', async (req) => {
+    const q = (req.query ?? {}) as {
+      project?: string;
+      date?: string;
+      consent?: string;
+      limit?: string;
+    };
+    const opts: Parameters<typeof store.db.listBrainstormsFiltered>[0] = {
+      kind: 'meeting',
+    };
+    if (q.project) opts.project_slug = q.project;
+    if (q.date) opts.date = q.date;
+    if (q.limit) opts.limit = Math.min(500, Math.max(1, Number(q.limit)));
+    let rows = store.db.listBrainstormsFiltered(opts);
+    if (q.consent === 'acked') rows = rows.filter((r) => (r.consent_acked ?? 0) === 1);
+    if (q.consent === 'pending') rows = rows.filter((r) => (r.consent_acked ?? 0) === 0);
+    return { ok: true, meetings: rows };
+  });
+
+  app.get('/meetings/:id', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.getBrainstorm(id);
+    if (!row || (row.kind ?? 'brainstorm') !== 'meeting') {
+      reply.code(404);
+      return { ok: false, error: 'meeting not found' };
+    }
+    /* Audio purge countdown per BF-17 / spec line 100. Default
+     * meeting audio max age is 30 days; the dashboard uses the
+     * derived audio_purges_at to render the countdown chip. */
+    const maxAgeDays = Number(
+      process.env.DEVNEURAL_MEETING_AUDIO_MAX_AGE_DAYS ?? 30,
+    );
+    let audio_purges_at: string | null = null;
+    if (row.audio_path && (row.keep_audio ?? 0) !== 1 && row.ended_ms) {
+      audio_purges_at = new Date(
+        row.ended_ms + maxAgeDays * 24 * 60 * 60 * 1000,
+      ).toISOString();
+    }
+    return {
+      ok: true,
+      meeting: row,
+      action_items: store.db.listMeetingActionItems(id),
+      audio_purges_at,
+    };
+  });
+
+  app.post('/meetings/:id/consent-ack', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { acked_by?: string };
+    const row = store.db.getBrainstorm(id);
+    if (!row || (row.kind ?? 'brainstorm') !== 'meeting') {
+      reply.code(404);
+      return { ok: false, error: 'meeting not found' };
+    }
+    store.db.setBrainstormPhaseTwo(id, {
+      consent_acked: 1,
+      consent_acked_at: new Date().toISOString(),
+      consent_acked_by: body.acked_by ?? 'user',
+    });
+    return { ok: true, meeting: store.db.getBrainstorm(id) };
+  });
+
+  app.post('/meetings/:id/keep-audio', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { keep?: boolean };
+    const row = store.db.getBrainstorm(id);
+    if (!row || (row.kind ?? 'brainstorm') !== 'meeting') {
+      reply.code(404);
+      return { ok: false, error: 'meeting not found' };
+    }
+    store.db.setBrainstormPhaseTwo(id, { keep_audio: body.keep === false ? 0 : 1 });
+    return { ok: true, meeting: store.db.getBrainstorm(id) };
+  });
+
+  app.post('/meetings/:id/action-items', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as {
+      text?: string;
+      assignee?: string;
+      due?: string;
+      source_turn_index?: number;
+    };
+    const row = store.db.getBrainstorm(id);
+    if (!row || (row.kind ?? 'brainstorm') !== 'meeting') {
+      reply.code(404);
+      return { ok: false, error: 'meeting not found' };
+    }
+    if (!body.text || typeof body.text !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'text required' };
+    }
+    const aid = `mai-${id}-${Date.now()}`;
+    store.db.insertMeetingActionItem({
+      id: aid,
+      meeting_id: id,
+      text: body.text,
+      assignee: body.assignee ?? null,
+      due: body.due ?? null,
+      source_turn_index: typeof body.source_turn_index === 'number' ? body.source_turn_index : null,
+    });
+    return { ok: true, action_items: store.db.listMeetingActionItems(id) };
+  });
+
+  app.patch('/meetings/:id/action-items/:aid', async (req, reply) => {
+    const id = (req.params as { id: string; aid: string }).id;
+    const aid = (req.params as { id: string; aid: string }).aid;
+    const body = (req.body ?? {}) as { status?: 'open' | 'done' | 'dismissed' | 'superseded' };
+    if (!body.status || !['open', 'done', 'dismissed', 'superseded'].includes(body.status)) {
+      reply.code(400);
+      return { ok: false, error: 'status must be open|done|dismissed|superseded' };
+    }
+    const updated = store.db.updateMeetingActionItemStatus(aid, body.status);
+    if (!updated || updated.meeting_id !== id) {
+      reply.code(404);
+      return { ok: false, error: 'action item not found' };
+    }
+    return { ok: true, action_item: updated };
+  });
+
+  /* Promote a meeting to a wiki page. Meetings never auto-distill
+   * (BF-15); the user must explicitly opt in via this endpoint. The
+   * actual write borrows the same writeDraftAsPendingWikiPage helper
+   * the BF-7 path uses, so the resulting page lands in pending/ and
+   * waits for /admin/wiki/promote/:id to canonicalise. */
+  app.post('/meetings/:id/promote-to-wiki', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { slug?: string; title?: string };
+    const row = store.db.getBrainstorm(id);
+    if (!row || (row.kind ?? 'brainstorm') !== 'meeting') {
+      reply.code(404);
+      return { ok: false, error: 'meeting not found' };
+    }
+    const slug = body.slug ?? `meeting-${id}`;
+    if (!/^[a-z0-9][a-z0-9-]+$/.test(slug)) {
+      reply.code(400);
+      return { ok: false, error: 'slug must match [a-z0-9][a-z0-9-]+' };
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    const action = store.db.listMeetingActionItems(id);
+    const summary = (row.last_summary ?? row.meeting_topic ?? row.user_label ?? id).slice(0, 580);
+    const body_markdown =
+      `# Meeting summary\n\n${row.last_summary ?? '(no summary captured)'}\n\n` +
+      (action.length > 0
+        ? `## Action items\n${action.map((a) => `- ${a.text}${a.assignee ? ` (${a.assignee})` : ''}${a.due ? ` due ${a.due}` : ''}`).join('\n')}\n`
+        : '');
+    try {
+      writePage(wikiPendingDir(), {
+        frontmatter: {
+          id: slug,
+          title: body.title ?? `${row.user_label ?? 'Meeting'} → notes`,
+          trigger: `from meeting ${id}`,
+          insight: row.meeting_topic ?? row.user_label ?? slug,
+          summary,
+          status: 'pending',
+          weight: 0.3,
+          hits: 0,
+          corrections: 0,
+          created: today,
+          last_touched: today,
+          projects: [],
+          human_edited: true,
+          human_edited_at: new Date().toISOString(),
+          source_meetings: [id],
+          derived_from_meeting: true,
+        },
+        sections: {
+          pattern: body_markdown,
+          crossRefs: [],
+          crossRefsRaw: [],
+          evidence: [],
+          openQuestions: [],
+          log: [`promoted from meeting ${id} on ${today}`],
+        },
+      });
+      return { ok: true, wiki_page_id: slug };
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, error: (err as Error).message };
+    }
+  });
+
+  /* ── /lex/feedback (Wave 2 day 5 step 24 / LX-5 / B5) ────────────
+   * Inline thumbs UI writes one row per Lex turn. prompt_version
+   * comes from the same versioned-prompt builder so weeks of votes
+   * can be aggregated per revision. */
+  app.post('/lex/feedback', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      turn_id?: string;
+      brainstorm_id?: string | null;
+      prompt_version?: string;
+      vote?: 'up' | 'down';
+      reason?: string;
+    };
+    if (!body.turn_id || !body.prompt_version || (body.vote !== 'up' && body.vote !== 'down')) {
+      reply.code(400);
+      return { ok: false, error: 'turn_id, prompt_version, vote (up|down) required' };
+    }
+    const id = `lf-${body.turn_id}-${body.vote}`;
+    try {
+      store.db.insertLexFeedback({
+        id,
+        turn_id: body.turn_id,
+        brainstorm_id: body.brainstorm_id ?? null,
+        prompt_version: body.prompt_version,
+        vote: body.vote,
+        reason: body.reason ?? null,
+      });
+    } catch (err) {
+      /* Duplicate vote on same turn is a no-op; surface other
+       * errors so the caller can retry. */
+      if (!/UNIQUE/.test((err as Error).message)) {
+        reply.code(500);
+        return { ok: false, error: (err as Error).message };
+      }
+    }
+    return { ok: true, id };
+  });
+
+  app.get('/lex/feedback', async (req) => {
+    const q = (req.query ?? {}) as {
+      version?: string;
+      brainstorm?: string;
+      vote?: string;
+      limit?: string;
+    };
+    const opts: Parameters<typeof store.db.listLexFeedback>[0] = {};
+    if (q.version) opts.prompt_version = q.version;
+    if (q.brainstorm) opts.brainstorm_id = q.brainstorm;
+    if (q.vote === 'up' || q.vote === 'down') opts.vote = q.vote;
+    if (q.limit) opts.limit = Math.min(500, Math.max(1, Number(q.limit)));
+    return { ok: true, feedback: store.db.listLexFeedback(opts) };
+  });
+
+  app.get('/lex/feedback/up-rate/:version', async (req) => {
+    const version = (req.params as { version: string }).version;
+    return { ok: true, version, ...store.db.lexFeedbackUpRate(version) };
+  });
+
+  /* ── /lex/awareness (Wave 2 day 5 step 24b / LX-7 + LX-8) ────────
+   * L1 broadcaster + L2 recent_context surface. Producers POST
+   * events; consumers (Lex via tool, dashboard for telemetry) GET
+   * the recent slice. */
+  app.get('/lex/awareness/recent', async (req) => {
+    const q = (req.query ?? {}) as { limit?: string; detail?: string };
+    const { recentContext } = await import('../lex/awareness.js');
+    return {
+      ok: true,
+      ...recentContext({
+        limit: q.limit ? Math.min(200, Math.max(1, Number(q.limit))) : 20,
+        detail: q.detail === 'true',
+      }),
+    };
+  });
+
+  app.post('/lex/awareness/emit', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      kind?: string;
+      label?: string;
+      detail?: Record<string, unknown>;
+      brainstorm_id?: string | null;
+    };
+    const valid = ['audit-finding', 'reminder-due', 'draft-auto-dropped', 'canary-fail', 'session-start', 'session-end', 'capture', 'manual'];
+    if (!body.kind || !valid.includes(body.kind) || !body.label) {
+      reply.code(400);
+      return { ok: false, error: `kind must be one of ${valid.join('|')}; label required` };
+    }
+    const { emitAwarenessEvent } = await import('../lex/awareness.js');
+    const r = emitAwarenessEvent({
+      kind: body.kind as 'audit-finding',
+      label: body.label,
+      ...(body.detail ? { detail: body.detail } : {}),
+      brainstorm_id: body.brainstorm_id ?? null,
+    });
+    return { ok: true, ...r };
+  });
+
+  app.post('/lex/awareness/mode', async (req, reply) => {
+    const body = (req.body ?? {}) as { mode?: string };
+    if (body.mode !== 'conversation' && body.mode !== 'push-to-talk' && body.mode !== 'notes') {
+      reply.code(400);
+      return { ok: false, error: 'mode must be conversation|push-to-talk|notes' };
+    }
+    const { setAwarenessMode } = await import('../lex/awareness.js');
+    setAwarenessMode(body.mode);
+    return { ok: true, mode: body.mode };
+  });
+
+  /* ── /lex/prompts (Wave 2 day 5 step 20 / LX-1) ──────────────────
+   * Disk archive of every Lex system-prompt revision. The dashboard
+   * LexReplayViewer lists versions and reads bodies. */
+  app.get('/lex/prompts/versions', async () => {
+    const { listPromptVersions } = await import('../lex/prompt-archive.js');
+    return { ok: true, versions: listPromptVersions().map((v) => v.version) };
+  });
+
+  app.post('/admin/lex-replay', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      input_path?: string;
+      version_a?: string;
+      version_b?: string;
+    };
+    if (!body.input_path || !body.version_a || !body.version_b) {
+      reply.code(400);
+      return { ok: false, error: 'input_path, version_a, version_b required' };
+    }
+    const { runLexReplay } = await import('../lex/replay.js');
+    const r = await runLexReplay({
+      inputPath: body.input_path,
+      versionA: body.version_a,
+      versionB: body.version_b,
+      log,
+    });
+    return { ok: true, result: r };
+  });
+
+  app.get('/lex/prompts/:version', async (req, reply) => {
+    const version = (req.params as { version: string }).version;
+    const { readPromptVersion } = await import('../lex/prompt-archive.js');
+    const body = readPromptVersion(version);
+    if (body === null) {
+      reply.code(404);
+      return { ok: false, error: 'version not found' };
+    }
+    reply.header('content-type', 'text/markdown; charset=utf-8');
+    return reply.send(body);
+  });
+
   /* ── audit_findings (Wave 2 day 4 steps 15, 16, 17) ─────────────
    * Cross-source surface for lint, the LLM self-audit, the canary,
    * the schema-regression suite, and the user-flag "this looks wrong"

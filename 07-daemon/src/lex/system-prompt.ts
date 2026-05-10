@@ -617,7 +617,45 @@ function snapshotRecentWiki(): string {
   }
 }
 
-export function buildLexSystemPrompt(): string {
+import {
+  loadFewShot,
+  loadRefusalContract,
+  loadRefusalContractMeeting,
+} from './prompt-blocks.js';
+import { archivePromptVersion } from './prompt-archive.js';
+
+/* Wave 2 day 5 step 22 + 23 (LX-3, LX-4): per-mode few-shot block +
+ * refusal contract block. Loaded from disk each call so the user can
+ * edit them without a daemon restart. Meeting mode also pulls the
+ * meeting-specific refusal addendum. Step 20 (LX-1): the assembled
+ * prompt is archived to <data>/lex-prompts/<version>.md whenever the
+ * body changes; the archive returns the version id so callers can
+ * tag lex_feedback rows with it. */
+export interface BuildLexSystemPromptOptions {
+  mode?: 'conversation' | 'push-to-talk' | 'notes';
+  /* When false, skip the on-disk archive write. Default true. The
+   * A/B replay harness sets false so tooling does not pollute the
+   * live archive. */
+  archive?: boolean;
+}
+
+export interface BuildLexSystemPromptResult {
+  prompt: string;
+  version: string;
+  mode: 'conversation' | 'push-to-talk' | 'notes';
+}
+
+export function buildLexSystemPrompt(
+  opts: BuildLexSystemPromptOptions = {},
+): string {
+  return buildLexSystemPromptVersioned(opts).prompt;
+}
+
+export function buildLexSystemPromptVersioned(
+  opts: BuildLexSystemPromptOptions = {},
+): BuildLexSystemPromptResult {
+  const mode = opts.mode ?? 'conversation';
+  const archive = opts.archive !== false;
   const ts = new Date().toISOString();
   const snapshot = `# Live snapshot (as of ${ts})
 
@@ -638,12 +676,31 @@ ${snapshotReminders()}
 ## Recent wiki pages
 ${snapshotRecentWiki()}
 `;
-  return [
+  const fewShot = loadFewShot(mode);
+  const refusalBlocks: string[] = [loadRefusalContract()];
+  if (mode === 'notes') refusalBlocks.push(loadRefusalContractMeeting());
+  const layers = [
     IDENTITY,
     MODE_CONTRACTS,
     ARTIFACT_CONTRACTS,
     API_SURFACE,
     SELF_CHECK,
+    refusalBlocks.join('\n\n'),
+    fewShot,
     snapshot,
-  ].join('\n\n');
+  ];
+  /* Snapshot section drifts every call (timestamp + live state); it
+   * must NOT participate in the version hash or the archive grows
+   * one row per spawn. Hash everything BEFORE the snapshot. */
+  const stable = layers.slice(0, -1).join('\n\n');
+  const prompt = `${stable}\n\n${snapshot}`;
+  let version = 'unarchived';
+  if (archive) {
+    try {
+      version = archivePromptVersion(stable).version;
+    } catch {
+      /* archive is observational; never block prompt assembly */
+    }
+  }
+  return { prompt, version, mode };
 }

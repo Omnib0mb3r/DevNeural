@@ -72,6 +72,35 @@ export interface BrainstormSessionRow {
   provenance?: 'voice' | 'audit-document' | 'synthetic';
 }
 
+/* lex_feedback row. Inline-thumbs writes here keyed on the system-
+ * prompt version so the prompt-tuning loop can aggregate up-rate
+ * per revision over weeks. */
+export interface LexFeedbackRow {
+  id: string;
+  turn_id: string;
+  brainstorm_id: string | null;
+  prompt_version: string;
+  vote: 'up' | 'down';
+  reason: string | null;
+  created_at: string;
+}
+
+/* meeting_action_items row. Extracted from notes-summary artifacts at
+ * the end of a meeting session; surfaced in MeetingDetail + seeds
+ * reminders. */
+export interface MeetingActionItemRow {
+  id: string;
+  meeting_id: string;
+  text: string;
+  assignee: string | null;
+  due: string | null;
+  reminder_id: string | null;
+  status: 'open' | 'done' | 'dismissed' | 'superseded';
+  source_turn_index: number | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+
 /* audit_findings row. Cross-source surface that lint, the LLM
  * self-audit, the canary, the schema-regression suite, and the
  * random artifact sampler all write to. Wave 2 day 4 introduces the
@@ -711,6 +740,136 @@ export class IndexDb {
     return this.db
       .prepare(`SELECT * FROM runtime_config ORDER BY key`)
       .all() as RuntimeConfigRow[];
+  }
+
+  /* Wave 2 day 5 step 24 (LX-5 / B5) lex_feedback helpers. */
+  insertLexFeedback(row: {
+    id: string;
+    turn_id: string;
+    brainstorm_id?: string | null;
+    prompt_version: string;
+    vote: 'up' | 'down';
+    reason?: string | null;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO lex_feedback
+           (id, turn_id, brainstorm_id, prompt_version, vote, reason)
+         VALUES (@id, @turn_id, @brainstorm_id, @prompt_version, @vote, @reason)`,
+      )
+      .run({
+        brainstorm_id: null,
+        reason: null,
+        ...row,
+      });
+  }
+
+  listLexFeedback(opts: {
+    prompt_version?: string;
+    brainstorm_id?: string;
+    vote?: 'up' | 'down';
+    limit?: number;
+  } = {}): LexFeedbackRow[] {
+    const limit = Math.min(500, Math.max(1, opts.limit ?? 100));
+    const where: string[] = [];
+    const params: Array<string | number> = [];
+    if (opts.prompt_version) {
+      where.push(`prompt_version = ?`);
+      params.push(opts.prompt_version);
+    }
+    if (opts.brainstorm_id) {
+      where.push(`brainstorm_id = ?`);
+      params.push(opts.brainstorm_id);
+    }
+    if (opts.vote) {
+      where.push(`vote = ?`);
+      params.push(opts.vote);
+    }
+    const sql =
+      `SELECT * FROM lex_feedback` +
+      (where.length ? ` WHERE ${where.join(' AND ')}` : '') +
+      ` ORDER BY created_at DESC LIMIT ?`;
+    params.push(limit);
+    return this.db.prepare(sql).all(...params) as LexFeedbackRow[];
+  }
+
+  /* Per-prompt-version up-rate. Drives the LX-1 prompt loop telemetry. */
+  lexFeedbackUpRate(promptVersion: string): {
+    up: number;
+    down: number;
+    total: number;
+    up_rate: number;
+  } {
+    const r = this.db
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN vote = 'up' THEN 1 ELSE 0 END) AS up,
+           SUM(CASE WHEN vote = 'down' THEN 1 ELSE 0 END) AS down,
+           COUNT(*) AS total
+         FROM lex_feedback
+         WHERE prompt_version = ?`,
+      )
+      .get(promptVersion) as { up: number; down: number; total: number };
+    const up = Number(r.up ?? 0);
+    const down = Number(r.down ?? 0);
+    const total = Number(r.total ?? 0);
+    return { up, down, total, up_rate: total > 0 ? up / total : 0 };
+  }
+
+  /* Wave 2 day 5 step 24a meeting_action_items helpers. */
+  insertMeetingActionItem(row: {
+    id: string;
+    meeting_id: string;
+    text: string;
+    assignee?: string | null;
+    due?: string | null;
+    reminder_id?: string | null;
+    status?: 'open' | 'done' | 'dismissed' | 'superseded';
+    source_turn_index?: number | null;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO meeting_action_items
+           (id, meeting_id, text, assignee, due, reminder_id, status, source_turn_index)
+         VALUES (@id, @meeting_id, @text, @assignee, @due, @reminder_id, @status, @source_turn_index)`,
+      )
+      .run({
+        assignee: null,
+        due: null,
+        reminder_id: null,
+        status: 'open',
+        source_turn_index: null,
+        ...row,
+      });
+  }
+
+  listMeetingActionItems(meetingId: string): MeetingActionItemRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM meeting_action_items WHERE meeting_id = ? ORDER BY created_at ASC`,
+      )
+      .all(meetingId) as MeetingActionItemRow[];
+  }
+
+  updateMeetingActionItemStatus(
+    id: string,
+    status: 'open' | 'done' | 'dismissed' | 'superseded',
+  ): MeetingActionItemRow | null {
+    const isTerminal = status !== 'open';
+    this.db
+      .prepare(
+        `UPDATE meeting_action_items SET status = ?, resolved_at = ? WHERE id = ?`,
+      )
+      .run(
+        status,
+        isTerminal ? new Date().toISOString() : null,
+        id,
+      );
+    return (
+      (this.db
+        .prepare(`SELECT * FROM meeting_action_items WHERE id = ?`)
+        .get(id) as MeetingActionItemRow | undefined) ?? null
+    );
   }
 
   /* CP-1 fallback audit log. Wave 2 day 3 reuses this table for the
