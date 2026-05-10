@@ -45,6 +45,10 @@ interface ArtifactRef {
   id: string;
   title?: string;
   added_ms?: number;
+  /* Wave 2 carry-over #1: claude-code assistant message uuid that
+   * spawned this artifact. Used as turn_id by LexThumbs so per-turn
+   * thumbs aggregate across every artifact emitted in the same turn. */
+  turn_id?: string;
 }
 
 interface Artifacts {

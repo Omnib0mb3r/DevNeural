@@ -54,7 +54,10 @@ import {
   startSessionDiscoveryProbe,
   seedFirstTurn,
 } from './pty-host.js';
-import { buildLexSystemPrompt } from '../lex/system-prompt.js';
+import {
+  buildLexSystemPrompt,
+  buildLexSystemPromptVersioned,
+} from '../lex/system-prompt.js';
 import {
   listBrainstorms,
   getBrainstorm,
@@ -787,6 +790,7 @@ export async function registerDashboardRoutes(
       id: string;
       title?: string;
       added_ms?: number;
+      turn_id?: string;
     }
     interface ArtifactManifest {
       research_notes: ArtifactManifestRef[];
@@ -829,6 +833,7 @@ export async function registerDashboardRoutes(
       created_ms: number;
       path: string;
       preview: string;
+      turn_id?: string;
     }
     const items: ArtifactItem[] = [];
     const categories: Array<keyof ArtifactManifest> = [
@@ -872,6 +877,7 @@ export async function registerDashboardRoutes(
             created_ms: parsed.created_ms ?? ref.added_ms ?? 0,
             path: resolved.file,
             preview,
+            ...(ref.turn_id ? { turn_id: ref.turn_id } : {}),
           });
         } catch {
           /* Skip unreadable / malformed artifact file. */
@@ -879,7 +885,13 @@ export async function registerDashboardRoutes(
       }
     }
     items.sort((a, b) => b.created_ms - a.created_ms);
-    return { ok: true, artifacts: items };
+    return {
+      ok: true,
+      artifacts: items,
+      ...(row.prompt_version
+        ? { session_prompt_version: row.prompt_version }
+        : {}),
+    };
   });
 
   /* Full artifact body. Used by the dashboard when the user expands
@@ -1126,7 +1138,9 @@ export async function registerDashboardRoutes(
       }
     }
     try {
-      const systemPrompt = buildLexSystemPrompt();
+      const built = buildLexSystemPromptVersioned();
+      const systemPrompt = built.prompt;
+      const promptVersion = built.version;
       /* Lex's brainstorm cwd is daemon-owned scratch space with no real
        * project files, so Claude Code's permissions onboarding wizard
        * just blocks the seed greeting and the SessionStart hook from
@@ -1161,6 +1175,21 @@ export async function registerDashboardRoutes(
           resumeId ? ` resume=${resumeId}` : ''
         }`,
       );
+      /* Wave 2 carry-over #1: pin the system-prompt version onto the
+       * brainstorm row that pty-host registered. setBrainstormPhaseTwo
+       * is the safe writer (insertBrainstorm/updateBrainstorm round-
+       * trip resets Phase Two columns to defaults). Best-effort; PTY
+       * spawn for a non-brainstorm cwd has no row to patch. */
+      try {
+        const bs = store.db.getBrainstormByPty(r.ptyId);
+        if (bs) {
+          store.db.setBrainstormPhaseTwo(bs.id, {
+            prompt_version: promptVersion,
+          });
+        }
+      } catch {
+        /* observability only; never block spawn */
+      }
       /* Fresh spawns get an autonomous first-turn greeting via the
        * [seed] protocol. Resumed spawns SKIP the seed: claude is
        * already restoring the prior conversation and a synthetic
@@ -1168,7 +1197,13 @@ export async function registerDashboardRoutes(
       if (!resumeId) {
         seedFirstTurn(r.ptyId);
       }
-      return { ok: true, ...r, cwd, resumed: Boolean(resumeId) };
+      return {
+        ok: true,
+        ...r,
+        cwd,
+        resumed: Boolean(resumeId),
+        prompt_version: promptVersion,
+      };
     } catch (err) {
       reply.code(500);
       return { ok: false, error: (err as Error).message };

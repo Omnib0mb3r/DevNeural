@@ -166,6 +166,11 @@ export interface PersistedArtifact {
   category: 'research_notes' | 'wiki_drafts' | 'spawned_projects' | 'reminders';
   title: string;
   file: string;
+  /** Claude-Code assistant message uuid for the turn that produced
+   * this artifact. Wave 2 carry-over #1: surfaces as turn_id in
+   * LexThumbs so multiple artifacts from the same turn share a vote.
+   * Undefined when the caller does not supply a dedupeKey. */
+  turn_id?: string;
   /** Reminder ids fanned out from a notes-summary block, if any. */
   reminder_ids?: string[];
 }
@@ -254,7 +259,11 @@ export function processAssistantTurn(
     }
     if (opts.brainstormId) {
       try {
-        appendArtifact(opts.brainstormId, category, { id, title });
+        appendArtifact(opts.brainstormId, category, {
+          id,
+          title,
+          ...(opts.dedupeKey ? { turn_id: opts.dedupeKey } : {}),
+        });
       } catch {
         /* observability */
       }
@@ -265,6 +274,7 @@ export function processAssistantTurn(
       category,
       title,
       file,
+      ...(opts.dedupeKey ? { turn_id: opts.dedupeKey } : {}),
     };
     if (block.kind === 'notes-summary') {
       record.reminder_ids = fanOutNotesSummary(block.data, opts.brainstormId);

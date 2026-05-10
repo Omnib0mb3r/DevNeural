@@ -9,6 +9,7 @@ import {
 } from "@/lib/daemon-client";
 import { relTime } from "@/lib/session-helpers";
 import { Icon } from "./Icon";
+import { LexThumbs } from "./LexThumbs";
 
 interface Props {
   brainstormId: string | null;
@@ -29,10 +30,18 @@ function iconFor(kind: string): "FileText" | "BookOpen" | "FolderPlus" | "ListCh
   return KIND_ICON[kind] ?? "FileText";
 }
 
-function ArtifactRow({ item, expanded, onToggle }: {
+function ArtifactRow({
+  item,
+  expanded,
+  onToggle,
+  promptVersion,
+  brainstormId,
+}: {
   item: LexArtifactItem;
   expanded: boolean;
   onToggle: () => void;
+  promptVersion: string | null;
+  brainstormId: string | null;
 }) {
   const detailQ = useQuery({
     queryKey: ["lex-artifact", item.kind, item.id],
@@ -44,25 +53,36 @@ function ArtifactRow({ item, expanded, onToggle }: {
   const isWikiDraft = item.kind === "wiki-draft";
   return (
     <li className="border-b border-border2 last:border-b-0">
-      <button
-        type="button"
-        onClick={onToggle}
-        className="w-full px-4 py-2.5 flex items-center gap-3 hover:bg-surface2/50 text-left"
-      >
-        <Icon name={iconFor(item.kind)} size={14} className="text-brandSoft flex-shrink-0" />
-        <div className="min-w-0 flex-1">
-          <div className="text-xs text-txt1 truncate">{item.title}</div>
-          <div className="text-nano text-txt3 font-mono flex items-center gap-2">
-            <span>{item.kind}</span>
-            <span>{relTime(item.created_ms)} ago</span>
+      <div className="w-full px-4 py-2.5 flex items-center gap-3 hover:bg-surface2/50">
+        <button
+          type="button"
+          onClick={onToggle}
+          className="flex-1 flex items-center gap-3 text-left min-w-0"
+        >
+          <Icon name={iconFor(item.kind)} size={14} className="text-brandSoft flex-shrink-0" />
+          <div className="min-w-0 flex-1">
+            <div className="text-xs text-txt1 truncate">{item.title}</div>
+            <div className="text-nano text-txt3 font-mono flex items-center gap-2">
+              <span>{item.kind}</span>
+              <span>{relTime(item.created_ms)} ago</span>
+            </div>
           </div>
-        </div>
-        <Icon
-          name={expanded ? "ChevronUp" : "ChevronDown"}
-          size={12}
-          className="text-txt3 flex-shrink-0"
-        />
-      </button>
+          <Icon
+            name={expanded ? "ChevronUp" : "ChevronDown"}
+            size={12}
+            className="text-txt3 flex-shrink-0"
+          />
+        </button>
+        {item.turn_id && promptVersion ? (
+          <div className="flex-shrink-0">
+            <LexThumbs
+              turn_id={item.turn_id}
+              prompt_version={promptVersion}
+              brainstorm_id={brainstormId ?? null}
+            />
+          </div>
+        ) : null}
+      </div>
       {expanded && (
         <div className="px-4 pb-3 pt-1 bg-surface2/40">
           {detailQ.isLoading && (
@@ -136,6 +156,7 @@ export function LexArtifactsPanel({ brainstormId, active }: Props) {
   });
 
   const items: LexArtifactItem[] = q.data?.artifacts ?? [];
+  const promptVersion = q.data?.session_prompt_version ?? null;
 
   return (
     <div className="rounded-panel bg-surface1 hairline">
@@ -173,6 +194,8 @@ export function LexArtifactsPanel({ brainstormId, active }: Props) {
               onToggle={() =>
                 setExpandedId((cur) => (cur === item.id ? null : item.id))
               }
+              promptVersion={promptVersion}
+              brainstormId={brainstormId}
             />
           ))}
         </ul>

@@ -70,6 +70,11 @@ export interface BrainstormSessionRow {
   consent_acked_by?: string | null;
   keep_audio?: number;
   provenance?: 'voice' | 'audit-document' | 'synthetic';
+  /* Wave 2 carry-over #1: snapshot of the system-prompt version
+   * (buildLexSystemPromptVersioned hash) at PTY spawn time so per-turn
+   * LexThumbs can attach the version without recomputing. NULL on
+   * legacy rows + non-Lex rows. */
+  prompt_version?: string | null;
 }
 
 /* lex_feedback row. Inline-thumbs writes here keyed on the system-
@@ -502,6 +507,7 @@ export class IndexDb {
       keep_audio: number;
       attendees: string | null;
       meeting_topic: string | null;
+      prompt_version: string | null;
     }>,
   ): void {
     const sets: string[] = [];

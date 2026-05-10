@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./Icon";
+import { LexThumbs } from "./LexThumbs";
 
 /**
  * Hands-free voice client for Lex.
@@ -159,6 +160,15 @@ export function VoiceClient({ sessionId }: Props) {
   }
   const [lastTranscript, setLastTranscript] = useState<string>("");
   const [lastReply, setLastReply] = useState<string>("");
+  /* Wave 2 carry-over #1: per-turn thumbs vote on Lex's last reply.
+   * The voice WS sends turn_id (claude-code assistant message uuid)
+   * + prompt_version on every assistant-text. Both are required by
+   * LexThumbs; null defers the render until we get them. */
+  const [lastTurn, setLastTurn] = useState<{
+    turn_id: string;
+    prompt_version: string;
+    brainstorm_id: string | null;
+  } | null>(null);
   const [errMsg, setErrMsg] = useState<string>("");
   /* Live counter shown while the user is talking so they know the
    * mic is still capturing and roughly how much they've said. */
@@ -651,8 +661,14 @@ export function VoiceClient({ sessionId }: Props) {
           case "injected":
             setStatus("thinking");
             break;
-          case "assistant-text":
+          case "assistant-text": {
             setLastReply(String(msg.text ?? ""));
+            const tid = typeof msg.turn_id === "string" ? msg.turn_id : "";
+            const pv = typeof msg.prompt_version === "string" ? msg.prompt_version : "";
+            const bid = typeof msg.brainstorm_id === "string" ? msg.brainstorm_id : null;
+            if (tid && pv) {
+              setLastTurn({ turn_id: tid, prompt_version: pv, brainstorm_id: bid });
+            }
             /* If the user pressed stop in notes mode and we are
              * waiting on the finalize summary, this is the turn we
              * were waiting for. Give the artifact-parser a beat to
@@ -667,6 +683,7 @@ export function VoiceClient({ sessionId }: Props) {
               setTimeout(() => setEnabled(false), 750);
             }
             break;
+          }
           case "finalize-injected":
             /* Server ack that the notes-summary prompt was injected.
              * Just surface a status update; the assistant-text turn
@@ -1275,9 +1292,16 @@ export function VoiceClient({ sessionId }: Props) {
             </div>
           )}
           {lastReply && (
-            <div>
-              <span className="text-nano text-brandSoft font-mono mr-2">lex:</span>
-              <span className="text-txt1">{lastReply}</span>
+            <div className="flex items-start gap-2">
+              <span className="text-nano text-brandSoft font-mono mr-2 pt-0.5">lex:</span>
+              <span className="text-txt1 flex-1 min-w-0">{lastReply}</span>
+              {lastTurn && (
+                <LexThumbs
+                  turn_id={lastTurn.turn_id}
+                  prompt_version={lastTurn.prompt_version}
+                  brainstorm_id={lastTurn.brainstorm_id}
+                />
+              )}
             </div>
           )}
           {errMsg && <div className="text-err">{errMsg}</div>}

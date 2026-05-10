@@ -442,7 +442,44 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * audio talkback). Push-to-talk still uses voice talkback by
      * default; the user can flip mode mid-session if they want
      * silence. */
-    send({ t: 'assistant-text', text });
+    /* Wave 2 carry-over #1: surface the per-turn id + the prompt
+     * version archived at spawn time so the VoiceClient can render
+     * inline LexThumbs. Both fields are optional in the protocol;
+     * older clients ignore them. The brainstorm row lookup uses the
+     * same handle resolution the artifact-extraction block below does;
+     * order matters because that block also wants brainstormId. */
+    let brainstormForFeedback: { id: string; prompt_version: string | null } | null = null;
+    try {
+      const handle = state.bindKey
+        ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
+        : undefined;
+      let bs = null as
+        | null
+        | { id: string; prompt_version?: string | null };
+      if (handle?.sessionId) {
+        bs = getBrainstormByClaudeSessionId(handle.sessionId);
+      }
+      if (!bs && handle) {
+        bs = getBrainstormByPty(handle.ptyId);
+      }
+      if (bs) {
+        brainstormForFeedback = {
+          id: bs.id,
+          prompt_version: bs.prompt_version ?? null,
+        };
+      }
+    } catch {
+      /* observability only */
+    }
+    send({
+      t: 'assistant-text',
+      text,
+      ...(uuid ? { turn_id: uuid } : {}),
+      ...(brainstormForFeedback?.id ? { brainstorm_id: brainstormForFeedback.id } : {}),
+      ...(brainstormForFeedback?.prompt_version
+        ? { prompt_version: brainstormForFeedback.prompt_version }
+        : {}),
+    });
     /* Slice C: scan the assistant turn for fenced artifact blocks
      * (research-note / wiki-draft / project-intent / notes-summary),
      * persist them, and link the artifact ids into the brainstorm
@@ -452,18 +489,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * this voice WS currently miss extraction. A daemon-wide
      * brainstorm jsonl watcher is the follow-up. */
     try {
-      const handle = state.bindKey
-        ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
-        : undefined;
-      let brainstormId: string | null = null;
-      if (handle?.sessionId) {
-        const bs = getBrainstormByClaudeSessionId(handle.sessionId);
-        if (bs) brainstormId = bs.id;
-      }
-      if (!brainstormId && handle) {
-        const bs = getBrainstormByPty(handle.ptyId);
-        if (bs) brainstormId = bs.id;
-      }
+      const brainstormId = brainstormForFeedback?.id ?? null;
       const persisted = processAssistantTurn(text, {
         brainstormId,
         fallbackTitle: text.slice(0, 60),

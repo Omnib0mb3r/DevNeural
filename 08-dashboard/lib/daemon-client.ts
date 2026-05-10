@@ -916,9 +916,19 @@ export interface LexArtifactItem {
   created_ms: number;
   path: string;
   preview: string;
+  /** Claude-Code assistant message uuid for the turn that produced
+   * this artifact. Used as turn_id by LexThumbs. */
+  turn_id?: string;
 }
 export const lexSessionArtifacts = (id: string) =>
-  request<{ ok: boolean; artifacts: LexArtifactItem[] }>(
+  request<{
+    ok: boolean;
+    artifacts: LexArtifactItem[];
+    /** System-prompt version archived at spawn time (Wave 2 day 5
+     * step 20). Same value for every artifact in the session; surfaced
+     * once so LexThumbs can pin it on every per-turn vote. */
+    session_prompt_version?: string;
+  }>(
     `/lex/sessions/${encodeURIComponent(id)}/artifacts`,
   );
 
