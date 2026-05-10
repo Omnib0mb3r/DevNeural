@@ -12,6 +12,7 @@
 import Database from 'better-sqlite3';
 import * as path from 'node:path';
 import { DATA_ROOT, ensureDataRoot } from '../paths.js';
+import { emitAwarenessEvent } from '../lex/awareness.js';
 
 export interface RawChunkRow {
   id: string;
@@ -646,7 +647,7 @@ export class IndexDb {
     detail?: string | null;
     status?: 'open' | 'acknowledged' | 'resolved' | 'dismissed';
   }): void {
-    this.db
+    const info = this.db
       .prepare(
         `INSERT OR IGNORE INTO audit_findings
            (id, source, severity, page_slug, brainstorm_id, finding, detail, status)
@@ -659,6 +660,27 @@ export class IndexDb {
         status: 'open',
         ...row,
       });
+    /* Wave 2 carry-over #2: producer hook for the L1 awareness
+     * broadcaster. Only emit when a new row landed (changes > 0) so
+     * idempotent INSERT OR IGNORE replays do not spam Lex. Canary
+     * source maps to the dedicated kind so meeting-mode + budget
+     * gating treat it the same as the spec's other push-on-change
+     * signals. */
+    if (info.changes > 0) {
+      const kind: 'audit-finding' | 'canary-fail' =
+        row.source === 'canary' ? 'canary-fail' : 'audit-finding';
+      const label = `${row.severity}:${row.page_slug ?? row.source}`;
+      try {
+        emitAwarenessEvent({
+          kind,
+          label,
+          ...(row.brainstorm_id ? { brainstorm_id: row.brainstorm_id } : {}),
+          detail: { finding: row.finding, source: row.source },
+        });
+      } catch {
+        /* awareness emit is best-effort; never break a DB write. */
+      }
+    }
   }
 
   listAuditFindings(opts: {
@@ -1027,6 +1049,28 @@ export class IndexDb {
          WHERE id = @id`,
       )
       .run(merged);
+    /* Wave 2 carry-over #2: producer hook for the awareness
+     * broadcaster's draft-auto-dropped signal. Only fires on the
+     * actual pending -> auto-dropped transition; manual discards
+     * are scoped to other kinds and would otherwise spam Lex. */
+    if (
+      patch.status === 'auto-dropped' &&
+      existing.status !== 'auto-dropped'
+    ) {
+      try {
+        emitAwarenessEvent({
+          kind: 'draft-auto-dropped',
+          label: `${merged.page_slug ?? id}`,
+          detail: {
+            draft_id: id,
+            page_title: merged.page_title,
+            resolved_by: merged.resolved_by,
+          },
+        });
+      } catch {
+        /* awareness emit is best-effort */
+      }
+    }
     return merged;
   }
 

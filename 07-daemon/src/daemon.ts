@@ -36,6 +36,8 @@ import { startWikiPushInterval } from './wiki/push.js';
 import { runBackfillWiki, getBackfillStatus } from './wiki/backfill.js';
 import { generateWhatsNew } from './wiki/whats-new.js';
 import { registerDashboardRoutes } from './dashboard/routes.js';
+import { listReminders } from './dashboard/reminders.js';
+import { emitAwarenessEvent } from './lex/awareness.js';
 import fastifyCookie from '@fastify/cookie';
 import fastifyMultipart from '@fastify/multipart';
 import fastifyWebsocket from '@fastify/websocket';
@@ -191,6 +193,47 @@ async function main(): Promise<void> {
     if (typeof repeat.unref === 'function') repeat.unref();
   }, 5 * 60 * 1000);
   if (typeof lintTimer.unref === 'function') lintTimer.unref();
+
+  /* Wave 2 carry-over #2: awareness reminder-due producer. Sweeps the
+   * append-only reminders log every 5 min, emits one awareness event
+   * per reminder the first time it goes due, and never re-emits the
+   * same id after that (per-process dedupe). Completed / archived /
+   * deleted reminders drop out of listReminders naturally so no
+   * teardown is required. Interval cheap; failure is best-effort. */
+  const reminderSweepIntervalMs = Number(
+    process.env.DEVNEURAL_REMINDER_SWEEP_INTERVAL_MS ?? 5 * 60 * 1000,
+  );
+  const remindedIds = new Set<string>();
+  function sweepReminders(): void {
+    try {
+      const now = Date.now();
+      for (const r of listReminders()) {
+        if (!r.due_at) continue;
+        if (r.completed_at) continue;
+        if (remindedIds.has(r.id)) continue;
+        const dueMs = Date.parse(r.due_at);
+        if (!Number.isFinite(dueMs) || dueMs > now) continue;
+        remindedIds.add(r.id);
+        emitAwarenessEvent({
+          kind: 'reminder-due',
+          label: r.title.slice(0, 80),
+          detail: {
+            id: r.id,
+            due_at: r.due_at,
+            ...(r.project_id ? { project_id: r.project_id } : {}),
+          },
+        });
+      }
+    } catch (err) {
+      logger(`[reminder sweep] failed: ${(err as Error).message}`);
+    }
+  }
+  const reminderTimer = setTimeout(() => {
+    sweepReminders();
+    const repeat = setInterval(sweepReminders, reminderSweepIntervalMs);
+    if (typeof repeat.unref === 'function') repeat.unref();
+  }, 30_000);
+  if (typeof reminderTimer.unref === 'function') reminderTimer.unref();
 
   const scaffold = ensureWiki();
   logger(
