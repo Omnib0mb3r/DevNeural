@@ -195,7 +195,7 @@ All schema changes follow this protocol:
    - (a) Runner exists and SQL migrations live in a folder. Use it. Do not create a parallel system.
    - (b) Runner exists but only has TS-coded migrations. Extend the existing runner to also load `*.sql` files; do not create a separate SQL-only runner.
    - (c) No runner exists. Build a minimal one in `07-daemon/src/db/migrate.ts`: read `07-daemon/scripts/migrations/*.sql` in lex order, run each inside a transaction, record applied filenames in a `_migrations` table. The migrate function runs at daemon boot after env load and before HTTP bind.
-2. **Migration numbering:** the spec uses placeholders (`P2-W1-D1-001` through `P2-W1-D1-009` for Wave 1 day 1, `P2-W1-D2-*` for day 2, etc.). On day 1, the agent picks a numbering scheme that matches the existing repo. If the existing repo uses `NNN-` prefixes, the agent computes the next available number and replaces the placeholders with concrete numbers in a single mechanical pass; this pass happens **before** any migration is run.
+2. **Migration numbering:** the spec uses placeholders (`001` through `009` for Wave 1 day 1, `P2-W1-D2-*` for day 2, etc.). On day 1, the agent picks a numbering scheme that matches the existing repo. If the existing repo uses `NNN-` prefixes, the agent computes the next available number and replaces the placeholders with concrete numbers in a single mechanical pass; this pass happens **before** any migration is run.
 3. Each migration is idempotent and wrapped in a transaction.
 4. Every new table has a `created_at` ISO timestamp default and an `id` primary key (TEXT UUID per Appendix C portability; **verify on day 1** that any divergence is intentional).
 5. Every migration ships with a sibling `.down.sql` that reverses where safely possible; for forward-only migrations the down file is a comment stating "rollback via snapshot only" and `RAISE(ABORT, ...)`.
@@ -445,7 +445,7 @@ CREATE INDEX meeting_action_items_meeting ON meeting_action_items(meeting_id);
 CREATE INDEX meeting_action_items_status  ON meeting_action_items(status, due);
 ```
 
-Migration filename: `P2-W2-D1-013a-meeting-action-items.sql` (lands with the Wave 2 day 1 prerequisite block; renumber on the day-1 mechanical pass per Q-1).
+Migration filename: `013a-meeting-action-items.sql` (lands with the Wave 2 day 1 prerequisite block; renumber on the day-1 mechanical pass per Q-1).
 
 ### 3.10 Artifact kinds (canonical enum)
 
@@ -1188,15 +1188,15 @@ Effort: ~3 days. Order is sequential within Wave 1 (later steps depend on earlie
 
 1. **Pre-flight backup.** `npm run backup`. Confirm latest snapshot in OneDrive folder.
 2. **Migrations directory.** Create `07-daemon/scripts/migrations/` if missing. **Verify on day 1**: list any existing migration runner; if absent, build a minimal one in `07-daemon/src/db/migrate.ts` (read SQL files alphabetically, run inside a transaction, record applied migrations in a `_migrations` table).
-3. **Schema versioning infrastructure (WI-1).** Migration `P2-W1-D1-001-schema-version-meta.sql` creates `_migrations` and `wiki_meta` tables.
-4. **Embedder model_id (EM-1).** Migration `P2-W1-D1-002-add-model-id.sql` adds `model_id` to chunk tables and backfills.
-5. **Brainstorm chunks table (BF-3).** Migration `P2-W1-D1-003-brainstorm-chunks.sql`.
-6. **Brainstorm sessions schema deltas (BF-6, BF-11, BF-14, BF-17).** Migration `P2-W1-D1-004-brainstorm-sessions-deltas.sql`. Drops `project_slug NOT NULL` if present, adds `audio_path`, `distilled_at`, `kind`, `attendees`, `meeting_topic`, `consent_acked`, `consent_acked_at`, `consent_acked_by`, `keep_audio`, `provenance` (full DDL in section 3.3). Meeting code paths do not light up until Wave 2 day 5, but the columns ship now to keep migration ordering clean.
-7. **Wiki drafts table (BF-7).** Migration `P2-W1-D1-005-wiki-drafts.sql`.
-8. **Outbound log + trigger (PB-2, BF-4).** Migration `P2-W1-D1-006-outbound-log.sql`.
-9. **Curator log and signal tables (CI-1, CI-2).** Migration `P2-W1-D1-007-curator-log.sql`.
-10. **Lex feedback (LX-5).** Migration `P2-W1-D1-008-lex-feedback.sql`.
-11. **Wiki frontmatter sweep (WI-1, WI-2, WI-3, WI-4).** Script `07-daemon/scripts/migrations/P2-W1-D1-009-wiki-frontmatter-sweep.ts` walks `wiki/`, parses frontmatter, adds defaults if missing.
+3. **Schema versioning infrastructure (WI-1).** Migration `001-schema-version-meta.sql` creates `_migrations` and `wiki_meta` tables.
+4. **Embedder model_id (EM-1).** Migration `002-add-model-id.sql` adds `model_id` to chunk tables and backfills.
+5. **Brainstorm chunks table (BF-3).** Migration `003-brainstorm-chunks.sql`.
+6. **Brainstorm sessions schema deltas (BF-6, BF-11, BF-14, BF-17).** Migration `004-brainstorm-sessions-deltas.sql`. Drops `project_slug NOT NULL` if present, adds `audio_path`, `distilled_at`, `kind`, `attendees`, `meeting_topic`, `consent_acked`, `consent_acked_at`, `consent_acked_by`, `keep_audio`, `provenance` (full DDL in section 3.3). Meeting code paths do not light up until Wave 2 day 5, but the columns ship now to keep migration ordering clean.
+7. **Wiki drafts table (BF-7).** Migration `005-wiki-drafts.sql`.
+8. **Outbound log + trigger (PB-2, BF-4).** Migration `006-outbound-log.sql`.
+9. **Curator log and signal tables (CI-1, CI-2).** Migration `007-curator-log.sql`.
+10. **Lex feedback (LX-5).** Migration `008-lex-feedback.sql`.
+11. **Wiki frontmatter sweep (WI-1, WI-2, WI-3, WI-4).** Script `07-daemon/scripts/migrations/009-wiki-frontmatter-sweep.ts` walks `wiki/`, parses frontmatter, adds defaults if missing.
 12. **Run migrations end-to-end** against a copy of the data root in a temp location. Verify schema and frontmatter on the copy. Promote to live data root only after the copy validates.
 
 Day 1 commit checkpoint: `chore(db): phase two migrations 001-009`.
@@ -1270,7 +1270,7 @@ Effort: ~5 days. Day-by-day below. Track A (brainstorm-first + wiki proof) and T
 Wave 2 introduces tables Codex-review flagged as referenced-but-undefined. They land first to avoid forward references.
 
 ```
--- P2-W2-D1-010-audit-findings.sql
+-- 010-audit-findings.sql
 CREATE TABLE audit_findings (
   id              TEXT PRIMARY KEY,
   source          TEXT NOT NULL CHECK (source IN ('lint','self-audit','canary','user-flag','schema-regression')),
@@ -1286,7 +1286,7 @@ CREATE TABLE audit_findings (
 CREATE INDEX audit_findings_status   ON audit_findings(status, created_at);
 CREATE INDEX audit_findings_page     ON audit_findings(page_slug);
 
--- P2-W2-D1-011-heartbeat-log.sql
+-- 011-heartbeat-log.sql
 CREATE TABLE heartbeat_log (
   id              TEXT PRIMARY KEY,
   ts              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -1297,7 +1297,7 @@ CREATE TABLE heartbeat_log (
 );
 CREATE INDEX heartbeat_log_ts ON heartbeat_log(ts);
 
--- P2-W2-D1-012-crossproject-fallback-log.sql
+-- 012-crossproject-fallback-log.sql
 CREATE TABLE crossproject_fallback_log (
   id              TEXT PRIMARY KEY,
   candidate_slug  TEXT NOT NULL,
@@ -1307,7 +1307,7 @@ CREATE TABLE crossproject_fallback_log (
 );
 CREATE INDEX crossproject_fallback_log_day ON crossproject_fallback_log(created_at);
 
--- P2-W2-D1-013-backfill-review-queue.sql
+-- 013-backfill-review-queue.sql
 CREATE TABLE backfill_review_queue (
   id              TEXT PRIMARY KEY,
   brainstorm_id   TEXT NOT NULL,
@@ -1326,7 +1326,7 @@ CREATE INDEX backfill_review_queue_status ON backfill_review_queue(status, band)
 ### Day 1: backend prerequisites + heartbeat + GPU queue
 
 1. **Pre-flight backup** (always).
-2. Apply migrations P2-W2-D1-010 through P2-W2-D1-013, plus P2-W2-D1-013a (`meeting_action_items` from section 3.9).
+2. Apply migrations 010 through 013, plus 013a (`meeting_action_items` from section 3.9).
 3. **GPU job queue (OP-3 / A11).** Implement `07-daemon/src/gpu/queue.ts`. Single in-process queue with priority lanes:
    - Lane 0 (highest): curator path (recall + injection latency-critical).
    - Lane 1: voice transcription jobs (whisper.cpp).
@@ -1403,7 +1403,7 @@ Day 5 commit: `feat(lex): wave 2 day 5 personality + feedback loop`.
 
 ### Wave 2 sign-off checklist
 
-- [ ] Migrations P2-W2-D1-010 through 013 applied.
+- [ ] Migrations 010 through 013 applied.
 - [ ] All Wave 2 endpoints respond per section 4.
 - [ ] All Wave 2 components render and pass axe a11y sweep (no violations).
 - [ ] Audio replay verified on at least one historic and one recent brainstorm.
@@ -1428,7 +1428,7 @@ Effort: ~5 days. Gated on Wave 2 signals (specifically: Curator Health card gree
 ### Wave 3 prerequisite migrations (apply on day 1)
 
 ```
--- P2-W3-D1-014-brainstorm-edges.sql
+-- 014-brainstorm-edges.sql
 CREATE TABLE brainstorm_edges (
   id              TEXT PRIMARY KEY,
   src_brainstorm  TEXT NOT NULL,
@@ -1447,7 +1447,7 @@ CREATE INDEX        brainstorm_edges_cos  ON brainstorm_edges(cosine);
 ### Day 1: cross-brainstorm linking
 
 1. **Pre-flight backup.**
-2. Apply migration P2-W3-D1-014.
+2. Apply migration 014.
 3. **Cross-brainstorm auto-link (BF-8 / W3-1).** Implement `07-daemon/scripts/brainstorm-edges.ts`. Daily scheduled job:
    - Compute cosine between every pair of brainstorm summaries (or, for scale, pairs above a candidate-shortlist filter using BM25 similarity first).
    - Threshold default 0.65 for `topic-recurrence`. Configurable: `DEVNEURAL_BRAINSTORM_EDGE_THRESHOLD`.
@@ -1543,7 +1543,7 @@ Day 5 commit: `chore(docs,polish): wave 3 day 5 spec review + done check`.
 
 ### Wave 3 sign-off checklist
 
-- [ ] Migration P2-W3-D1-014 applied.
+- [ ] Migration 014 applied.
 - [ ] Brainstorm edges populated; orb shows recurrence edges.
 - [ ] `/graph/unified` returns valid response with all node types.
 - [ ] Unified orb renders all node types; filter chips work; performance under 16ms paint at typical density (200 nodes).
@@ -1645,21 +1645,21 @@ Items the spec author could not fully decide without running the code. Resolve o
 
 New files created in this spec (referenced above; consolidated for grep-ability):
 
-- `07-daemon/scripts/migrations/P2-W1-D1-001-schema-version-meta.sql`
-- `07-daemon/scripts/migrations/P2-W1-D1-002-add-model-id.sql`
-- `07-daemon/scripts/migrations/P2-W1-D1-003-brainstorm-chunks.sql`
-- `07-daemon/scripts/migrations/P2-W1-D1-004-brainstorm-sessions-deltas.sql`
-- `07-daemon/scripts/migrations/P2-W1-D1-005-wiki-drafts.sql`
-- `07-daemon/scripts/migrations/P2-W1-D1-006-outbound-log.sql`
-- `07-daemon/scripts/migrations/P2-W1-D1-007-curator-log.sql`
-- `07-daemon/scripts/migrations/P2-W1-D1-008-lex-feedback.sql`
-- `07-daemon/scripts/migrations/P2-W1-D1-009-wiki-frontmatter-sweep.ts`
-- `07-daemon/scripts/migrations/P2-W2-D1-010-audit-findings.sql`
-- `07-daemon/scripts/migrations/P2-W2-D1-011-heartbeat-log.sql`
-- `07-daemon/scripts/migrations/P2-W2-D1-012-crossproject-fallback-log.sql`
-- `07-daemon/scripts/migrations/P2-W2-D1-013-backfill-review-queue.sql`
-- `07-daemon/scripts/migrations/P2-W2-D1-013a-meeting-action-items.sql`
-- `07-daemon/scripts/migrations/P2-W3-D1-014-brainstorm-edges.sql`
+- `07-daemon/scripts/migrations/001-schema-version-meta.sql`
+- `07-daemon/scripts/migrations/002-add-model-id.sql`
+- `07-daemon/scripts/migrations/003-brainstorm-chunks.sql`
+- `07-daemon/scripts/migrations/004-brainstorm-sessions-deltas.sql`
+- `07-daemon/scripts/migrations/005-wiki-drafts.sql`
+- `07-daemon/scripts/migrations/006-outbound-log.sql`
+- `07-daemon/scripts/migrations/007-curator-log.sql`
+- `07-daemon/scripts/migrations/008-lex-feedback.sql`
+- `07-daemon/scripts/migrations/009-wiki-frontmatter-sweep.ts`
+- `07-daemon/scripts/migrations/010-audit-findings.sql`
+- `07-daemon/scripts/migrations/011-heartbeat-log.sql`
+- `07-daemon/scripts/migrations/012-crossproject-fallback-log.sql`
+- `07-daemon/scripts/migrations/013-backfill-review-queue.sql`
+- `07-daemon/scripts/migrations/013a-meeting-action-items.sql`
+- `07-daemon/scripts/migrations/014-brainstorm-edges.sql`
 - `07-daemon/src/db/migrate.ts` (if not present)
 - `07-daemon/src/gpu/queue.ts`
 - `07-daemon/src/scheduler.ts` (if not present)
@@ -1793,7 +1793,7 @@ First two integration tests under 07-daemon/tests/integration/.
 **Implementation guidance during Phase Two:**
 
 1. Use TEXT UUIDs for every PK (already specified).
-2. Keep DDL in plain SQL files; reserve the trigger logic for SQLite-specific files (e.g. `migrations/P2-W1-D1-006-outbound-log.sqlite.sql`) so a Postgres branch can swap the trigger file without touching anything else.
+2. Keep DDL in plain SQL files; reserve the trigger logic for SQLite-specific files (e.g. `migrations/006-outbound-log.sqlite.sql`) so a Postgres branch can swap the trigger file without touching anything else.
 3. Keep query logic in TypeScript (Knex, Kysely, or hand-written SQL) rather than as `VIEW`s where possible. A query in TS can be parameterised by dialect; a VIEW must be rewritten.
 4. Encapsulate FTS5 use behind a single search function so swapping to `tsvector` later is one file, not many.
 5. Encapsulate `sqlite-vec` use behind a single vector-search function for the same reason.
