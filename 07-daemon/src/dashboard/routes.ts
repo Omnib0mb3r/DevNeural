@@ -353,6 +353,20 @@ export async function registerDashboardRoutes(
             cross_refs: page.sections.crossRefs,
             evidence: page.sections.evidence,
             log: page.sections.log,
+            /* Phase Two frontmatter (Wave 2 day 3 step 12 lineage panel
+             * + WI-3 last_verified + WI-1 frozen). Optional in the
+             * frontmatter parser; surface the raw arrays / flags so
+             * the dashboard can render the source-brainstorms section
+             * and the verification-state pill. */
+            schema_version: page.frontmatter.schema_version ?? null,
+            last_verified: page.frontmatter.last_verified ?? null,
+            frozen: page.frontmatter.frozen === true,
+            source_brainstorms: page.frontmatter.source_brainstorms ?? [],
+            source_meetings: page.frontmatter.source_meetings ?? [],
+            derived_from_brainstorm:
+              page.frontmatter.derived_from_brainstorm === true,
+            derived_from_meeting:
+              page.frontmatter.derived_from_meeting === true,
           },
         };
       } catch (err) {
@@ -2681,6 +2695,89 @@ export async function registerDashboardRoutes(
     reply.header('content-range', `bytes ${start}-${end}/${total}`);
     reply.header('content-length', String(end - start + 1));
     return reply.send(fs.createReadStream(wavPath, { start, end }));
+  });
+
+  /* ── /brainstorms/backfill-review (Wave 2 day 3 step 13 / BF-13) ─
+   * Surfaces borderline-band candidates produced by
+   * `npm run backfill-brainstorms`. The user one-clicks link / reject;
+   * link writes source_brainstorms onto the page, reject just flips
+   * the row to status='rejected'. */
+  app.get('/brainstorms/backfill-review', async (req) => {
+    const q = (req.query ?? {}) as { status?: string; band?: string; limit?: string };
+    const validStatus = ['pending', 'linked', 'rejected', 'skipped'].includes(q.status ?? '')
+      ? (q.status as 'pending' | 'linked' | 'rejected' | 'skipped')
+      : 'pending';
+    const validBand = ['high', 'borderline', 'low'].includes(q.band ?? '')
+      ? (q.band as 'high' | 'borderline' | 'low')
+      : undefined;
+    const opts: { status?: 'pending' | 'linked' | 'rejected' | 'skipped'; band?: 'high' | 'borderline' | 'low'; limit?: number } = { status: validStatus };
+    if (validBand) opts.band = validBand;
+    if (q.limit) opts.limit = Math.min(500, Math.max(1, Number(q.limit)));
+    return { ok: true, candidates: store.db.listBackfillReview(opts) };
+  });
+
+  app.post('/brainstorms/backfill-review/:id/link', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.listBackfillReview({}).find((r) => r.id === id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'review row not found' };
+    }
+    if (row.status !== 'pending') {
+      reply.code(409);
+      return { ok: false, conflict: 'already_resolved', row };
+    }
+    const { loadPage, rewritePageFrontmatter } = await import('../reinforcement/index.js');
+    const page = loadPage(row.candidate_page_slug);
+    if (!page) {
+      reply.code(404);
+      return {
+        ok: false,
+        error: `wiki page ${row.candidate_page_slug} no longer exists`,
+      };
+    }
+    const existing = page.frontmatter.source_brainstorms ?? [];
+    if (!existing.includes(row.brainstorm_id)) {
+      rewritePageFrontmatter(page, {
+        ...page.frontmatter,
+        source_brainstorms: [...existing, row.brainstorm_id],
+      });
+    }
+    const merged = store.db.updateBackfillReview(id, { status: 'linked', resolved_by: 'user' });
+    return { ok: true, row: merged };
+  });
+
+  app.post('/brainstorms/backfill-review/:id/reject', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.listBackfillReview({}).find((r) => r.id === id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'review row not found' };
+    }
+    if (row.status !== 'pending') {
+      reply.code(409);
+      return { ok: false, conflict: 'already_resolved', row };
+    }
+    const merged = store.db.updateBackfillReview(id, { status: 'rejected', resolved_by: 'user' });
+    return { ok: true, row: merged };
+  });
+
+  /* Trigger the backfill from the dashboard. Long-running; returns
+   * 202 + the result payload after the job finishes. Single-flight at
+   * the daemon level via the same in-process lock the GPU queue would
+   * use; here we accept simple sequential runs because the script is
+   * a one-shot. */
+  app.post('/admin/backfill/brainstorms', async (req, reply) => {
+    void req;
+    try {
+      const { runBackfillBrainstorms } = await import('../wiki/backfill-brainstorms.js');
+      const result = await runBackfillBrainstorms(store, log);
+      reply.code(202);
+      return { ok: true, result };
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, error: (err as Error).message };
+    }
   });
 
   /* ── /drafts (Wave 2 day 2 step 10 / BF-7 review / A2) ────────────

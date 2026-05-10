@@ -274,6 +274,52 @@ export function WikiPageModal({ id, onClose }: Props) {
                 })}
               </ul>
             </section>
+            {(q.data.page.source_brainstorms?.length ?? 0) > 0 && (
+              <section>
+                <div className="text-nano text-txt3 uppercase tracking-wider mb-1 flex items-center gap-2">
+                  <Icon name="Sparkles" size={11} className="text-brandSoft" />
+                  Source brainstorms
+                  {q.data.page.derived_from_brainstorm ? (
+                    <span className="text-brandSoft">(primary)</span>
+                  ) : null}
+                </div>
+                <ul className="text-txt2 text-xs space-y-1">
+                  {q.data.page.source_brainstorms!.map((bid) => (
+                    <li key={bid} className="font-mono">
+                      <a
+                        href={`/brainstorms/${encodeURIComponent(bid)}`}
+                        className="hover:text-brandSoft underline"
+                      >
+                        {bid}
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
+            {(q.data.page.source_meetings?.length ?? 0) > 0 && (
+              <section>
+                <div className="text-nano text-txt3 uppercase tracking-wider mb-1 flex items-center gap-2">
+                  <Icon name="Mic" size={11} className="text-brandSoft" />
+                  Source meetings
+                  {q.data.page.derived_from_meeting ? (
+                    <span className="text-brandSoft">(primary)</span>
+                  ) : null}
+                </div>
+                <ul className="text-txt2 text-xs space-y-1">
+                  {q.data.page.source_meetings!.map((mid) => (
+                    <li key={mid} className="font-mono">
+                      <a
+                        href={`/brainstorms/${encodeURIComponent(mid)}`}
+                        className="hover:text-brandSoft underline"
+                      >
+                        {mid}
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
             {q.data.page.cross_refs?.length > 0 && (
               <section>
                 <div className="text-nano text-txt3 uppercase tracking-wider mb-1">

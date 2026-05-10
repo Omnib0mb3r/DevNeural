@@ -72,6 +72,36 @@ export interface BrainstormSessionRow {
   provenance?: 'voice' | 'audit-document' | 'synthetic';
 }
 
+/* brainstorm_chunks row. Backing table for full-transcript retrieval
+ * of voice sessions. Populated by the session-end pipeline + by
+ * Wave 2 day 3 backfill / audit-doc auto-ingest. */
+export interface BrainstormChunkRow {
+  id: string;
+  brainstorm_id: string;
+  turn_index: number;
+  role: 'user' | 'lex' | 'tool';
+  mode: 'conversation' | 'notes' | 'push-to-talk';
+  text: string;
+  model_id: string;
+  no_decay: number;
+  created_at: string;
+}
+
+/* backfill_review_queue row. Populated by npm run backfill-brainstorms
+ * with one (page, brainstorm) candidate pair per band; the dashboard
+ * empties the queue at /brainstorms/backfill-review. */
+export interface BackfillReviewRow {
+  id: string;
+  brainstorm_id: string;
+  candidate_page_slug: string;
+  cosine: number;
+  band: 'high' | 'borderline' | 'low';
+  status: 'pending' | 'linked' | 'rejected' | 'skipped';
+  created_at: string;
+  resolved_at: string | null;
+  resolved_by: string | null;
+}
+
 /* wiki_drafts row. Created by the session-end distillation pipeline
  * (BF-7). Reviewed via /drafts (Wave 2 day 2). */
 export interface WikiDraftRow {
@@ -382,6 +412,164 @@ export class IndexDb {
         `UPDATE brainstorm_sessions SET audio_path = ? WHERE id = ?`,
       )
       .run(audioPath, brainstormId);
+  }
+
+  /* Wave 2 day 3: dedicated setters for the Phase Two additive columns.
+   * insertBrainstorm() / updateBrainstorm() round-trip via INSERT OR
+   * REPLACE on the legacy 15-column shape, which silently resets the
+   * Phase Two columns to their SQLite defaults. Backfill + audit-doc
+   * ingest must use these direct UPDATEs to persist kind, provenance,
+   * project_slug, consent flags, distillation timestamps, and the
+   * meeting topic / attendees fields. */
+  setBrainstormPhaseTwo(
+    brainstormId: string,
+    patch: Partial<{
+      kind: 'brainstorm' | 'meeting';
+      provenance: 'voice' | 'audit-document' | 'synthetic';
+      project_slug: string | null;
+      audio_path: string | null;
+      consent_acked: number;
+      consent_acked_at: string | null;
+      consent_acked_by: string | null;
+      keep_audio: number;
+      attendees: string | null;
+      meeting_topic: string | null;
+    }>,
+  ): void {
+    const sets: string[] = [];
+    const params: Array<string | number | null> = [];
+    for (const [k, v] of Object.entries(patch)) {
+      if (v === undefined) continue;
+      sets.push(`${k} = ?`);
+      params.push(v as string | number | null);
+    }
+    if (sets.length === 0) return;
+    params.push(brainstormId);
+    this.db
+      .prepare(
+        `UPDATE brainstorm_sessions SET ${sets.join(', ')} WHERE id = ?`,
+      )
+      .run(...params);
+  }
+
+  /* Wave 2 day 3: brainstorm_chunks helpers. Insert is best-effort
+   * idempotent via INSERT OR REPLACE on the primary key so backfill
+   * retries do not duplicate rows. listBrainstormChunks walks the
+   * full session in turn order so callers can recover the transcript
+   * deterministically (no JS sort needed). */
+  insertBrainstormChunk(row: {
+    id: string;
+    brainstorm_id: string;
+    turn_index: number;
+    role: 'user' | 'lex' | 'tool';
+    mode: 'conversation' | 'notes' | 'push-to-talk';
+    text: string;
+    model_id: string;
+    no_decay?: number;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO brainstorm_chunks
+           (id, brainstorm_id, turn_index, role, mode, text, model_id, no_decay)
+         VALUES (@id, @brainstorm_id, @turn_index, @role, @mode, @text, @model_id, @no_decay)`,
+      )
+      .run({ no_decay: 1, ...row });
+  }
+
+  countBrainstormChunks(brainstormId: string): number {
+    const r = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM brainstorm_chunks WHERE brainstorm_id = ?`)
+      .get(brainstormId) as { n: number };
+    return r.n;
+  }
+
+  listBrainstormChunks(brainstormId: string, limit = 1000): BrainstormChunkRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM brainstorm_chunks WHERE brainstorm_id = ? ORDER BY turn_index ASC LIMIT ?`,
+      )
+      .all(brainstormId, limit) as BrainstormChunkRow[];
+  }
+
+  /* Wave 2 day 3 backfill_review_queue helpers. Insert is the band
+   * classifier's write path; the list helper drives /brainstorms/
+   * backfill-review; the update helper handles one-click link / reject
+   * from the dashboard. */
+  insertBackfillReview(row: {
+    id: string;
+    brainstorm_id: string;
+    candidate_page_slug: string;
+    cosine: number;
+    band: 'high' | 'borderline' | 'low';
+    status?: 'pending' | 'linked' | 'rejected' | 'skipped';
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO backfill_review_queue
+           (id, brainstorm_id, candidate_page_slug, cosine, band, status)
+         VALUES (@id, @brainstorm_id, @candidate_page_slug, @cosine, @band, @status)`,
+      )
+      .run({ status: 'pending', ...row });
+  }
+
+  listBackfillReview(opts: {
+    status?: 'pending' | 'linked' | 'rejected' | 'skipped';
+    band?: 'high' | 'borderline' | 'low';
+    limit?: number;
+  } = {}): BackfillReviewRow[] {
+    const limit = Math.min(500, Math.max(1, opts.limit ?? 200));
+    const where: string[] = [];
+    const params: Array<string | number> = [];
+    if (opts.status) {
+      where.push(`status = ?`);
+      params.push(opts.status);
+    }
+    if (opts.band) {
+      where.push(`band = ?`);
+      params.push(opts.band);
+    }
+    const sql =
+      `SELECT * FROM backfill_review_queue` +
+      (where.length ? ` WHERE ${where.join(' AND ')}` : '') +
+      ` ORDER BY cosine DESC LIMIT ?`;
+    params.push(limit);
+    return this.db.prepare(sql).all(...params) as BackfillReviewRow[];
+  }
+
+  updateBackfillReview(
+    id: string,
+    patch: { status: 'linked' | 'rejected' | 'skipped'; resolved_by?: string },
+  ): BackfillReviewRow | null {
+    this.db
+      .prepare(
+        `UPDATE backfill_review_queue
+         SET status = ?, resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), resolved_by = ?
+         WHERE id = ?`,
+      )
+      .run(patch.status, patch.resolved_by ?? 'user', id);
+    return (
+      (this.db
+        .prepare(`SELECT * FROM backfill_review_queue WHERE id = ?`)
+        .get(id) as BackfillReviewRow | undefined) ?? null
+    );
+  }
+
+  /* CP-1 fallback audit log. Wave 2 day 3 reuses this table for the
+   * low-band backfill candidates so the user can audit ignored pairs
+   * without a separate table. */
+  insertCrossprojectFallback(row: {
+    id: string;
+    candidate_slug: string;
+    reason: string;
+    participating_projects: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO crossproject_fallback_log
+           (id, candidate_slug, reason, participating_projects)
+         VALUES (@id, @candidate_slug, @reason, @participating_projects)`,
+      )
+      .run(row);
   }
 
   /* Wave 2 day 2 step 9 list filter helper. Combines the kind /

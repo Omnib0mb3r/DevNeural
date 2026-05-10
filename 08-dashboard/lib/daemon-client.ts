@@ -590,6 +590,61 @@ export interface BrainstormCues {
 export const getBrainstormCuesApi = (id: string) =>
   request<BrainstormCues>(`/brainstorms/${encodeURIComponent(id)}/cues`);
 
+/* Wave 2 day 3 step 13. Borderline-band candidates from
+ * `npm run backfill-brainstorms` await one-click link / reject. */
+export interface BackfillReviewRow {
+  id: string;
+  brainstorm_id: string;
+  candidate_page_slug: string;
+  cosine: number;
+  band: "high" | "borderline" | "low";
+  status: "pending" | "linked" | "rejected" | "skipped";
+  created_at: string;
+  resolved_at: string | null;
+  resolved_by: string | null;
+}
+export const listBackfillReview = (
+  opts: {
+    status?: BackfillReviewRow["status"];
+    band?: BackfillReviewRow["band"];
+    limit?: number;
+  } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.status) qs.set("status", opts.status);
+  if (opts.band) qs.set("band", opts.band);
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const q = qs.toString();
+  return request<{ ok: boolean; candidates: BackfillReviewRow[] }>(
+    `/brainstorms/backfill-review${q ? `?${q}` : ""}`,
+  );
+};
+export const linkBackfillReview = (id: string) =>
+  request<{ ok: boolean; row?: BackfillReviewRow; error?: string; conflict?: string }>(
+    `/brainstorms/backfill-review/${encodeURIComponent(id)}/link`,
+    { method: "POST" },
+  );
+export const rejectBackfillReview = (id: string) =>
+  request<{ ok: boolean; row?: BackfillReviewRow; error?: string; conflict?: string }>(
+    `/brainstorms/backfill-review/${encodeURIComponent(id)}/reject`,
+    { method: "POST" },
+  );
+export const triggerBackfillBrainstorms = () =>
+  request<{
+    ok: boolean;
+    result?: {
+      scanned: number;
+      ingested: number;
+      chunks_written: number;
+      high_links: number;
+      borderline_queued: number;
+      low_logged: number;
+      meetings_skipped_for_lineage: number;
+      errors: string[];
+    };
+    error?: string;
+  }>(`/admin/backfill/brainstorms`, { method: "POST" });
+
 export interface WikiDraftRow {
   id: string;
   brainstorm_id: string;
@@ -929,6 +984,16 @@ export interface WikiPageDetail {
   cross_refs: string[];
   evidence: string[];
   log: string[];
+  /* Phase Two frontmatter (Wave 2 day 3 step 12). Optional on legacy
+   * pages that pre-date migration 009; reads default to safe values
+   * via the daemon's response builder. */
+  schema_version?: number | null;
+  last_verified?: string | null;
+  frozen?: boolean;
+  source_brainstorms?: string[];
+  source_meetings?: string[];
+  derived_from_brainstorm?: boolean;
+  derived_from_meeting?: boolean;
 }
 export const wikiPage = (id: string) =>
   request<{ ok: boolean; page: WikiPageDetail; error?: string }>(`/wiki/page/${encodeURIComponent(id)}`);
