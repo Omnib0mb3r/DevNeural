@@ -201,6 +201,42 @@ describe('migration runner (Wave 1 day 1)', () => {
     expect(partial).not.toContain('frozen: false');
   });
 
+  it('Wave 2 day 1 migrations create the prerequisite tables', async () => {
+    await runMigrations({
+      dbPath: dbFile,
+      migrationsDir: MIGRATIONS_DIR,
+    });
+    const db = new Database(dbFile);
+    try {
+      const tables = db
+        .prepare(
+          `SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`,
+        )
+        .all() as { name: string }[];
+      const names = tables.map((t) => t.name);
+      for (const t of [
+        'audit_findings',
+        'heartbeat_log',
+        'crossproject_fallback_log',
+        'backfill_review_queue',
+        'meeting_action_items',
+      ]) {
+        expect(names).toContain(t);
+      }
+      // Spot-check audit_findings CHECK constraints by attempting an
+      // invalid source.
+      expect(() =>
+        db
+          .prepare(
+            `INSERT INTO audit_findings (id, source, severity, finding) VALUES ('a', 'BOGUS', 'low', 'x')`,
+          )
+          .run(),
+      ).toThrow(/CHECK/);
+    } finally {
+      db.close();
+    }
+  });
+
   it('curator_log enforces unique prompt_id', async () => {
     await runMigrations({
       dbPath: dbFile,
