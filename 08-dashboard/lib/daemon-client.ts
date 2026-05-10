@@ -344,6 +344,15 @@ export interface PtyEntry {
 }
 export const listPtys = () =>
   request<{ ok: boolean; ptys: PtyEntry[] }>("/pty");
+export interface LocStats {
+  ok: boolean;
+  total: number;
+  by_project: { id: string; name: string; lines: number }[];
+  computed_at: string;
+  cache?: "hit" | "miss";
+}
+export const statsLoc = () => request<LocStats>("/stats/loc");
+
 export const spawnLex = (cwd?: string, resumeSessionId?: string) =>
   request<{ ok: boolean; ptyId?: string; pid?: number; cwd?: string; resumed?: boolean; error?: string }>(
     "/pty/spawn-lex",

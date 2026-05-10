@@ -5,6 +5,7 @@ import { InstallPrompt } from "@/components/InstallPrompt";
 import { ProjectsGrid } from "@/components/ProjectsGrid";
 import { Orb } from "@/components/Orb";
 import { ReinforcementPanel } from "@/components/ReinforcementPanel";
+import { KpiStrip } from "@/components/KpiStrip";
 import { Icon } from "@/components/Icon";
 
 export default function HomePage() {
@@ -14,6 +15,7 @@ export default function HomePage() {
         <div className="flex items-center justify-end">
           <InstallPrompt />
         </div>
+        <KpiStrip />
         <DailyBrief />
 
         <section className="grid grid-cols-2 gap-5">

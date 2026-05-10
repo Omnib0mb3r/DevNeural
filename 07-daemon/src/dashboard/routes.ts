@@ -1812,6 +1812,84 @@ export async function registerDashboardRoutes(
     return { ok: true, doc };
   });
 
+  // ── Stats: total lines of code across registered projects ──────
+  /* Walks every registered project's root with `git ls-files` and
+   * counts lines. Skips lockfiles, vendored bundles, and binary file
+   * extensions. Cached in-process for 5 minutes because git ls-files
+   * + wc on N projects is several hundred ms; the dashboard ticker
+   * polls every 60s and can tolerate a stale value within the cache
+   * window. */
+  interface LocCacheEntry {
+    total: number;
+    by_project: { id: string; name: string; lines: number }[];
+    computed_at: string;
+  }
+  let locCache: { value: LocCacheEntry; expires_at: number } | null = null;
+  const LOC_CACHE_MS = 5 * 60 * 1000;
+  app.get('/stats/loc', async () => {
+    if (locCache && Date.now() < locCache.expires_at) {
+      return { ok: true, ...locCache.value, cache: 'hit' };
+    }
+    const { listProjects: lp } = await import('../identity/registry.js');
+    const { execSync } = await import('node:child_process');
+    const projects = lp();
+    const by_project: { id: string; name: string; lines: number }[] = [];
+    let total = 0;
+    /* Skip files that inflate the count without representing source.
+     * Ignored: package-lock, raster images, archives, binaries,
+     * vendored ML wasm + onnx bundles. */
+    const skip =
+      /(?:^|\/)(package-lock\.json|.*\.png|.*\.ico|.*\.svg|.*\.zip|.*\.exe|.*\.dll|.*\.pdb|.*\.bin|.*\.onnx|.*\.wasm)$|public\/vad\//i;
+    for (const project of projects) {
+      const root = project.root.replace(/\\/g, '/');
+      if (!fs.existsSync(root)) continue;
+      try {
+        /* git ls-files lists tracked files only — the right unit
+         * because that's what the developer actually owns. */
+        const out = execSync('git ls-files', {
+          cwd: root,
+          encoding: 'utf-8',
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'ignore'],
+          maxBuffer: 16 * 1024 * 1024,
+        });
+        const files = out
+          .split(/\r?\n/)
+          .filter((f) => f.length > 0 && !skip.test(f));
+        let lines = 0;
+        for (const rel of files) {
+          const p = path.posix.join(root, rel);
+          try {
+            const buf = fs.readFileSync(p);
+            /* Count newlines + 1 for last line if non-empty. Cheap
+             * approximation; matches `wc -l` semantics closely. */
+            let nl = 0;
+            for (let i = 0; i < buf.length; i++) {
+              if (buf[i] === 0x0a) nl++;
+            }
+            lines += nl;
+          } catch {
+            /* unreadable / deleted between ls-files and read */
+          }
+        }
+        if (lines > 0) {
+          by_project.push({ id: project.id, name: project.name, lines });
+          total += lines;
+        }
+      } catch {
+        /* not a git repo or git missing; skip silently */
+      }
+    }
+    by_project.sort((a, b) => b.lines - a.lines);
+    const value: LocCacheEntry = {
+      total,
+      by_project,
+      computed_at: new Date().toISOString(),
+    };
+    locCache = { value, expires_at: Date.now() + LOC_CACHE_MS };
+    return { ok: true, ...value, cache: 'miss' };
+  });
+
   // ── Admin: one-time backfill of historical Claude transcripts ───
   /* These endpoints are gated behind authMiddleware (registered above on
    * preHandler). They kick off long-running in-process work and return
