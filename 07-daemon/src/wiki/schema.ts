@@ -33,6 +33,18 @@ export interface PageFrontmatter {
   human_edited: boolean;
   human_edited_at?: string;
   flag_for_review?: boolean;
+  /* Phase Two frontmatter (WI-1, WI-2, WI-3, WI-4, plus the
+   * meeting-source mirror fields landed in CODEX-002 adoption).
+   * All optional in the type so legacy pages that pre-date migration
+   * 009 still parse; the migration sweep adds defaults to disk and
+   * future writes carry them forward via renderFrontmatter. */
+  schema_version?: number;
+  last_verified?: string | null;
+  frozen?: boolean;
+  source_brainstorms?: string[];
+  source_meetings?: string[];
+  derived_from_brainstorm?: boolean;
+  derived_from_meeting?: boolean;
 }
 
 export interface PageSections {
@@ -306,6 +318,9 @@ function parseScalar(value: string): unknown {
 }
 
 function normalizeFrontmatter(obj: RawObj): PageFrontmatter {
+  const stringArray = (v: unknown): string[] =>
+    Array.isArray(v) ? (v as unknown[]).map((p) => String(p)) : [];
+
   return {
     id: String(obj.id ?? ''),
     title: String(obj.title ?? ''),
@@ -320,14 +335,35 @@ function normalizeFrontmatter(obj: RawObj): PageFrontmatter {
     last_touched: String(
       obj.last_touched ?? new Date().toISOString().slice(0, 10),
     ),
-    projects: Array.isArray(obj.projects)
-      ? (obj.projects as unknown[]).map((p) => String(p))
-      : [],
+    projects: stringArray(obj.projects),
     human_edited: obj.human_edited === true,
     ...(obj.human_edited_at
       ? { human_edited_at: String(obj.human_edited_at) }
       : {}),
     ...(obj.flag_for_review === true ? { flag_for_review: true } : {}),
+    /* Phase Two fields. Default to nothing rather than spec defaults
+     * here; the migration 009 sweep is the source of defaults on
+     * disk. Reading a page that pre-dates the sweep returns undefined
+     * and the consumer applies its own fallback. */
+    ...(typeof obj.schema_version === 'number'
+      ? { schema_version: obj.schema_version }
+      : {}),
+    ...(obj.last_verified === null || typeof obj.last_verified === 'string'
+      ? { last_verified: obj.last_verified as string | null }
+      : {}),
+    ...(typeof obj.frozen === 'boolean' ? { frozen: obj.frozen } : {}),
+    ...(Array.isArray(obj.source_brainstorms)
+      ? { source_brainstorms: stringArray(obj.source_brainstorms) }
+      : {}),
+    ...(Array.isArray(obj.source_meetings)
+      ? { source_meetings: stringArray(obj.source_meetings) }
+      : {}),
+    ...(obj.derived_from_brainstorm === true
+      ? { derived_from_brainstorm: true }
+      : {}),
+    ...(obj.derived_from_meeting === true
+      ? { derived_from_meeting: true }
+      : {}),
   };
 }
 
@@ -355,6 +391,33 @@ function renderFrontmatter(fm: PageFrontmatter): string {
   lines.push(`human_edited: ${fm.human_edited}`);
   if (fm.human_edited_at) lines.push(`human_edited_at: ${fm.human_edited_at}`);
   if (fm.flag_for_review) lines.push(`flag_for_review: true`);
+  /* Phase Two frontmatter persists on every save so we never strip
+   * fields that migration 009 added. Defaults follow spec section 3.8:
+   * schema_version=2, last_verified=null, frozen=false,
+   * source_brainstorms=[], source_meetings=[], derived_from_brainstorm
+   * and derived_from_meeting=false. The defaults render only when the
+   * field is undefined; explicit user values pass through verbatim. */
+  lines.push(`schema_version: ${fm.schema_version ?? 2}`);
+  if (fm.last_verified === undefined || fm.last_verified === null) {
+    lines.push(`last_verified: null`);
+  } else {
+    lines.push(`last_verified: ${escapeScalar(fm.last_verified)}`);
+  }
+  lines.push(`frozen: ${fm.frozen ?? false}`);
+  const sb = fm.source_brainstorms ?? [];
+  lines.push(
+    sb.length === 0
+      ? `source_brainstorms: []`
+      : `source_brainstorms: [${sb.map((p) => escapeScalar(p)).join(', ')}]`,
+  );
+  const sm = fm.source_meetings ?? [];
+  lines.push(
+    sm.length === 0
+      ? `source_meetings: []`
+      : `source_meetings: [${sm.map((p) => escapeScalar(p)).join(', ')}]`,
+  );
+  lines.push(`derived_from_brainstorm: ${fm.derived_from_brainstorm ?? false}`);
+  lines.push(`derived_from_meeting: ${fm.derived_from_meeting ?? false}`);
   return lines.join('\n') + '\n';
 }
 

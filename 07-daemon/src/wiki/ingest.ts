@@ -588,6 +588,21 @@ async function rewritePage(
   page: { frontmatter: PageFrontmatter; sections: PageSections },
   file: string,
 ): Promise<void> {
+  /* WI-2: ingest skips pages the user has frozen. Frontmatter
+   * survives, body survives, the LLM's proposed rewrite is dropped.
+   * Reads the on-disk current frontmatter (not the in-memory
+   * proposed) so the freeze decision is always based on truth as
+   * persisted by the user, never on whatever the rewrite path
+   * computed before checking. */
+  try {
+    if (fs.existsSync(file)) {
+      const current = parsePage(fs.readFileSync(file, 'utf-8'));
+      if (current.frontmatter.frozen === true) return;
+    }
+  } catch {
+    // fall through; if we can't parse the on-disk page, the rewrite
+    // is the safer path.
+  }
   const dir = path.dirname(file).replace(/\\/g, '/');
   writePage(dir, page);
   await indexPage(store, page);

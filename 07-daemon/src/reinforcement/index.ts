@@ -608,6 +608,11 @@ export async function decayInactivePages(
       } catch {
         continue;
       }
+      /* WI-2 / BF-2: frozen pages are user-locked. Decay must skip
+       * them; ingest also skips them in the wiki ingest write path
+       * (see wiki/ingest.ts). User edits to frozen pages survive
+       * across decay cycles unchanged. */
+      if (parsed.frontmatter.frozen === true) continue;
       const fm = { ...parsed.frontmatter };
       const newWeight = fm.weight * DECAY_PER_SESSION;
       fm.weight = newWeight;
