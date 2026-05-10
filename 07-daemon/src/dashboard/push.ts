@@ -155,14 +155,28 @@ export async function sendPushToAll(
   return { delivered, pruned };
 }
 
-/** Hook into emitNotification — only warn + alert push by default. */
+/** Hook into emitNotification — only warn + alert push by default.
+ * OP-2 native toast fallback: when web push delivers zero pushes
+ * (no subscriptions, all stale, push server unreachable), spawn a
+ * Windows toast via BurntToast. The notification is already in
+ * notifications.jsonl regardless, so the dashboard surface is
+ * unaffected; the toast is the user-eyeball signal that survives
+ * a missing PWA install. */
 export async function maybePushNotification(n: Notification): Promise<void> {
   if (n.severity === 'info') return;
-  await sendPushToAll({
+  const result = await sendPushToAll({
     title: n.title,
     ...(n.body ? { body: n.body } : {}),
     ...(n.link ? { url: n.link } : {}),
     id: n.id,
     tag: n.source,
   });
+  if (result.delivered === 0) {
+    const { showToast } = await import('./toast-fallback.js');
+    await showToast({
+      title: n.title,
+      ...(n.body ? { body: n.body } : {}),
+      ...(n.link ? { url: n.link } : {}),
+    });
+  }
 }
