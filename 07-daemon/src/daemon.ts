@@ -18,6 +18,8 @@ import { startFsWatcher } from './capture/fs-watcher.js';
 import { startGitWatcher } from './capture/git-watcher.js';
 import { Store } from './store/index.js';
 import { runMigrations } from './db/migrate.js';
+import { initGpuQueue } from './gpu/queue.js';
+import { VramMonitor } from './gpu/vram-monitor.js';
 import { embedOne, warmUp, getEmbedDim, getModelId, setEmbedderLogger, embedderStats } from './embedder/index.js';
 import { ensureWiki } from './wiki/scaffolding.js';
 import { runSeed, hasSeeded } from './corpus/seed.js';
@@ -95,6 +97,20 @@ async function main(): Promise<void> {
     logger(`migrations FAILED: ${(err as Error).message}`);
     throw err;
   }
+
+  /* GPU job queue + VRAM monitor (Wave 2 day 1 steps 3 + 4).
+   * Lanes 0 and 1 always run (curator + voice). Lanes 2 and 3
+   * defer when free VRAM dips below the floor. The VRAM monitor
+   * fails open on hosts without nvidia-smi so the queue keeps
+   * dispatching. */
+  const vram = new VramMonitor({ log: logger });
+  vram.start();
+  initGpuQueue({
+    vramOk: () => vram.vramOk(),
+    vramBackoffMs: Number(process.env.DEVNEURAL_VRAM_BACKOFF_MS ?? 10_000),
+    log: logger,
+  });
+  logger('gpu queue + vram monitor up');
 
   const scaffold = ensureWiki();
   logger(

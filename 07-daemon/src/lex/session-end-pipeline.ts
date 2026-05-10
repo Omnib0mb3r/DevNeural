@@ -49,6 +49,7 @@ import { updateSummary, readSummary } from '../curation/session-summarizer.js';
 import { listProjects } from '../identity/registry.js';
 import { withSessionEndLock } from './session-end-lock.js';
 import { distillBrainstorm } from './brainstorm-distillation.js';
+import { gpuQueue } from '../gpu/queue.js';
 
 export interface SessionEndInput {
   /** Brainstorm row id, used only for logging; the pipeline does not
@@ -194,12 +195,16 @@ async function runOrderedPipeline(
    * strongest available guarantee. */
 
   /* Step 2 (ordered flush): drain GPU queue for this session_id.
-   * No-op until Wave 2 day 1 ships 07-daemon/src/gpu/queue.ts and
-   * a drainSessionId() helper. The wire-up will look like:
-   *   await gpuQueue.drainSessionId(input.claudeSessionId);
-   * Until then transcription is fire-and-forget per chunk and the
-   * summary refresh in step 6 is the last reader of any in-flight
-   * transcript bytes. */
+   * Blocks until no pending or running GPU job carries this
+   * session_id. Wired against the singleton GpuQueue initialised
+   * at daemon boot (07-daemon/src/daemon.ts). When no jobs were
+   * ever submitted with this sessionId, the drain returns
+   * immediately. */
+  try {
+    await gpuQueue().drainSessionId(input.claudeSessionId);
+  } catch (err) {
+    log(`[session-end] gpu drain failed: ${(err as Error).message}`);
+  }
 
   /* Step 3 (ordered flush): persist the final transcript and update
    * brainstorm_sessions ended_ms / status='ended'. The pipeline
