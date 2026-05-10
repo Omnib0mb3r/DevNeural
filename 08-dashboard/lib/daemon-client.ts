@@ -415,6 +415,25 @@ export interface KpiStats {
 }
 export const statsKpi = () => request<KpiStats>("/stats/kpi");
 
+/* CI-6 Curator Health KPI card. Endpoint shape mirrors spec
+ * section 4.1 GET /stats/curator-health. */
+export interface CuratorHealthStats {
+  ok: boolean;
+  window_days: number;
+  injections_per_day: number[];
+  hit_rate: number;
+  correction_rate: number;
+  silence_rate: number;
+  click_through_rate: number;
+  canary_status: "green" | "red" | "unknown";
+  canary_last_run: string | null;
+  flagged_pages_count: number;
+}
+export const statsCuratorHealth = (windowDays?: number) => {
+  const qs = windowDays ? `?window=${windowDays}` : "";
+  return request<CuratorHealthStats>(`/stats/curator-health${qs}`);
+};
+
 export const spawnLex = (cwd?: string, resumeSessionId?: string) =>
   request<{ ok: boolean; ptyId?: string; pid?: number; cwd?: string; resumed?: boolean; error?: string }>(
     "/pty/spawn-lex",

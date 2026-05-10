@@ -21,6 +21,7 @@ import { useQuery } from "@tanstack/react-query";
 import { statsLoc, statsKpi, type LocStats, type KpiStats } from "@/lib/daemon-client";
 import * as Lucide from "lucide-react";
 import { Icon } from "./Icon";
+import { CuratorHealthCard } from "./kpi/CuratorHealthCard";
 
 type LucideIconName = keyof typeof Lucide;
 
@@ -286,6 +287,8 @@ export function KpiStrip() {
           sub="patterns proven across 2+ projects"
           loading={loading}
         />
+        {/* Phase Two CI-6: additive into the Quality row. */}
+        <CuratorHealthCard />
       </Row>
 
       <Row title="Activity">
