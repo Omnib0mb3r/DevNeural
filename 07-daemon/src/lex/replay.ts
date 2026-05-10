@@ -1,23 +1,23 @@
 /**
- * Wave 2 day 5 step 21 (LX-2 / B2). A/B replay harness for Lex
- * system-prompt revisions. Loads two archived prompt versions, runs
- * a fixture file (one user turn per JSONL line, format
- * { user: string }) through each via the configured LLM provider,
+ * Wave 2 day 5 step 21 (LX-2 / B2) + carry-over #4. A/B replay harness
+ * for Lex system-prompt revisions. Loads two archived prompt versions,
+ * runs a fixture file (one user turn per JSONL line, format
+ * { user: string }) through each via a hermetic Claude Code PTY spawn,
  * and writes a side-by-side diff at
  * <DATA_ROOT>/lex-replay-output/<timestamp>/diff.md.
  *
- * The "hermetic Lex spawn" the spec describes uses a fresh-context
- * Claude Code PTY; that path lands in Wave 3 once the prompt-
- * versioning archive has accumulated enough revisions to be
- * worth A/B-testing through a real PTY. The day 5 implementation
- * uses the in-process LLM provider (same code path as the
- * self-audit) so the harness ships with the same provider gate.
+ * The execution path is now spec-compliant: each prompt version gets
+ * its own throwaway PTY at a non-brainstorm tmp cwd, the entire fixture
+ * is replayed through that PTY, then the PTY + cwd tear down. The
+ * earlier day-5 ship used the in-process LLM provider as a shortcut;
+ * the diff format + output dir are unchanged so existing consumers
+ * (admin route, LexReplayViewer) need no updates.
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { lexReplayRoot, ensureDir } from '../paths.js';
 import { readPromptVersion } from './prompt-archive.js';
-import { pickProvider } from '../llm/index.js';
+import { runHermeticVersion } from './replay-pty.js';
 
 export interface ReplayInput {
   user: string;
@@ -36,7 +36,10 @@ export interface ReplayResult {
   version_b: string;
   pairs: number;
   errors: string[];
-  skipped_reason?: 'no_provider' | 'version_a_missing' | 'version_b_missing' | 'no_inputs';
+  skipped_reason?:
+    | 'version_a_missing'
+    | 'version_b_missing'
+    | 'no_inputs';
 }
 
 function readFixture(filePath: string): ReplayInput[] {
@@ -126,18 +129,6 @@ export async function runLexReplay(opts: {
       skipped_reason: 'version_b_missing',
     };
   }
-  const provider = pickProvider();
-  if (!provider || !provider.isConfigured()) {
-    return {
-      output_dir: outDir,
-      diff_path: '',
-      version_a: opts.versionA,
-      version_b: opts.versionB,
-      pairs: 0,
-      errors: [],
-      skipped_reason: 'no_provider',
-    };
-  }
   const inputs = readFixture(opts.inputPath);
   if (inputs.length === 0) {
     return {
@@ -150,45 +141,29 @@ export async function runLexReplay(opts: {
       skipped_reason: 'no_inputs',
     };
   }
+  /* Run each version against the SAME fixture in order so the diff
+   * isolates the prompt as the only varying input. Run A then B; we
+   * could parallelise, but two simultaneous Claude Code spawns at the
+   * same cwd-slug pattern have produced cross-talk in past testing,
+   * and replay is rarely latency-sensitive. */
+  const userTurns = inputs.map((i) => i.user);
+  log(`[lex-replay] version A: spawning hermetic PTY (${opts.versionA})`);
+  const aResults = await runHermeticVersion(promptA, userTurns, { log });
+  log(`[lex-replay] version B: spawning hermetic PTY (${opts.versionB})`);
+  const bResults = await runHermeticVersion(promptB, userTurns, { log });
+
   const errors: string[] = [];
   const pairs: ReplayPair[] = [];
-  for (const input of inputs) {
-    const aT0 = Date.now();
-    let aText = '';
-    let aErr: string | undefined;
-    try {
-      const r = await provider.call('reconcile', {
-        systemBlocks: [{ text: promptA, cache: true }],
-        user: input.user,
-        maxTokens: 600,
-        temperature: 0.1,
-      });
-      aText = r.text;
-    } catch (err) {
-      aErr = (err as Error).message;
-      errors.push(`A "${input.user.slice(0, 30)}": ${aErr}`);
-    }
-    const aMs = Date.now() - aT0;
-    const bT0 = Date.now();
-    let bText = '';
-    let bErr: string | undefined;
-    try {
-      const r = await provider.call('reconcile', {
-        systemBlocks: [{ text: promptB, cache: true }],
-        user: input.user,
-        maxTokens: 600,
-        temperature: 0.1,
-      });
-      bText = r.text;
-    } catch (err) {
-      bErr = (err as Error).message;
-      errors.push(`B "${input.user.slice(0, 30)}": ${bErr}`);
-    }
-    const bMs = Date.now() - bT0;
+  for (let i = 0; i < inputs.length; i++) {
+    const userText = inputs[i]!.user;
+    const a = aResults[i] ?? { text: '', ms: 0, error: 'missing-A' };
+    const b = bResults[i] ?? { text: '', ms: 0, error: 'missing-B' };
+    if (a.error) errors.push(`A "${userText.slice(0, 30)}": ${a.error}`);
+    if (b.error) errors.push(`B "${userText.slice(0, 30)}": ${b.error}`);
     pairs.push({
-      input: input.user,
-      a: { text: aText, ms: aMs, ...(aErr ? { error: aErr } : {}) },
-      b: { text: bText, ms: bMs, ...(bErr ? { error: bErr } : {}) },
+      input: userText,
+      a: { text: a.text, ms: a.ms, ...(a.error ? { error: a.error } : {}) },
+      b: { text: b.text, ms: b.ms, ...(b.error ? { error: b.error } : {}) },
     });
   }
   const diffPath = writeDiff(outDir, opts.versionA, opts.versionB, pairs);
