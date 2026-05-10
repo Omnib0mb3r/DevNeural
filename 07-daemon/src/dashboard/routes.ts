@@ -1303,7 +1303,7 @@ export async function registerDashboardRoutes(
      * don't run a real semantic contradiction check here; we mark
      * the overlap so Lex knows to look. */
     const hasCanonical = page.results.some(
-      (r) => r.source_class === 'wiki-canonical',
+      (r) => r.source_class === 'wiki',
     );
     const hasBrainstorm = (page.groups?.length ?? 0) > 0;
     const conflictCheckRequired = hasCanonical && hasBrainstorm;
@@ -1318,7 +1318,7 @@ export async function registerDashboardRoutes(
       conflict_overlap: conflictCheckRequired
         ? {
             canonical: page.results
-              .filter((r) => r.source_class === 'wiki-canonical')
+              .filter((r) => r.source_class === 'wiki')
               .slice(0, 3)
               .map((r) => ({
                 id: r.id,

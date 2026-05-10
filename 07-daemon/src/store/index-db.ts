@@ -54,6 +54,22 @@ export interface BrainstormSessionRow {
   artifacts_json: string;
   last_summary: string | null;
   last_summary_ms: number | null;
+  /* Phase Two columns (added by migrations 004). Optional in the TS
+   * type so legacy code paths and tests that build rows without
+   * Phase Two awareness continue to compile. SQLite supplies defaults
+   * (kind='brainstorm', consent_acked=0, keep_audio=0,
+   * provenance='voice') so reads always populate these. */
+  project_slug?: string | null;
+  audio_path?: string | null;
+  distilled_at?: string | null;
+  kind?: 'brainstorm' | 'meeting';
+  attendees?: string | null;
+  meeting_topic?: string | null;
+  consent_acked?: number;
+  consent_acked_at?: string | null;
+  consent_acked_by?: string | null;
+  keep_audio?: number;
+  provenance?: 'voice' | 'audit-document' | 'synthetic';
 }
 
 export interface FtsHit {
