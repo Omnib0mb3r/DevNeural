@@ -590,19 +590,35 @@ export function evaluateCorrection(
   commitWiki(`reinforce correction ${p.pageId}`);
 }
 
-/* WI-5 pause mode. Reads DEVNEURAL_PAUSE_MODE on every call so the
- * env var can be flipped at runtime without daemon restart.
+/* WI-5 pause mode (Wave 2 day 4 step 19 / A15 dashboard toggle).
  *   on   - decay always frozen
  *   off  - decay always runs
  *   auto - decay runs unless the daemon has seen no activity for
  *          DEVNEURAL_PAUSE_INACTIVITY_DAYS days. Activity is defined
  *          as any reinforcement-log line in that window.
  *
+ * Resolution order (added in Wave 2 day 4 to support live toggling
+ * via /system without a daemon restart):
+ *   1. runtime_config.pause_mode   (dashboard toggle, highest priority)
+ *   2. DEVNEURAL_PAUSE_MODE env    (sysadmin override)
+ *   3. 'auto'                      (default)
+ *
  * The auto branch falls back to "not paused" when the activity
  * timestamp file is missing or unreadable so a fresh install never
  * silently freezes its own decay loop. */
-function isPauseModeActive(): boolean {
-  const mode = (process.env.DEVNEURAL_PAUSE_MODE ?? 'auto').toLowerCase();
+let pauseModeStore: Store | null = null;
+export function setPauseModeStore(s: Store | null): void {
+  pauseModeStore = s;
+}
+export function isPauseModeActive(): boolean {
+  let mode: string | null = null;
+  try {
+    mode = pauseModeStore?.db.getRuntimeConfig('pause_mode') ?? null;
+  } catch {
+    /* db read should never throw; tolerate it so the gate never
+     * blocks the decay loop on a transient sqlite state */
+  }
+  mode = (mode ?? process.env.DEVNEURAL_PAUSE_MODE ?? 'auto').toLowerCase();
   if (mode === 'on') return true;
   if (mode === 'off') return false;
   // auto
@@ -622,6 +638,10 @@ export async function decayInactivePages(
   store: Store,
   log: (msg: string) => void = () => undefined,
 ): Promise<{ decayed: number; archived: number }> {
+  /* Plumb the store through on every call so the runtime_config
+   * lookup uses the live IndexDb without depending on a separate
+   * boot-time setPauseModeStore() (which would skew tests). */
+  setPauseModeStore(store);
   if (isPauseModeActive()) {
     log('[reinforce] pause mode active; decay skipped');
     return { decayed: 0, archived: 0 };

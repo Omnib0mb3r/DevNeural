@@ -2697,6 +2697,137 @@ export async function registerDashboardRoutes(
     return reply.send(fs.createReadStream(wavPath, { start, end }));
   });
 
+  /* ── audit_findings (Wave 2 day 4 steps 15, 16, 17) ─────────────
+   * Cross-source surface for lint, the LLM self-audit, the canary,
+   * the schema-regression suite, and the user-flag "this looks wrong"
+   * button. The dashboard LintFindingsPanel reads from here. */
+  app.get('/audit-findings', async (req) => {
+    const q = (req.query ?? {}) as {
+      status?: string;
+      source?: string;
+      severity?: string;
+      page?: string;
+      limit?: string;
+    };
+    const opts: Parameters<typeof store.db.listAuditFindings>[0] = {};
+    if (q.status === 'open' || q.status === 'acknowledged' || q.status === 'resolved' || q.status === 'dismissed') {
+      opts.status = q.status;
+    } else {
+      opts.status = 'open';
+    }
+    if (q.source === 'lint' || q.source === 'self-audit' || q.source === 'canary' || q.source === 'user-flag' || q.source === 'schema-regression') {
+      opts.source = q.source;
+    }
+    if (q.severity === 'low' || q.severity === 'medium' || q.severity === 'high') {
+      opts.severity = q.severity;
+    }
+    if (q.page) opts.page_slug = q.page;
+    if (q.limit) opts.limit = Math.min(500, Math.max(1, Number(q.limit)));
+    return { ok: true, findings: store.db.listAuditFindings(opts) };
+  });
+
+  app.post('/audit-findings/:id/:action', async (req, reply) => {
+    const id = (req.params as { id: string; action: string }).id;
+    const action = (req.params as { id: string; action: string }).action;
+    const status =
+      action === 'acknowledge'
+        ? 'acknowledged'
+        : action === 'resolve'
+          ? 'resolved'
+          : action === 'dismiss'
+            ? 'dismissed'
+            : null;
+    if (!status) {
+      reply.code(400);
+      return { ok: false, error: 'action must be acknowledge|resolve|dismiss' };
+    }
+    const row = store.db.updateAuditFindingStatus(id, status as 'acknowledged' | 'resolved' | 'dismissed');
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'finding not found' };
+    }
+    return { ok: true, finding: row };
+  });
+
+  /* POST /admin/lint/run — manual trigger for the nightly lint pass.
+   * Same shape as the scheduled call; useful when the user wants an
+   * immediate pass after promoting a batch of drafts. */
+  app.post('/admin/lint/run', async () => {
+    const { runLint } = await import('../wiki/lint.js');
+    const r = await runLint({ db: store.db });
+    return { ok: true, result: r };
+  });
+
+  /* POST /admin/self-audit/run — Wave 2 day 4 step 16 manual
+   * trigger for the LLM self-audit. Picks N random canonical pages,
+   * asks "are these accurate, useful, well-scoped?" and writes
+   * findings with source='self-audit'. */
+  app.post('/admin/self-audit/run', async (req) => {
+    const body = (req.body ?? {}) as { sample?: number };
+    const { runSelfAudit } = await import('../wiki/self-audit.js');
+    const r = await runSelfAudit(store, { sample: body.sample, log });
+    return { ok: true, result: r };
+  });
+
+  /* POST /curator/wrong (Wave 2 day 4 step 17 / CI-5 / A9). The
+   * dashboard "this looks wrong" button posts here. Does the same
+   * weight drop + archive-on-3 work as /admin/wiki/correct/:id, plus
+   * opens a self-audit user-flag finding so the LLM self-audit pass
+   * sees the page next time. */
+  app.post('/curator/wrong', async (req, reply) => {
+    const body = (req.body ?? {}) as { page_id?: string; curator_log_id?: string; note?: string };
+    if (!body.page_id) {
+      reply.code(400);
+      return { ok: false, error: 'page_id required' };
+    }
+    const { correctWikiPageById } = await import('../reinforcement/index.js');
+    const r = await correctWikiPageById(store, body.page_id, log);
+    if (!r.ok) {
+      reply.code(404);
+      return r;
+    }
+    try {
+      store.db.insertAuditFinding({
+        id: `userflag-${body.page_id}-${Date.now()}`,
+        source: 'user-flag',
+        severity: 'medium',
+        page_slug: body.page_id,
+        finding: 'user flagged injection as wrong',
+        detail: body.note ?? (body.curator_log_id ? `curator_log_id=${body.curator_log_id}` : null),
+      });
+    } catch (err) {
+      log(`[curator/wrong] audit_finding insert failed: ${(err as Error).message}`);
+    }
+    return r;
+  });
+
+  /* ── runtime_config (Wave 2 day 4 step 19 / A15) ─────────────────
+   * Pause-mode toggle lives in runtime_config.pause_mode; the
+   * decayInactivePages gate consults this first, then env, then
+   * default. The dashboard /system route reads / writes here. */
+  app.get('/runtime-config', async () => ({
+    ok: true,
+    config: store.db.listRuntimeConfig(),
+  }));
+
+  app.post('/runtime-config/:key', async (req, reply) => {
+    const key = (req.params as { key: string }).key;
+    const body = (req.body ?? {}) as { value?: string; updated_by?: string };
+    if (typeof body.value !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'value (string) required' };
+    }
+    /* Validate pause_mode values explicitly so a typo does not
+     * silently disable the gate (any unknown string falls through
+     * to "default"). */
+    if (key === 'pause_mode' && !['on', 'off', 'auto'].includes(body.value)) {
+      reply.code(400);
+      return { ok: false, error: 'pause_mode must be on|off|auto' };
+    }
+    store.db.setRuntimeConfig(key, body.value, body.updated_by);
+    return { ok: true, key, value: body.value };
+  });
+
   /* ── /brainstorms/backfill-review (Wave 2 day 3 step 13 / BF-13) ─
    * Surfaces borderline-band candidates produced by
    * `npm run backfill-brainstorms`. The user one-clicks link / reject;

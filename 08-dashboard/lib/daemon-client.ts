@@ -629,6 +629,76 @@ export const rejectBackfillReview = (id: string) =>
     `/brainstorms/backfill-review/${encodeURIComponent(id)}/reject`,
     { method: "POST" },
   );
+/* Wave 2 day 4 audit_findings + curator/wrong + runtime_config. */
+export interface AuditFindingRow {
+  id: string;
+  source: "lint" | "self-audit" | "canary" | "user-flag" | "schema-regression";
+  severity: "low" | "medium" | "high";
+  page_slug: string | null;
+  brainstorm_id: string | null;
+  finding: string;
+  detail: string | null;
+  status: "open" | "acknowledged" | "resolved" | "dismissed";
+  created_at: string;
+  resolved_at: string | null;
+}
+export const listAuditFindings = (
+  opts: {
+    status?: AuditFindingRow["status"];
+    source?: AuditFindingRow["source"];
+    severity?: AuditFindingRow["severity"];
+    page?: string;
+    limit?: number;
+  } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.status) qs.set("status", opts.status);
+  if (opts.source) qs.set("source", opts.source);
+  if (opts.severity) qs.set("severity", opts.severity);
+  if (opts.page) qs.set("page", opts.page);
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const q = qs.toString();
+  return request<{ ok: boolean; findings: AuditFindingRow[] }>(
+    `/audit-findings${q ? `?${q}` : ""}`,
+  );
+};
+export const updateAuditFinding = (
+  id: string,
+  action: "acknowledge" | "resolve" | "dismiss",
+) =>
+  request<{ ok: boolean; finding?: AuditFindingRow; error?: string }>(
+    `/audit-findings/${encodeURIComponent(id)}/${action}`,
+    { method: "POST" },
+  );
+export const triggerLintNow = () =>
+  request<{ ok: boolean; result?: unknown }>(`/admin/lint/run`, {
+    method: "POST",
+  });
+export const triggerSelfAudit = (sample = 10) =>
+  request<{ ok: boolean; result?: unknown }>(`/admin/self-audit/run`, {
+    method: "POST",
+    body: { sample },
+  });
+export const curatorWrong = (page_id: string, opts: { curator_log_id?: string; note?: string } = {}) =>
+  request<{ ok: boolean; weight?: number; corrections?: number; archived?: boolean; error?: string }>(
+    `/curator/wrong`,
+    { method: "POST", body: { page_id, ...opts } },
+  );
+
+export interface RuntimeConfigRow {
+  key: string;
+  value: string;
+  updated_at: string;
+  updated_by: string | null;
+}
+export const listRuntimeConfig = () =>
+  request<{ ok: boolean; config: RuntimeConfigRow[] }>(`/runtime-config`);
+export const setRuntimeConfig = (key: string, value: string) =>
+  request<{ ok: boolean; key?: string; value?: string; error?: string }>(
+    `/runtime-config/${encodeURIComponent(key)}`,
+    { method: "POST", body: { value } },
+  );
+
 export const triggerBackfillBrainstorms = () =>
   request<{
     ok: boolean;

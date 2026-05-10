@@ -72,6 +72,34 @@ export interface BrainstormSessionRow {
   provenance?: 'voice' | 'audit-document' | 'synthetic';
 }
 
+/* audit_findings row. Cross-source surface that lint, the LLM
+ * self-audit, the canary, the schema-regression suite, and the
+ * random artifact sampler all write to. Wave 2 day 4 introduces the
+ * lint + self-audit + user-flag writers. */
+export interface AuditFindingRow {
+  id: string;
+  source: 'lint' | 'self-audit' | 'canary' | 'user-flag' | 'schema-regression';
+  severity: 'low' | 'medium' | 'high';
+  page_slug: string | null;
+  brainstorm_id: string | null;
+  finding: string;
+  detail: string | null;
+  status: 'open' | 'acknowledged' | 'resolved' | 'dismissed';
+  created_at: string;
+  resolved_at: string | null;
+}
+
+/* runtime_config row. Wave 2 day 4 step 19 (A15) pause-mode toggle
+ * lives here so a daemon restart is not required to flip the gate.
+ * Generic key/value JSON so future toggles (lint cadence override,
+ * ingest model choice, etc.) reuse the table. */
+export interface RuntimeConfigRow {
+  key: string;
+  value: string;
+  updated_at: string;
+  updated_by: string | null;
+}
+
 /* brainstorm_chunks row. Backing table for full-transcript retrieval
  * of voice sessions. Populated by the session-end pipeline + by
  * Wave 2 day 3 backfill / audit-doc auto-ingest. */
@@ -201,6 +229,17 @@ export class IndexDb {
         value TEXT NOT NULL
       );
       INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '1');
+
+      /* Wave 2 day 4 step 19 (A15): runtime configuration overrides.
+       * Daemon reads this table first, env second, hardcoded default
+       * last. Generic key/value so /system toggles (pause_mode today,
+       * future cadence + provider toggles) reuse the same table. */
+      CREATE TABLE IF NOT EXISTS runtime_config (
+        key        TEXT PRIMARY KEY,
+        value      TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_by TEXT
+      );
 
       /* Brainstorm sessions are first-class records, not just claude
        * jsonl traces. Each Lex spawn creates one; lifecycle moves
@@ -552,6 +591,126 @@ export class IndexDb {
         .prepare(`SELECT * FROM backfill_review_queue WHERE id = ?`)
         .get(id) as BackfillReviewRow | undefined) ?? null
     );
+  }
+
+  /* Wave 2 day 4 audit_findings helpers (steps 15, 16, 17, 18).
+   * insertAuditFinding is the write path for lint, the LLM self-audit,
+   * canary, schema-regression, and the user-flag "this looks wrong"
+   * surface. listAuditFindings drives the dashboard panel; the update
+   * helper handles ack / resolve / dismiss transitions. Inserts use
+   * INSERT OR IGNORE keyed on a content-derived id when the caller
+   * passes one so re-running lint does not produce duplicates of the
+   * same finding for the same page. */
+  insertAuditFinding(row: {
+    id: string;
+    source: 'lint' | 'self-audit' | 'canary' | 'user-flag' | 'schema-regression';
+    severity: 'low' | 'medium' | 'high';
+    page_slug?: string | null;
+    brainstorm_id?: string | null;
+    finding: string;
+    detail?: string | null;
+    status?: 'open' | 'acknowledged' | 'resolved' | 'dismissed';
+  }): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO audit_findings
+           (id, source, severity, page_slug, brainstorm_id, finding, detail, status)
+         VALUES (@id, @source, @severity, @page_slug, @brainstorm_id, @finding, @detail, @status)`,
+      )
+      .run({
+        page_slug: null,
+        brainstorm_id: null,
+        detail: null,
+        status: 'open',
+        ...row,
+      });
+  }
+
+  listAuditFindings(opts: {
+    status?: 'open' | 'acknowledged' | 'resolved' | 'dismissed';
+    source?: 'lint' | 'self-audit' | 'canary' | 'user-flag' | 'schema-regression';
+    severity?: 'low' | 'medium' | 'high';
+    page_slug?: string;
+    limit?: number;
+  } = {}): AuditFindingRow[] {
+    const limit = Math.min(500, Math.max(1, opts.limit ?? 200));
+    const where: string[] = [];
+    const params: Array<string | number> = [];
+    if (opts.status) {
+      where.push(`status = ?`);
+      params.push(opts.status);
+    }
+    if (opts.source) {
+      where.push(`source = ?`);
+      params.push(opts.source);
+    }
+    if (opts.severity) {
+      where.push(`severity = ?`);
+      params.push(opts.severity);
+    }
+    if (opts.page_slug) {
+      where.push(`page_slug = ?`);
+      params.push(opts.page_slug);
+    }
+    const sql =
+      `SELECT * FROM audit_findings` +
+      (where.length ? ` WHERE ${where.join(' AND ')}` : '') +
+      /* High severity bubbles to the top so the panel surfaces the
+       * urgent items first; ties broken by recency. */
+      ` ORDER BY CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, created_at DESC LIMIT ?`;
+    params.push(limit);
+    return this.db.prepare(sql).all(...params) as AuditFindingRow[];
+  }
+
+  updateAuditFindingStatus(
+    id: string,
+    status: 'open' | 'acknowledged' | 'resolved' | 'dismissed',
+  ): AuditFindingRow | null {
+    const isTerminal = status === 'resolved' || status === 'dismissed';
+    this.db
+      .prepare(
+        `UPDATE audit_findings SET status = ?, resolved_at = ? WHERE id = ?`,
+      )
+      .run(
+        status,
+        isTerminal ? new Date().toISOString() : null,
+        id,
+      );
+    return (
+      (this.db
+        .prepare(`SELECT * FROM audit_findings WHERE id = ?`)
+        .get(id) as AuditFindingRow | undefined) ?? null
+    );
+  }
+
+  /* runtime_config helpers. The daemon reads via getRuntimeConfig
+   * before falling back to env / defaults. Writes from /system land
+   * via setRuntimeConfig + go through here so the daemon does not
+   * need a restart to flip the gate. */
+  getRuntimeConfig(key: string): string | null {
+    const row = this.db
+      .prepare(`SELECT value FROM runtime_config WHERE key = ?`)
+      .get(key) as { value: string } | undefined;
+    return row?.value ?? null;
+  }
+
+  setRuntimeConfig(key: string, value: string, updatedBy?: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO runtime_config (key, value, updated_at, updated_by)
+         VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value = excluded.value,
+           updated_at = excluded.updated_at,
+           updated_by = excluded.updated_by`,
+      )
+      .run(key, value, updatedBy ?? null);
+  }
+
+  listRuntimeConfig(): RuntimeConfigRow[] {
+    return this.db
+      .prepare(`SELECT * FROM runtime_config ORDER BY key`)
+      .all() as RuntimeConfigRow[];
   }
 
   /* CP-1 fallback audit log. Wave 2 day 3 reuses this table for the

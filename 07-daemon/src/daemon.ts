@@ -143,6 +143,55 @@ async function main(): Promise<void> {
   }, 60_000);
   if (typeof cullTimer.unref === 'function') cullTimer.unref();
 
+  /* Self-audit periodic (Wave 2 day 4 step 16 / Karpathy steal 3 / A8).
+   * Runs at +15min after boot then every DEVNEURAL_SELF_AUDIT_INTERVAL_MS
+   * (default 7d). Skipped when DEVNEURAL_LLM_PROVIDER=none or when the
+   * provider is not configured (the module returns skipped_reason). */
+  const selfAuditIntervalMs = Number(
+    process.env.DEVNEURAL_SELF_AUDIT_INTERVAL_MS ?? 7 * 24 * 60 * 60 * 1000,
+  );
+  const selfAuditTimer = setTimeout(() => {
+    void (async () => {
+      const { runSelfAudit } = await import('./wiki/self-audit.js');
+      await runSelfAudit(store, { log: logger }).catch((err) =>
+        logger(`[self-audit] failed: ${(err as Error).message}`),
+      );
+    })();
+    const repeat = setInterval(() => {
+      void (async () => {
+        const { runSelfAudit } = await import('./wiki/self-audit.js');
+        await runSelfAudit(store, { log: logger }).catch((err) =>
+          logger(`[self-audit] failed: ${(err as Error).message}`),
+        );
+      })();
+    }, selfAuditIntervalMs);
+    if (typeof repeat.unref === 'function') repeat.unref();
+  }, 15 * 60 * 1000);
+  if (typeof selfAuditTimer.unref === 'function') selfAuditTimer.unref();
+
+  /* Lint nightly (Wave 2 day 4 step 15 / Karpathy steal 2 / A7).
+   * Runs the full lint pass with apply=false + the IndexDb handle so
+   * findings flow into audit_findings. The existing debounced lint-
+   * queue still fires on every wiki mutation; this nightly pass is
+   * the safety net that scans pages no mutation touched. The 5-min
+   * stagger after boot keeps the daemon's listen + first-ingest
+   * latency clean. */
+  const lintIntervalMs = Number(
+    process.env.DEVNEURAL_LINT_NIGHTLY_INTERVAL_MS ?? 24 * 60 * 60 * 1000,
+  );
+  const lintTimer = setTimeout(() => {
+    void runLint({ db: store.db }).catch((err) =>
+      logger(`[lint nightly] failed: ${(err as Error).message}`),
+    );
+    const repeat = setInterval(() => {
+      void runLint({ db: store.db }).catch((err) =>
+        logger(`[lint nightly] failed: ${(err as Error).message}`),
+      );
+    }, lintIntervalMs);
+    if (typeof repeat.unref === 'function') repeat.unref();
+  }, 5 * 60 * 1000);
+  if (typeof lintTimer.unref === 'function') lintTimer.unref();
+
   const scaffold = ensureWiki();
   logger(
     `wiki scaffold: created=${scaffold.created.length} updated=${scaffold.updated.length} present=${scaffold.alreadyPresent.length}`,
