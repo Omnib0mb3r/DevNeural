@@ -26,24 +26,37 @@ import type { ReferenceStore } from '../reference/store.js';
 import type { BrainstormSessionRow } from '../store/index-db.js';
 
 export type SourceClass =
-  | 'wiki-canonical'
-  | 'wiki-pending'
   | 'brainstorm'
+  | 'wiki'
+  | 'meeting'
+  | 'draft'
+  | 'project'
   | 'raw'
   | 'reference';
 
-/* Source-class scoring multiplier (codex-pinned). Applied on top of
- * the cosine similarity so the same query surfaces canonical wisdom
- * first, pending drafts next, then live brainstorm context, then
- * generic logs, then reference material. Ranking is reversible —
- * delete the multiplier and you're back to raw cosine. */
-const SOURCE_CLASS_MULTIPLIER: Record<SourceClass, number> = {
-  'wiki-canonical': 1.0,
-  'wiki-pending': 0.85,
-  brainstorm: 0.7,
-  raw: 0.6,
-  reference: 0.5,
+/* Source-class scoring weights (BF-1 source-classed retrieval order,
+ * BF-16 meeting class). Spec section 4.2 DEFAULT_SOURCE_CLASS_WEIGHTS.
+ * Brainstorms outrank wiki, meetings rank between wiki and draft.
+ * `project` is a reserved class for future per-project transcript
+ * routing; today's raw_chunks_meta still classifies as 'raw' until
+ * project-class routing lands. The ranking flip from previous
+ * (wiki-canonical=1.0, brainstorm=0.7) to current (brainstorm=1.20,
+ * wiki=1.00) is a deliberate identity-level change documented in
+ * voice-review.md and PHASE-TWO-IMPLEMENTATION.md section 2.1. */
+export const DEFAULT_SOURCE_CLASS_WEIGHTS: Record<SourceClass, number> = {
+  brainstorm: 1.2,
+  wiki: 1.0,
+  meeting: 0.9,
+  draft: 0.85,
+  project: 0.7,
+  raw: 0.5,
+  reference: 0.3,
 };
+
+/* Backwards-compat alias retained for any in-flight import that
+ * still wants the constant under its old name. New code reads
+ * DEFAULT_SOURCE_CLASS_WEIGHTS. */
+const SOURCE_CLASS_MULTIPLIER = DEFAULT_SOURCE_CLASS_WEIGHTS;
 
 export interface BrainstormSummary {
   id: string;
@@ -53,6 +66,11 @@ export interface BrainstormSummary {
   mode: string;
   status: string;
   started_ms: number;
+  /* BF-14: distinguishes brainstorm (solo ideation) from meeting
+   * (third-party voices) so the source-class router can route to
+   * 'brainstorm' or 'meeting' weights respectively. Default
+   * 'brainstorm' for legacy rows that pre-date the kind column. */
+  kind: 'brainstorm' | 'meeting';
 }
 
 export interface UnifiedSearchHit {
@@ -125,6 +143,7 @@ function summariseBrainstorm(row: BrainstormSessionRow): BrainstormSummary {
     mode: row.mode,
     status: row.status,
     started_ms: row.started_ms,
+    kind: row.kind === 'meeting' ? 'meeting' : 'brainstorm',
   };
 }
 
@@ -150,11 +169,11 @@ function buildBrainstormIndex(store: Store): Map<string, BrainstormSummary> {
 
 function classifyWiki(metadata: Record<string, unknown>): SourceClass {
   const status = metadata.status;
-  if (status === 'canonical') return 'wiki-canonical';
-  /* Pending and archived both fall into pending priority. Archived
+  if (status === 'canonical') return 'wiki';
+  /* Pending and archived both fall into draft priority. Archived
    * is rare and downranking it further would just hide useful
    * historical context behind generic raw chunks. */
-  return 'wiki-pending';
+  return 'draft';
 }
 
 export async function searchAll(
@@ -230,7 +249,11 @@ export async function searchAll(
       const metadata = h.metadata as Record<string, unknown>;
       const sessionId = metadata.session_id as string | undefined;
       const brainstorm = sessionId ? brainstormIndex.get(sessionId) : undefined;
-      const source_class: SourceClass = brainstorm ? 'brainstorm' : 'raw';
+      const source_class: SourceClass = brainstorm
+        ? brainstorm.kind === 'meeting'
+          ? 'meeting'
+          : 'brainstorm'
+        : 'raw';
       const hit: UnifiedSearchHit = {
         source: 'raw_chunk',
         source_class,
@@ -293,7 +316,10 @@ export async function searchAll(
   if (options.group_by_session) {
     const groupMap = new Map<string, SessionGroup>();
     for (const hit of results) {
-      if (hit.source_class !== 'brainstorm' || !hit.brainstorm_session) continue;
+      if (
+        (hit.source_class !== 'brainstorm' && hit.source_class !== 'meeting') ||
+        !hit.brainstorm_session
+      ) continue;
       const key = hit.brainstorm_session.id;
       const existing = groupMap.get(key);
       if (existing) {

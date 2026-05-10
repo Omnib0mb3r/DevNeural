@@ -415,6 +415,58 @@ export interface KpiStats {
 }
 export const statsKpi = () => request<KpiStats>("/stats/kpi");
 
+/* CI-6 Curator Health KPI card. Endpoint shape mirrors spec
+ * section 4.1 GET /stats/curator-health. */
+export interface CuratorHealthStats {
+  ok: boolean;
+  window_days: number;
+  injections_per_day: number[];
+  hit_rate: number;
+  correction_rate: number;
+  silence_rate: number;
+  click_through_rate: number;
+  canary_status: "green" | "red" | "unknown";
+  canary_last_run: string | null;
+  flagged_pages_count: number;
+}
+export const statsCuratorHealth = (windowDays?: number) => {
+  const qs = windowDays ? `?window=${windowDays}` : "";
+  return request<CuratorHealthStats>(`/stats/curator-health${qs}`);
+};
+
+/* BF-12 brainstorm KPI tiles. Endpoint shape mirrors spec section
+ * 4.1 GET /stats/brainstorm-kpi. */
+export interface BrainstormKpiStats {
+  ok: boolean;
+  total_brainstorms: number;
+  hours_captured: number;
+  artifacts_per_brainstorm_avg: number;
+  wiki_lineage_coverage: number;
+  project_less_ratio: number;
+  active_today: number;
+}
+export const statsBrainstormKpi = () =>
+  request<BrainstormKpiStats>("/stats/brainstorm-kpi");
+
+/* PB-3 outbound dashboard tile. Endpoint shape mirrors spec section
+ * 4.1 GET /stats/outbound. brainstorm_outbound_count_alltime is
+ * always 0 by contract; the field exists so the card can render
+ * the "0 ever, by design" assertion. */
+export interface OutboundStats {
+  ok: boolean;
+  today: {
+    calls_total: number;
+    calls_by_destination: Record<string, number>;
+    bytes_total: number;
+    cap: number;
+    cap_remaining: number;
+    paused: boolean;
+  };
+  last_7_days: Array<{ date: string; calls: number; bytes: number }>;
+  brainstorm_outbound_count_alltime: number;
+}
+export const statsOutbound = () => request<OutboundStats>("/stats/outbound");
+
 export const spawnLex = (cwd?: string, resumeSessionId?: string) =>
   request<{ ok: boolean; ptyId?: string; pid?: number; cwd?: string; resumed?: boolean; error?: string }>(
     "/pty/spawn-lex",
@@ -479,6 +531,382 @@ export const patchLexSession = (
     `/lex/sessions/${encodeURIComponent(id)}`,
     { method: "PATCH", body: patch },
   );
+
+/* Wave 2 day 2 (BF-5 / A1, BF-7 review / A2). The /brainstorms +
+ * /drafts route family lives alongside the older /lex/sessions
+ * surface; the two share the same underlying brainstorm_sessions and
+ * wiki_drafts tables. New consumers should prefer these typed
+ * helpers; the older lexSessions* helpers stay until /lex itself
+ * gets retired (out of scope for Wave 2). */
+export interface BrainstormDecorated {
+  brainstorm: BrainstormSessionRow & {
+    project_slug?: string | null;
+    audio_path?: string | null;
+    distilled_at?: string | null;
+    kind?: "brainstorm" | "meeting";
+    consent_acked?: number;
+    keep_audio?: number;
+    provenance?: "voice" | "audit-document" | "synthetic";
+  };
+  audio_url: string | null;
+  cues_url: string | null;
+}
+export interface BrainstormFilter {
+  kind?: "brainstorm" | "meeting";
+  project?: string;
+  mode?: string;
+  date?: string;
+  limit?: number;
+}
+export const listBrainstormsApi = (opts: BrainstormFilter = {}) => {
+  const qs = new URLSearchParams();
+  if (opts.kind) qs.set("kind", opts.kind);
+  if (opts.project) qs.set("project", opts.project);
+  if (opts.mode) qs.set("mode", opts.mode);
+  if (opts.date) qs.set("date", opts.date);
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const q = qs.toString();
+  return request<{ ok: boolean; brainstorms: BrainstormDecorated[] }>(
+    `/brainstorms${q ? `?${q}` : ""}`,
+  );
+};
+export const getBrainstormApi = (id: string) =>
+  request<{ ok: boolean; brainstorm: BrainstormDecorated; error?: string }>(
+    `/brainstorms/${encodeURIComponent(id)}`,
+  );
+
+export interface AudioCue {
+  turn_index: number;
+  start_ms: number;
+  end_ms: number;
+}
+export interface BrainstormCues {
+  session_id: string;
+  sample_rate: number;
+  channels: number;
+  bits_per_sample: number;
+  cues: AudioCue[];
+}
+export const getBrainstormCuesApi = (id: string) =>
+  request<BrainstormCues>(`/brainstorms/${encodeURIComponent(id)}/cues`);
+
+/* Wave 2 day 3 step 13. Borderline-band candidates from
+ * `npm run backfill-brainstorms` await one-click link / reject. */
+export interface BackfillReviewRow {
+  id: string;
+  brainstorm_id: string;
+  candidate_page_slug: string;
+  cosine: number;
+  band: "high" | "borderline" | "low";
+  status: "pending" | "linked" | "rejected" | "skipped";
+  created_at: string;
+  resolved_at: string | null;
+  resolved_by: string | null;
+}
+export const listBackfillReview = (
+  opts: {
+    status?: BackfillReviewRow["status"];
+    band?: BackfillReviewRow["band"];
+    limit?: number;
+  } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.status) qs.set("status", opts.status);
+  if (opts.band) qs.set("band", opts.band);
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const q = qs.toString();
+  return request<{ ok: boolean; candidates: BackfillReviewRow[] }>(
+    `/brainstorms/backfill-review${q ? `?${q}` : ""}`,
+  );
+};
+export const linkBackfillReview = (id: string) =>
+  request<{ ok: boolean; row?: BackfillReviewRow; error?: string; conflict?: string }>(
+    `/brainstorms/backfill-review/${encodeURIComponent(id)}/link`,
+    { method: "POST" },
+  );
+export const rejectBackfillReview = (id: string) =>
+  request<{ ok: boolean; row?: BackfillReviewRow; error?: string; conflict?: string }>(
+    `/brainstorms/backfill-review/${encodeURIComponent(id)}/reject`,
+    { method: "POST" },
+  );
+/* Wave 2 day 4 audit_findings + curator/wrong + runtime_config. */
+export interface AuditFindingRow {
+  id: string;
+  source: "lint" | "self-audit" | "canary" | "user-flag" | "schema-regression";
+  severity: "low" | "medium" | "high";
+  page_slug: string | null;
+  brainstorm_id: string | null;
+  finding: string;
+  detail: string | null;
+  status: "open" | "acknowledged" | "resolved" | "dismissed";
+  created_at: string;
+  resolved_at: string | null;
+}
+export const listAuditFindings = (
+  opts: {
+    status?: AuditFindingRow["status"];
+    source?: AuditFindingRow["source"];
+    severity?: AuditFindingRow["severity"];
+    page?: string;
+    limit?: number;
+  } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.status) qs.set("status", opts.status);
+  if (opts.source) qs.set("source", opts.source);
+  if (opts.severity) qs.set("severity", opts.severity);
+  if (opts.page) qs.set("page", opts.page);
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const q = qs.toString();
+  return request<{ ok: boolean; findings: AuditFindingRow[] }>(
+    `/audit-findings${q ? `?${q}` : ""}`,
+  );
+};
+export const updateAuditFinding = (
+  id: string,
+  action: "acknowledge" | "resolve" | "dismiss",
+) =>
+  request<{ ok: boolean; finding?: AuditFindingRow; error?: string }>(
+    `/audit-findings/${encodeURIComponent(id)}/${action}`,
+    { method: "POST" },
+  );
+export const triggerLintNow = () =>
+  request<{ ok: boolean; result?: unknown }>(`/admin/lint/run`, {
+    method: "POST",
+  });
+export const triggerSelfAudit = (sample = 10) =>
+  request<{ ok: boolean; result?: unknown }>(`/admin/self-audit/run`, {
+    method: "POST",
+    body: { sample },
+  });
+export const curatorWrong = (page_id: string, opts: { curator_log_id?: string; note?: string } = {}) =>
+  request<{ ok: boolean; weight?: number; corrections?: number; archived?: boolean; error?: string }>(
+    `/curator/wrong`,
+    { method: "POST", body: { page_id, ...opts } },
+  );
+
+export interface RuntimeConfigRow {
+  key: string;
+  value: string;
+  updated_at: string;
+  updated_by: string | null;
+}
+export const listRuntimeConfig = () =>
+  request<{ ok: boolean; config: RuntimeConfigRow[] }>(`/runtime-config`);
+/* Wave 2 day 5: meetings + lex feedback + lex prompts + lex replay
+ * + lex awareness. */
+export interface MeetingRow extends BrainstormSessionRow {
+  project_slug?: string | null;
+  audio_path?: string | null;
+  consent_acked?: number;
+  consent_acked_at?: string | null;
+  consent_acked_by?: string | null;
+  keep_audio?: number;
+  attendees?: string | null;
+  meeting_topic?: string | null;
+  kind?: "brainstorm" | "meeting";
+}
+export interface MeetingActionItem {
+  id: string;
+  meeting_id: string;
+  text: string;
+  assignee: string | null;
+  due: string | null;
+  reminder_id: string | null;
+  status: "open" | "done" | "dismissed" | "superseded";
+  source_turn_index: number | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+export const listMeetings = (
+  opts: { project?: string; date?: string; consent?: "acked" | "pending"; limit?: number } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.project) qs.set("project", opts.project);
+  if (opts.date) qs.set("date", opts.date);
+  if (opts.consent) qs.set("consent", opts.consent);
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const q = qs.toString();
+  return request<{ ok: boolean; meetings: MeetingRow[] }>(
+    `/meetings${q ? `?${q}` : ""}`,
+  );
+};
+export const getMeeting = (id: string) =>
+  request<{
+    ok: boolean;
+    meeting: MeetingRow;
+    action_items: MeetingActionItem[];
+    audio_purges_at: string | null;
+    error?: string;
+  }>(`/meetings/${encodeURIComponent(id)}`);
+export const consentAckMeeting = (id: string, acked_by?: string) =>
+  request<{ ok: boolean; meeting?: MeetingRow; error?: string }>(
+    `/meetings/${encodeURIComponent(id)}/consent-ack`,
+    { method: "POST", body: { acked_by } },
+  );
+export const setMeetingKeepAudio = (id: string, keep: boolean) =>
+  request<{ ok: boolean; meeting?: MeetingRow; error?: string }>(
+    `/meetings/${encodeURIComponent(id)}/keep-audio`,
+    { method: "POST", body: { keep } },
+  );
+export const addMeetingActionItem = (
+  id: string,
+  body: { text: string; assignee?: string; due?: string },
+) =>
+  request<{ ok: boolean; action_items: MeetingActionItem[]; error?: string }>(
+    `/meetings/${encodeURIComponent(id)}/action-items`,
+    { method: "POST", body },
+  );
+export const updateMeetingActionItem = (
+  meetingId: string,
+  itemId: string,
+  status: MeetingActionItem["status"],
+) =>
+  request<{ ok: boolean; action_item?: MeetingActionItem; error?: string }>(
+    `/meetings/${encodeURIComponent(meetingId)}/action-items/${encodeURIComponent(itemId)}`,
+    { method: "PATCH", body: { status } },
+  );
+export const promoteMeetingToWiki = (
+  id: string,
+  body: { slug?: string; title?: string } = {},
+) =>
+  request<{ ok: boolean; wiki_page_id?: string; error?: string }>(
+    `/meetings/${encodeURIComponent(id)}/promote-to-wiki`,
+    { method: "POST", body },
+  );
+
+export const lexFeedback = (body: {
+  turn_id: string;
+  prompt_version: string;
+  vote: "up" | "down";
+  reason?: string;
+  brainstorm_id?: string | null;
+}) =>
+  request<{ ok: boolean; id?: string; error?: string }>(`/lex/feedback`, {
+    method: "POST",
+    body,
+  });
+
+export const listLexPromptVersions = () =>
+  request<{ ok: boolean; versions: string[] }>(`/lex/prompts/versions`);
+
+export interface LexAwarenessEvent {
+  ts: string;
+  kind: string;
+  label: string;
+  brainstorm_id?: string | null;
+  detail?: Record<string, unknown>;
+}
+export const lexAwarenessRecent = (limit = 20, detail = false) =>
+  request<{ ok: boolean; mode: string; events: LexAwarenessEvent[]; budget_remaining_tokens: number }>(
+    `/lex/awareness/recent?limit=${limit}${detail ? "&detail=true" : ""}`,
+  );
+
+export const triggerLexReplay = (body: {
+  input_path: string;
+  version_a: string;
+  version_b: string;
+}) =>
+  request<{ ok: boolean; result?: unknown; error?: string }>(
+    `/admin/lex-replay`,
+    { method: "POST", body },
+  );
+
+export const setRuntimeConfig = (key: string, value: string) =>
+  request<{ ok: boolean; key?: string; value?: string; error?: string }>(
+    `/runtime-config/${encodeURIComponent(key)}`,
+    { method: "POST", body: { value } },
+  );
+
+export const triggerBackfillBrainstorms = () =>
+  request<{
+    ok: boolean;
+    result?: {
+      scanned: number;
+      ingested: number;
+      chunks_written: number;
+      high_links: number;
+      borderline_queued: number;
+      low_logged: number;
+      meetings_skipped_for_lineage: number;
+      errors: string[];
+    };
+    error?: string;
+  }>(`/admin/backfill/brainstorms`, { method: "POST" });
+
+export interface WikiDraftRow {
+  id: string;
+  brainstorm_id: string;
+  page_slug: string;
+  page_title: string;
+  body_markdown: string;
+  confidence: number;
+  status:
+    | "pending"
+    | "promoted"
+    | "discarded"
+    | "auto-promoted"
+    | "auto-dropped"
+    | "superseded";
+  created_at: string;
+  resolved_at: string | null;
+  resolved_by: string | null;
+}
+export const listDrafts = (
+  opts: { status?: WikiDraftRow["status"]; limit?: number } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.status) qs.set("status", opts.status);
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const q = qs.toString();
+  return request<{ ok: boolean; drafts: WikiDraftRow[] }>(
+    `/drafts${q ? `?${q}` : ""}`,
+  );
+};
+export const getDraft = (id: string) =>
+  request<{ ok: boolean; draft: WikiDraftRow; error?: string }>(
+    `/drafts/${encodeURIComponent(id)}`,
+  );
+export const patchDraft = (
+  id: string,
+  patch: Partial<Pick<WikiDraftRow, "page_slug" | "page_title" | "body_markdown">>,
+) =>
+  request<{ ok: boolean; draft?: WikiDraftRow; error?: string; conflict?: string }>(
+    `/drafts/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: patch },
+  );
+export const discardDraft = (id: string) =>
+  request<{ ok: boolean; draft?: WikiDraftRow; error?: string; conflict?: string }>(
+    `/drafts/${encodeURIComponent(id)}/discard`,
+    { method: "POST" },
+  );
+export interface PromoteDraftBody {
+  resolution?: "rename" | "merge" | "overwrite";
+  new_slug?: string;
+  force?: boolean;
+  expected_resolved_at?: string | null;
+}
+export interface PromoteDraftResult {
+  ok: boolean;
+  draft?: WikiDraftRow;
+  wiki_page_id?: string;
+  wiki_page_path?: string;
+  conflict?:
+    | "slug_collision"
+    | "frozen_target"
+    | "superseded"
+    | "target_drift"
+    | "already_resolved";
+  existing_page_id?: string;
+  existing_status?: string;
+  promoted_id?: string;
+  error?: string;
+}
+export const promoteDraft = (id: string, body: PromoteDraftBody = {}) =>
+  request<PromoteDraftResult>(`/drafts/${encodeURIComponent(id)}/promote`, {
+    method: "POST",
+    body,
+  });
 
 export interface LexArtifactItem {
   kind: string;
@@ -745,6 +1173,16 @@ export interface WikiPageDetail {
   cross_refs: string[];
   evidence: string[];
   log: string[];
+  /* Phase Two frontmatter (Wave 2 day 3 step 12). Optional on legacy
+   * pages that pre-date migration 009; reads default to safe values
+   * via the daemon's response builder. */
+  schema_version?: number | null;
+  last_verified?: string | null;
+  frozen?: boolean;
+  source_brainstorms?: string[];
+  source_meetings?: string[];
+  derived_from_brainstorm?: boolean;
+  derived_from_meeting?: boolean;
 }
 export const wikiPage = (id: string) =>
   request<{ ok: boolean; page: WikiPageDetail; error?: string }>(`/wiki/page/${encodeURIComponent(id)}`);

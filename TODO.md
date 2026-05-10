@@ -29,16 +29,16 @@ Captured 2026-05-04. Living list. Tick when shipped.
 - Phase 5 settings audit + personalized recovery docs. Mostly documentation.
 - Audio/video binary smoke test post whisper.cpp + ffmpeg install.
 
-## Phase Two queue (2026-05-09)
+## Phase Two queue (2026-05-09; superseded 2026-05-10)
 
-Full plan in `docs/spec/FUNCTIONAL-SPEC.md` section 17. Tracking in `docs/HANDOVER-2026-05-09-second-brain-strengthening.md` Phase Two section.
+**Authoritative plan now lives in `docs/spec/PHASE-TWO-IMPLEMENTATION.md` (3 waves over ~3 weeks, post-CODEX-REVIEW-001 + 002 adoption). Day-1 verifications in `docs/spec/PHASE-TWO-DAY-1-VERIFICATIONS.md`. Active branch: `phase-two`. Resume guidance in `docs/HANDOVER-2026-05-10-phase-two-wave-1-day-1.md` (covers Wave 1 days 1-3 + Wave 2 entry).** P2-0 through P2-5 below are superseded; the same goals are tracked under spec section 11 wave structure with concrete file paths and step ordering. P2-0 (adversarial review of FUNCTIONAL-SPEC.md) is scheduled for Wave 3 day 5 per spec section 12 step 14.
 
-- [ ] **P2-0** ⚠ FIRST: Adversarial review of `docs/spec/FUNCTIONAL-SPEC.md` → output at `docs/spec/FUNCTIONAL-SPEC-REVIEW-001.md`. Must catch holes, contradictions, stale claims, missing edge cases, untested assumptions, architectural concerns at 10x scale, security gaps, Phase Two risks. Bullet list grouped by spec section.
-- [ ] **P2-1** Lex personality customization: dials, per-mode few-shot, refusal contract, `SYSTEM_PROMPT_VERSION` versioning, in-prompt comments documenting WHY each block exists.
-- [ ] **P2-2** L1 live awareness broadcaster (`07-daemon/src/lex/awareness-broadcaster.ts`): 5–15s tick, snapshot of active CC sessions + brainstorms + recent artifacts + flagged pages, push as system-message-shaped block to Lex's PTY.
-- [ ] **P2-3** Lex feedback loop: per-turn thumbs up/down inline, regex-detected negative cues, aggregate per `SYSTEM_PROMPT_VERSION`, "worst-rated turns this week" dashboard surface.
-- [ ] **P2-4** UI fine-tuning: brainstorm rows in /sessions, /wiki↔/orb deeplink, "now playing" indicator, mobile PWA polish, brainstorm-as-orb-node.
-- [ ] **P2-5** Documentation refresh after P2-1 through P2-4.
+- [x] **P2-0** Superseded: scheduled for Wave 3 day 5 against `docs/spec/FUNCTIONAL-SPEC.md`. Implementation-plan reviews already completed (CODEX-REVIEW-001 + 002, both adopted).
+- [x] **P2-1** Tracked as Wave 2 day 5 steps 20-23 in `PHASE-TWO-IMPLEMENTATION.md`.
+- [x] **P2-2** Tracked as Wave 3 day 3 + Appendix R (gated on Curator Health green for 7 days).
+- [x] **P2-3** Tracked as Wave 1 step 22 (in-flight on phase-two branch) + Wave 2 day 5 step 24.
+- [x] **P2-4** Tracked as Wave 2 day 2 (`/brainstorms` route) + Wave 3 day 2 (unified orb).
+- [x] **P2-5** Tracked as Wave 3 day 4 (docs + restore drill + cold-start test).
 
 ## Operational
 

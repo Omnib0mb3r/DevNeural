@@ -60,6 +60,47 @@ export const sessionTaskFile = (sessionId: string): string =>
 export const sessionMetaFile = (sessionId: string): string =>
   path.posix.join(sessionStateDir(), `${sessionId}.meta.json`);
 
+/* Wave 2 day 5 (LX-1, LX-3, LX-4): on-disk prompt archive + per-mode
+ * few-shot + refusal contract blocks. Versions land at
+ * <root>/<version>.md; few-shot files at <root>/few-shot/<mode>.md;
+ * refusal contracts at <root>/refusal-contract.md and the meeting-
+ * specific variant at <root>/refusal-contract-meeting.md. */
+export const lexPromptsRoot = (): string =>
+  path.posix.join(DATA_ROOT, 'lex-prompts');
+export const lexPromptVersionsDir = (): string => lexPromptsRoot();
+export const lexPromptFewShotDir = (): string =>
+  path.posix.join(lexPromptsRoot(), 'few-shot');
+export const lexPromptFewShotFile = (mode: string): string =>
+  path.posix.join(lexPromptFewShotDir(), `${mode}.md`);
+export const lexRefusalContractFile = (): string =>
+  path.posix.join(lexPromptsRoot(), 'refusal-contract.md');
+export const lexRefusalContractMeetingFile = (): string =>
+  path.posix.join(lexPromptsRoot(), 'refusal-contract-meeting.md');
+
+/* Wave 2 day 5 step 21 (LX-2 / B2). A/B replay output. Each run
+ * writes <root>/<timestamp>/diff.md plus version-a.txt + version-b.txt. */
+export const lexReplayRoot = (): string =>
+  path.posix.join(DATA_ROOT, 'lex-replay-output');
+
+/* Wave 2 day 2 step 11: canonical audio storage. Per session, one
+ * <id>.opus (or <id>.wav) plus a sibling <id>.cues.json listing
+ * { turn_index, start_ms, end_ms }. The capture rig writes both
+ * atomically at session end. Older per-utterance layouts are not
+ * supported by the audio endpoint or backfill. */
+export const brainstormsRoot = (): string =>
+  path.posix.join(DATA_ROOT, 'brainstorms');
+export const brainstormDir = (brainstormId: string): string =>
+  path.posix.join(brainstormsRoot(), brainstormId);
+export const brainstormAudioDir = (brainstormId: string): string =>
+  path.posix.join(brainstormDir(brainstormId), 'audio');
+export const brainstormAudioFile = (
+  brainstormId: string,
+  ext: 'opus' | 'wav',
+): string =>
+  path.posix.join(brainstormAudioDir(brainstormId), `${brainstormId}.${ext}`);
+export const brainstormCuesFile = (brainstormId: string): string =>
+  path.posix.join(brainstormAudioDir(brainstormId), `${brainstormId}.cues.json`);
+
 export const referenceRoot = (): string =>
   path.posix.join(DATA_ROOT, 'reference');
 export const referenceQueueDir = (): string =>

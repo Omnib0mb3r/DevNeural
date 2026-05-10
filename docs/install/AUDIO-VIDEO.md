@@ -168,3 +168,39 @@ chunks the result the same way as a PDF.
   the daemon before the binaries were installed has status `queued`.
   Re-uploading the same file works; a re-process endpoint is on the
   Phase 3.6 list.
+
+## Brainstorm session audio retention (Wave 2 day 2)
+
+Per spec section 11 day 2 step 11, a brainstorm or meeting voice
+session writes a single canonical audio bundle at
+`<DATA_ROOT>/brainstorms/<id>/audio/`:
+
+- `<id>.wav` — concatenated PCM with a standard RIFF header.
+- `<id>.cues.json` — per-turn `[{ turn_index, start_ms, end_ms }]`
+  offsets so the dashboard player can jump to any utterance.
+
+The daemon serves these via `GET /brainstorms/:id/audio` (Range
+support; iOS Safari requires it for the seek bar) and
+`GET /brainstorms/:id/cues`. Cache-Control is `no-store`; the
+service worker is configured to skip caching audio so multi-hour
+sessions do not displace the dashboard's static assets.
+
+### Sensitivity and ACL
+
+`<DATA_ROOT>/brainstorms/<id>/audio/` inherits the data root
+permissions. On a multi-user host, lock the folder to the daemon
+owner only:
+
+```powershell
+icacls "$env:DEVNEURAL_DATA_ROOT\brainstorms" /inheritance:r /grant:r "$env:USERNAME:(OI)(CI)F" /T
+```
+
+### Meeting consent gate (BF-17)
+
+Meeting-kind sessions only retain audio after the user posts to
+`POST /meetings/:id/consent-ack` (Wave 2 day 5). Until consent is
+acknowledged, transcription still runs but PCM frames are dropped
+on session-end (`audio-bundle.discard()` instead of `finalize()`).
+Brainstorm-kind sessions retain audio by default; that is governed
+by `DEVNEURAL_AUDIO_MAX_AGE_DAYS=0` (forever). Meeting audio defaults
+to `DEVNEURAL_MEETING_AUDIO_MAX_AGE_DAYS=30`.

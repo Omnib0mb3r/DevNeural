@@ -12,7 +12,14 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { DATA_ROOT, wikiPagesDir, wikiPendingDir, wikiArchiveDir } from '../paths.js';
+import {
+  DATA_ROOT,
+  wikiPagesDir,
+  wikiPendingDir,
+  wikiArchiveDir,
+  brainstormAudioFile,
+  brainstormCuesFile,
+} from '../paths.js';
 import { authMiddleware, registerAuthRoutes, isPinSet } from './auth.js';
 import { ReferenceStore } from '../reference/store.js';
 import { ingestUpload } from '../reference/process.js';
@@ -113,6 +120,7 @@ import {
   removeSubscription,
   listSubscriptions,
 } from './push.js';
+import { writePage, parsePage } from '../wiki/schema.js';
 
 export async function registerDashboardRoutes(
   app: FastifyInstance,
@@ -345,6 +353,20 @@ export async function registerDashboardRoutes(
             cross_refs: page.sections.crossRefs,
             evidence: page.sections.evidence,
             log: page.sections.log,
+            /* Phase Two frontmatter (Wave 2 day 3 step 12 lineage panel
+             * + WI-3 last_verified + WI-1 frozen). Optional in the
+             * frontmatter parser; surface the raw arrays / flags so
+             * the dashboard can render the source-brainstorms section
+             * and the verification-state pill. */
+            schema_version: page.frontmatter.schema_version ?? null,
+            last_verified: page.frontmatter.last_verified ?? null,
+            frozen: page.frontmatter.frozen === true,
+            source_brainstorms: page.frontmatter.source_brainstorms ?? [],
+            source_meetings: page.frontmatter.source_meetings ?? [],
+            derived_from_brainstorm:
+              page.frontmatter.derived_from_brainstorm === true,
+            derived_from_meeting:
+              page.frontmatter.derived_from_meeting === true,
           },
         };
       } catch (err) {
@@ -1303,7 +1325,7 @@ export async function registerDashboardRoutes(
      * don't run a real semantic contradiction check here; we mark
      * the overlap so Lex knows to look. */
     const hasCanonical = page.results.some(
-      (r) => r.source_class === 'wiki-canonical',
+      (r) => r.source_class === 'wiki',
     );
     const hasBrainstorm = (page.groups?.length ?? 0) > 0;
     const conflictCheckRequired = hasCanonical && hasBrainstorm;
@@ -1318,7 +1340,7 @@ export async function registerDashboardRoutes(
       conflict_overlap: conflictCheckRequired
         ? {
             canonical: page.results
-              .filter((r) => r.source_class === 'wiki-canonical')
+              .filter((r) => r.source_class === 'wiki')
               .slice(0, 3)
               .map((r) => ({
                 id: r.id,
@@ -2233,6 +2255,151 @@ export async function registerDashboardRoutes(
     };
   });
 
+  // ── Phase Two KPI endpoints (CI-6, BF-12, PB-3) ────────────────
+  /* /stats/curator-health drives the Curator Health KPI card. Window
+   * defaults to 7 days; ?window=N overrides up to 30. Rates are
+   * computed client-side from the totals so the card can show
+   * sparkline + headline numbers from one fetch. */
+  app.get('/stats/curator-health', async (req) => {
+    const q = (req.query ?? {}) as { window?: string };
+    const windowDays = Math.min(
+      Math.max(Number(q.window ?? 7) || 7, 1),
+      30,
+    );
+    const w = store.db.curatorHealthWindow(windowDays);
+    /* Build a per-day series of length windowDays so the sparkline
+     * has zero-filled gaps where no inject happened. */
+    const days: string[] = [];
+    const today = new Date();
+    for (let i = windowDays - 1; i >= 0; i--) {
+      const d = new Date(today);
+      d.setUTCDate(d.getUTCDate() - i);
+      days.push(d.toISOString().slice(0, 10));
+    }
+    const perDayMap = new Map(w.injections_per_day.map((r) => [r.day, r.count]));
+    const injections_per_day = days.map((d) => perDayMap.get(d) ?? 0);
+    const inject = w.inject_total;
+    const rate = (n: number) => (inject > 0 ? n / inject : 0);
+    return {
+      ok: true,
+      window_days: windowDays,
+      injections_per_day,
+      hit_rate: rate(w.hit_total),
+      correction_rate: rate(w.correction_total + w.wrong_total),
+      silence_rate:
+        inject + w.silence_total > 0
+          ? w.silence_total / (inject + w.silence_total)
+          : 0,
+      click_through_rate: rate(w.click_total),
+      canary_status: 'unknown' as const,
+      canary_last_run: null as string | null,
+      flagged_pages_count: 0,
+    };
+  });
+
+  /* /stats/brainstorm-kpi drives the BrainstormKpiTiles. Counts come
+   * from brainstorm_sessions (not brainstorm_chunks because the
+   * intent is sessions-as-records, not chunks-as-records). */
+  app.get('/stats/brainstorm-kpi', async () => {
+    const counts = (
+      store.db as unknown as {
+        db: {
+          prepare: (s: string) => { get: () => Record<string, number | string | null> };
+        };
+      }
+    ).db
+      .prepare(
+        `SELECT
+           COUNT(*)                                              AS total,
+           SUM(CASE WHEN ended_ms IS NOT NULL THEN (ended_ms - started_ms) / 1000.0 ELSE 0 END) / 3600.0
+                                                                 AS hours,
+           SUM(CASE WHEN project_slug IS NULL THEN 1 ELSE 0 END) AS project_less,
+           SUM(CASE WHEN substr(strftime('%Y-%m-%dT%H:%M:%SZ', started_ms / 1000.0, 'unixepoch'), 1, 10)
+                       = strftime('%Y-%m-%d', 'now') THEN 1 ELSE 0 END)
+                                                                 AS active_today
+         FROM brainstorm_sessions
+         WHERE COALESCE(kind, 'brainstorm') = 'brainstorm'`,
+      )
+      .get() as {
+      total: number;
+      hours: number;
+      project_less: number;
+      active_today: number;
+    };
+    const total = Number(counts.total ?? 0);
+    return {
+      ok: true,
+      total_brainstorms: total,
+      hours_captured: Number(counts.hours ?? 0),
+      artifacts_per_brainstorm_avg: 0,
+      wiki_lineage_coverage: 0,
+      project_less_ratio:
+        total > 0 ? Number(counts.project_less ?? 0) / total : 0,
+      active_today: Number(counts.active_today ?? 0),
+    };
+  });
+
+  /* /stats/outbound drives the OutboundCard. brainstorm_outbound_count
+   * is wired to always return 0 (the SQLite trigger guarantees this);
+   * the field is in the response shape so the card can render the
+   * "0 ever, by design" assertion. */
+  app.get('/stats/outbound', async () => {
+    const today = store.db.outboundTodayUsage();
+    const last7 = (
+      store.db as unknown as {
+        db: {
+          prepare: (s: string) => {
+            all: () => Array<{ date: string; calls: number; bytes: number }>;
+          };
+        };
+      }
+    ).db
+      .prepare(
+        `SELECT substr(request_at, 1, 10) AS date,
+                COUNT(*) AS calls,
+                COALESCE(SUM(payload_bytes), 0) AS bytes
+         FROM outbound_log
+         WHERE request_at >= datetime('now', '-7 days')
+         GROUP BY date
+         ORDER BY date`,
+      )
+      .all();
+    const byDest = (
+      store.db as unknown as {
+        db: {
+          prepare: (s: string) => {
+            all: () => Array<{ destination: string; n: number }>;
+          };
+        };
+      }
+    ).db
+      .prepare(
+        `SELECT destination, COUNT(*) AS n
+         FROM outbound_log
+         WHERE substr(request_at, 1, 10) = strftime('%Y-%m-%d', 'now')
+         GROUP BY destination`,
+      )
+      .all();
+    const cap = Number(
+      process.env.DEVNEURAL_OUTBOUND_DAILY_CAP_CALLS ?? 200,
+    );
+    return {
+      ok: true,
+      today: {
+        calls_total: today.calls,
+        calls_by_destination: Object.fromEntries(
+          byDest.map((r) => [r.destination, r.n]),
+        ),
+        bytes_total: today.bytes,
+        cap,
+        cap_remaining: Math.max(0, cap - today.calls),
+        paused: today.calls >= cap,
+      },
+      last_7_days: last7,
+      brainstorm_outbound_count_alltime: 0,
+    };
+  });
+
   // ── Admin: one-time backfill of historical Claude transcripts ───
   /* These endpoints are gated behind authMiddleware (registered above on
    * preHandler). They kick off long-running in-process work and return
@@ -2410,6 +2577,989 @@ export async function registerDashboardRoutes(
     return { ok: true };
   });
 
+  /* ── /brainstorms (Wave 2 day 2 step 9 / BF-5 / A1) ───────────────
+   * Brainstorm-first dashboard surface. /brainstorms returns the
+   * filtered list (project_slug + mode + date filter chips); /brain
+   * storms/:id returns the row plus the artifacts manifest plus a
+   * cues_url + audio_url when audio was retained. /brainstorms/:id/
+   * audio + /brainstorms/:id/cues serve the on-disk bundle written
+   * by the session-end pipeline. */
+  app.get('/brainstorms', async (req) => {
+    const q = (req.query ?? {}) as {
+      kind?: string;
+      project?: string;
+      mode?: string;
+      date?: string;
+      limit?: string;
+    };
+    const kind = q.kind === 'meeting' ? 'meeting' : 'brainstorm';
+    const opts: {
+      kind: 'brainstorm' | 'meeting';
+      project_slug?: string;
+      mode?: string;
+      date?: string;
+      limit?: number;
+    } = { kind };
+    if (q.project) opts.project_slug = q.project;
+    if (q.mode) opts.mode = q.mode;
+    if (q.date) opts.date = q.date;
+    if (q.limit) opts.limit = Math.min(500, Math.max(1, Number(q.limit)));
+    const rows = store.db.listBrainstormsFiltered(opts);
+    return {
+      ok: true,
+      brainstorms: rows.map(decorateBrainstorm),
+    };
+  });
+
+  app.get('/brainstorms/:id', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.getBrainstorm(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    return { ok: true, brainstorm: decorateBrainstorm(row) };
+  });
+
+  app.get('/brainstorms/:id/cues', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.getBrainstorm(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    const cuesPath = brainstormCuesFile(id);
+    if (!fs.existsSync(cuesPath)) {
+      reply.code(404);
+      return { ok: false, error: 'no cues file for this session' };
+    }
+    try {
+      const raw = fs.readFileSync(cuesPath, 'utf-8');
+      reply.header('content-type', 'application/json; charset=utf-8');
+      return JSON.parse(raw);
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, error: `cues read failed: ${(err as Error).message}` };
+    }
+  });
+
+  /* Range-supporting audio endpoint. The browser <audio> element
+   * issues `Range: bytes=N-` requests on first play and again on
+   * seeks; without a 206 response the seek bar locks up on iOS. We
+   * read the file once per request — cheap because OS page cache
+   * keeps repeat hits hot — and slice the requested window. */
+  app.get('/brainstorms/:id/audio', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.getBrainstorm(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    const wavPath = brainstormAudioFile(id, 'wav');
+    if (!fs.existsSync(wavPath)) {
+      reply.code(404);
+      return { ok: false, error: 'no audio for this session' };
+    }
+    const stat = fs.statSync(wavPath);
+    const total = stat.size;
+    const range = req.headers.range;
+    reply.header('accept-ranges', 'bytes');
+    reply.header('content-type', 'audio/wav');
+    reply.header('cache-control', 'no-store');
+    if (!range) {
+      reply.header('content-length', String(total));
+      return reply.send(fs.createReadStream(wavPath));
+    }
+    const m = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!m) {
+      reply.code(416);
+      reply.header('content-range', `bytes */${total}`);
+      return { ok: false, error: 'invalid range header' };
+    }
+    const startStr = m[1] ?? '';
+    const endStr = m[2] ?? '';
+    const start = startStr === '' ? Math.max(0, total - Number(endStr)) : Number(startStr);
+    const end = endStr === '' || startStr === '' ? total - 1 : Math.min(Number(endStr), total - 1);
+    if (
+      Number.isNaN(start) ||
+      Number.isNaN(end) ||
+      start < 0 ||
+      end < start ||
+      start >= total
+    ) {
+      reply.code(416);
+      reply.header('content-range', `bytes */${total}`);
+      return { ok: false, error: 'unsatisfiable range' };
+    }
+    reply.code(206);
+    reply.header('content-range', `bytes ${start}-${end}/${total}`);
+    reply.header('content-length', String(end - start + 1));
+    return reply.send(fs.createReadStream(wavPath, { start, end }));
+  });
+
+  /* ── /meetings (Wave 2 day 5 step 24a / BF-15 / BF-17 / 5.1) ─────
+   * Meeting-kind brainstorm rows surface here; the route family
+   * mirrors /brainstorms but adds the consent gate, action items,
+   * and the explicit promote-to-wiki path that meetings require
+   * (BF-15: no auto-distillation). */
+  app.get('/meetings', async (req) => {
+    const q = (req.query ?? {}) as {
+      project?: string;
+      date?: string;
+      consent?: string;
+      limit?: string;
+    };
+    const opts: Parameters<typeof store.db.listBrainstormsFiltered>[0] = {
+      kind: 'meeting',
+    };
+    if (q.project) opts.project_slug = q.project;
+    if (q.date) opts.date = q.date;
+    if (q.limit) opts.limit = Math.min(500, Math.max(1, Number(q.limit)));
+    let rows = store.db.listBrainstormsFiltered(opts);
+    if (q.consent === 'acked') rows = rows.filter((r) => (r.consent_acked ?? 0) === 1);
+    if (q.consent === 'pending') rows = rows.filter((r) => (r.consent_acked ?? 0) === 0);
+    return { ok: true, meetings: rows };
+  });
+
+  app.get('/meetings/:id', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.getBrainstorm(id);
+    if (!row || (row.kind ?? 'brainstorm') !== 'meeting') {
+      reply.code(404);
+      return { ok: false, error: 'meeting not found' };
+    }
+    /* Audio purge countdown per BF-17 / spec line 100. Default
+     * meeting audio max age is 30 days; the dashboard uses the
+     * derived audio_purges_at to render the countdown chip. */
+    const maxAgeDays = Number(
+      process.env.DEVNEURAL_MEETING_AUDIO_MAX_AGE_DAYS ?? 30,
+    );
+    let audio_purges_at: string | null = null;
+    if (row.audio_path && (row.keep_audio ?? 0) !== 1 && row.ended_ms) {
+      audio_purges_at = new Date(
+        row.ended_ms + maxAgeDays * 24 * 60 * 60 * 1000,
+      ).toISOString();
+    }
+    return {
+      ok: true,
+      meeting: row,
+      action_items: store.db.listMeetingActionItems(id),
+      audio_purges_at,
+    };
+  });
+
+  app.post('/meetings/:id/consent-ack', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { acked_by?: string };
+    const row = store.db.getBrainstorm(id);
+    if (!row || (row.kind ?? 'brainstorm') !== 'meeting') {
+      reply.code(404);
+      return { ok: false, error: 'meeting not found' };
+    }
+    store.db.setBrainstormPhaseTwo(id, {
+      consent_acked: 1,
+      consent_acked_at: new Date().toISOString(),
+      consent_acked_by: body.acked_by ?? 'user',
+    });
+    return { ok: true, meeting: store.db.getBrainstorm(id) };
+  });
+
+  app.post('/meetings/:id/keep-audio', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { keep?: boolean };
+    const row = store.db.getBrainstorm(id);
+    if (!row || (row.kind ?? 'brainstorm') !== 'meeting') {
+      reply.code(404);
+      return { ok: false, error: 'meeting not found' };
+    }
+    store.db.setBrainstormPhaseTwo(id, { keep_audio: body.keep === false ? 0 : 1 });
+    return { ok: true, meeting: store.db.getBrainstorm(id) };
+  });
+
+  app.post('/meetings/:id/action-items', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as {
+      text?: string;
+      assignee?: string;
+      due?: string;
+      source_turn_index?: number;
+    };
+    const row = store.db.getBrainstorm(id);
+    if (!row || (row.kind ?? 'brainstorm') !== 'meeting') {
+      reply.code(404);
+      return { ok: false, error: 'meeting not found' };
+    }
+    if (!body.text || typeof body.text !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'text required' };
+    }
+    const aid = `mai-${id}-${Date.now()}`;
+    store.db.insertMeetingActionItem({
+      id: aid,
+      meeting_id: id,
+      text: body.text,
+      assignee: body.assignee ?? null,
+      due: body.due ?? null,
+      source_turn_index: typeof body.source_turn_index === 'number' ? body.source_turn_index : null,
+    });
+    return { ok: true, action_items: store.db.listMeetingActionItems(id) };
+  });
+
+  app.patch('/meetings/:id/action-items/:aid', async (req, reply) => {
+    const id = (req.params as { id: string; aid: string }).id;
+    const aid = (req.params as { id: string; aid: string }).aid;
+    const body = (req.body ?? {}) as { status?: 'open' | 'done' | 'dismissed' | 'superseded' };
+    if (!body.status || !['open', 'done', 'dismissed', 'superseded'].includes(body.status)) {
+      reply.code(400);
+      return { ok: false, error: 'status must be open|done|dismissed|superseded' };
+    }
+    const updated = store.db.updateMeetingActionItemStatus(aid, body.status);
+    if (!updated || updated.meeting_id !== id) {
+      reply.code(404);
+      return { ok: false, error: 'action item not found' };
+    }
+    return { ok: true, action_item: updated };
+  });
+
+  /* Promote a meeting to a wiki page. Meetings never auto-distill
+   * (BF-15); the user must explicitly opt in via this endpoint. The
+   * actual write borrows the same writeDraftAsPendingWikiPage helper
+   * the BF-7 path uses, so the resulting page lands in pending/ and
+   * waits for /admin/wiki/promote/:id to canonicalise. */
+  app.post('/meetings/:id/promote-to-wiki', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { slug?: string; title?: string };
+    const row = store.db.getBrainstorm(id);
+    if (!row || (row.kind ?? 'brainstorm') !== 'meeting') {
+      reply.code(404);
+      return { ok: false, error: 'meeting not found' };
+    }
+    const slug = body.slug ?? `meeting-${id}`;
+    if (!/^[a-z0-9][a-z0-9-]+$/.test(slug)) {
+      reply.code(400);
+      return { ok: false, error: 'slug must match [a-z0-9][a-z0-9-]+' };
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    const action = store.db.listMeetingActionItems(id);
+    const summary = (row.last_summary ?? row.meeting_topic ?? row.user_label ?? id).slice(0, 580);
+    const body_markdown =
+      `# Meeting summary\n\n${row.last_summary ?? '(no summary captured)'}\n\n` +
+      (action.length > 0
+        ? `## Action items\n${action.map((a) => `- ${a.text}${a.assignee ? ` (${a.assignee})` : ''}${a.due ? ` due ${a.due}` : ''}`).join('\n')}\n`
+        : '');
+    try {
+      writePage(wikiPendingDir(), {
+        frontmatter: {
+          id: slug,
+          title: body.title ?? `${row.user_label ?? 'Meeting'} → notes`,
+          trigger: `from meeting ${id}`,
+          insight: row.meeting_topic ?? row.user_label ?? slug,
+          summary,
+          status: 'pending',
+          weight: 0.3,
+          hits: 0,
+          corrections: 0,
+          created: today,
+          last_touched: today,
+          projects: [],
+          human_edited: true,
+          human_edited_at: new Date().toISOString(),
+          source_meetings: [id],
+          derived_from_meeting: true,
+        },
+        sections: {
+          pattern: body_markdown,
+          crossRefs: [],
+          crossRefsRaw: [],
+          evidence: [],
+          openQuestions: [],
+          log: [`promoted from meeting ${id} on ${today}`],
+        },
+      });
+      return { ok: true, wiki_page_id: slug };
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, error: (err as Error).message };
+    }
+  });
+
+  /* ── /lex/feedback (Wave 2 day 5 step 24 / LX-5 / B5) ────────────
+   * Inline thumbs UI writes one row per Lex turn. prompt_version
+   * comes from the same versioned-prompt builder so weeks of votes
+   * can be aggregated per revision. */
+  app.post('/lex/feedback', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      turn_id?: string;
+      brainstorm_id?: string | null;
+      prompt_version?: string;
+      vote?: 'up' | 'down';
+      reason?: string;
+    };
+    if (!body.turn_id || !body.prompt_version || (body.vote !== 'up' && body.vote !== 'down')) {
+      reply.code(400);
+      return { ok: false, error: 'turn_id, prompt_version, vote (up|down) required' };
+    }
+    const id = `lf-${body.turn_id}-${body.vote}`;
+    try {
+      store.db.insertLexFeedback({
+        id,
+        turn_id: body.turn_id,
+        brainstorm_id: body.brainstorm_id ?? null,
+        prompt_version: body.prompt_version,
+        vote: body.vote,
+        reason: body.reason ?? null,
+      });
+    } catch (err) {
+      /* Duplicate vote on same turn is a no-op; surface other
+       * errors so the caller can retry. */
+      if (!/UNIQUE/.test((err as Error).message)) {
+        reply.code(500);
+        return { ok: false, error: (err as Error).message };
+      }
+    }
+    return { ok: true, id };
+  });
+
+  app.get('/lex/feedback', async (req) => {
+    const q = (req.query ?? {}) as {
+      version?: string;
+      brainstorm?: string;
+      vote?: string;
+      limit?: string;
+    };
+    const opts: Parameters<typeof store.db.listLexFeedback>[0] = {};
+    if (q.version) opts.prompt_version = q.version;
+    if (q.brainstorm) opts.brainstorm_id = q.brainstorm;
+    if (q.vote === 'up' || q.vote === 'down') opts.vote = q.vote;
+    if (q.limit) opts.limit = Math.min(500, Math.max(1, Number(q.limit)));
+    return { ok: true, feedback: store.db.listLexFeedback(opts) };
+  });
+
+  app.get('/lex/feedback/up-rate/:version', async (req) => {
+    const version = (req.params as { version: string }).version;
+    return { ok: true, version, ...store.db.lexFeedbackUpRate(version) };
+  });
+
+  /* ── /lex/awareness (Wave 2 day 5 step 24b / LX-7 + LX-8) ────────
+   * L1 broadcaster + L2 recent_context surface. Producers POST
+   * events; consumers (Lex via tool, dashboard for telemetry) GET
+   * the recent slice. */
+  app.get('/lex/awareness/recent', async (req) => {
+    const q = (req.query ?? {}) as { limit?: string; detail?: string };
+    const { recentContext } = await import('../lex/awareness.js');
+    return {
+      ok: true,
+      ...recentContext({
+        limit: q.limit ? Math.min(200, Math.max(1, Number(q.limit))) : 20,
+        detail: q.detail === 'true',
+      }),
+    };
+  });
+
+  app.post('/lex/awareness/emit', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      kind?: string;
+      label?: string;
+      detail?: Record<string, unknown>;
+      brainstorm_id?: string | null;
+    };
+    const valid = ['audit-finding', 'reminder-due', 'draft-auto-dropped', 'canary-fail', 'session-start', 'session-end', 'capture', 'manual'];
+    if (!body.kind || !valid.includes(body.kind) || !body.label) {
+      reply.code(400);
+      return { ok: false, error: `kind must be one of ${valid.join('|')}; label required` };
+    }
+    const { emitAwarenessEvent } = await import('../lex/awareness.js');
+    const r = emitAwarenessEvent({
+      kind: body.kind as 'audit-finding',
+      label: body.label,
+      ...(body.detail ? { detail: body.detail } : {}),
+      brainstorm_id: body.brainstorm_id ?? null,
+    });
+    return { ok: true, ...r };
+  });
+
+  app.post('/lex/awareness/mode', async (req, reply) => {
+    const body = (req.body ?? {}) as { mode?: string };
+    if (body.mode !== 'conversation' && body.mode !== 'push-to-talk' && body.mode !== 'notes') {
+      reply.code(400);
+      return { ok: false, error: 'mode must be conversation|push-to-talk|notes' };
+    }
+    const { setAwarenessMode } = await import('../lex/awareness.js');
+    setAwarenessMode(body.mode);
+    return { ok: true, mode: body.mode };
+  });
+
+  /* ── /lex/prompts (Wave 2 day 5 step 20 / LX-1) ──────────────────
+   * Disk archive of every Lex system-prompt revision. The dashboard
+   * LexReplayViewer lists versions and reads bodies. */
+  app.get('/lex/prompts/versions', async () => {
+    const { listPromptVersions } = await import('../lex/prompt-archive.js');
+    return { ok: true, versions: listPromptVersions().map((v) => v.version) };
+  });
+
+  app.post('/admin/lex-replay', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      input_path?: string;
+      version_a?: string;
+      version_b?: string;
+    };
+    if (!body.input_path || !body.version_a || !body.version_b) {
+      reply.code(400);
+      return { ok: false, error: 'input_path, version_a, version_b required' };
+    }
+    const { runLexReplay } = await import('../lex/replay.js');
+    const r = await runLexReplay({
+      inputPath: body.input_path,
+      versionA: body.version_a,
+      versionB: body.version_b,
+      log,
+    });
+    return { ok: true, result: r };
+  });
+
+  app.get('/lex/prompts/:version', async (req, reply) => {
+    const version = (req.params as { version: string }).version;
+    const { readPromptVersion } = await import('../lex/prompt-archive.js');
+    const body = readPromptVersion(version);
+    if (body === null) {
+      reply.code(404);
+      return { ok: false, error: 'version not found' };
+    }
+    reply.header('content-type', 'text/markdown; charset=utf-8');
+    return reply.send(body);
+  });
+
+  /* ── audit_findings (Wave 2 day 4 steps 15, 16, 17) ─────────────
+   * Cross-source surface for lint, the LLM self-audit, the canary,
+   * the schema-regression suite, and the user-flag "this looks wrong"
+   * button. The dashboard LintFindingsPanel reads from here. */
+  app.get('/audit-findings', async (req) => {
+    const q = (req.query ?? {}) as {
+      status?: string;
+      source?: string;
+      severity?: string;
+      page?: string;
+      limit?: string;
+    };
+    const opts: Parameters<typeof store.db.listAuditFindings>[0] = {};
+    if (q.status === 'open' || q.status === 'acknowledged' || q.status === 'resolved' || q.status === 'dismissed') {
+      opts.status = q.status;
+    } else {
+      opts.status = 'open';
+    }
+    if (q.source === 'lint' || q.source === 'self-audit' || q.source === 'canary' || q.source === 'user-flag' || q.source === 'schema-regression') {
+      opts.source = q.source;
+    }
+    if (q.severity === 'low' || q.severity === 'medium' || q.severity === 'high') {
+      opts.severity = q.severity;
+    }
+    if (q.page) opts.page_slug = q.page;
+    if (q.limit) opts.limit = Math.min(500, Math.max(1, Number(q.limit)));
+    return { ok: true, findings: store.db.listAuditFindings(opts) };
+  });
+
+  app.post('/audit-findings/:id/:action', async (req, reply) => {
+    const id = (req.params as { id: string; action: string }).id;
+    const action = (req.params as { id: string; action: string }).action;
+    const status =
+      action === 'acknowledge'
+        ? 'acknowledged'
+        : action === 'resolve'
+          ? 'resolved'
+          : action === 'dismiss'
+            ? 'dismissed'
+            : null;
+    if (!status) {
+      reply.code(400);
+      return { ok: false, error: 'action must be acknowledge|resolve|dismiss' };
+    }
+    const row = store.db.updateAuditFindingStatus(id, status as 'acknowledged' | 'resolved' | 'dismissed');
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'finding not found' };
+    }
+    return { ok: true, finding: row };
+  });
+
+  /* POST /admin/lint/run — manual trigger for the nightly lint pass.
+   * Same shape as the scheduled call; useful when the user wants an
+   * immediate pass after promoting a batch of drafts. */
+  app.post('/admin/lint/run', async () => {
+    const { runLint } = await import('../wiki/lint.js');
+    const r = await runLint({ db: store.db });
+    return { ok: true, result: r };
+  });
+
+  /* POST /admin/self-audit/run — Wave 2 day 4 step 16 manual
+   * trigger for the LLM self-audit. Picks N random canonical pages,
+   * asks "are these accurate, useful, well-scoped?" and writes
+   * findings with source='self-audit'. */
+  app.post('/admin/self-audit/run', async (req) => {
+    const body = (req.body ?? {}) as { sample?: number };
+    const { runSelfAudit } = await import('../wiki/self-audit.js');
+    const r = await runSelfAudit(store, { sample: body.sample, log });
+    return { ok: true, result: r };
+  });
+
+  /* POST /curator/wrong (Wave 2 day 4 step 17 / CI-5 / A9). The
+   * dashboard "this looks wrong" button posts here. Does the same
+   * weight drop + archive-on-3 work as /admin/wiki/correct/:id, plus
+   * opens a self-audit user-flag finding so the LLM self-audit pass
+   * sees the page next time. */
+  app.post('/curator/wrong', async (req, reply) => {
+    const body = (req.body ?? {}) as { page_id?: string; curator_log_id?: string; note?: string };
+    if (!body.page_id) {
+      reply.code(400);
+      return { ok: false, error: 'page_id required' };
+    }
+    const { correctWikiPageById } = await import('../reinforcement/index.js');
+    const r = await correctWikiPageById(store, body.page_id, log);
+    if (!r.ok) {
+      reply.code(404);
+      return r;
+    }
+    try {
+      store.db.insertAuditFinding({
+        id: `userflag-${body.page_id}-${Date.now()}`,
+        source: 'user-flag',
+        severity: 'medium',
+        page_slug: body.page_id,
+        finding: 'user flagged injection as wrong',
+        detail: body.note ?? (body.curator_log_id ? `curator_log_id=${body.curator_log_id}` : null),
+      });
+    } catch (err) {
+      log(`[curator/wrong] audit_finding insert failed: ${(err as Error).message}`);
+    }
+    return r;
+  });
+
+  /* ── runtime_config (Wave 2 day 4 step 19 / A15) ─────────────────
+   * Pause-mode toggle lives in runtime_config.pause_mode; the
+   * decayInactivePages gate consults this first, then env, then
+   * default. The dashboard /system route reads / writes here. */
+  app.get('/runtime-config', async () => ({
+    ok: true,
+    config: store.db.listRuntimeConfig(),
+  }));
+
+  app.post('/runtime-config/:key', async (req, reply) => {
+    const key = (req.params as { key: string }).key;
+    const body = (req.body ?? {}) as { value?: string; updated_by?: string };
+    if (typeof body.value !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'value (string) required' };
+    }
+    /* Validate pause_mode values explicitly so a typo does not
+     * silently disable the gate (any unknown string falls through
+     * to "default"). */
+    if (key === 'pause_mode' && !['on', 'off', 'auto'].includes(body.value)) {
+      reply.code(400);
+      return { ok: false, error: 'pause_mode must be on|off|auto' };
+    }
+    store.db.setRuntimeConfig(key, body.value, body.updated_by);
+    return { ok: true, key, value: body.value };
+  });
+
+  /* ── /brainstorms/backfill-review (Wave 2 day 3 step 13 / BF-13) ─
+   * Surfaces borderline-band candidates produced by
+   * `npm run backfill-brainstorms`. The user one-clicks link / reject;
+   * link writes source_brainstorms onto the page, reject just flips
+   * the row to status='rejected'. */
+  app.get('/brainstorms/backfill-review', async (req) => {
+    const q = (req.query ?? {}) as { status?: string; band?: string; limit?: string };
+    const validStatus = ['pending', 'linked', 'rejected', 'skipped'].includes(q.status ?? '')
+      ? (q.status as 'pending' | 'linked' | 'rejected' | 'skipped')
+      : 'pending';
+    const validBand = ['high', 'borderline', 'low'].includes(q.band ?? '')
+      ? (q.band as 'high' | 'borderline' | 'low')
+      : undefined;
+    const opts: { status?: 'pending' | 'linked' | 'rejected' | 'skipped'; band?: 'high' | 'borderline' | 'low'; limit?: number } = { status: validStatus };
+    if (validBand) opts.band = validBand;
+    if (q.limit) opts.limit = Math.min(500, Math.max(1, Number(q.limit)));
+    return { ok: true, candidates: store.db.listBackfillReview(opts) };
+  });
+
+  app.post('/brainstorms/backfill-review/:id/link', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.listBackfillReview({}).find((r) => r.id === id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'review row not found' };
+    }
+    if (row.status !== 'pending') {
+      reply.code(409);
+      return { ok: false, conflict: 'already_resolved', row };
+    }
+    const { loadPage, rewritePageFrontmatter } = await import('../reinforcement/index.js');
+    const page = loadPage(row.candidate_page_slug);
+    if (!page) {
+      reply.code(404);
+      return {
+        ok: false,
+        error: `wiki page ${row.candidate_page_slug} no longer exists`,
+      };
+    }
+    const existing = page.frontmatter.source_brainstorms ?? [];
+    if (!existing.includes(row.brainstorm_id)) {
+      rewritePageFrontmatter(page, {
+        ...page.frontmatter,
+        source_brainstorms: [...existing, row.brainstorm_id],
+      });
+    }
+    const merged = store.db.updateBackfillReview(id, { status: 'linked', resolved_by: 'user' });
+    return { ok: true, row: merged };
+  });
+
+  app.post('/brainstorms/backfill-review/:id/reject', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.listBackfillReview({}).find((r) => r.id === id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'review row not found' };
+    }
+    if (row.status !== 'pending') {
+      reply.code(409);
+      return { ok: false, conflict: 'already_resolved', row };
+    }
+    const merged = store.db.updateBackfillReview(id, { status: 'rejected', resolved_by: 'user' });
+    return { ok: true, row: merged };
+  });
+
+  /* Trigger the backfill from the dashboard. Long-running; returns
+   * 202 + the result payload after the job finishes. Single-flight at
+   * the daemon level via the same in-process lock the GPU queue would
+   * use; here we accept simple sequential runs because the script is
+   * a one-shot. */
+  app.post('/admin/backfill/brainstorms', async (req, reply) => {
+    void req;
+    try {
+      const { runBackfillBrainstorms } = await import('../wiki/backfill-brainstorms.js');
+      const result = await runBackfillBrainstorms(store, log);
+      reply.code(202);
+      return { ok: true, result };
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, error: (err as Error).message };
+    }
+  });
+
+  /* ── /drafts (Wave 2 day 2 step 10 / BF-7 review / A2) ────────────
+   * List + detail + edit + promote + discard for wiki_drafts rows
+   * produced by the session-end auto-distillation pipeline. The
+   * promote handler enforces the four conflict cases per the spec:
+   * slug_collision, frozen_target, superseded, target_drift. */
+  app.get('/drafts', async (req) => {
+    const q = (req.query ?? {}) as { status?: string; limit?: string };
+    const status = isDraftStatus(q.status) ? q.status : 'pending';
+    const limit = q.limit ? Math.min(500, Math.max(1, Number(q.limit))) : 100;
+    const rows = store.db.listWikiDrafts({ status, limit });
+    return { ok: true, drafts: rows };
+  });
+
+  app.get('/drafts/:id', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.getWikiDraft(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    return { ok: true, draft: row };
+  });
+
+  app.patch('/drafts/:id', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as {
+      page_slug?: string;
+      page_title?: string;
+      body_markdown?: string;
+    };
+    const existing = store.db.getWikiDraft(id);
+    if (!existing) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    if (existing.status !== 'pending') {
+      reply.code(409);
+      return {
+        ok: false,
+        conflict: 'already_resolved',
+        error: `draft status ${existing.status} no longer editable`,
+        draft: existing,
+      };
+    }
+    if (body.page_slug && !/^[a-z0-9][a-z0-9-]+$/.test(body.page_slug)) {
+      reply.code(400);
+      return {
+        ok: false,
+        error: `page_slug must match [a-z0-9][a-z0-9-]+: got ${body.page_slug}`,
+      };
+    }
+    const merged = store.db.updateWikiDraft(id, {
+      ...(body.page_slug ? { page_slug: body.page_slug } : {}),
+      ...(body.page_title ? { page_title: body.page_title } : {}),
+      ...(body.body_markdown !== undefined
+        ? { body_markdown: body.body_markdown }
+        : {}),
+    });
+    return { ok: true, draft: merged };
+  });
+
+  app.post('/drafts/:id/discard', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const existing = store.db.getWikiDraft(id);
+    if (!existing) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    if (existing.status !== 'pending') {
+      reply.code(409);
+      return {
+        ok: false,
+        conflict: 'already_resolved',
+        draft: existing,
+      };
+    }
+    const merged = store.db.updateWikiDraft(id, {
+      status: 'discarded',
+      resolved_by: 'user',
+    });
+    return { ok: true, draft: merged };
+  });
+
+  app.post('/drafts/:id/promote', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as {
+      resolution?: 'rename' | 'merge' | 'overwrite';
+      new_slug?: string;
+      force?: boolean;
+      expected_resolved_at?: string | null;
+    };
+    const draft = store.db.getWikiDraft(id);
+    if (!draft) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    if (draft.status !== 'pending') {
+      reply.code(409);
+      return {
+        ok: false,
+        conflict: 'already_resolved',
+        error: `draft status ${draft.status}`,
+        draft,
+      };
+    }
+    /* Conflict 1: target-drift. The dashboard sends the resolved_at
+     * snapshot it observed when it loaded the draft; if that no
+     * longer matches the row, another tab edited the draft and the
+     * user is acting on stale content. resolved_at is null on every
+     * pending draft, so any non-null mismatch from the client also
+     * trips this case (defensive: protects against partial updates
+     * that landed without status flipping). */
+    if (
+      body.expected_resolved_at !== undefined &&
+      body.expected_resolved_at !== draft.resolved_at
+    ) {
+      reply.code(409);
+      return {
+        ok: false,
+        conflict: 'target_drift',
+        error: 'draft was edited by another caller; refresh and retry',
+        draft,
+      };
+    }
+    const slug = body.new_slug ?? draft.page_slug;
+    if (!/^[a-z0-9][a-z0-9-]+$/.test(slug)) {
+      reply.code(400);
+      return {
+        ok: false,
+        error: `slug must match [a-z0-9][a-z0-9-]+: got ${slug}`,
+      };
+    }
+    /* Conflict 2: superseded race. Some other draft for the same
+     * page_slug already promoted while this one was sitting in
+     * pending. Mark this draft superseded so the user sees the new
+     * status in the list and stop here. */
+    const sibling = store.db
+      .wikiDraftsBySlug(slug, ['promoted', 'auto-promoted'])
+      .find((d) => d.id !== id);
+    if (sibling) {
+      const merged = store.db.updateWikiDraft(id, {
+        status: 'superseded',
+        resolved_by: 'system:promote-race',
+      });
+      reply.code(409);
+      return {
+        ok: false,
+        conflict: 'superseded',
+        error: `another draft for slug ${slug} already promoted`,
+        draft: merged,
+        promoted_id: sibling.id,
+      };
+    }
+    /* Conflict 3 + 4: frozen target + slug collision. Look for an
+     * existing wiki page on disk under the slug. The promoted draft
+     * writes a NEW pending wiki page; canonicalisation is a separate
+     * step via /admin/wiki/promote/:id. */
+    const { loadPage } = await import('../reinforcement/index.js');
+    const existingPage = loadPage(slug);
+    if (existingPage) {
+      if (existingPage.frontmatter.frozen === true && body.force !== true) {
+        reply.code(409);
+        return {
+          ok: false,
+          conflict: 'frozen_target',
+          error: `target page ${slug} is frozen; pass force:true to override`,
+          draft,
+          existing_page_id: existingPage.frontmatter.id,
+        };
+      }
+      if (!body.resolution) {
+        reply.code(409);
+        return {
+          ok: false,
+          conflict: 'slug_collision',
+          error: `wiki page ${slug} already exists; supply resolution:rename|merge|overwrite`,
+          draft,
+          existing_page_id: existingPage.frontmatter.id,
+          existing_status: existingPage.frontmatter.status,
+        };
+      }
+      if (body.resolution === 'rename') {
+        if (!body.new_slug || body.new_slug === draft.page_slug) {
+          reply.code(400);
+          return {
+            ok: false,
+            conflict: 'slug_collision',
+            error: 'rename resolution requires a new_slug different from current',
+            draft,
+          };
+        }
+        /* fall through to write at body.new_slug */
+      }
+      /* merge / overwrite both write a new pending page under the
+       * existing slug; merge concats existing body, overwrite
+       * replaces. The actual file write happens below. */
+    }
+    const targetSlug = slug;
+    const writeRes = writeDraftAsPendingWikiPage({
+      draft,
+      targetSlug,
+      resolution: existingPage ? body.resolution ?? 'overwrite' : 'overwrite',
+      existingPage,
+    });
+    if (!writeRes.ok) {
+      reply.code(500);
+      return { ok: false, error: writeRes.error };
+    }
+    const merged = store.db.updateWikiDraft(id, {
+      status: 'promoted',
+      resolved_by: 'user',
+      ...(body.new_slug ? { page_slug: body.new_slug } : {}),
+    });
+    log(
+      `[drafts] promoted draft ${id} -> wiki page ${targetSlug} (resolution=${body.resolution ?? 'new'})`,
+    );
+    return {
+      ok: true,
+      draft: merged,
+      wiki_page_id: targetSlug,
+      wiki_page_path: writeRes.path,
+    };
+  });
+
   // Use the notification event bus to suppress unused-import lint
   void notificationEvents;
+}
+
+/* Decorate a brainstorm row with the audio + cues URLs the dashboard
+ * needs without forcing every consumer to know the data-root layout.
+ * audio_url is null when no audio bundle was finalised (text-only
+ * session, or meeting without consent_acked). */
+function decorateBrainstorm(row: import('../store/index-db.js').BrainstormSessionRow): {
+  brainstorm: import('../store/index-db.js').BrainstormSessionRow;
+  audio_url: string | null;
+  cues_url: string | null;
+} {
+  const hasAudio = Boolean(row.audio_path) && fs.existsSync(brainstormAudioFile(row.id, 'wav'));
+  return {
+    brainstorm: row,
+    audio_url: hasAudio ? `/brainstorms/${encodeURIComponent(row.id)}/audio` : null,
+    cues_url: hasAudio && fs.existsSync(brainstormCuesFile(row.id))
+      ? `/brainstorms/${encodeURIComponent(row.id)}/cues`
+      : null,
+  };
+}
+
+function isDraftStatus(
+  s: string | undefined,
+): s is 'pending' | 'promoted' | 'discarded' | 'auto-promoted' | 'auto-dropped' | 'superseded' {
+  return (
+    s === 'pending' ||
+    s === 'promoted' ||
+    s === 'discarded' ||
+    s === 'auto-promoted' ||
+    s === 'auto-dropped' ||
+    s === 'superseded'
+  );
+}
+
+/* Write a wiki_drafts row to disk as a pending wiki page. Used by
+ * /drafts/:id/promote. The new page lands in the pending dir; an
+ * explicit /admin/wiki/promote/:id call canonicalises it later. The
+ * draft body becomes the page's pattern section (free-form markdown);
+ * trigger / insight / summary fall back to the draft title when the
+ * upstream distillation prompt did not split them out. */
+function writeDraftAsPendingWikiPage(args: {
+  draft: import('../store/index-db.js').WikiDraftRow;
+  targetSlug: string;
+  resolution: 'rename' | 'merge' | 'overwrite';
+  existingPage:
+    | { frontmatter: import('../wiki/schema.js').PageFrontmatter; raw: string }
+    | null;
+}): { ok: true; path: string } | { ok: false; error: string } {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const titleHasArrow = args.draft.page_title.includes('→');
+    const safeTitle = titleHasArrow
+      ? args.draft.page_title
+      : `${args.draft.page_title} → captured`;
+    let body = args.draft.body_markdown;
+    if (args.existingPage && args.resolution === 'merge') {
+      const existingParsed = parsePage(args.existingPage.raw);
+      body = `${existingParsed.sections.pattern}\n\n---\n\n${args.draft.body_markdown}`;
+    }
+    const summary = (args.draft.body_markdown ?? '').slice(0, 580);
+    writePage(wikiPendingDir(), {
+      frontmatter: {
+        id: args.targetSlug,
+        title: safeTitle,
+        trigger: `from brainstorm ${args.draft.brainstorm_id}`,
+        insight: args.draft.page_title,
+        summary,
+        status: 'pending',
+        weight: 0.3,
+        hits: 0,
+        corrections: 0,
+        created: today,
+        last_touched: today,
+        projects: [],
+        human_edited: true,
+        human_edited_at: new Date().toISOString(),
+        source_brainstorms: [args.draft.brainstorm_id],
+        derived_from_brainstorm: true,
+      },
+      sections: {
+        pattern: body,
+        crossRefs: [],
+        crossRefsRaw: [],
+        evidence: [],
+        openQuestions: [],
+        log: [`promoted from draft ${args.draft.id} on ${today}`],
+      },
+    });
+    const filePath = path.posix.join(wikiPendingDir(), `${args.targetSlug}.md`);
+    return { ok: true, path: filePath };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
 }

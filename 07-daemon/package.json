@@ -24,7 +24,12 @@
     "uninstall-offsite-backup-task": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-offsite-backup-task.ps1 -Disable",
     "backup-where": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/show-backup-target.ps1",
     "test": "vitest run",
-    "build:check": "tsc --noEmit"
+    "build:check": "tsc --noEmit",
+    "canary": "tsx scripts/canary.ts",
+    "migrate": "tsx src/db/migrate.ts",
+    "backfill-brainstorms": "tsx scripts/backfill-brainstorms.ts",
+    "audit-doc-ingest": "tsx scripts/audit-doc-ingest.ts",
+    "lex-replay": "tsx scripts/lex-replay.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.91.1",

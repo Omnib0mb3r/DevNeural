@@ -1,0 +1,8 @@
+[
+  {
+    "id": "seed-1-empty",
+    "prompt": "what is the schema for the wiki frontmatter",
+    "expected_page_slug": null,
+    "comment": "Seed fixture. Marked expected_page_slug=null until a real wiki page is consistently matched. Update once /admin/wiki contents are stable for the canary corpus."
+  }
+]

@@ -21,6 +21,9 @@ import { useQuery } from "@tanstack/react-query";
 import { statsLoc, statsKpi, type LocStats, type KpiStats } from "@/lib/daemon-client";
 import * as Lucide from "lucide-react";
 import { Icon } from "./Icon";
+import { CuratorHealthCard } from "./kpi/CuratorHealthCard";
+import { BrainstormKpiTiles } from "./kpi/BrainstormKpiTiles";
+import { OutboundCard } from "./kpi/OutboundCard";
 
 type LucideIconName = keyof typeof Lucide;
 
@@ -286,6 +289,8 @@ export function KpiStrip() {
           sub="patterns proven across 2+ projects"
           loading={loading}
         />
+        {/* Phase Two CI-6: additive into the Quality row. */}
+        <CuratorHealthCard />
       </Row>
 
       <Row title="Activity">
@@ -315,6 +320,8 @@ export function KpiStrip() {
           sub={artifactSub || "research-notes + wiki-drafts + notes-summaries + project-intents"}
           loading={loading}
         />
+        {/* Phase Two BF-12: additive into the Activity row. */}
+        <BrainstormKpiTiles />
       </Row>
 
       <Row title="Velocity">
@@ -352,6 +359,8 @@ export function KpiStrip() {
           sub={`${k?.embedder?.model ?? "—"} · ${k?.embedder?.dim ?? 0}-dim`}
           loading={loading}
         />
+        {/* Phase Two PB-3: additive into the Health row. */}
+        <OutboundCard />
       </Row>
     </section>
   );

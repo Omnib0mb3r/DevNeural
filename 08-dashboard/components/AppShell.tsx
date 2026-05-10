@@ -46,10 +46,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
  * customer-app, applied here for mobile usability even on internal apps). */
 function MobileTabBar({ activeTab }: { activeTab: string }) {
   const TABS = [
-    { href: "/",          label: "Home",     icon: "Home" as const },
-    { href: "/wiki",      label: "Wiki",     icon: "BookOpen" as const },
-    { href: "/sessions",  label: "Sessions", icon: "Terminal" as const },
-    { href: "/system",    label: "System",   icon: "Cpu" as const },
+    { href: "/",            label: "Home",        icon: "Home" as const },
+    { href: "/brainstorms", label: "Brainstorms", icon: "Sparkles" as const },
+    { href: "/wiki",        label: "Wiki",        icon: "BookOpen" as const },
+    { href: "/drafts",      label: "Drafts",      icon: "FilePen" as const },
+    { href: "/system",      label: "System",      icon: "Cpu" as const },
   ];
   return (
     <nav
@@ -76,6 +77,10 @@ function MobileTabBar({ activeTab }: { activeTab: string }) {
   );
 }
 
-function MobileIcon({ name }: { name: "Home" | "BookOpen" | "Terminal" | "Cpu" }) {
+function MobileIcon({
+  name,
+}: {
+  name: "Home" | "BookOpen" | "Terminal" | "Cpu" | "Sparkles" | "FilePen";
+}) {
   return <Icon name={name} size={20} />;
 }

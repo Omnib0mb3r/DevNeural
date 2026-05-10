@@ -17,6 +17,11 @@ import { startTranscriptWatcher } from './capture/transcript-watcher.js';
 import { startFsWatcher } from './capture/fs-watcher.js';
 import { startGitWatcher } from './capture/git-watcher.js';
 import { Store } from './store/index.js';
+import { runMigrations } from './db/migrate.js';
+import { initGpuQueue } from './gpu/queue.js';
+import { VramMonitor } from './gpu/vram-monitor.js';
+import { createHeartbeatPoster } from './heartbeat/poster.js';
+import { cullRawChunks } from './reinforcement/raw-chunks-cull.js';
 import { embedOne, warmUp, getEmbedDim, getModelId, setEmbedderLogger, embedderStats } from './embedder/index.js';
 import { ensureWiki } from './wiki/scaffolding.js';
 import { runSeed, hasSeeded } from './corpus/seed.js';
@@ -69,6 +74,123 @@ async function main(): Promise<void> {
   logger(
     `store open: raw_chunks=${store.rawChunks.size()} wiki_pages=${store.wikiPages.size()} embedder=${getModelId()} dim=${getEmbedDim()}`,
   );
+
+  // Phase Two migration runner. Applies any new files in
+  // scripts/migrations not yet recorded in the _migrations table.
+  // Runs after the legacy Store.open() which sets up the original
+  // tables, and before HTTP bind so all routes see the post-migration
+  // schema. Idempotent on every boot.
+  try {
+    const migDir = path.posix.join(
+      path.dirname(fileURLToPath(import.meta.url)).replace(/\\/g, '/'),
+      '..',
+      'scripts',
+      'migrations',
+    );
+    const migResult = await runMigrations({ migrationsDir: migDir });
+    if (migResult.applied.length > 0) {
+      logger(
+        `migrations: applied ${migResult.applied.length} (${migResult.applied.join(', ')}); total=${migResult.totalAppliedAfter}`,
+      );
+    } else {
+      logger(`migrations: no new (total=${migResult.totalAppliedAfter})`);
+    }
+  } catch (err) {
+    logger(`migrations FAILED: ${(err as Error).message}`);
+    throw err;
+  }
+
+  /* GPU job queue + VRAM monitor (Wave 2 day 1 steps 3 + 4).
+   * Lanes 0 and 1 always run (curator + voice). Lanes 2 and 3
+   * defer when free VRAM dips below the floor. The VRAM monitor
+   * fails open on hosts without nvidia-smi so the queue keeps
+   * dispatching. */
+  const vram = new VramMonitor({ log: logger });
+  vram.start();
+  initGpuQueue({
+    vramOk: () => vram.vramOk(),
+    vramBackoffMs: Number(process.env.DEVNEURAL_VRAM_BACKOFF_MS ?? 10_000),
+    log: logger,
+  });
+  logger('gpu queue + vram monitor up');
+
+  /* External heartbeat poster (Wave 2 day 1 step 5).
+   * No-op when DEVNEURAL_HEARTBEAT_URL is unset; the poster logs
+   * the disabled state and skips the timer. With the URL set, a
+   * row lands in heartbeat_log every 60s (default) regardless of
+   * watcher reachability so a forensic trail survives. */
+  const heartbeat = createHeartbeatPoster({ log: logger });
+  heartbeat.start(store.db);
+  void heartbeat;
+
+  /* Raw chunks cull (Wave 2 day 1 step 7 / OP-4).
+   * Runs once at boot (after a small delay so the daemon does not
+   * block its own listen call) and then daily. brainstorm_chunks
+   * is a different table and is never touched. */
+  const cullIntervalMs = Number(
+    process.env.DEVNEURAL_RAW_CHUNK_CULL_INTERVAL_MS ?? 24 * 60 * 60 * 1000,
+  );
+  const cullTimer = setTimeout(() => {
+    void cullRawChunks(store, { log: logger }).catch((err) =>
+      logger(`[cull] failed: ${(err as Error).message}`),
+    );
+    const repeat = setInterval(() => {
+      void cullRawChunks(store, { log: logger }).catch((err) =>
+        logger(`[cull] failed: ${(err as Error).message}`),
+      );
+    }, cullIntervalMs);
+    if (typeof repeat.unref === 'function') repeat.unref();
+  }, 60_000);
+  if (typeof cullTimer.unref === 'function') cullTimer.unref();
+
+  /* Self-audit periodic (Wave 2 day 4 step 16 / Karpathy steal 3 / A8).
+   * Runs at +15min after boot then every DEVNEURAL_SELF_AUDIT_INTERVAL_MS
+   * (default 7d). Skipped when DEVNEURAL_LLM_PROVIDER=none or when the
+   * provider is not configured (the module returns skipped_reason). */
+  const selfAuditIntervalMs = Number(
+    process.env.DEVNEURAL_SELF_AUDIT_INTERVAL_MS ?? 7 * 24 * 60 * 60 * 1000,
+  );
+  const selfAuditTimer = setTimeout(() => {
+    void (async () => {
+      const { runSelfAudit } = await import('./wiki/self-audit.js');
+      await runSelfAudit(store, { log: logger }).catch((err) =>
+        logger(`[self-audit] failed: ${(err as Error).message}`),
+      );
+    })();
+    const repeat = setInterval(() => {
+      void (async () => {
+        const { runSelfAudit } = await import('./wiki/self-audit.js');
+        await runSelfAudit(store, { log: logger }).catch((err) =>
+          logger(`[self-audit] failed: ${(err as Error).message}`),
+        );
+      })();
+    }, selfAuditIntervalMs);
+    if (typeof repeat.unref === 'function') repeat.unref();
+  }, 15 * 60 * 1000);
+  if (typeof selfAuditTimer.unref === 'function') selfAuditTimer.unref();
+
+  /* Lint nightly (Wave 2 day 4 step 15 / Karpathy steal 2 / A7).
+   * Runs the full lint pass with apply=false + the IndexDb handle so
+   * findings flow into audit_findings. The existing debounced lint-
+   * queue still fires on every wiki mutation; this nightly pass is
+   * the safety net that scans pages no mutation touched. The 5-min
+   * stagger after boot keeps the daemon's listen + first-ingest
+   * latency clean. */
+  const lintIntervalMs = Number(
+    process.env.DEVNEURAL_LINT_NIGHTLY_INTERVAL_MS ?? 24 * 60 * 60 * 1000,
+  );
+  const lintTimer = setTimeout(() => {
+    void runLint({ db: store.db }).catch((err) =>
+      logger(`[lint nightly] failed: ${(err as Error).message}`),
+    );
+    const repeat = setInterval(() => {
+      void runLint({ db: store.db }).catch((err) =>
+        logger(`[lint nightly] failed: ${(err as Error).message}`),
+      );
+    }, lintIntervalMs);
+    if (typeof repeat.unref === 'function') repeat.unref();
+  }, 5 * 60 * 1000);
+  if (typeof lintTimer.unref === 'function') lintTimer.unref();
 
   const scaffold = ensureWiki();
   logger(
