@@ -20,6 +20,7 @@ import { Store } from './store/index.js';
 import { runMigrations } from './db/migrate.js';
 import { initGpuQueue } from './gpu/queue.js';
 import { VramMonitor } from './gpu/vram-monitor.js';
+import { createHeartbeatPoster } from './heartbeat/poster.js';
 import { embedOne, warmUp, getEmbedDim, getModelId, setEmbedderLogger, embedderStats } from './embedder/index.js';
 import { ensureWiki } from './wiki/scaffolding.js';
 import { runSeed, hasSeeded } from './corpus/seed.js';
@@ -111,6 +112,15 @@ async function main(): Promise<void> {
     log: logger,
   });
   logger('gpu queue + vram monitor up');
+
+  /* External heartbeat poster (Wave 2 day 1 step 5).
+   * No-op when DEVNEURAL_HEARTBEAT_URL is unset; the poster logs
+   * the disabled state and skips the timer. With the URL set, a
+   * row lands in heartbeat_log every 60s (default) regardless of
+   * watcher reachability so a forensic trail survives. */
+  const heartbeat = createHeartbeatPoster({ log: logger });
+  heartbeat.start(store.db);
+  void heartbeat;
 
   const scaffold = ensureWiki();
   logger(

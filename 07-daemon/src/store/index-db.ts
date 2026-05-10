@@ -287,6 +287,34 @@ export class IndexDb {
     };
   }
 
+  // ── heartbeat_log (OP-1) ──────────────────────────────────────
+  insertHeartbeatRow(row: {
+    id: string;
+    daemon_pid: number;
+    daemon_version: string;
+    status: 'posted' | 'ack' | 'no-ack' | 'watcher-alarm';
+    detail?: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO heartbeat_log (id, daemon_pid, daemon_version, status, detail)
+         VALUES (@id, @daemon_pid, @daemon_version, @status, @detail)`,
+      )
+      .run({ detail: null, ...row });
+  }
+
+  updateHeartbeatStatus(
+    id: string,
+    status: 'ack' | 'no-ack' | 'watcher-alarm',
+    detail?: string,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE heartbeat_log SET status = ?, detail = COALESCE(?, detail) WHERE id = ?`,
+      )
+      .run(status, detail ?? null, id);
+  }
+
   // ── wiki_drafts (BF-7) ─────────────────────────────────────────
   /* Insert a pending wiki draft produced by the session-end auto-
    * distillation. brainstorm_id is the voice-session FK (column name
