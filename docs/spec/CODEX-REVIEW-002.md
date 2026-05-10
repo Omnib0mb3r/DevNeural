@@ -3,6 +3,24 @@
 > Captured 2026-05-10 during the Phase Two planning session. This review covered additions made after `docs/spec/CODEX-REVIEW-001.md`, with emphasis on meeting fold-in, kind classification and backfill, meeting-mode awareness silence, and Appendix R's Lex three-level context model.
 >
 > This review did not re-cover issues already flagged and adopted from review 001.
+>
+> Codex's verdict: "Execute with edits."
+>
+> All B1 through B9 (important) findings have been adopted into `PHASE-TWO-IMPLEMENTATION.md` (revision dated 2026-05-10 evening, immediately after this review landed). C-tier nice-to-haves (rename `brainstorm_*` persistence layer, meeting KPIs, consent audit metadata) are partially adopted: `consent_acked_at` and `consent_acked_by` (C3) landed with B5; the `brainstorm_*` rename (C1) and meeting KPIs (C2) are deferred to a later cleanup pass to avoid widening Wave 1 scope. This file preserves the original review for traceability.
+>
+> Adoption summary (file edits in `PHASE-TWO-IMPLEMENTATION.md`):
+>
+> - **B1 (meeting silence at API/tool boundary):** BF-19 tightened; section 4.2 `POST /lex/recall` now takes `session_id` and refuses on `kind='meeting'`; new section 4.3 defines `recent_context()` and `lex_recall()` Lex tool contracts with the same daemon-side gate; Appendix R.2 #4 rewritten to be daemon-enforced.
+> - **B2 (synthetic audit-doc kind conflict):** Wave 2 day 3 step 14 now pins synthetic audit sessions to `kind='brainstorm'` and `provenance='audit-document'` with rationale; section 3.3 adds the `provenance` column.
+> - **B3 (meeting artifact contract):** new section 3.9 `meeting_action_items` table; new section 3.10 canonical artifact-kind enum including `meeting-summary` and `meeting-action-item`; Wave 2 day 5 step 25 random sampling pool expanded with stratification floor.
+> - **B4 (`wiki_drafts.brainstorm_id` semantics):** section 3.4 DDL now annotates the column as a voice-session FK retained for compatibility, accepting both kinds.
+> - **B5 (meeting consent and retention executable):** section 3.3 adds `consent_acked_at`, `consent_acked_by`, `keep_audio`; new "meeting capture / consent gate" rules block audio write before ack; new section 4.1 `POST /sessions/new` defines the canonical create contract with validation rules; new `POST /sessions/:id/consent` post-create ack endpoint.
+> - **B6 (Appendix E contradicted authoritative sections):** Appendix E rewritten as two worked examples (E.1 brainstorm, E.2 meeting) that match BF-14 through BF-19, the new endpoints, and the new consent gate.
+> - **B7 (backpressure brittleness):** Appendix R.2 #5 rewritten with a 200-token denominator floor, 0.25 recovery threshold (0.15 hysteresis gap), 5-minute recovery wait, and exponential anti-flap backoff capped at 60 minutes.
+> - **B8 (L1 revision protocol):** Appendix R.2 #2 rewritten with monotonic revision ids, Lex-side ack via `lex_awareness_ack=<revision>`, daemon-side stale-ack detection that forces full snapshot, PTY write-failure retry plus forced resync.
+> - **B9 (closed actionable-event enum):** Appendix R.1 L2 push-on-change section now lists all seven permitted event names in a closed-enum table; spec text states additions require updating the appendix.
+>
+> Risk E4 (recursive load from awareness summarisation under contention) was also addressed: Appendix R.2 #1a adds a load-shedding rule that consults the GPU queue and skips summarisation when lane 0 or lane 1 is busy.
 
 ## A. Critical issues
 

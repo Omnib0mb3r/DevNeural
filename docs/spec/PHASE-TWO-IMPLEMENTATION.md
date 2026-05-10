@@ -99,7 +99,7 @@ This is the single source of truth for Phase Two design decisions. If `voice-rev
 | BF-16 | **`meeting` is a distinct source class** in retrieval, ranked between `wiki` and `draft`. Default order becomes: `brainstorm > wiki > meeting > draft > project > raw > reference`. A new intent `'meeting-recall'` (or `'what-was-said'`) filters to meeting-only. |
 | BF-17 | **Meeting audio retention is stricter than brainstorm audio.** Default purges meeting audio after 30 days unless explicitly kept. Configurable via `DEVNEURAL_MEETING_AUDIO_MAX_AGE_DAYS` (default `30`). Brainstorm audio retains the existing `DEVNEURAL_AUDIO_MAX_AGE_DAYS=0` (forever) default. Reasoning: meetings contain third-party voices and the consent-to-record posture matters legally and ethically. |
 | BF-18 | **Lex behaviour in meeting mode does not participate.** Listen, summarise, flag action items. The few-shot block at `07-daemon/data/lex-prompts/few-shot/meeting-notes.md` (LX-3) plus a meeting-specific refusal contract enforce this. |
-| BF-19 | **Awareness broadcaster is fully silent in meeting mode.** No L1 ticks, no L2 push, period. Resumes only after the meeting session ends. |
+| BF-19 | **Awareness broadcaster is fully silent in meeting mode.** No L1 ticks, no L2 push, period. Resumes only after the meeting session ends. **Enforcement is daemon-side, not prompt-side:** every awareness path (`recent_context()` tool, `POST /lex/recall`, L1 broadcaster ticks) checks `brainstorm_sessions.kind` for the active session and refuses with `403 Forbidden { reason: 'meeting_mode_silenced' }` when `kind='meeting'`. The refusal contract in the prompt is a defence-in-depth backstop, never the only guard. See section 4.1 (`recent_context()`), section 4.2 (`POST /lex/recall`), and Appendix R.2 #4. |
 
 ### 2.2 Curator and reinforcement instrumentation
 
@@ -254,6 +254,11 @@ ALTER TABLE brainstorm_sessions ADD COLUMN kind           TEXT NOT NULL DEFAULT 
 ALTER TABLE brainstorm_sessions ADD COLUMN attendees      TEXT;
 ALTER TABLE brainstorm_sessions ADD COLUMN meeting_topic  TEXT;
 ALTER TABLE brainstorm_sessions ADD COLUMN consent_acked  INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE brainstorm_sessions ADD COLUMN consent_acked_at TEXT;
+ALTER TABLE brainstorm_sessions ADD COLUMN consent_acked_by TEXT;
+ALTER TABLE brainstorm_sessions ADD COLUMN keep_audio     INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE brainstorm_sessions ADD COLUMN provenance     TEXT NOT NULL DEFAULT 'voice'
+  CHECK (provenance IN ('voice','audit-document','synthetic'));
 ```
 
 Column meanings:
@@ -264,7 +269,19 @@ Column meanings:
 - `kind`: `brainstorm` (conversation + push-to-talk modes; solo ideation; first-class wiki distillation source) or `meeting` (notes mode; third-party voices; meeting-summary artifact only).
 - `attendees`: JSON array of strings; null when `kind='brainstorm'`. The user fills this at session start or post-hoc.
 - `meeting_topic`: short descriptor for the meeting; null when `kind='brainstorm'`.
-- `consent_acked`: `1` when the user has confirmed every attendee was informed of the recording. `0` is the default; meetings cannot start in a state that retains audio without `consent_acked=1`. `kind='brainstorm'` ignores this column.
+- `consent_acked`: `1` when the user has confirmed every attendee was informed of the recording. `0` is the default. `kind='brainstorm'` ignores this column.
+- `consent_acked_at`: ISO timestamp of the ack. Null until ack happens. Required for later privacy audits.
+- `consent_acked_by`: actor who acked (the user account or 'cli'). Null until ack happens.
+- `keep_audio`: `1` to override the `DEVNEURAL_MEETING_AUDIO_MAX_AGE_DAYS` purge for this session. Default `0`. Only the user can set; the capture path never sets this implicitly.
+- `provenance`: `voice` (the default; real captured speech), `audit-document` (synthetic session created by the audit-document ingest job per section 11 day 3 step 14), `synthetic` (any other non-voice synthetic source added in the future). Drives kind-rules and silence-rules independent of `mode`.
+
+**Meeting capture / consent gate (executable rules):**
+
+1. A session created with `kind='meeting'` starts in `consent_acked=0`. The capture rig MUST NOT write audio to disk until the user clicks the consent gate in `/meetings/[id]` or supplies `consent_acked=1` in the create payload (and `consent_acked_at` is set server-side, `consent_acked_by` from auth).
+2. While `consent_acked=0`, transcription still runs in-memory but no `<session_id>.opus` or `.wav` is persisted; partial transcript chunks may persist (text only, no audio).
+3. The `ConsentGate` component (section 5.2 entry) blocks the meeting detail UI behind the ack until done.
+4. `keep_audio=1` only overrides retention age; it does NOT bypass the consent gate.
+5. `kind='brainstorm'` sessions skip this gate entirely.
 
 **`project_slug` was previously expected non-null.** **Verify on day 1**: check existing schema; if non-null, drop the constraint.
 
@@ -283,7 +300,9 @@ Pending wiki drafts produced by automatic session-end distillation. Awaiting pro
 ```
 CREATE TABLE wiki_drafts (
   id              TEXT PRIMARY KEY,
-  brainstorm_id   TEXT NOT NULL,
+  brainstorm_id   TEXT NOT NULL,  -- voice-session FK; column name retained for compatibility
+                                  -- and accepts BOTH kind='brainstorm' AND kind='meeting' session ids
+                                  -- (meetings only insert here on explicit POST /meetings/:id/promote-to-wiki)
   page_slug       TEXT NOT NULL,
   page_title      TEXT NOT NULL,
   body_markdown   TEXT NOT NULL,
@@ -403,6 +422,46 @@ derived_from_meeting: false      # true if this page's primary evidence came fro
 A migration script sweeps every existing wiki page and adds defaults: `schema_version: 2`, `last_verified: null` (NOT now: `now` would destroy the staleness signal for 90 days), `frozen: false`, `source_brainstorms: []`, `source_meetings: []`, `derived_from_brainstorm: false`, `derived_from_meeting: false`. Lint treats `last_verified: null` as `verification_unknown` and flags pages for first-time verification on a separate, lower-severity track than the 90-day stale flag.
 
 **Lineage KPI denominator (S-8) is brainstorm-only:** `wiki_lineage_coverage = COUNT(pages WHERE derived_from_brainstorm = true AND source_brainstorms != []) / COUNT(pages WHERE derived_from_brainstorm = true)`. Meeting-derived pages are excluded from the brainstorm lineage KPI because meetings rarely spawn wiki pages and the ratio would be misleading. Pages where `derived_from_brainstorm = false` are excluded from the denominator. This prevents the metric from incentivising fake lineage tagging on pages that never came from a brainstorm.
+
+### 3.9 `meeting_action_items` (new)
+
+Action items extracted from meeting summaries. Surfaced in `MeetingDetailResponse.action_items` and feed reminder creation. Persisted as a first-class table (not as JSON in a meeting summary blob) so dashboards, reminder system, and the random-artifact sampler can index over them.
+
+```
+CREATE TABLE meeting_action_items (
+  id              TEXT PRIMARY KEY,
+  meeting_id      TEXT NOT NULL,           -- voice-session FK with kind='meeting'
+  text            TEXT NOT NULL,
+  assignee        TEXT,                    -- attendee name string; nullable for un-assigned
+  due             TEXT,                    -- ISO date or null
+  reminder_id     TEXT,                    -- FK to reminders table when promoted to a reminder
+  status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','done','dismissed','superseded')),
+  source_turn_index INTEGER,               -- which turn the item came from; helps retraction on transcript edit
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  resolved_at     TEXT,
+  FOREIGN KEY (meeting_id) REFERENCES brainstorm_sessions(id)
+);
+CREATE INDEX meeting_action_items_meeting ON meeting_action_items(meeting_id);
+CREATE INDEX meeting_action_items_status  ON meeting_action_items(status, due);
+```
+
+Migration filename: `P2-W2-D1-013a-meeting-action-items.sql` (lands with the Wave 2 day 1 prerequisite block; renumber on the day-1 mechanical pass per Q-1).
+
+### 3.10 Artifact kinds (canonical enum)
+
+The artifact universe surfaced in `BrainstormDetailResponse.artifacts`, `MeetingDetailResponse.action_items` (for action items only), and the random-artifact sampler (LX-6) is:
+
+| Kind | Source | Owning session kind | Random-sample participation |
+|---|---|---|---|
+| `research-note` | Pass 2 + manual | brainstorm | yes |
+| `wiki-draft` | session-end auto-distillation | brainstorm | yes |
+| `project-intent` | Pass 2 | brainstorm | yes |
+| `notes-summary` | session-end pipeline | brainstorm (legacy notes mode pre-BF-14) | yes |
+| `meeting-summary` | session-end pipeline | meeting | yes |
+| `meeting-action-item` | meeting-summary extractor | meeting | yes (separate row in sampler) |
+| `audit-finding` | lint, self-audit, canary, user-flag | not session-bound | no (handled by `LintFindingsPanel`) |
+
+Adding a new artifact kind requires updating: section 3.10, the `artifacts.kind` enum in section 4.1 responses, the random-artifact sampler in section 11 day 5 step 25, and any retention rule in Appendix M.
 
 ---
 
@@ -725,12 +784,63 @@ Response: `{ acked: true }`.
 
 (This endpoint lives outside the daemon, on the heartbeat watcher; section 11 covers the watcher service.)
 
+#### `POST /sessions/new` (canonical voice-session create contract)
+
+Creates either a brainstorm or a meeting voice-session row. This is the single canonical entry point for both kinds; UI, CLI, and PTY-spawn paths all funnel through it. Replaces any earlier per-kind endpoints.
+
+Request body:
+
+```ts
+{
+  mode: 'conversation' | 'notes' | 'push-to-talk';
+  kind?: 'brainstorm' | 'meeting';   // if omitted: derived from mode per BF-14
+                                     // (conversation -> brainstorm; push-to-talk -> brainstorm; notes -> meeting)
+  project_slug?: string | null;      // null = general namespace
+  title?: string;                    // brainstorm title; ignored when kind='meeting'
+  meeting_topic?: string;            // required when kind='meeting'
+  attendees?: string[];              // required when kind='meeting'; non-empty
+  consent_acked?: boolean;           // when kind='meeting': true unlocks audio capture immediately
+                                     // false (or omitted) creates the session in pre-consent state
+                                     // (see section 3.3 meeting capture / consent gate rules)
+  keep_audio?: boolean;              // when kind='meeting': overrides DEVNEURAL_MEETING_AUDIO_MAX_AGE_DAYS
+                                     // ignored for brainstorm (always retained per DEVNEURAL_AUDIO_MAX_AGE_DAYS)
+}
+```
+
+Server-side validation:
+
+- `kind='meeting'` requires `meeting_topic` and `attendees.length >= 1`. Otherwise `400 Bad Request { reason: 'meeting_requires_topic_and_attendees' }`.
+- `kind='meeting'` with `consent_acked=true` records `consent_acked_at = now()` and `consent_acked_by = <auth subject>`.
+- A `notes`-mode session with explicit `kind='brainstorm'` is allowed (override for solo voice-notes flows). It records a low-severity `audit_findings` row with `source='user-flag'` so the user can see the override later in case it was wrong (see review-002 risk E3 mitigation).
+- The capture rig consults `kind`, `consent_acked`, and `keep_audio` before writing audio.
+
+Response:
+
+```ts
+{
+  id: string;
+  kind: 'brainstorm' | 'meeting';
+  capture_state: 'capturing' | 'awaiting_consent' | 'pre_capture';
+}
+```
+
+#### `POST /sessions/:id/consent`
+
+Acknowledges meeting consent post-create. Required when the session was created with `consent_acked=false` and the user wants audio retention to begin.
+
+Request body: `{ consent_acked: true }`.
+
+Response: `{ id, capture_state: 'capturing', consent_acked_at: string, consent_acked_by: string }`.
+
+Refuses (`400 Bad Request { reason: 'wrong_kind' }`) when called on a `kind='brainstorm'` session.
+
 ### 4.2 Modified endpoints
 
 #### `POST /lex/recall` (existing, modified)
 
 New optional fields:
 
+- `session_id`: voice-session id of the calling Lex turn. **Required when called from a Lex tool path** (so the daemon can enforce meeting-mode silence per BF-19); permitted to be omitted for non-Lex callers (admin tools, dashboard search). When provided, the daemon looks up `brainstorm_sessions.kind` and refuses with `403 Forbidden { reason: 'meeting_mode_silenced' }` if `kind='meeting'`. When omitted, the call proceeds without the gate; this path is gated behind admin auth.
 - `intent`: `'default' | 'brainstorm-only' | 'what-was-i-thinking' | 'meeting-recall'`. Default `'default'`.
 - `source_class_weights`: optional override `{ brainstorm: number; wiki: number; meeting: number; draft: number; project: number; raw: number; reference: number }`. If omitted, server uses defaults.
 
@@ -759,6 +869,57 @@ Intent overrides:
 #### `GET /sessions/:id` (existing, additive)
 
 Add fields: `pending_prompt`, `injected_pages: Array<{ page_slug, score, confidence, prompt_id }>`. **Verify on day 1**: confirm field naming convention.
+
+### 4.3 Lex tool contracts
+
+Tools exposed to Lex via the existing tool-spawn mechanism. Tool contracts mirror HTTP endpoints but carry the active `session_id` automatically (the Lex runtime injects it from the spawn context); the daemon enforces the same kind-gate as the corresponding HTTP path.
+
+#### `recent_context()`
+
+Lex's L2 pull-by-default tool (Appendix R.1). Returns user-actionable recent state.
+
+Tool input schema:
+
+```ts
+{
+  since?: string;                    // ISO timestamp; default = "now - 24h"
+  categories?: Array<                // closed enum; default = all enabled categories per per-mode rules
+    'audit_findings' |
+    'reminders_due' |
+    'drafts_dropped' |
+    'canary_failures' |
+    'outbound_cap_hits' |
+    'heartbeat_missed' |
+    'thumbs_down_recent'
+  >;
+}
+```
+
+Tool output schema:
+
+```ts
+{
+  items: Array<{
+    category: string;                // matches the categories enum above
+    summary: string;                 // 1-2 sentence summary; per-item budget enforced
+    detail_url?: string;             // dashboard deep-link
+    severity?: 'low' | 'medium' | 'high';
+    occurred_at: string;             // ISO
+  }>;
+  truncated: boolean;                // true if budget forced summarisation
+  total_token_estimate: number;      // pre-summarisation
+}
+```
+
+Daemon-side rules:
+
+1. **Meeting silence:** if the active `session_id` resolves to `kind='meeting'`, the tool returns `{ items: [], truncated: false, total_token_estimate: 0, refused: 'meeting_mode_silenced' }`. The Lex runtime treats `refused` as a signal to drop the tool from the available-tools list for the remainder of the meeting session.
+2. **Per-mode verbosity (Appendix R.2 #4):** in `push-to-talk` brainstorm sessions the tool is available but `categories` is filtered to `['reminders_due']` only.
+3. **Token budget:** tool output is capped at `DEVNEURAL_LEX_AWARENESS_L2_TOKEN_CAP` (default 600). Over-budget items are summarised by the same fast-path local LLM (`qwen3:8b`) used by the L1 broadcaster, with the load-shedding rule from Appendix R.2 #1a.
+
+#### `lex_recall()`
+
+Thin wrapper over `POST /lex/recall`. Always passes the active `session_id`. Same meeting-silence behaviour as `recent_context()`.
 
 ---
 
@@ -1030,7 +1191,7 @@ Effort: ~3 days. Order is sequential within Wave 1 (later steps depend on earlie
 3. **Schema versioning infrastructure (WI-1).** Migration `P2-W1-D1-001-schema-version-meta.sql` creates `_migrations` and `wiki_meta` tables.
 4. **Embedder model_id (EM-1).** Migration `P2-W1-D1-002-add-model-id.sql` adds `model_id` to chunk tables and backfills.
 5. **Brainstorm chunks table (BF-3).** Migration `P2-W1-D1-003-brainstorm-chunks.sql`.
-6. **Brainstorm sessions schema deltas (BF-6, BF-11).** Migration `P2-W1-D1-004-brainstorm-sessions-deltas.sql` (`project_slug` nullable, add `audio_path`, `distilled_at`).
+6. **Brainstorm sessions schema deltas (BF-6, BF-11, BF-14, BF-17).** Migration `P2-W1-D1-004-brainstorm-sessions-deltas.sql`. Drops `project_slug NOT NULL` if present, adds `audio_path`, `distilled_at`, `kind`, `attendees`, `meeting_topic`, `consent_acked`, `consent_acked_at`, `consent_acked_by`, `keep_audio`, `provenance` (full DDL in section 3.3). Meeting code paths do not light up until Wave 2 day 5, but the columns ship now to keep migration ordering clean.
 7. **Wiki drafts table (BF-7).** Migration `P2-W1-D1-005-wiki-drafts.sql`.
 8. **Outbound log + trigger (PB-2, BF-4).** Migration `P2-W1-D1-006-outbound-log.sql`.
 9. **Curator log and signal tables (CI-1, CI-2).** Migration `P2-W1-D1-007-curator-log.sql`.
@@ -1165,7 +1326,7 @@ CREATE INDEX backfill_review_queue_status ON backfill_review_queue(status, band)
 ### Day 1: backend prerequisites + heartbeat + GPU queue
 
 1. **Pre-flight backup** (always).
-2. Apply migrations P2-W2-D1-010 through P2-W2-D1-013.
+2. Apply migrations P2-W2-D1-010 through P2-W2-D1-013, plus P2-W2-D1-013a (`meeting_action_items` from section 3.9).
 3. **GPU job queue (OP-3 / A11).** Implement `07-daemon/src/gpu/queue.ts`. Single in-process queue with priority lanes:
    - Lane 0 (highest): curator path (recall + injection latency-critical).
    - Lane 1: voice transcription jobs (whisper.cpp).
@@ -1211,7 +1372,9 @@ Day 2 commit: `feat(dashboard,brainstorm): wave 2 day 2 routes + audio`.
     - Borderline-band: surface in dashboard at `/brainstorms/backfill-review` with one-click link or reject. Stop condition: queue empty OR user dismisses.
     - Low-band: written to `crossproject_fallback_log`-style audit log for traceability; never linked.
     - **Meeting sessions:** no auto-lineage to wiki pages by default. The user must explicitly call `POST /meetings/:id/promote-to-wiki` if they want a wiki page from a meeting. Backfill leaves meetings as `kind='meeting'`, populates `meeting-summary` artifact if absent, and stops there.
-14. **Auto-ingest of audit documents (A6).** Periodic job (daily) walks `voice-review.md` plus any `docs/audit/*.md`. Each gets a synthetic `brainstorm_sessions` row with `mode='notes'`, `project_slug=NULL`, `audio_path=NULL`, and chunked into `brainstorm_chunks`. Future Lex recall surfaces them.
+14. **Auto-ingest of audit documents (A6).** Periodic job (daily) walks `voice-review.md` plus any `docs/audit/*.md`. Each gets a synthetic `brainstorm_sessions` row with `mode='notes'`, `kind='brainstorm'` (explicit override of the default `notes -> meeting` rule from BF-14), `provenance='audit-document'`, `project_slug=NULL`, `audio_path=NULL`, `consent_acked=0` (no audio is ever attached, so consent is irrelevant), and chunked into `brainstorm_chunks`. Future Lex recall surfaces them.
+
+    **Why the kind override:** audit documents are written reflection on the system itself (the user's own thinking captured as text), not third-party speech. They belong in the brainstorm retrieval class and must not inherit meeting-class privacy treatment (which would block lineage and force them into a meeting-recall intent). Synthetic audit sessions are also exempt from the `/meetings` route (filtered out by `provenance='audit-document'`) and from auto-distillation to wiki drafts (BF-7 only fires when `provenance='voice'`).
 
 Day 3 commit: `feat(brainstorm): wave 2 day 3 lineage + backfill`.
 
@@ -1234,7 +1397,7 @@ Day 4 commit: `feat(wiki,curator): wave 2 day 4 integrity + ui polish`.
 24a. **Meeting routes UI (BF-15, BF-17, 5.1).** `08-dashboard/app/meetings/page.tsx` and `[id]/page.tsx`. Components: `MeetingList`, `MeetingDetail`, `ActionItemList`, `AttendeeChips`, `ConsentGate`. The detail page shows audio purge countdown when `audio_purges_at` is non-null. The promote-to-wiki action surfaces only on user click.
 24b. **Lex three-level awareness model (LX-7, LX-8, Appendix R).** Implement L1 broadcaster scaffolding (idle suppression, diff-only emit, token budget). Implement L2 `recent_context()` tool exposed to Lex via the existing tool-spawn mechanism. Implement push-on-change for actionable events (audit findings, due reminders, dropped drafts, canary failures). Per-mode verbosity rules enforced; meeting mode disables all awareness.
 24. **Inline thumbs UI (LX-5 / B5).** `LexThumbs.tsx` per Lex turn. POSTs to `/lex/feedback`. Tested against `lex_feedback` schema.
-25. **Random artifact sampling (LX-6 / B6).** Daily, the dashboard surfaces 5 random recent artifacts (research-note, wiki-draft, project-intent, notes-summary) on the home page for one-click correct/incorrect labelling. Labels feed `audit_findings` with `source='user-flag'`.
+25. **Random artifact sampling (LX-6 / B6).** Daily, the dashboard surfaces 5 random recent artifacts on the home page for one-click correct/incorrect labelling. Sample pool is the canonical artifact enum from section 3.10: `research-note`, `wiki-draft`, `project-intent`, `notes-summary`, `meeting-summary`, `meeting-action-item`. Sampling is stratified so meeting artifacts cannot crowd out brainstorm artifacts when meeting volume spikes (target floor: at least 2 of 5 from brainstorm artifacts when any exist). Labels feed `audit_findings` with `source='user-flag'`.
 
 Day 5 commit: `feat(lex): wave 2 day 5 personality + feedback loop`.
 
@@ -1495,6 +1658,7 @@ New files created in this spec (referenced above; consolidated for grep-ability)
 - `07-daemon/scripts/migrations/P2-W2-D1-011-heartbeat-log.sql`
 - `07-daemon/scripts/migrations/P2-W2-D1-012-crossproject-fallback-log.sql`
 - `07-daemon/scripts/migrations/P2-W2-D1-013-backfill-review-queue.sql`
+- `07-daemon/scripts/migrations/P2-W2-D1-013a-meeting-action-items.sql`
 - `07-daemon/scripts/migrations/P2-W3-D1-014-brainstorm-edges.sql`
 - `07-daemon/src/db/migrate.ts` (if not present)
 - `07-daemon/src/gpu/queue.ts`
@@ -1731,25 +1895,50 @@ Key data flows:
 
 ---
 
-## Appendix E: Worked example: brainstorm session lifecycle
+## Appendix E: Worked examples (brainstorm and meeting lifecycles)
 
-A concrete walk-through. Use this as a model for tests and as documentation for the user.
+Two walk-throughs that match the post-BF-14 rules. Use as models for integration tests and as user-facing documentation.
 
-1. **Start.** User opens `/sessions` in the dashboard, clicks "new brainstorm", chooses mode `notes`, leaves project as `general`. Daemon spawns a Lex PTY. `brainstorm_sessions` row inserted: `id=bs_2026-05-10_a1b2`, `project_slug=NULL`, `mode=notes`, `started_at=2026-05-10T05:00:00Z`.
-2. **Voice capture.** User speaks. whisper.cpp transcribes. Each finalised utterance becomes a `brainstorm_chunks` row with `role=user`, `mode=notes`, `model_id=<configured-onnx-embedder-id>` (NOT the LLM id; `model_id` records the embedding model that produced the vector), `no_decay=1`. Lex's responses (silent in notes mode but text-emitted) become `role=lex` rows.
-3. **Audio capture.** WAV/OGG bundle written to `data/brainstorms/bs_2026-05-10_a1b2/audio/<timestamp>.wav` per finalised utterance window (or one continuous file with marker offsets, per existing capture rig; **verify on day 1**).
-4. **Stop.** User clicks Stop. `ended_at` set. Session-end pipeline fires (BF-7):
-   - Force-flush wiki ingest (existing).
-   - Refresh rolling session summary; embed into `raw_chunks` with `kind='brainstorm-summary'`, `mode=notes` (existing).
-   - **New:** Pass 2 against the full transcript produces N candidate wiki pages. Each goes to `wiki_drafts` with computed confidence (Appendix H). `distilled_at` set.
-   - **New:** notes-mode summary still creates reminders (existing) AND now writes a `wiki-draft` artifact that is one of the drafts.
-5. **Review.** User opens `/drafts`. Sees the N pending drafts. Promotes 1, edits 1, discards 1, leaves 1 idle.
-   - Promote: `wiki_drafts.status='promoted'`; new file in `wiki/` with `source_brainstorms: [bs_2026-05-10_a1b2]`; commit to wiki repo with message `feat(wiki): promote draft from brainstorm bs_2026-05-10_a1b2`.
+### E.1 Brainstorm session lifecycle (`kind='brainstorm'`)
+
+1. **Start.** User opens `/sessions/new`, picks `mode='conversation'`, leaves project `general`. The daemon receives `POST /sessions/new { mode: 'conversation', project_slug: null }`. Per BF-14 the default `kind` derives to `brainstorm`. The daemon spawns a Lex PTY. `brainstorm_sessions` row inserted: `id=bs_2026-05-10_a1b2`, `project_slug=NULL`, `mode=conversation`, `kind=brainstorm`, `provenance=voice`, `consent_acked=0` (irrelevant for brainstorm), `started_at=2026-05-10T05:00:00Z`.
+2. **Voice capture.** User speaks. whisper.cpp transcribes. Each finalised utterance becomes a `brainstorm_chunks` row with `role=user`, `mode=conversation`, `model_id=<configured-onnx-embedder-id>` (the embedding model id, NOT the LLM id), `no_decay=1`. Lex's spoken responses become `role=lex` rows.
+3. **Audio capture.** Per Wave 2 day 2 step 11 the canonical layout is one `<session_id>.opus` plus a sibling `<session_id>.cues.json` listing turn offsets. The capture rig writes both atomically at session end into `data/brainstorms/bs_2026-05-10_a1b2/audio/`.
+4. **Stop.** User clicks Stop (or says "end session", or closes the browser). The 8-step session-end pipeline (Wave 1 day 2 step 20) fires under a session-level lock:
+   - Stop accepting new transcript chunks.
+   - Drain in-flight transcription jobs.
+   - Persist final transcript; set `ended_at`.
+   - Force-flush wiki ingest.
+   - Pass 2 against the full transcript produces N `wiki_drafts` rows with computed confidence (Appendix H).
+   - Refresh rolling session summary; embed into `raw_chunks` with `kind='brainstorm-summary'`.
+   - Set `distilled_at`.
+   - Release the lock.
+5. **Review.** User opens `/drafts`. Sees N pending drafts. Promotes 1, edits 1, discards 1, leaves 1 idle.
+   - Promote: `wiki_drafts.status='promoted'`; new file in `wiki/` with `source_brainstorms: [bs_2026-05-10_a1b2]` and `derived_from_brainstorm: true`; commit message `feat(wiki): promote draft from brainstorm bs_2026-05-10_a1b2`.
    - Edit: dashboard editor sends `body_markdown` overrides; promote with edits applied.
-   - Discard: `status='discarded'`; resolved_at and resolved_by set.
-   - Idle: after 7 days, auto-promote check: confidence >= 0.85 -> promoted. Otherwise wait 14 days; then auto-drop check.
-6. **Future recall.** A future Lex session asks "what was I thinking about X". Intent override fires (`intent='what-was-i-thinking'`). Recall returns brainstorm chunks first, ranked by (cosine + age boost). The original brainstorm and any sibling brainstorms surface.
-7. **Backup.** Nightly backup at 03:00 local. The session, chunks, audio bundle, and wiki page (if promoted) are all in the snapshot.
+   - Discard: `status='discarded'`; `resolved_at` and `resolved_by` set.
+   - Idle: after 7 days, auto-promote check (gated off in Wave 1 per section 3.4). After 14 days, auto-drop check fires unconditionally and drops below `DEVNEURAL_DRAFT_AUTO_DROP_THRESHOLD=0.30`.
+6. **Future recall.** A future Lex session in `kind='brainstorm'` asks "what was I thinking about X". Intent override fires (`intent='what-was-i-thinking'`). Recall returns brainstorm chunks first, ranked by `cosine + bounded older_boost` (capped at 3.0 per section 4.2). The original brainstorm and any sibling brainstorms surface.
+7. **Backup.** Nightly backup at 03:00 local. Session row, chunks, audio bundle, drafts, and the promoted wiki page are all in the snapshot.
+
+### E.2 Meeting session lifecycle (`kind='meeting'`)
+
+1. **Start.** User opens `/sessions/new`, picks `mode='notes'`, fills `meeting_topic="Q2 review with Acme"`, fills `attendees=["Sam Acme","Jordan Beta"]`, leaves `consent_acked=false` (the user has not yet asked attendees on the call). Daemon receives `POST /sessions/new` and inserts: `id=mt_2026-05-10_c3d4`, `project_slug=NULL`, `mode=notes`, `kind=meeting`, `provenance=voice`, `consent_acked=0`, `keep_audio=0`, `started_at=2026-05-10T14:00:00Z`. Response: `{ id, kind:'meeting', capture_state:'awaiting_consent' }`. The dashboard renders the `ConsentGate` component blocking the meeting detail UI until consent is acked.
+2. **Pre-consent capture.** whisper.cpp runs in-memory only. Partial transcript chunks may persist to text storage but no audio file is written to disk per the meeting-capture gate (section 3.3).
+3. **Consent ack.** User says "everyone okay if I record this for notes?" and clicks "Acknowledge consent". Dashboard POSTs `/sessions/:id/consent { consent_acked: true }`. Daemon sets `consent_acked=1`, `consent_acked_at=<now>`, `consent_acked_by=<auth subject>`. `capture_state` flips to `capturing`. The audio file `mt_2026-05-10_c3d4.opus` plus `mt_2026-05-10_c3d4.cues.json` start being written.
+4. **Lex behaviour during the meeting.** Per BF-18 + LX-3 the meeting few-shot loads: listen, summarise, do not interject, do not opine. Per BF-19 + Appendix R.2 #4 the awareness broadcaster is fully silent: no L1 ticks, no L2 push, and `recent_context()` plus `lex_recall()` refuse with `meeting_mode_silenced` if Lex tries to call them. The refusals are daemon-enforced per section 4.3.
+5. **Stop.** User clicks Stop. The session-end pipeline runs but takes the meeting branch:
+   - Persist final transcript; set `ended_at`.
+   - Generate `meeting-summary` artifact (NOT a `wiki-draft`).
+   - Extract action items: each becomes a `meeting_action_items` row (section 3.9) with `assignee` mapped to an attendee where possible, `due` parsed where stated. Each action item also seeds a row in the existing reminders table; `meeting_action_items.reminder_id` records the FK.
+   - Set `distilled_at`. No `wiki_drafts` row is created.
+6. **Review.** User opens `/meetings/[id]`. Sees the summary, action items, audio player with countdown to auto-purge (default 30 days per `DEVNEURAL_MEETING_AUDIO_MAX_AGE_DAYS`). User can:
+   - Mark an action item `done` or `dismissed`.
+   - Toggle `keep_audio=1` (the per-session retention override).
+   - Click "promote to wiki" if the meeting summary is canonical reference material. That fires `POST /meetings/:id/promote-to-wiki` which creates a `wiki_drafts` row (the FK column is named `brainstorm_id` for compatibility per section 3.4) and follows the normal draft flow. On promotion, the new wiki page sets `source_meetings: [mt_2026-05-10_c3d4]` and `derived_from_meeting: true`.
+7. **Audio purge.** On day 31 the daily purge job removes `mt_2026-05-10_c3d4.opus` plus `.cues.json` unless `keep_audio=1`. The transcript and summary remain. `audio_url` flips to null in `MeetingDetailResponse`.
+8. **Future recall.** A future Lex session in a brainstorm context asks "what did Sam say about the API timeline". Intent override `'meeting-recall'` fires; recall filters to `kind='meeting'`, ranks by recency-weighted cosine, returns the relevant transcript turns with speaker mapping intact. Meeting-mode silence does NOT apply because the *calling* session is a brainstorm (the gate is on the calling session's kind, not the source data's kind).
+9. **Backup.** Nightly backup includes the session row, transcript chunks, action items, summary artifact. Audio bundle is included while it exists; once purged it is gone from new snapshots.
 
 ---
 
@@ -2078,8 +2267,20 @@ Lex needs to be conversationally aware without inundation. Three levels of conte
 
 **L2 recent context** (pull-by-default, push-on-change). What has happened *recently* and might matter: artifacts created in the last 24h, open brainstorms, open audit findings, flagged pages, recent thumbs-down turns. Two delivery modes:
 
-- **Pull (primary).** Lex has an explicit `recent_context()` tool. Lex calls it when the conversation suggests the user wants recent state. The daemon does NOT push L2 unsolicited.
-- **Push-on-change (exception).** Only when a *user-actionable* event fires: new audit finding, reminder due now, draft auto-dropped, canary failure. These are tagged `<recent_context kind="actionable">...</recent_context>`. Token budget: **600 tokens per push**, summarised if over.
+- **Pull (primary).** Lex has an explicit `recent_context()` tool (contract in section 4.3). Lex calls it when the conversation suggests the user wants recent state. The daemon does NOT push L2 unsolicited.
+- **Push-on-change (exception).** Only when a *user-actionable* event fires. **The actionable event set is closed** and any addition requires updating this appendix:
+
+  | Event | Trigger | Severity | Suppressible by user |
+  |---|---|---|---|
+  | `audit_finding_high` | new `audit_findings` row with `severity='high'` | high | no |
+  | `audit_finding_medium` | new `audit_findings` row with `severity='medium'` | medium | yes |
+  | `reminder_due_now` | reminder crosses its due time | medium | per-reminder |
+  | `draft_auto_dropped` | a `wiki_drafts` row flips to `auto-dropped` | low | yes |
+  | `canary_failure` | nightly canary (CI-7) returns red | high | no |
+  | `outbound_cap_hit` | daily outbound cap exhausted | high | no |
+  | `heartbeat_missed` | watcher reports >1 missed beat (defence-in-depth; primary alarm is the watcher) | high | no |
+
+  These are tagged `<recent_context kind="actionable" event="<name>">...</recent_context>`. Token budget: **600 tokens per push**, summarised if over per R.2 #1. Anything not on this list MUST NOT be pushed via L2; if a future need arises, the spec is updated first.
 
 **L3 deep memory** (pull only, on demand). The wiki, brainstorms (full transcripts and summaries), reference corpus, project transcripts, all source-classed. Accessed via `/lex/recall` with optional intent override. Token budget: **600 tokens per call** (matches existing curator budget). Lex decides when to call; the system does not auto-inject L3 into the conversation.
 
@@ -2088,14 +2289,32 @@ Lex needs to be conversationally aware without inundation. Three levels of conte
 ### R.2 Inundation prevention rules
 
 1. **Hard budget.** Per-layer caps above are enforced by the broadcaster. Over-budget content is summarised by a small local LLM call (qwen3:8b, fast path) before emission.
-2. **Diff-only L1 after baseline.** First tick on Lex spawn emits the full state. Every subsequent tick emits only changed fields plus their previous values. A baseline refresh fires every 30 minutes or on explicit `/lex/snapshot`.
-3. **Idle suppression.** If the Lex PTY has been idle for >5 minutes (no user input, no Lex output), the broadcaster pauses. Resumes on user activity.
-4. **Per-mode verbosity.** Each voice mode dictates which layers run:
+
+   **1a. Load-shedding under contention.** The summarisation LLM call adds GPU queue pressure exactly when the system is busy. The broadcaster MUST consult the GPU queue (section 11 wave 2 day 1 step 3) before scheduling a summarisation call:
+   - If lane 0 (curator) has work pending OR lane 1 (voice transcription) is active, the broadcaster SKIPS this tick's summarisation entirely. It emits a degraded payload: the L1 diff is hard-truncated to the highest-priority changed field plus a `<live_state truncated="true">...</live_state>` marker. L2 actionable pushes that would over-budget are deferred to the next tick (max two-tick deferral; on the third, they are dropped with a counter increment).
+   - If lane 2 (Pass 2 ingest) is active but lane 0 and 1 are idle, summarisation runs normally; lane 2 yields per the queue's at-job-boundary preemption.
+   - The skip count surfaces in Curator Health as `awareness_summary_skips_per_hour`.
+
+2. **Diff-only L1 after baseline, with revision protocol.** First tick on Lex spawn emits the full state with `revision=1`. Every subsequent tick emits only changed fields tagged with a monotonic `revision=N` and `prev_revision=N-1`. A baseline refresh fires every 30 minutes or on explicit `/lex/snapshot`. **Diff-application rules (Lex-side, enforced by daemon-side guards):**
+   - The daemon tracks per-Lex-PTY `last_acked_revision`. Lex acks each diff on receipt by including `lex_awareness_ack=<revision>` in its next emitted turn (the runtime parses this out before the user sees it).
+   - If the daemon detects `last_acked_revision != current_revision - 1` when it is about to send a new diff, it forces a full snapshot (`revision=N+1, full=true`) instead of another diff.
+   - PTY write failure on a diff: the daemon retries once, then on second failure schedules a forced full snapshot for the next tick and bumps a `awareness_resync_count` counter (surfaces in Curator Health).
+   - If the broadcaster's tick is skipped (idle suppression, meeting silence), the next emitted snapshot is full, not a diff against a stale baseline.
+
+3. **Idle suppression.** If the Lex PTY has been idle for >5 minutes (no user input, no Lex output), the broadcaster pauses. Resumes on user activity. Resume emits a full snapshot (per #2).
+
+4. **Per-mode verbosity (daemon-enforced; do not rely on prompt for the silence guarantees).** Each voice mode dictates which layers run AND each awareness path checks `brainstorm_sessions.kind` for the active session before serving:
    - `conversation` (kind=brainstorm): L1 + L2 push-on-change + L3 on demand.
-   - `push-to-talk` (kind=brainstorm): L1 only + L3 on demand. L2 push-on-change suppressed (user is in tight focus mode).
-   - `notes` (kind=meeting, BF-19): all three layers silent. No broadcaster ticks at all during a meeting. L3 also disabled (the user does not want Lex pulling unrelated context while a stakeholder is talking). Only after the meeting session ends does Lex re-enable normal awareness.
-5. **Backpressure metric.** Per-Lex-turn the daemon tracks the ratio of awareness tokens to user/turn tokens. If awareness exceeds 40% of turn input tokens over a rolling 10-turn window, automatic verbosity downshift: cut L1 budget to 100 tokens, suspend L2 push for 5 minutes. Surfaces in Curator Health card as `awareness_overhead_ratio`.
-6. **Tagged blocks.** All awareness is wrapped in tags so the model can visually parse what is push vs what is conversation: `<live_state>`, `<recent_context kind="actionable">`, `<recall>`. Existing Lex prompt convention.
+   - `push-to-talk` (kind=brainstorm): L1 only + L3 on demand. L2 push-on-change suppressed at the broadcaster (the user is in tight focus mode); `recent_context()` still callable but filters categories to `['reminders_due']` only.
+   - `notes` (kind=meeting, BF-19): all three layers silent at the daemon boundary. The L1 broadcaster does not tick. The L2 push-on-change emitter is short-circuited (events still queue; they fire on session end via a "while you were in the meeting" digest). `recent_context()` and `lex_recall()` both refuse with `meeting_mode_silenced` per section 4.3. Only after the meeting session ends does Lex re-enable normal awareness; the next L1 emission after that is a full snapshot (per #2).
+
+5. **Backpressure metric, with floor and hysteresis.** Per-Lex-turn the daemon tracks `awareness_overhead_ratio = awareness_tokens / max(user_turn_tokens, FLOOR)` where `FLOOR = 200` tokens. The floor prevents short voice acknowledgements ("yes", "ok", "go on") from collapsing the denominator and producing spurious downshifts.
+   - **Trip condition.** Rolling-10-turn average of the ratio exceeds `DEVNEURAL_LEX_AWARENESS_BACKPRESSURE_RATIO` (default 0.40). On trip: cut L1 budget to 100 tokens AND suspend L2 push for 5 minutes. Persist trip state to runtime config so a daemon restart preserves it.
+   - **Recovery condition (hysteresis).** Rolling-10-turn average of the ratio drops below `0.25` (a hard hysteresis gap of 0.15 below the trip threshold) AND at least 5 minutes have elapsed since trip. On recovery: restore L1 budget to default, re-enable L2 push.
+   - **Counters.** `awareness_overhead_ratio`, `awareness_backpressure_trips_per_day`, and `awareness_backpressure_active` all surface in the Curator Health card.
+   - **Anti-flap.** A second trip within 10 minutes of recovery doubles the recovery wait to 10 minutes; a third doubles again to 20 minutes; cap at 60 minutes. This prevents the system oscillating during a noisy stretch.
+
+6. **Tagged blocks.** All awareness is wrapped in tags so the model can visually parse what is push vs what is conversation: `<live_state revision="N">`, `<recent_context kind="actionable" event="<name>">`, `<recall>`. Existing Lex prompt convention.
 
 ### R.3 How Lex actually gets smarter (LX-9 expanded)
 
