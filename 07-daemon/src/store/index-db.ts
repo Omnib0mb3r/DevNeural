@@ -186,6 +186,68 @@ export class IndexDb {
     `);
   }
 
+  // ── outbound log (PB-2 / BF-4) ────────────────────────────────
+  /* Records every outbound call. The DB trigger
+   * outbound_no_voice_session blocks any insert whose payload_class
+   * starts with 'brainstorm-' or 'meeting-' OR whose
+   * contains_voice_session_source flag is 1, so callers MUST set
+   * contains_voice_session_source accurately. Returning the inserted
+   * id lets callers update response_status + error after the call. */
+  insertOutboundLog(row: {
+    id: string;
+    destination: string;
+    purpose: string;
+    payload_class: string;
+    contains_voice_session_source: 0 | 1;
+    payload_bytes: number;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO outbound_log
+           (id, destination, purpose, payload_class, contains_voice_session_source, payload_bytes)
+         VALUES (@id, @destination, @purpose, @payload_class, @contains_voice_session_source, @payload_bytes)`,
+      )
+      .run(row);
+  }
+
+  finalizeOutboundLog(
+    id: string,
+    patch: {
+      response_status?: number;
+      error?: string;
+      failure_code?: string;
+    },
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE outbound_log
+         SET response_status = COALESCE(@response_status, response_status),
+             response_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+             error = COALESCE(@error, error),
+             failure_code = COALESCE(@failure_code, failure_code)
+         WHERE id = @id`,
+      )
+      .run({
+        id,
+        response_status: patch.response_status ?? null,
+        error: patch.error ?? null,
+        failure_code: patch.failure_code ?? null,
+      });
+  }
+
+  /* Returns today's UTC totals from outbound_log. Used by the daily
+   * cap check before any new outbound call. */
+  outboundTodayUsage(): { calls: number; bytes: number } {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS calls, COALESCE(SUM(payload_bytes), 0) AS bytes
+         FROM outbound_log
+         WHERE substr(request_at, 1, 10) = strftime('%Y-%m-%d', 'now')`,
+      )
+      .get() as { calls: number; bytes: number };
+    return { calls: row.calls, bytes: row.bytes };
+  }
+
   // ── brainstorm sessions ────────────────────────────────────────
   insertBrainstorm(row: BrainstormSessionRow): void {
     this.db

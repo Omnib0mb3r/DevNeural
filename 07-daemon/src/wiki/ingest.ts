@@ -247,24 +247,54 @@ export async function runIngest(
   ) {
     try {
       const { AnthropicProvider } = await import('../llm/anthropic.js');
+      const { outboundCall, OutboundRefused } = await import('../db/outbound-guard.js');
       const fallback = new AnthropicProvider();
       if (fallback.isConfigured()) {
-        log(`[ingest] pass2 fallback to anthropic after local exhaustion`);
-        const retry = await callValidated(
-          fallback,
-          {
-            role: 'ingest',
-            systemBlocks: [
-              { text: schemaText, cache: true },
-              { text: pass1Preamble, cache: true },
-            ],
-            user: pass2User,
-            maxTokens: 2500,
-            ...(input.signal ? { signal: input.signal } : {}),
-          },
-          validatePass2,
-          log,
+        /* PB-2 outbound guard. Pass 2 fallback hits api.anthropic.com
+         * with the project's own ingest payload, never voice-session
+         * content (this branch only fires for project transcript
+         * ingest paths; brainstorm session-end pipeline does not
+         * fall back to anthropic per BF-4). The guard refuses on
+         * daily cap exhaustion and writes a row to outbound_log. */
+        const payloadBytes = Buffer.byteLength(
+          schemaText + pass1Preamble + pass2User,
+          'utf8',
         );
+        log(`[ingest] pass2 fallback to anthropic after local exhaustion`);
+        let retry;
+        try {
+          retry = await outboundCall(store.db, {
+            destination: 'api.anthropic.com',
+            purpose: 'pass2-fallback',
+            payloadClass: 'pass2-fallback',
+            payloadBytes,
+            containsVoiceSessionSource: false,
+            thunk: () =>
+              callValidated(
+                fallback,
+                {
+                  role: 'ingest',
+                  systemBlocks: [
+                    { text: schemaText, cache: true },
+                    { text: pass1Preamble, cache: true },
+                  ],
+                  user: pass2User,
+                  maxTokens: 2500,
+                  ...(input.signal ? { signal: input.signal } : {}),
+                },
+                validatePass2,
+                log,
+              ),
+          });
+        } catch (e) {
+          if (e instanceof OutboundRefused) {
+            log(
+              `[ingest] pass2 fallback REFUSED by outbound guard: ${e.failureCode}`,
+            );
+            throw e;
+          }
+          throw e;
+        }
         result.cost.input_tokens += retry.totalInputTokens;
         result.cost.output_tokens += retry.totalOutputTokens;
         result.cost.cache_read += retry.totalCacheRead;
@@ -313,22 +343,38 @@ export async function runIngest(
     }
 
     const wasCrossProject =
-      target.page.frontmatter.projects.length >= 2 ||
+      target.page.frontmatter.projects.length >= 3 ||
       target.page.frontmatter.projects.includes(input.projectId);
     const updated = applyPageUpdate(target.page, update, input);
-    /* Cross-project verification gate. DEVNEURAL.md 7.3: a pattern
-     * observed only in project A becomes a cross-project page when
-     * project B's evidence joins it. Without verification, "logging"
-     * in two domains can falsely fuse into a single global page that
-     * misleads retrieval. When this update is the FIRST mention of
-     * input.projectId on a page that already had >=1 different
-     * project, ask the LLM whether the new evidence genuinely
-     * describes the same pattern. On no/uncertain we flip
-     * flag_for_review so a human (or the next lint pass) can sort it
-     * out instead of silently merging. */
+    /* Cross-project verification gate (CP-1). Spec section 2.4: the
+     * verifier fires only when N >= 3 distinct projects share the
+     * page AND a domain-distance condition holds. Per Q-4 day-1
+     * verifications: project metadata has no tags yet, so the
+     * domain-distance check falls back to "different project_slug =
+     * different domain" until tags ship. With that fallback, having
+     * 3 distinct project_slugs trivially satisfies domain-distance.
+     *
+     * BF-4 + CP-3: voice-session-derived pages (those with non-empty
+     * source_brainstorms or source_meetings) are never sent through
+     * the verifier because the verifier is an outbound LLM call.
+     * Such pages skip the verifier and stay flagged for human
+     * review only via the lint loop. */
     const becameCrossProject =
-      !wasCrossProject && updated.frontmatter.projects.length >= 2;
-    if (becameCrossProject && (update.evidence_add ?? []).length > 0) {
+      !wasCrossProject && updated.frontmatter.projects.length >= 3;
+    const hasVoiceSource =
+      (updated.frontmatter.source_brainstorms ?? []).length > 0 ||
+      (updated.frontmatter.source_meetings ?? []).length > 0;
+    if (becameCrossProject && hasVoiceSource) {
+      log(
+        `[ingest] ${update.id}: cross-project verifier SKIPPED (voice-session-derived); flagging for lint review`,
+      );
+      updated.frontmatter.flag_for_review = true;
+    }
+    if (
+      becameCrossProject &&
+      !hasVoiceSource &&
+      (update.evidence_add ?? []).length > 0
+    ) {
       try {
         const sameSource =
           await verifyCrossProjectFit(
@@ -338,6 +384,7 @@ export async function runIngest(
             update.evidence_add ?? [],
             input,
             log,
+            store,
           );
         if (!sameSource) {
           updated.frontmatter.flag_for_review = true;
@@ -643,6 +690,7 @@ async function verifyCrossProjectFit(
   newEvidence: string[],
   input: IngestInput,
   log: (msg: string) => void,
+  store?: import('../store/index.js').Store,
 ): Promise<boolean> {
   const evidenceBlock = newEvidence.slice(0, 5).join('\n  - ');
   const user =
@@ -662,25 +710,60 @@ async function verifyCrossProjectFit(
       return { ok: false, errors: ['same_pattern not bool'] };
     return { ok: true, value: { same_pattern: v }, errors: [] };
   };
-  const result = await callValidated(
-    provider,
-    {
-      role: 'self_query',
-      systemBlocks: [
-        {
-          text:
-            'You are a strict pattern verifier for a wiki of [trigger]→[insight] pages. ' +
-            'Reply ONLY with the requested JSON object. No prose.',
-          cache: false,
-        },
-      ],
-      user,
-      maxTokens: 50,
-      ...(input.signal ? { signal: input.signal } : {}),
-    },
-    verifier,
-    log,
-  );
+  /* Outbound guard wraps the verifier when the active provider is
+   * Anthropic. Local providers (ollama / qwen3) stay un-wrapped
+   * because no off-host call happens. The store handle is optional
+   * to keep older callers compiling; without it, the guard is
+   * skipped entirely (the provider check still gates anthropic vs
+   * local). */
+  const callRaw = () =>
+    callValidated(
+      provider,
+      {
+        role: 'self_query',
+        systemBlocks: [
+          {
+            text:
+              'You are a strict pattern verifier for a wiki of [trigger]→[insight] pages. ' +
+              'Reply ONLY with the requested JSON object. No prose.',
+            cache: false,
+          },
+        ],
+        user,
+        maxTokens: 50,
+        ...(input.signal ? { signal: input.signal } : {}),
+      },
+      verifier,
+      log,
+    );
+
+  let result;
+  if (provider.name === 'anthropic' && store) {
+    const { outboundCall, OutboundRefused } = await import(
+      '../db/outbound-guard.js'
+    );
+    const payloadBytes = Buffer.byteLength(user, 'utf8');
+    try {
+      result = await outboundCall(store.db, {
+        destination: 'api.anthropic.com',
+        purpose: 'cross-project-verifier',
+        payloadClass: 'wiki-page-candidate',
+        payloadBytes,
+        containsVoiceSessionSource: false,
+        thunk: callRaw,
+      });
+    } catch (e) {
+      if (e instanceof OutboundRefused) {
+        log(
+          `[ingest] cross-project verifier REFUSED by outbound guard: ${e.failureCode}; failing closed`,
+        );
+        return false;
+      }
+      throw e;
+    }
+  } else {
+    result = await callRaw();
+  }
   if (!result.value) return false; // fail closed
   return result.value.same_pattern;
 }
