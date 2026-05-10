@@ -353,6 +353,68 @@ export interface LocStats {
 }
 export const statsLoc = () => request<LocStats>("/stats/loc");
 
+export interface KpiStats {
+  ok: boolean;
+  computed_at: string;
+  store: {
+    raw_chunks: number;
+    wiki_vectors: number;
+    reference_chunks: number;
+  };
+  sessions: {
+    total: number;
+    active: number;
+    by_phase: Record<string, number>;
+  };
+  brainstorm: {
+    total: number;
+    active: number;
+    by_mode: Record<string, number>;
+  } | null;
+  wiki: {
+    canonical: number;
+    pending: number;
+    archived: number;
+    avg_weight: number | null;
+    flagged_for_review: number;
+    cross_project: number;
+  } | null;
+  artifacts: {
+    research_notes: number;
+    wiki_drafts: number;
+    project_intents: number;
+    notes_summaries: number;
+    total: number;
+  } | null;
+  reinforcement: {
+    hits_7d: number;
+    corrections_7d: number;
+    raw_hits_7d: number;
+  } | null;
+  git: { commits_7d: number } | null;
+  backup: { last_run_at: string | null; days_ago: number | null } | null;
+  llm: {
+    name: string;
+    configured: boolean;
+    hint: string;
+    models: { ingest: string; lint: string; reconcile: string; selfQuery: string };
+  } | null;
+  embedder: {
+    warmed_at: string | null;
+    warm_ms: number;
+    embed_calls: number;
+    embed_items: number;
+    total_embed_ms: number;
+    last_batch_size: number;
+    last_batch_ms: number;
+    last_error: string | null;
+    model: string;
+    dim: number;
+  };
+  daemon: { uptime_s: number; node_pid: number };
+}
+export const statsKpi = () => request<KpiStats>("/stats/kpi");
+
 export const spawnLex = (cwd?: string, resumeSessionId?: string) =>
   request<{ ok: boolean; ptyId?: string; pid?: number; cwd?: string; resumed?: boolean; error?: string }>(
     "/pty/spawn-lex",

@@ -12,7 +12,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { DATA_ROOT } from '../paths.js';
+import { DATA_ROOT, wikiPagesDir, wikiPendingDir, wikiArchiveDir } from '../paths.js';
 import { authMiddleware, registerAuthRoutes, isPinSet } from './auth.js';
 import { ReferenceStore } from '../reference/store.js';
 import { ingestUpload } from '../reference/process.js';
@@ -1888,6 +1888,349 @@ export async function registerDashboardRoutes(
     };
     locCache = { value, expires_at: Date.now() + LOC_CACHE_MS };
     return { ok: true, ...value, cache: 'miss' };
+  });
+
+  // ── Stats: omnibus KPI snapshot for the dashboard strip ────────
+  /* One round-trip, multiple numbers. Every section is best-effort:
+   * any sub-computation that errors returns null instead of throwing
+   * so a single missing data source never blacks out the whole strip.
+   * Heavy parts (wiki dir scan, git commit walk) are cached for 60s
+   * because the strip polls every 30s and can tolerate that latency.
+   * Light parts (in-memory store sizes, db queries) are computed
+   * fresh on every call. */
+  interface KpiCacheEntry {
+    wiki: {
+      canonical: number;
+      pending: number;
+      archived: number;
+      avg_weight: number | null;
+      flagged_for_review: number;
+      cross_project: number;
+    } | null;
+    git: { commits_7d: number } | null;
+    artifacts: {
+      research_notes: number;
+      wiki_drafts: number;
+      project_intents: number;
+      notes_summaries: number;
+      total: number;
+    } | null;
+    backup: { last_run_at: string | null; days_ago: number | null } | null;
+    computed_at: string;
+  }
+  let kpiHeavyCache: { value: KpiCacheEntry; expires_at: number } | null = null;
+  const KPI_HEAVY_CACHE_MS = 60_000;
+
+  function readWikiSnapshot(): KpiCacheEntry['wiki'] {
+    try {
+      const wp = wikiPagesDir();
+      const wpend = wikiPendingDir();
+      const warch = wikiArchiveDir();
+      const countMd = (dir: string): number => {
+        try {
+          return fs.readdirSync(dir).filter((f) => f.endsWith('.md')).length;
+        } catch {
+          return 0;
+        }
+      };
+      const canonical = countMd(wp);
+      const pending = countMd(wpend);
+      const archived = countMd(warch);
+      let totalWeight = 0;
+      let weighted = 0;
+      let flagged = 0;
+      let crossProject = 0;
+      const scan = (dir: string) => {
+        try {
+          for (const file of fs.readdirSync(dir)) {
+            if (!file.endsWith('.md')) continue;
+            try {
+              const raw = fs.readFileSync(path.posix.join(dir, file), 'utf-8');
+              const fmMatch = raw.match(/^---\n([\s\S]*?)\n---/);
+              if (!fmMatch) continue;
+              const fm = fmMatch[1] ?? '';
+              const wMatch = fm.match(/^weight:\s*([0-9.]+)/m);
+              if (wMatch) {
+                const w = Number(wMatch[1]);
+                if (Number.isFinite(w)) {
+                  totalWeight += w;
+                  weighted++;
+                }
+              }
+              if (/^flag_for_review:\s*true/m.test(fm)) flagged++;
+              const projMatch = fm.match(/^projects:\s*\[([^\]]*)\]/m);
+              if (projMatch) {
+                const inner = projMatch[1] ?? '';
+                const items = inner
+                  .split(',')
+                  .map((s) => s.trim())
+                  .filter((s) => s.length > 0);
+                if (items.length >= 2) crossProject++;
+              }
+            } catch {
+              /* unreadable page, skip */
+            }
+          }
+        } catch {
+          /* dir missing */
+        }
+      };
+      scan(wp);
+      scan(wpend);
+      return {
+        canonical,
+        pending,
+        archived,
+        avg_weight: weighted > 0 ? totalWeight / weighted : null,
+        flagged_for_review: flagged,
+        cross_project: crossProject,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function readGitCommits7d(): KpiCacheEntry['git'] {
+    try {
+      const { listProjects: lp } = require('../identity/registry.js') as typeof import('../identity/registry.js');
+      const projects = lp();
+      const { execSync } = require('node:child_process') as typeof import('node:child_process');
+      let total = 0;
+      const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+        .toISOString()
+        .slice(0, 10);
+      for (const project of projects) {
+        const root = project.root.replace(/\\/g, '/');
+        if (!fs.existsSync(root)) continue;
+        try {
+          const out = execSync(`git log --since=${since} --oneline`, {
+            cwd: root,
+            encoding: 'utf-8',
+            windowsHide: true,
+            stdio: ['ignore', 'pipe', 'ignore'],
+            maxBuffer: 4 * 1024 * 1024,
+          });
+          total += out.split(/\r?\n/).filter((l) => l.length > 0).length;
+        } catch {
+          /* not a git repo or git missing */
+        }
+      }
+      return { commits_7d: total };
+    } catch {
+      return null;
+    }
+  }
+
+  function readArtifacts(): KpiCacheEntry['artifacts'] {
+    try {
+      const root = path.posix.join(
+        DATA_ROOT.replace(/\\/g, '/'),
+        'lex',
+        'artifacts',
+      );
+      const countDir = (kind: string): number => {
+        try {
+          return fs
+            .readdirSync(path.posix.join(root, kind))
+            .filter((f) => f.endsWith('.json')).length;
+        } catch {
+          return 0;
+        }
+      };
+      const rn = countDir('research-note');
+      const wd = countDir('wiki-draft');
+      const pi = countDir('project-intent');
+      const ns = countDir('notes-summary');
+      return {
+        research_notes: rn,
+        wiki_drafts: wd,
+        project_intents: pi,
+        notes_summaries: ns,
+        total: rn + wd + pi + ns,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function readBackup(): KpiCacheEntry['backup'] {
+    try {
+      /* Backup task writes a small marker; we look for the most recent
+       * snapshot directory under the configured target. The target is
+       * recorded by install-backup-task.ps1 in a sibling marker file
+       * under DATA_ROOT/backup-target.json. Best-effort. */
+      const marker = path.posix.join(
+        DATA_ROOT.replace(/\\/g, '/'),
+        'backup-target.json',
+      );
+      let target: string | null = null;
+      if (fs.existsSync(marker)) {
+        try {
+          const j = JSON.parse(fs.readFileSync(marker, 'utf-8')) as {
+            BackupRoot?: string;
+          };
+          target = j.BackupRoot ?? null;
+        } catch {
+          /* marker malformed */
+        }
+      }
+      if (!target || !fs.existsSync(target)) {
+        return { last_run_at: null, days_ago: null };
+      }
+      const entries = fs
+        .readdirSync(target)
+        .map((name) => {
+          try {
+            const stat = fs.statSync(path.posix.join(target as string, name));
+            return { name, mtime: stat.mtimeMs };
+          } catch {
+            return null;
+          }
+        })
+        .filter((e): e is { name: string; mtime: number } => e !== null)
+        .sort((a, b) => b.mtime - a.mtime);
+      if (entries.length === 0) return { last_run_at: null, days_ago: null };
+      const newest = entries[0]!;
+      const daysAgo = (Date.now() - newest.mtime) / (24 * 60 * 60 * 1000);
+      return {
+        last_run_at: new Date(newest.mtime).toISOString(),
+        days_ago: Math.round(daysAgo * 10) / 10,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function getKpiHeavy(): KpiCacheEntry {
+    if (kpiHeavyCache && Date.now() < kpiHeavyCache.expires_at) {
+      return kpiHeavyCache.value;
+    }
+    const value: KpiCacheEntry = {
+      wiki: readWikiSnapshot(),
+      git: readGitCommits7d(),
+      artifacts: readArtifacts(),
+      backup: readBackup(),
+      computed_at: new Date().toISOString(),
+    };
+    kpiHeavyCache = { value, expires_at: Date.now() + KPI_HEAVY_CACHE_MS };
+    return value;
+  }
+
+  app.get('/stats/kpi', async () => {
+    const heavy = getKpiHeavy();
+    const sessions = listSessions();
+    const active = sessions.filter((s) => s.active);
+    const byPhase: Record<string, number> = {
+      thinking: 0,
+      tool: 0,
+      permission: 0,
+      idle: 0,
+      unknown: 0,
+    };
+    for (const s of active) byPhase[s.phase] = (byPhase[s.phase] ?? 0) + 1;
+    /* Brainstorms */
+    let brainstorm: {
+      total: number;
+      active: number;
+      by_mode: Record<string, number>;
+    } | null = null;
+    try {
+      const all = store.db.listBrainstorms({ limit: 10_000 });
+      const act = all.filter((b) => b.status === 'active');
+      const byMode: Record<string, number> = {};
+      for (const b of act) byMode[b.mode] = (byMode[b.mode] ?? 0) + 1;
+      brainstorm = { total: all.length, active: act.length, by_mode: byMode };
+    } catch {
+      /* leave null */
+    }
+    /* Reinforcement signals from the last 7 days */
+    let reinforcement: {
+      hits_7d: number;
+      corrections_7d: number;
+      raw_hits_7d: number;
+    } | null = null;
+    try {
+      const file = path.posix.join(
+        DATA_ROOT.replace(/\\/g, '/'),
+        'reinforcement.log.jsonl',
+      );
+      if (fs.existsSync(file)) {
+        const stat = fs.statSync(file);
+        const tailBytes = Math.min(stat.size, 512 * 1024);
+        const fd = fs.openSync(file, 'r');
+        const buf = Buffer.alloc(tailBytes);
+        try {
+          fs.readSync(fd, buf, 0, tailBytes, stat.size - tailBytes);
+        } finally {
+          fs.closeSync(fd);
+        }
+        const text = buf.toString('utf-8');
+        const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+        let hits = 0;
+        let corrections = 0;
+        let rawHits = 0;
+        for (const line of text.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const ev = JSON.parse(trimmed) as {
+              kind?: string;
+              ts?: string | number;
+            };
+            const t =
+              typeof ev.ts === 'string'
+                ? Date.parse(ev.ts)
+                : typeof ev.ts === 'number'
+                  ? ev.ts
+                  : 0;
+            if (!t || t < cutoff) continue;
+            if (ev.kind === 'hit' || ev.kind === 'promote') hits++;
+            else if (ev.kind === 'correction') corrections++;
+            else if (ev.kind === 'raw-hit') rawHits++;
+          } catch {
+            /* skip malformed line */
+          }
+        }
+        reinforcement = {
+          hits_7d: hits,
+          corrections_7d: corrections,
+          raw_hits_7d: rawHits,
+        };
+      } else {
+        reinforcement = { hits_7d: 0, corrections_7d: 0, raw_hits_7d: 0 };
+      }
+    } catch {
+      /* leave null */
+    }
+    /* LLM token totals + uptime + embedder */
+    const provider = providerStatus();
+    const embedder = embedderStats();
+    return {
+      ok: true,
+      computed_at: new Date().toISOString(),
+      store: {
+        raw_chunks: store.rawChunks.size(),
+        wiki_vectors: store.wikiPages.size(),
+        reference_chunks: referenceStore.chunks.size(),
+      },
+      sessions: {
+        total: sessions.length,
+        active: active.length,
+        by_phase: byPhase,
+      },
+      brainstorm,
+      wiki: heavy.wiki,
+      artifacts: heavy.artifacts,
+      reinforcement,
+      git: heavy.git,
+      backup: heavy.backup,
+      llm: provider,
+      embedder,
+      daemon: {
+        uptime_s: Math.round(process.uptime()),
+        node_pid: process.pid,
+      },
+    };
   });
 
   // ── Admin: one-time backfill of historical Claude transcripts ───
