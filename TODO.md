@@ -28,6 +28,7 @@ Captured 2026-05-04. Living list. Tick when shipped.
 - Phase 4 Orb data rebind. Force-directed UI shipped; pages-as-nodes data layer awaiting more accumulated wiki content.
 - Phase 5 settings audit + personalized recovery docs. Mostly documentation.
 - Audio/video binary smoke test post whisper.cpp + ffmpeg install.
+- **Phase 7 voice identity bundle** (planned 2026-05-10): pyannote-based speaker diarization so Lex distinguishes primary user voice from third-party / background speech and routes ambient utterances out of the reply path. Same enrolled voice profile doubles as a voice-unlock biometric (with liveness check) for dashboard / Lex auth, augmenting PIN. Bundled with Phase 7 Lex personality fine-tune.
 
 ## Phase Two queue (2026-05-09; superseded 2026-05-10)
 
