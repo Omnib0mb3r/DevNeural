@@ -1,5 +1,30 @@
 # Handover: Phase Two Wave 1 days 1, 2, 3 (2026-05-10)
 
+> **RESUME POINTER (2026-05-10 19:55 evening, post-context-clear):**
+> Active branch: `phase-two`. Worktree: `C:\dev\Projects\DevNeural-phase-two` (open this folder in VS Code, NOT the plain `DevNeural` folder).
+>
+> **Stop snapshot (2026-05-10 ~15:55 worker stop):**
+> - Last commit at stop: `f812da9 feat(reinforcement): OP-4 raw chunks cull rule`
+> - Done since heartbeat poster (`607afdd`):
+>   - `2b26a4d feat(notifications): OP-2 native OS toast fallback via BurntToast` (BurntToast spawn, fail-open caching, single-quote escaping; wired into `maybePushNotification` after `sendPushToAll`; `docs/install/NOTIFICATIONS.md`).
+>   - `f812da9 feat(reinforcement): OP-4 raw chunks cull rule` (cullRawChunks module; daemon boot wires a daily setInterval; brainstorm_chunks untouched; reinforcement.log.jsonl reference scan; raw_chunks_archived sibling table created inline; test refactored to use a stub Store after a paths.ts capture-at-import incident archived 4 synthetic rows from production raw_chunks_meta — recovered via DELETE WHERE project_id='proj-cull').
+>   - GPU queue + VRAM monitor wiring (`34553ac`) and Wave 2 prerequisite migrations 010-013 + 013a (`8bb07e9`) shipped earlier in the same Wave 2 day 1 push; both were complete before the heartbeat poster but listed here for completeness since the user's wrap-up directive named them as recent.
+> - Step 20 status: SHIPPED in commit `663309f` earlier this session (Wave 1 day 2 keystone, 8-step ordered flush + brainstorm auto-distillation under per-session lock; gated on `kind='brainstorm'`; refuses Anthropic per BF-4). Older lines below that reference Step 20 as deferred predate that commit.
+> - Wave 2 day 1 sign-off checklist (per spec section 11 wave 2 day 1):
+>   - [x] Prerequisite migrations 010 through 013 + 013a applied (`8bb07e9`).
+>   - [x] GPU job queue with priority lanes (`34553ac`).
+>   - [x] VRAM monitor (`34553ac`; fail-open on hosts without nvidia-smi).
+>   - [x] External heartbeat poster (`607afdd`); `docs/install/HEARTBEAT.md` documents the watcher options. The standalone watcher service (`07-daemon/heartbeat-watcher/`) is the off-process half and can deploy independently; not yet built.
+>   - [x] Native OS toast fallback (`2b26a4d`).
+>   - [x] Raw chunks cull rule (`f812da9`).
+> - Very next step on resume: **Wave 2 day 2** per spec section 11. First task: `/brainstorms` route + components in `08-dashboard/app/brainstorms/page.tsx` and `[id]/page.tsx`, plus `BrainstormList`, `BrainstormDetail`, `AudioPlayer`. Audio retention canonicalised to one `<session_id>.opus` + sibling `<session_id>.cues.json` per spec wave 2 day 2 step 11. The `/drafts` route + `DraftEditor` modal with all four conflict cases is also day 2. Stop at the day 2 boundary unless otherwise instructed.
+> - Tests + typecheck state: 113 of 113 green; `tsc --noEmit` clean across both daemon and dashboard.
+>
+> One-line resume prompt to paste into the fresh session after `/clear`:
+> `read docs/HANDOVER-2026-05-10-phase-two-wave-1-day-1.md, then continue from the stop snapshot at the top`
+>
+> (Unrelated open bug for the state tracker is logged separately at `docs/bugs/2026-05-10-state-tracker-loses-live-sessions.md`; not on Wave 2's critical path, do not interrupt Wave 2 to fix it.)
+
 > **2026-05-10 evening update:** Days 2 and 3 also shipped on `phase-two` (step 20 explicitly skipped per user directive; Wave 2 boundary respected). Pick up at **Wave 2 day 1** (prerequisite migrations 010 through 013 + 013a) per spec section 11.
 >
 > The original Day 1 handover content is preserved below.
