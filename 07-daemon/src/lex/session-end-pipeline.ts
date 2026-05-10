@@ -2,37 +2,43 @@
  * Session-end pipeline for Lex / brainstorm / voice sessions.
  *
  * One function called from every session-end path (PTY exit, voice
- * "end session" command, voice WS close, notes-mode finalize). Runs
- * the existing wiki + RAG infrastructure so brainstorm sessions leave
- * the same durable record as any other Claude Code session, plus a
- * mode-tagged session summary chunk that retrieval can find later.
+ * "end session" command, voice WS close, notes-mode finalize, plus
+ * Wave 2's admin /brainstorms/:id/redistill). Runs an 8-step ordered
+ * flush per spec section 11 day 2 step 20 (BF-7). Holds a per-
+ * session lock so concurrent funnel paths funnel through one
+ * pipeline run; the others await its result.
  *
- * Steps (each is best-effort, failures are logged not thrown so we
- * never block the teardown that called us):
- *   1. forceIngestProject() — flush the project's transcripts.jsonl
- *      tail past its last-ingest cursor through runIngest(). Same
- *      LLM, same Pass-1/Pass-2, same wiki page output as the periodic
- *      auto-ingest loop. The 600-byte minimum is bypassed: small
- *      tail content still goes through; the LLM's own filter decides
- *      whether anything is worth a page.
- *   2. updateSummary() — refresh the rolling session summary at
- *      session-state/<sid>.summary.md. Uses recent raw chunks from
- *      this session_id only (not whole project) so the summary is
- *      session-scoped.
- *   3. Embed the summary text into raw_chunks with metadata
- *      kind='brainstorm-summary' and mode=<voice mode>. The mode
- *      tag is how a meeting recording stays identifiable as such
- *      even after its brainstorm_sessions row is archived. Source-
- *      class lookup at search time still gives it the brainstorm
- *      tier (×0.7) when the row is alive; once archived the chunk
- *      falls back to raw (×0.6) but the mode metadata persists for
- *      filtered queries like "show meeting recordings only".
- *   4. scheduleLint() runs as a side effect of runIngest(); we don't
- *      call it again here.
+ * Atomic ordering (each step completes before the next begins):
+ *   1. Stop accepting new transcript chunks for this session.
+ *      The lock taken at entry is the gate; new caller paths
+ *      observe the lock and await rather than racing the writer.
+ *      A future fs-watcher coordination flag would tighten this
+ *      to disk-flush boundaries; today the in-process lock is the
+ *      strongest available guarantee.
+ *   2. Drain in-flight transcription jobs from the GPU queue.
+ *      No-op until Wave 2 day 1 ships 07-daemon/src/gpu/queue.ts.
+ *      The queue's drainSessionId() lands then; the stub here
+ *      logs a one-line note so the wire-up is unambiguous.
+ *   3. Persist final transcript and update brainstorm_sessions
+ *      ended_ms / status='ended'. The pipeline takes ownership
+ *      of these fields from the teardown caller; idempotent
+ *      because UPDATE is a no-op when the row is already in
+ *      that state.
+ *   4. Force-flush wiki ingest (existing forceIngestProject).
+ *   5. Run Pass 2 against the full transcript via
+ *      distillBrainstorm(); produce wiki_drafts rows. Gated on
+ *      kind='brainstorm' (BF-15: meetings do NOT auto-distill).
+ *      Local LLM only (BF-4: anthropic forbidden for brainstorm
+ *      content). Skipped on legacy rows that pre-date the kind
+ *      column only when kind is explicitly 'meeting'.
+ *   6. Refresh rolling session summary; write to raw_chunks with
+ *      kind='brainstorm-summary' (existing).
+ *   7. Set distilled_at on the brainstorm_sessions row.
+ *   8. Release the session lock (automatic via the lock helper's
+ *      finally branch).
  *
- * The teardown that called us (voice WS close, PTY exit) handles
- * setting brainstorm_sessions.status='ended' itself; this pipeline
- * does not touch the row.
+ * Each step is best-effort and logs failures rather than throwing
+ * so a single step's error does not abort the teardown.
  */
 import * as fs from 'node:fs';
 import { transcriptsFile } from '../paths.js';
@@ -41,6 +47,8 @@ import { embedOne } from '../embedder/index.js';
 import { forceIngestProject } from '../wiki/auto-ingest.js';
 import { updateSummary, readSummary } from '../curation/session-summarizer.js';
 import { listProjects } from '../identity/registry.js';
+import { withSessionEndLock } from './session-end-lock.js';
+import { distillBrainstorm } from './brainstorm-distillation.js';
 
 export interface SessionEndInput {
   /** Brainstorm row id, used only for logging; the pipeline does not
@@ -65,6 +73,18 @@ export interface SessionEndResult {
   ingest_pages_updated: number;
   summary_written: boolean;
   summary_embedded: boolean;
+  /* BF-7 distillation. drafts_created counts wiki_drafts rows
+   * inserted; drafts_skipped_reason names the gate that blocked
+   * distillation when applicable (kind=meeting, no_provider,
+   * bf4_anthropic_blocked, transcript_too_short, llm_validation_failed). */
+  drafts_created: number;
+  drafts_skipped_reason?: string;
+  /* True when this call did the work; false when an earlier
+   * concurrent caller already ran and we observed its result via
+   * the session-end lock. Helps callers distinguish "nothing
+   * changed because already terminated" from "nothing changed
+   * because the pipeline really did nothing". */
+  was_primary_runner: boolean;
 }
 
 /* Pull last N raw chunks for this session from raw_chunks_meta and
@@ -121,12 +141,34 @@ export async function runSessionEndPipeline(
   input: SessionEndInput,
   log: (msg: string) => void = () => undefined,
 ): Promise<SessionEndResult> {
+  /* The whole pipeline runs under the per-session lock so concurrent
+   * funnel paths (PTY exit + WS close, Stop button + spoken "end
+   * session") agree on a single runner. Awaiters get the same result
+   * object the primary runner returned and have was_primary_runner
+   * set to false. */
+  const sessionKey =
+    input.claudeSessionId ?? `brainstorm:${input.brainstormId}`;
+  let primaryRan = false;
+  const result = await withSessionEndLock<SessionEndResult>(sessionKey, async () => {
+    primaryRan = true;
+    return runOrderedPipeline(store, input, log);
+  });
+  return { ...result, was_primary_runner: primaryRan };
+}
+
+async function runOrderedPipeline(
+  store: Store,
+  input: SessionEndInput,
+  log: (msg: string) => void,
+): Promise<SessionEndResult> {
   const out: SessionEndResult = {
     ingest_triggered: false,
     ingest_pages_created: 0,
     ingest_pages_updated: 0,
     summary_written: false,
     summary_embedded: false,
+    drafts_created: 0,
+    was_primary_runner: true,
   };
   if (!input.claudeSessionId) {
     log(
@@ -144,7 +186,37 @@ export async function runSessionEndPipeline(
   const project = listProjects().find((p) => p.id === projectId);
   const projectName = project?.name ?? projectId;
 
-  /* Step 1: force-flush wiki ingest. Independent of the periodic loop
+  /* Step 1 (ordered flush): stop accepting new transcript chunks.
+   * The session-end lock is the gate; subsequent caller paths
+   * observe the lock and await rather than racing this writer.
+   * A future fs-watcher coordination flag would tighten this to
+   * disk-flush boundaries; today the in-process lock is the
+   * strongest available guarantee. */
+
+  /* Step 2 (ordered flush): drain GPU queue for this session_id.
+   * No-op until Wave 2 day 1 ships 07-daemon/src/gpu/queue.ts and
+   * a drainSessionId() helper. The wire-up will look like:
+   *   await gpuQueue.drainSessionId(input.claudeSessionId);
+   * Until then transcription is fire-and-forget per chunk and the
+   * summary refresh in step 6 is the last reader of any in-flight
+   * transcript bytes. */
+
+  /* Step 3 (ordered flush): persist the final transcript and update
+   * brainstorm_sessions ended_ms / status='ended'. The pipeline
+   * takes ownership of these fields; idempotent on repeat calls. */
+  try {
+    const existing = store.db.getBrainstorm(input.brainstormId);
+    if (existing && existing.status !== 'ended') {
+      store.db.updateBrainstorm(input.brainstormId, {
+        status: 'ended',
+        ended_ms: existing.ended_ms ?? Date.now(),
+      });
+    }
+  } catch (err) {
+    log(`[session-end] ended_ms update failed: ${(err as Error).message}`);
+  }
+
+  /* Step 4: force-flush wiki ingest. Independent of the periodic loop
    * so an end-of-session that lands between ticks still ships content. */
   try {
     const ingest = await forceIngestProject(store, projectId, log);
@@ -155,8 +227,41 @@ export async function runSessionEndPipeline(
     log(`[session-end] force-ingest failed: ${(err as Error).message}`);
   }
 
-  /* Step 2: refresh the rolling session summary one last time so the
-   * summarizer captures content from the final turns. */
+  /* Step 5: BF-7 brainstorm auto-distillation. Only fires for
+   * kind='brainstorm' rows; meetings (BF-15) get the meeting-summary
+   * artifact via a separate path that does not run here. */
+  const kind = store.db.brainstormKind(input.brainstormId);
+  if (kind === 'meeting') {
+    out.drafts_skipped_reason = 'kind_meeting';
+    log(
+      `[session-end] distillation skipped: kind=meeting (meetings do not auto-distill, BF-15)`,
+    );
+  } else {
+    try {
+      const transcript = recentTranscriptText(
+        store,
+        projectId,
+        input.claudeSessionId,
+      );
+      const distill = await distillBrainstorm(
+        store,
+        input.brainstormId,
+        transcript,
+        log,
+      );
+      out.drafts_created = distill.drafts_created;
+      if (distill.skipped_reason) {
+        out.drafts_skipped_reason = distill.skipped_reason;
+      }
+    } catch (err) {
+      log(`[session-end] distillation failed: ${(err as Error).message}`);
+      out.drafts_skipped_reason = 'distillation_threw';
+    }
+  }
+
+  /* Step 6: refresh the rolling session summary one last time so the
+   * summarizer captures content from the final turns; embed into
+   * raw_chunks tagged kind='brainstorm-summary'. */
   const recent = loadSessionChunks(store, projectId, input.claudeSessionId, 60);
   if (recent.length >= 2) {
     try {
@@ -183,10 +288,6 @@ export async function runSessionEndPipeline(
     );
   }
 
-  /* Step 3: embed the latest summary text into raw_chunks tagged as
-   * a brainstorm-summary with the session's mode. This is the chunk
-   * future retrieval finds when the user asks "what was that meeting
-   * about" or "summarise my last brainstorm". */
   const summaryText = readSummary(input.claudeSessionId).trim();
   if (summaryText) {
     try {
@@ -232,5 +333,35 @@ export async function runSessionEndPipeline(
       );
     }
   }
+
+  /* Step 7: set distilled_at on the brainstorm_sessions row. Marks
+   * the row as having been through the full pipeline so /brainstorms
+   * can show "distilled" state and admin /redistill can rerun. */
+  try {
+    store.db.setBrainstormDistilledAt(
+      input.brainstormId,
+      new Date().toISOString(),
+    );
+  } catch (err) {
+    log(`[session-end] distilled_at update failed: ${(err as Error).message}`);
+  }
+
+  /* Step 8: release lock. Handled automatically by withSessionEndLock's
+   * finally branch on return. */
   return out;
+}
+
+/* Read the full transcript text for a session. Concatenates the
+ * recent-chunks loader (already used for the summary refresh) into
+ * a single string for the distillation prompt. Cap at 12k chars at
+ * the prompt-build site, not here. */
+function recentTranscriptText(
+  store: Store,
+  projectId: string,
+  sessionId: string,
+): string {
+  const chunks = loadSessionChunks(store, projectId, sessionId, 200);
+  return chunks
+    .map((c) => `${c.role === 'user' ? 'USER' : 'LEX'}: ${c.text}`)
+    .join('\n\n');
 }

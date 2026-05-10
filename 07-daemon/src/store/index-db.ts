@@ -287,6 +287,49 @@ export class IndexDb {
     };
   }
 
+  // ── wiki_drafts (BF-7) ─────────────────────────────────────────
+  /* Insert a pending wiki draft produced by the session-end auto-
+   * distillation. brainstorm_id is the voice-session FK (column name
+   * retained for compatibility per CODEX-002 B4). status defaults to
+   * 'pending'; the user reviews via /drafts and promotes / edits /
+   * discards. */
+  insertWikiDraft(row: {
+    id: string;
+    brainstorm_id: string;
+    page_slug: string;
+    page_title: string;
+    body_markdown: string;
+    confidence: number;
+    status?: 'pending' | 'promoted' | 'discarded' | 'auto-promoted' | 'auto-dropped' | 'superseded';
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO wiki_drafts
+           (id, brainstorm_id, page_slug, page_title, body_markdown, confidence, status)
+         VALUES (@id, @brainstorm_id, @page_slug, @page_title, @body_markdown, @confidence, @status)`,
+      )
+      .run({ status: 'pending', ...row });
+  }
+
+  /* Set the distillation timestamp on the brainstorm_sessions row.
+   * Called at the end of a successful session-end pipeline (BF-7
+   * step 7) so /brainstorms route can show the distilled state. */
+  setBrainstormDistilledAt(brainstormId: string, isoTs: string): void {
+    this.db
+      .prepare(
+        `UPDATE brainstorm_sessions SET distilled_at = ? WHERE id = ?`,
+      )
+      .run(isoTs, brainstormId);
+  }
+
+  /* Read the kind column (and other Phase Two state) for a single
+   * brainstorm. Convenience wrapper around getBrainstorm() that
+   * tolerates the legacy null-kind shape. */
+  brainstormKind(brainstormId: string): 'brainstorm' | 'meeting' {
+    const row = this.getBrainstorm(brainstormId);
+    return row?.kind === 'meeting' ? 'meeting' : 'brainstorm';
+  }
+
   // ── outbound log (PB-2 / BF-4) ────────────────────────────────
   /* Records every outbound call. The DB trigger
    * outbound_no_voice_session blocks any insert whose payload_class
