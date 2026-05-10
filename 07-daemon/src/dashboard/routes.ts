@@ -12,7 +12,14 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { DATA_ROOT, wikiPagesDir, wikiPendingDir, wikiArchiveDir } from '../paths.js';
+import {
+  DATA_ROOT,
+  wikiPagesDir,
+  wikiPendingDir,
+  wikiArchiveDir,
+  brainstormAudioFile,
+  brainstormCuesFile,
+} from '../paths.js';
 import { authMiddleware, registerAuthRoutes, isPinSet } from './auth.js';
 import { ReferenceStore } from '../reference/store.js';
 import { ingestUpload } from '../reference/process.js';
@@ -113,6 +120,7 @@ import {
   removeSubscription,
   listSubscriptions,
 } from './push.js';
+import { writePage, parsePage } from '../wiki/schema.js';
 
 export async function registerDashboardRoutes(
   app: FastifyInstance,
@@ -2555,6 +2563,443 @@ export async function registerDashboardRoutes(
     return { ok: true };
   });
 
+  /* ── /brainstorms (Wave 2 day 2 step 9 / BF-5 / A1) ───────────────
+   * Brainstorm-first dashboard surface. /brainstorms returns the
+   * filtered list (project_slug + mode + date filter chips); /brain
+   * storms/:id returns the row plus the artifacts manifest plus a
+   * cues_url + audio_url when audio was retained. /brainstorms/:id/
+   * audio + /brainstorms/:id/cues serve the on-disk bundle written
+   * by the session-end pipeline. */
+  app.get('/brainstorms', async (req) => {
+    const q = (req.query ?? {}) as {
+      kind?: string;
+      project?: string;
+      mode?: string;
+      date?: string;
+      limit?: string;
+    };
+    const kind = q.kind === 'meeting' ? 'meeting' : 'brainstorm';
+    const opts: {
+      kind: 'brainstorm' | 'meeting';
+      project_slug?: string;
+      mode?: string;
+      date?: string;
+      limit?: number;
+    } = { kind };
+    if (q.project) opts.project_slug = q.project;
+    if (q.mode) opts.mode = q.mode;
+    if (q.date) opts.date = q.date;
+    if (q.limit) opts.limit = Math.min(500, Math.max(1, Number(q.limit)));
+    const rows = store.db.listBrainstormsFiltered(opts);
+    return {
+      ok: true,
+      brainstorms: rows.map(decorateBrainstorm),
+    };
+  });
+
+  app.get('/brainstorms/:id', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.getBrainstorm(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    return { ok: true, brainstorm: decorateBrainstorm(row) };
+  });
+
+  app.get('/brainstorms/:id/cues', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.getBrainstorm(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    const cuesPath = brainstormCuesFile(id);
+    if (!fs.existsSync(cuesPath)) {
+      reply.code(404);
+      return { ok: false, error: 'no cues file for this session' };
+    }
+    try {
+      const raw = fs.readFileSync(cuesPath, 'utf-8');
+      reply.header('content-type', 'application/json; charset=utf-8');
+      return JSON.parse(raw);
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, error: `cues read failed: ${(err as Error).message}` };
+    }
+  });
+
+  /* Range-supporting audio endpoint. The browser <audio> element
+   * issues `Range: bytes=N-` requests on first play and again on
+   * seeks; without a 206 response the seek bar locks up on iOS. We
+   * read the file once per request — cheap because OS page cache
+   * keeps repeat hits hot — and slice the requested window. */
+  app.get('/brainstorms/:id/audio', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.getBrainstorm(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    const wavPath = brainstormAudioFile(id, 'wav');
+    if (!fs.existsSync(wavPath)) {
+      reply.code(404);
+      return { ok: false, error: 'no audio for this session' };
+    }
+    const stat = fs.statSync(wavPath);
+    const total = stat.size;
+    const range = req.headers.range;
+    reply.header('accept-ranges', 'bytes');
+    reply.header('content-type', 'audio/wav');
+    reply.header('cache-control', 'no-store');
+    if (!range) {
+      reply.header('content-length', String(total));
+      return reply.send(fs.createReadStream(wavPath));
+    }
+    const m = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!m) {
+      reply.code(416);
+      reply.header('content-range', `bytes */${total}`);
+      return { ok: false, error: 'invalid range header' };
+    }
+    const startStr = m[1] ?? '';
+    const endStr = m[2] ?? '';
+    const start = startStr === '' ? Math.max(0, total - Number(endStr)) : Number(startStr);
+    const end = endStr === '' || startStr === '' ? total - 1 : Math.min(Number(endStr), total - 1);
+    if (
+      Number.isNaN(start) ||
+      Number.isNaN(end) ||
+      start < 0 ||
+      end < start ||
+      start >= total
+    ) {
+      reply.code(416);
+      reply.header('content-range', `bytes */${total}`);
+      return { ok: false, error: 'unsatisfiable range' };
+    }
+    reply.code(206);
+    reply.header('content-range', `bytes ${start}-${end}/${total}`);
+    reply.header('content-length', String(end - start + 1));
+    return reply.send(fs.createReadStream(wavPath, { start, end }));
+  });
+
+  /* ── /drafts (Wave 2 day 2 step 10 / BF-7 review / A2) ────────────
+   * List + detail + edit + promote + discard for wiki_drafts rows
+   * produced by the session-end auto-distillation pipeline. The
+   * promote handler enforces the four conflict cases per the spec:
+   * slug_collision, frozen_target, superseded, target_drift. */
+  app.get('/drafts', async (req) => {
+    const q = (req.query ?? {}) as { status?: string; limit?: string };
+    const status = isDraftStatus(q.status) ? q.status : 'pending';
+    const limit = q.limit ? Math.min(500, Math.max(1, Number(q.limit))) : 100;
+    const rows = store.db.listWikiDrafts({ status, limit });
+    return { ok: true, drafts: rows };
+  });
+
+  app.get('/drafts/:id', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.getWikiDraft(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    return { ok: true, draft: row };
+  });
+
+  app.patch('/drafts/:id', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as {
+      page_slug?: string;
+      page_title?: string;
+      body_markdown?: string;
+    };
+    const existing = store.db.getWikiDraft(id);
+    if (!existing) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    if (existing.status !== 'pending') {
+      reply.code(409);
+      return {
+        ok: false,
+        conflict: 'already_resolved',
+        error: `draft status ${existing.status} no longer editable`,
+        draft: existing,
+      };
+    }
+    if (body.page_slug && !/^[a-z0-9][a-z0-9-]+$/.test(body.page_slug)) {
+      reply.code(400);
+      return {
+        ok: false,
+        error: `page_slug must match [a-z0-9][a-z0-9-]+: got ${body.page_slug}`,
+      };
+    }
+    const merged = store.db.updateWikiDraft(id, {
+      ...(body.page_slug ? { page_slug: body.page_slug } : {}),
+      ...(body.page_title ? { page_title: body.page_title } : {}),
+      ...(body.body_markdown !== undefined
+        ? { body_markdown: body.body_markdown }
+        : {}),
+    });
+    return { ok: true, draft: merged };
+  });
+
+  app.post('/drafts/:id/discard', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const existing = store.db.getWikiDraft(id);
+    if (!existing) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    if (existing.status !== 'pending') {
+      reply.code(409);
+      return {
+        ok: false,
+        conflict: 'already_resolved',
+        draft: existing,
+      };
+    }
+    const merged = store.db.updateWikiDraft(id, {
+      status: 'discarded',
+      resolved_by: 'user',
+    });
+    return { ok: true, draft: merged };
+  });
+
+  app.post('/drafts/:id/promote', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as {
+      resolution?: 'rename' | 'merge' | 'overwrite';
+      new_slug?: string;
+      force?: boolean;
+      expected_resolved_at?: string | null;
+    };
+    const draft = store.db.getWikiDraft(id);
+    if (!draft) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    if (draft.status !== 'pending') {
+      reply.code(409);
+      return {
+        ok: false,
+        conflict: 'already_resolved',
+        error: `draft status ${draft.status}`,
+        draft,
+      };
+    }
+    /* Conflict 1: target-drift. The dashboard sends the resolved_at
+     * snapshot it observed when it loaded the draft; if that no
+     * longer matches the row, another tab edited the draft and the
+     * user is acting on stale content. resolved_at is null on every
+     * pending draft, so any non-null mismatch from the client also
+     * trips this case (defensive: protects against partial updates
+     * that landed without status flipping). */
+    if (
+      body.expected_resolved_at !== undefined &&
+      body.expected_resolved_at !== draft.resolved_at
+    ) {
+      reply.code(409);
+      return {
+        ok: false,
+        conflict: 'target_drift',
+        error: 'draft was edited by another caller; refresh and retry',
+        draft,
+      };
+    }
+    const slug = body.new_slug ?? draft.page_slug;
+    if (!/^[a-z0-9][a-z0-9-]+$/.test(slug)) {
+      reply.code(400);
+      return {
+        ok: false,
+        error: `slug must match [a-z0-9][a-z0-9-]+: got ${slug}`,
+      };
+    }
+    /* Conflict 2: superseded race. Some other draft for the same
+     * page_slug already promoted while this one was sitting in
+     * pending. Mark this draft superseded so the user sees the new
+     * status in the list and stop here. */
+    const sibling = store.db
+      .wikiDraftsBySlug(slug, ['promoted', 'auto-promoted'])
+      .find((d) => d.id !== id);
+    if (sibling) {
+      const merged = store.db.updateWikiDraft(id, {
+        status: 'superseded',
+        resolved_by: 'system:promote-race',
+      });
+      reply.code(409);
+      return {
+        ok: false,
+        conflict: 'superseded',
+        error: `another draft for slug ${slug} already promoted`,
+        draft: merged,
+        promoted_id: sibling.id,
+      };
+    }
+    /* Conflict 3 + 4: frozen target + slug collision. Look for an
+     * existing wiki page on disk under the slug. The promoted draft
+     * writes a NEW pending wiki page; canonicalisation is a separate
+     * step via /admin/wiki/promote/:id. */
+    const { loadPage } = await import('../reinforcement/index.js');
+    const existingPage = loadPage(slug);
+    if (existingPage) {
+      if (existingPage.frontmatter.frozen === true && body.force !== true) {
+        reply.code(409);
+        return {
+          ok: false,
+          conflict: 'frozen_target',
+          error: `target page ${slug} is frozen; pass force:true to override`,
+          draft,
+          existing_page_id: existingPage.frontmatter.id,
+        };
+      }
+      if (!body.resolution) {
+        reply.code(409);
+        return {
+          ok: false,
+          conflict: 'slug_collision',
+          error: `wiki page ${slug} already exists; supply resolution:rename|merge|overwrite`,
+          draft,
+          existing_page_id: existingPage.frontmatter.id,
+          existing_status: existingPage.frontmatter.status,
+        };
+      }
+      if (body.resolution === 'rename') {
+        if (!body.new_slug || body.new_slug === draft.page_slug) {
+          reply.code(400);
+          return {
+            ok: false,
+            conflict: 'slug_collision',
+            error: 'rename resolution requires a new_slug different from current',
+            draft,
+          };
+        }
+        /* fall through to write at body.new_slug */
+      }
+      /* merge / overwrite both write a new pending page under the
+       * existing slug; merge concats existing body, overwrite
+       * replaces. The actual file write happens below. */
+    }
+    const targetSlug = slug;
+    const writeRes = writeDraftAsPendingWikiPage({
+      draft,
+      targetSlug,
+      resolution: existingPage ? body.resolution ?? 'overwrite' : 'overwrite',
+      existingPage,
+    });
+    if (!writeRes.ok) {
+      reply.code(500);
+      return { ok: false, error: writeRes.error };
+    }
+    const merged = store.db.updateWikiDraft(id, {
+      status: 'promoted',
+      resolved_by: 'user',
+      ...(body.new_slug ? { page_slug: body.new_slug } : {}),
+    });
+    log(
+      `[drafts] promoted draft ${id} -> wiki page ${targetSlug} (resolution=${body.resolution ?? 'new'})`,
+    );
+    return {
+      ok: true,
+      draft: merged,
+      wiki_page_id: targetSlug,
+      wiki_page_path: writeRes.path,
+    };
+  });
+
   // Use the notification event bus to suppress unused-import lint
   void notificationEvents;
+}
+
+/* Decorate a brainstorm row with the audio + cues URLs the dashboard
+ * needs without forcing every consumer to know the data-root layout.
+ * audio_url is null when no audio bundle was finalised (text-only
+ * session, or meeting without consent_acked). */
+function decorateBrainstorm(row: import('../store/index-db.js').BrainstormSessionRow): {
+  brainstorm: import('../store/index-db.js').BrainstormSessionRow;
+  audio_url: string | null;
+  cues_url: string | null;
+} {
+  const hasAudio = Boolean(row.audio_path) && fs.existsSync(brainstormAudioFile(row.id, 'wav'));
+  return {
+    brainstorm: row,
+    audio_url: hasAudio ? `/brainstorms/${encodeURIComponent(row.id)}/audio` : null,
+    cues_url: hasAudio && fs.existsSync(brainstormCuesFile(row.id))
+      ? `/brainstorms/${encodeURIComponent(row.id)}/cues`
+      : null,
+  };
+}
+
+function isDraftStatus(
+  s: string | undefined,
+): s is 'pending' | 'promoted' | 'discarded' | 'auto-promoted' | 'auto-dropped' | 'superseded' {
+  return (
+    s === 'pending' ||
+    s === 'promoted' ||
+    s === 'discarded' ||
+    s === 'auto-promoted' ||
+    s === 'auto-dropped' ||
+    s === 'superseded'
+  );
+}
+
+/* Write a wiki_drafts row to disk as a pending wiki page. Used by
+ * /drafts/:id/promote. The new page lands in the pending dir; an
+ * explicit /admin/wiki/promote/:id call canonicalises it later. The
+ * draft body becomes the page's pattern section (free-form markdown);
+ * trigger / insight / summary fall back to the draft title when the
+ * upstream distillation prompt did not split them out. */
+function writeDraftAsPendingWikiPage(args: {
+  draft: import('../store/index-db.js').WikiDraftRow;
+  targetSlug: string;
+  resolution: 'rename' | 'merge' | 'overwrite';
+  existingPage:
+    | { frontmatter: import('../wiki/schema.js').PageFrontmatter; raw: string }
+    | null;
+}): { ok: true; path: string } | { ok: false; error: string } {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const titleHasArrow = args.draft.page_title.includes('→');
+    const safeTitle = titleHasArrow
+      ? args.draft.page_title
+      : `${args.draft.page_title} → captured`;
+    let body = args.draft.body_markdown;
+    if (args.existingPage && args.resolution === 'merge') {
+      const existingParsed = parsePage(args.existingPage.raw);
+      body = `${existingParsed.sections.pattern}\n\n---\n\n${args.draft.body_markdown}`;
+    }
+    const summary = (args.draft.body_markdown ?? '').slice(0, 580);
+    writePage(wikiPendingDir(), {
+      frontmatter: {
+        id: args.targetSlug,
+        title: safeTitle,
+        trigger: `from brainstorm ${args.draft.brainstorm_id}`,
+        insight: args.draft.page_title,
+        summary,
+        status: 'pending',
+        weight: 0.3,
+        hits: 0,
+        corrections: 0,
+        created: today,
+        last_touched: today,
+        projects: [],
+        human_edited: true,
+        human_edited_at: new Date().toISOString(),
+        source_brainstorms: [args.draft.brainstorm_id],
+        derived_from_brainstorm: true,
+      },
+      sections: {
+        pattern: body,
+        crossRefs: [],
+        crossRefsRaw: [],
+        evidence: [],
+        openQuestions: [],
+        log: [`promoted from draft ${args.draft.id} on ${today}`],
+      },
+    });
+    const filePath = path.posix.join(wikiPendingDir(), `${args.targetSlug}.md`);
+    return { ok: true, path: filePath };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
 }

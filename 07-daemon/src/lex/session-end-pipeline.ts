@@ -50,6 +50,10 @@ import { listProjects } from '../identity/registry.js';
 import { withSessionEndLock } from './session-end-lock.js';
 import { distillBrainstorm } from './brainstorm-distillation.js';
 import { gpuQueue } from '../gpu/queue.js';
+import {
+  finalize as finalizeAudioBundle,
+  discard as discardAudioBundle,
+} from '../voice/audio-bundle.js';
 
 export interface SessionEndInput {
   /** Brainstorm row id, used only for logging; the pipeline does not
@@ -219,6 +223,35 @@ async function runOrderedPipeline(
     }
   } catch (err) {
     log(`[session-end] ended_ms update failed: ${(err as Error).message}`);
+  }
+
+  /* Step 3a (Wave 2 day 2 / BF-11 / A4): finalise the per-session
+   * audio bundle into <id>.wav + <id>.cues.json. Meetings without
+   * consent_acked drop their accumulated audio rather than persist it
+   * (BF-17 / spec line 281). Brainstorms always persist when audio
+   * was captured. Stamps brainstorm_sessions.audio_path so
+   * /brainstorms/:id/audio can find the file. */
+  try {
+    const row = store.db.getBrainstorm(input.brainstormId);
+    const isMeeting = (row?.kind ?? 'brainstorm') === 'meeting';
+    const consentOk =
+      !isMeeting || (row?.consent_acked ?? 0) === 1;
+    if (!consentOk) {
+      discardAudioBundle(input.brainstormId);
+      log(
+        `[session-end] audio bundle discarded: meeting without consent_acked (BF-17)`,
+      );
+    } else {
+      const finalised = finalizeAudioBundle(input.brainstormId);
+      if (finalised) {
+        store.db.setBrainstormAudioPath(input.brainstormId, finalised.audioPath);
+        log(
+          `[session-end] audio bundle finalised: ${finalised.cueCount} cues, ${finalised.bytes} pcm bytes -> ${finalised.audioPath}`,
+        );
+      }
+    }
+  } catch (err) {
+    log(`[session-end] audio finalise failed: ${(err as Error).message}`);
   }
 
   /* Step 4: force-flush wiki ingest. Independent of the periodic loop

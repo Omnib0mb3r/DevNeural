@@ -14,14 +14,16 @@ import { StatusDot } from "./StatusDot";
 import { lexPickStable } from "@/lib/lex";
 
 const TABS = [
-  { href: "/",          label: "Home",         icon: "Home" as const },
-  { href: "/lex",       label: "Brainstorm",   icon: "Sparkles" as const },
-  { href: "/wiki",      label: "Wiki",         icon: "BookOpen" as const },
-  { href: "/sessions",  label: "Sessions",     icon: "Terminal" as const },
-  { href: "/projects",  label: "Projects",     icon: "FolderGit2" as const },
-  { href: "/system",    label: "System",       icon: "Cpu" as const },
-  { href: "/reminders", label: "Reminders",    icon: "BellRing" as const },
-  { href: "/orb",       label: "Neural network", icon: "Brain" as const },
+  { href: "/",            label: "Home",           icon: "Home" as const },
+  { href: "/brainstorms", label: "Brainstorms",    icon: "Sparkles" as const },
+  { href: "/sessions",    label: "Sessions",       icon: "Terminal" as const },
+  { href: "/wiki",        label: "Wiki",           icon: "BookOpen" as const },
+  { href: "/drafts",      label: "Drafts",         icon: "FilePen" as const },
+  { href: "/projects",    label: "Projects",       icon: "FolderGit2" as const },
+  { href: "/reminders",   label: "Reminders",      icon: "BellRing" as const },
+  { href: "/system",      label: "System",         icon: "Cpu" as const },
+  { href: "/orb",         label: "Neural network", icon: "Brain" as const },
+  { href: "/lex",         label: "Lex chat",       icon: "Bot" as const },
 ];
 
 /* TopBar previously had a non-functioning notifications icon, settings

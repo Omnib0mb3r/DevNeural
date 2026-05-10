@@ -532,6 +532,138 @@ export const patchLexSession = (
     { method: "PATCH", body: patch },
   );
 
+/* Wave 2 day 2 (BF-5 / A1, BF-7 review / A2). The /brainstorms +
+ * /drafts route family lives alongside the older /lex/sessions
+ * surface; the two share the same underlying brainstorm_sessions and
+ * wiki_drafts tables. New consumers should prefer these typed
+ * helpers; the older lexSessions* helpers stay until /lex itself
+ * gets retired (out of scope for Wave 2). */
+export interface BrainstormDecorated {
+  brainstorm: BrainstormSessionRow & {
+    project_slug?: string | null;
+    audio_path?: string | null;
+    distilled_at?: string | null;
+    kind?: "brainstorm" | "meeting";
+    consent_acked?: number;
+    keep_audio?: number;
+    provenance?: "voice" | "audit-document" | "synthetic";
+  };
+  audio_url: string | null;
+  cues_url: string | null;
+}
+export interface BrainstormFilter {
+  kind?: "brainstorm" | "meeting";
+  project?: string;
+  mode?: string;
+  date?: string;
+  limit?: number;
+}
+export const listBrainstormsApi = (opts: BrainstormFilter = {}) => {
+  const qs = new URLSearchParams();
+  if (opts.kind) qs.set("kind", opts.kind);
+  if (opts.project) qs.set("project", opts.project);
+  if (opts.mode) qs.set("mode", opts.mode);
+  if (opts.date) qs.set("date", opts.date);
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const q = qs.toString();
+  return request<{ ok: boolean; brainstorms: BrainstormDecorated[] }>(
+    `/brainstorms${q ? `?${q}` : ""}`,
+  );
+};
+export const getBrainstormApi = (id: string) =>
+  request<{ ok: boolean; brainstorm: BrainstormDecorated; error?: string }>(
+    `/brainstorms/${encodeURIComponent(id)}`,
+  );
+
+export interface AudioCue {
+  turn_index: number;
+  start_ms: number;
+  end_ms: number;
+}
+export interface BrainstormCues {
+  session_id: string;
+  sample_rate: number;
+  channels: number;
+  bits_per_sample: number;
+  cues: AudioCue[];
+}
+export const getBrainstormCuesApi = (id: string) =>
+  request<BrainstormCues>(`/brainstorms/${encodeURIComponent(id)}/cues`);
+
+export interface WikiDraftRow {
+  id: string;
+  brainstorm_id: string;
+  page_slug: string;
+  page_title: string;
+  body_markdown: string;
+  confidence: number;
+  status:
+    | "pending"
+    | "promoted"
+    | "discarded"
+    | "auto-promoted"
+    | "auto-dropped"
+    | "superseded";
+  created_at: string;
+  resolved_at: string | null;
+  resolved_by: string | null;
+}
+export const listDrafts = (
+  opts: { status?: WikiDraftRow["status"]; limit?: number } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.status) qs.set("status", opts.status);
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const q = qs.toString();
+  return request<{ ok: boolean; drafts: WikiDraftRow[] }>(
+    `/drafts${q ? `?${q}` : ""}`,
+  );
+};
+export const getDraft = (id: string) =>
+  request<{ ok: boolean; draft: WikiDraftRow; error?: string }>(
+    `/drafts/${encodeURIComponent(id)}`,
+  );
+export const patchDraft = (
+  id: string,
+  patch: Partial<Pick<WikiDraftRow, "page_slug" | "page_title" | "body_markdown">>,
+) =>
+  request<{ ok: boolean; draft?: WikiDraftRow; error?: string; conflict?: string }>(
+    `/drafts/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: patch },
+  );
+export const discardDraft = (id: string) =>
+  request<{ ok: boolean; draft?: WikiDraftRow; error?: string; conflict?: string }>(
+    `/drafts/${encodeURIComponent(id)}/discard`,
+    { method: "POST" },
+  );
+export interface PromoteDraftBody {
+  resolution?: "rename" | "merge" | "overwrite";
+  new_slug?: string;
+  force?: boolean;
+  expected_resolved_at?: string | null;
+}
+export interface PromoteDraftResult {
+  ok: boolean;
+  draft?: WikiDraftRow;
+  wiki_page_id?: string;
+  wiki_page_path?: string;
+  conflict?:
+    | "slug_collision"
+    | "frozen_target"
+    | "superseded"
+    | "target_drift"
+    | "already_resolved";
+  existing_page_id?: string;
+  existing_status?: string;
+  promoted_id?: string;
+  error?: string;
+}
+export const promoteDraft = (id: string, body: PromoteDraftBody = {}) =>
+  request<PromoteDraftResult>(`/drafts/${encodeURIComponent(id)}/promote`, {
+    method: "POST",
+    body,
+  });
+
 export interface LexArtifactItem {
   kind: string;
   category: string;

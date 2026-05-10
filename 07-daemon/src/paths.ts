@@ -60,6 +60,25 @@ export const sessionTaskFile = (sessionId: string): string =>
 export const sessionMetaFile = (sessionId: string): string =>
   path.posix.join(sessionStateDir(), `${sessionId}.meta.json`);
 
+/* Wave 2 day 2 step 11: canonical audio storage. Per session, one
+ * <id>.opus (or <id>.wav) plus a sibling <id>.cues.json listing
+ * { turn_index, start_ms, end_ms }. The capture rig writes both
+ * atomically at session end. Older per-utterance layouts are not
+ * supported by the audio endpoint or backfill. */
+export const brainstormsRoot = (): string =>
+  path.posix.join(DATA_ROOT, 'brainstorms');
+export const brainstormDir = (brainstormId: string): string =>
+  path.posix.join(brainstormsRoot(), brainstormId);
+export const brainstormAudioDir = (brainstormId: string): string =>
+  path.posix.join(brainstormDir(brainstormId), 'audio');
+export const brainstormAudioFile = (
+  brainstormId: string,
+  ext: 'opus' | 'wav',
+): string =>
+  path.posix.join(brainstormAudioDir(brainstormId), `${brainstormId}.${ext}`);
+export const brainstormCuesFile = (brainstormId: string): string =>
+  path.posix.join(brainstormAudioDir(brainstormId), `${brainstormId}.cues.json`);
+
 export const referenceRoot = (): string =>
   path.posix.join(DATA_ROOT, 'reference');
 export const referenceQueueDir = (): string =>

@@ -72,6 +72,27 @@ export interface BrainstormSessionRow {
   provenance?: 'voice' | 'audit-document' | 'synthetic';
 }
 
+/* wiki_drafts row. Created by the session-end distillation pipeline
+ * (BF-7). Reviewed via /drafts (Wave 2 day 2). */
+export interface WikiDraftRow {
+  id: string;
+  brainstorm_id: string;
+  page_slug: string;
+  page_title: string;
+  body_markdown: string;
+  confidence: number;
+  status:
+    | 'pending'
+    | 'promoted'
+    | 'discarded'
+    | 'auto-promoted'
+    | 'auto-dropped'
+    | 'superseded';
+  created_at: string;
+  resolved_at: string | null;
+  resolved_by: string | null;
+}
+
 export interface FtsHit {
   page_id: string;
   rank: number;
@@ -348,6 +369,153 @@ export class IndexDb {
         `UPDATE brainstorm_sessions SET distilled_at = ? WHERE id = ?`,
       )
       .run(isoTs, brainstormId);
+  }
+
+  /* Wave 2 day 2 step 11 (BF-11/A4): record the data-root-relative
+   * path to the finalised audio bundle for this brainstorm. Set by
+   * the audio finaliser during the session-end pipeline. Stays NULL
+   * for sessions without audio (meeting with consent_acked=0 or text-
+   * only brainstorms). */
+  setBrainstormAudioPath(brainstormId: string, audioPath: string | null): void {
+    this.db
+      .prepare(
+        `UPDATE brainstorm_sessions SET audio_path = ? WHERE id = ?`,
+      )
+      .run(audioPath, brainstormId);
+  }
+
+  /* Wave 2 day 2 step 9 list filter helper. Combines the kind /
+   * project_slug / mode / day filters into a single prepared query
+   * so the /brainstorms route does not need to do post-fetch JS
+   * filtering on large session histories. Date is YYYY-MM-DD against
+   * started_ms in UTC. */
+  listBrainstormsFiltered(opts: {
+    kind?: 'brainstorm' | 'meeting';
+    project_slug?: string;
+    mode?: string;
+    date?: string;
+    limit?: number;
+  } = {}): BrainstormSessionRow[] {
+    const limit = Math.min(500, Math.max(1, opts.limit ?? 100));
+    const where: string[] = [];
+    const params: Array<string | number> = [];
+    if (opts.kind) {
+      where.push(`COALESCE(kind, 'brainstorm') = ?`);
+      params.push(opts.kind);
+    }
+    if (opts.project_slug) {
+      where.push(`project_slug = ?`);
+      params.push(opts.project_slug);
+    }
+    if (opts.mode) {
+      where.push(`mode = ?`);
+      params.push(opts.mode);
+    }
+    if (opts.date) {
+      where.push(
+        `substr(strftime('%Y-%m-%dT%H:%M:%SZ', started_ms / 1000.0, 'unixepoch'), 1, 10) = ?`,
+      );
+      params.push(opts.date);
+    }
+    const sql =
+      `SELECT * FROM brainstorm_sessions` +
+      (where.length ? ` WHERE ${where.join(' AND ')}` : '') +
+      ` ORDER BY started_ms DESC LIMIT ?`;
+    params.push(limit);
+    return this.db.prepare(sql).all(...params) as BrainstormSessionRow[];
+  }
+
+  /* wiki_drafts list + detail + mutation helpers. Wave 1 ships only
+   * insert via the distillation pipeline; Wave 2 day 2 adds the
+   * review surface (/drafts) so the user can promote / edit / discard
+   * drafts. status filter accepts a single status; pass undefined to
+   * see everything. */
+  listWikiDrafts(opts: {
+    status?: 'pending' | 'promoted' | 'discarded' | 'auto-promoted' | 'auto-dropped' | 'superseded';
+    limit?: number;
+  } = {}): WikiDraftRow[] {
+    const limit = Math.min(500, Math.max(1, opts.limit ?? 100));
+    if (opts.status) {
+      return this.db
+        .prepare(
+          `SELECT * FROM wiki_drafts WHERE status = ? ORDER BY created_at DESC LIMIT ?`,
+        )
+        .all(opts.status, limit) as WikiDraftRow[];
+    }
+    return this.db
+      .prepare(`SELECT * FROM wiki_drafts ORDER BY created_at DESC LIMIT ?`)
+      .all(limit) as WikiDraftRow[];
+  }
+
+  getWikiDraft(id: string): WikiDraftRow | null {
+    return (
+      (this.db
+        .prepare(`SELECT * FROM wiki_drafts WHERE id = ?`)
+        .get(id) as WikiDraftRow | undefined) ?? null
+    );
+  }
+
+  /* Slug lookup used by the /drafts/:id/promote conflict detector.
+   * Returns the most recent draft for the given slug across the
+   * supplied statuses, so callers can spot the "another draft for the
+   * same slug already shipped" case (superseded race) without doing
+   * the join themselves. */
+  wikiDraftsBySlug(
+    slug: string,
+    statuses: Array<'pending' | 'promoted' | 'discarded' | 'auto-promoted' | 'auto-dropped' | 'superseded'>,
+  ): WikiDraftRow[] {
+    if (statuses.length === 0) return [];
+    const qs = statuses.map(() => '?').join(',');
+    return this.db
+      .prepare(
+        `SELECT * FROM wiki_drafts WHERE page_slug = ? AND status IN (${qs}) ORDER BY created_at DESC`,
+      )
+      .all(slug, ...statuses) as WikiDraftRow[];
+  }
+
+  /* Apply an inline edit and / or terminal status update to a draft.
+   * Body fields are merged; status transitions stamp resolved_at +
+   * resolved_by. Returns the merged row or null if the id is unknown. */
+  updateWikiDraft(
+    id: string,
+    patch: {
+      page_slug?: string;
+      page_title?: string;
+      body_markdown?: string;
+      status?: 'pending' | 'promoted' | 'discarded' | 'auto-promoted' | 'auto-dropped' | 'superseded';
+      resolved_by?: string;
+    },
+  ): WikiDraftRow | null {
+    const existing = this.getWikiDraft(id);
+    if (!existing) return null;
+    const isTerminal =
+      patch.status &&
+      patch.status !== 'pending' &&
+      existing.status !== patch.status;
+    const merged: WikiDraftRow = {
+      ...existing,
+      ...patch,
+      resolved_at: isTerminal
+        ? new Date().toISOString()
+        : existing.resolved_at,
+      resolved_by: isTerminal
+        ? patch.resolved_by ?? existing.resolved_by ?? 'user'
+        : existing.resolved_by,
+    };
+    this.db
+      .prepare(
+        `UPDATE wiki_drafts
+         SET page_slug = @page_slug,
+             page_title = @page_title,
+             body_markdown = @body_markdown,
+             confidence = @confidence,
+             status = @status,
+             resolved_at = @resolved_at,
+             resolved_by = @resolved_by
+         WHERE id = @id`,
+      )
+      .run(merged);
+    return merged;
   }
 
   /* Read the kind column (and other Phase Two state) for a single

@@ -54,6 +54,7 @@ import {
 import { processAssistantTurn } from '../lex/artifact-parser.js';
 import { buildVoiceSnapshot } from '../lex/snapshot-context.js';
 import { runSessionEndPipeline } from '../lex/session-end-pipeline.js';
+import { appendUtterance as appendSessionAudio } from './audio-bundle.js';
 
 /* Voice modes drive whether the daemon synthesizes Lex's response
  * out loud. The browser still receives transcript + assistant-text
@@ -557,6 +558,34 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       return;
     }
     send({ t: 'transcript', text: result.text, ms: result.ms });
+    /* Wave 2 day 2 step 11: persist this utterance into the per-session
+     * audio bundle so /brainstorms/:id/audio can serve it back later.
+     * Brainstorm sessions retain audio by default; meeting sessions
+     * (kind='meeting') only retain audio once consent_acked=1 (BF-17 /
+     * spec line 281). The lookup is best-effort: if we can't find the
+     * brainstorm row from this socket's bind state, skip persistence
+     * rather than retain audio that has no canonical owner row. */
+    try {
+      const handle = state.bindKey
+        ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
+        : null;
+      const watchSid = handle?.sessionId ?? state.watchSessionId ?? null;
+      const ptyId = handle?.ptyId ?? null;
+      const bs =
+        (watchSid && getBrainstormByClaudeSessionId(watchSid)) ||
+        (ptyId && getBrainstormByPty(ptyId)) ||
+        null;
+      if (bs) {
+        const consent = (bs as { kind?: string; consent_acked?: number }).consent_acked ?? 0;
+        const kind = (bs as { kind?: string }).kind ?? 'brainstorm';
+        const consentOk = kind !== 'meeting' || consent === 1;
+        if (consentOk) {
+          appendSessionAudio(bs.id, pcm, 16000);
+        }
+      }
+    } catch {
+      /* audio bundle is observational; never block the turn */
+    }
     if (!result.text.trim()) return;
     /* Hands-free stop: if the transcript matches a spoken end-session
      * command, skip the inject path so Lex doesn't reply, and notify
