@@ -1,0 +1,15 @@
+{
+  "page_updates": [],
+  "new_pending_page": {
+    "id": "windows-hide-on-spawn",
+    "title": "Spawn child processes with windowsHide -> avoid console flash",
+    "trigger": "Calling child_process.spawn or execSync from a long-running Node process on Windows",
+    "insight": "Always set windowsHide:true so the brief console window does not flash; matters in polling loops",
+    "summary": "On Windows, every Node child_process call without windowsHide briefly flashes a console window. In polling loops or hooks that fire repeatedly the flash compounds into a UX bug. Pass {windowsHide:true} to spawn / execSync / spawnSync.",
+    "pattern": "Default Node child_process spawn shows a console window on Windows; setting windowsHide:true suppresses it. Required for any subprocess called from a daemon or scheduled task.",
+    "evidence_refs": [
+      "07-daemon/src/lifecycle/spawn.ts:14"
+    ],
+    "cross_refs": []
+  }
+}

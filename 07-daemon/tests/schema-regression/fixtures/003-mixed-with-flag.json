@@ -1,0 +1,29 @@
+{
+  "page_updates": [
+    {
+      "id": "use-memo-for-stable-references",
+      "evidence_add": [
+        "src/components/Filter.tsx:18 wraps filter object in useMemo"
+      ],
+      "log_add": "2026-05-10 confirmed pattern in dashboard filter chips",
+      "cross_refs_add": ["react-render-loop-causes"],
+      "cross_refs_remove": [],
+      "pattern_rewrite": null,
+      "summary_rewrite": "Recreating an object literal in JSX on every render gives the child a new prop reference, defeating React.memo and forcing re-render. Wrap in useMemo with a stable dependency list. Same applies to inline arrow functions; useCallback solves those.",
+      "flag_for_review": false
+    },
+    {
+      "id": "react-render-loop-causes",
+      "evidence_add": [
+        "src/hooks/useFilteredList.ts:7 returns a new array each call"
+      ],
+      "log_add": null,
+      "cross_refs_add": [],
+      "cross_refs_remove": [],
+      "pattern_rewrite": null,
+      "summary_rewrite": null,
+      "flag_for_review": true
+    }
+  ],
+  "new_pending_page": null
+}

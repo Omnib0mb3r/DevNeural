@@ -1,0 +1,17 @@
+{
+  "page_updates": [
+    {
+      "id": "connection-pooling",
+      "evidence_add": [
+        "src/db/pool.ts:42 reuses a single pool instance per process"
+      ],
+      "log_add": "2026-05-10 reinforced from devneural-phase-two project",
+      "cross_refs_add": [],
+      "cross_refs_remove": [],
+      "pattern_rewrite": null,
+      "summary_rewrite": null,
+      "flag_for_review": false
+    }
+  ],
+  "new_pending_page": null
+}
