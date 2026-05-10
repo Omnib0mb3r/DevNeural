@@ -479,7 +479,23 @@ Major surfaces:
 - `/settings` — voice tuning, PIN change, system metrics, Tremor sparklines
 - `/admin` — daemon restart, decay trigger, lint trigger, backup runner
 
-### 12.2 Orb (graph viz)
+### 12.2 KPI strip (dashboard home)
+
+`08-dashboard/components/KpiStrip.tsx` renders at the top of the home page. Five rows, one per axis of "is the brain working":
+
+| Row | Tiles | Source |
+|---|---|---|
+| Size | lines of code, wiki pages (canonical/pending/archived breakdown), raw chunks, reference chunks | `/stats/loc` + `/stats/kpi` |
+| Quality | wiki avg weight, hits last 7d (with corrections sub), flagged for review, cross-project pages | `/stats/kpi` (reinforcement.log.jsonl tail + wiki frontmatter scan) |
+| Activity | active CC sessions (phase breakdown), active brainstorms (mode breakdown), artifacts captured | `/stats/kpi` (sessions table + brainstorm_sessions + lex/artifacts dir scan) |
+| Velocity | commits last 7d across every registered project | `/stats/kpi` (`git log --since=7d` per project) |
+| Health | last backup (days/hours ago), daemon uptime, embedder calls | `/stats/kpi` (backup target marker + process.uptime + embedderStats) |
+
+Two endpoints back the strip. `/stats/loc` walks `git ls-files` per project and counts newlines (cached 5 min, polled 60s). `/stats/kpi` is an omnibus snapshot (heavy parts cached 60s, polled 30s). Each sub-computation in `/stats/kpi` is best-effort: a failure returns `null` for that section so a single broken data source does not black out the whole strip.
+
+KpiCard renders one tile: icon, monospace tabular-nums big number, sub line. Animated count-up tween on numeric changes, pulse highlight on growth-signal tiles (LOC, wiki pages, hits, active sessions, commits).
+
+### 12.3 Orb (graph viz)
 
 `07-daemon/src/dashboard/graph.ts`. Reads every page in `wiki/pages`, `wiki/pending`, `wiki/archive`. Nodes from frontmatter, edges from `## Cross-references`. Output: `{nodes: [{id, title, status, weight, ...}], edges: [{source, target, weight}]}`.
 
@@ -665,6 +681,9 @@ Items already known:
 | Dashboard routes | `07-daemon/src/dashboard/routes.ts` |
 | Search-all (source classes) | `07-daemon/src/dashboard/search-all.ts` |
 | Graph (orb) | `07-daemon/src/dashboard/graph.ts` |
+| KPI omnibus endpoint | `07-daemon/src/dashboard/routes.ts` (search for `/stats/kpi`) |
+| KPI strip component | `08-dashboard/components/KpiStrip.tsx` |
+| LOC walk endpoint | `07-daemon/src/dashboard/routes.ts` (search for `/stats/loc`) |
 | Reference corpus | `07-daemon/src/reference/` |
 | Identity registry | `07-daemon/src/identity/registry.ts` |
 | Hooks runner | `07-daemon/src/capture/hooks/hook-runner.ts` |
