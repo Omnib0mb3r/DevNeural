@@ -21,6 +21,7 @@ import { runMigrations } from './db/migrate.js';
 import { initGpuQueue } from './gpu/queue.js';
 import { VramMonitor } from './gpu/vram-monitor.js';
 import { createHeartbeatPoster } from './heartbeat/poster.js';
+import { cullRawChunks } from './reinforcement/raw-chunks-cull.js';
 import { embedOne, warmUp, getEmbedDim, getModelId, setEmbedderLogger, embedderStats } from './embedder/index.js';
 import { ensureWiki } from './wiki/scaffolding.js';
 import { runSeed, hasSeeded } from './corpus/seed.js';
@@ -121,6 +122,26 @@ async function main(): Promise<void> {
   const heartbeat = createHeartbeatPoster({ log: logger });
   heartbeat.start(store.db);
   void heartbeat;
+
+  /* Raw chunks cull (Wave 2 day 1 step 7 / OP-4).
+   * Runs once at boot (after a small delay so the daemon does not
+   * block its own listen call) and then daily. brainstorm_chunks
+   * is a different table and is never touched. */
+  const cullIntervalMs = Number(
+    process.env.DEVNEURAL_RAW_CHUNK_CULL_INTERVAL_MS ?? 24 * 60 * 60 * 1000,
+  );
+  const cullTimer = setTimeout(() => {
+    void cullRawChunks(store, { log: logger }).catch((err) =>
+      logger(`[cull] failed: ${(err as Error).message}`),
+    );
+    const repeat = setInterval(() => {
+      void cullRawChunks(store, { log: logger }).catch((err) =>
+        logger(`[cull] failed: ${(err as Error).message}`),
+      );
+    }, cullIntervalMs);
+    if (typeof repeat.unref === 'function') repeat.unref();
+  }, 60_000);
+  if (typeof cullTimer.unref === 'function') cullTimer.unref();
 
   const scaffold = ensureWiki();
   logger(
