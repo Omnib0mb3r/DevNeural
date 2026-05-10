@@ -17,6 +17,7 @@ import { startTranscriptWatcher } from './capture/transcript-watcher.js';
 import { startFsWatcher } from './capture/fs-watcher.js';
 import { startGitWatcher } from './capture/git-watcher.js';
 import { Store } from './store/index.js';
+import { runMigrations } from './db/migrate.js';
 import { embedOne, warmUp, getEmbedDim, getModelId, setEmbedderLogger, embedderStats } from './embedder/index.js';
 import { ensureWiki } from './wiki/scaffolding.js';
 import { runSeed, hasSeeded } from './corpus/seed.js';
@@ -69,6 +70,31 @@ async function main(): Promise<void> {
   logger(
     `store open: raw_chunks=${store.rawChunks.size()} wiki_pages=${store.wikiPages.size()} embedder=${getModelId()} dim=${getEmbedDim()}`,
   );
+
+  // Phase Two migration runner. Applies any new files in
+  // scripts/migrations not yet recorded in the _migrations table.
+  // Runs after the legacy Store.open() which sets up the original
+  // tables, and before HTTP bind so all routes see the post-migration
+  // schema. Idempotent on every boot.
+  try {
+    const migDir = path.posix.join(
+      path.dirname(fileURLToPath(import.meta.url)).replace(/\\/g, '/'),
+      '..',
+      'scripts',
+      'migrations',
+    );
+    const migResult = await runMigrations({ migrationsDir: migDir });
+    if (migResult.applied.length > 0) {
+      logger(
+        `migrations: applied ${migResult.applied.length} (${migResult.applied.join(', ')}); total=${migResult.totalAppliedAfter}`,
+      );
+    } else {
+      logger(`migrations: no new (total=${migResult.totalAppliedAfter})`);
+    }
+  } catch (err) {
+    logger(`migrations FAILED: ${(err as Error).message}`);
+    throw err;
+  }
 
   const scaffold = ensureWiki();
   logger(
