@@ -22,6 +22,7 @@ import { initGpuQueue } from './gpu/queue.js';
 import { VramMonitor } from './gpu/vram-monitor.js';
 import { createHeartbeatPoster } from './heartbeat/poster.js';
 import { cullRawChunks } from './reinforcement/raw-chunks-cull.js';
+import { purgeMeetingAudio } from './voice/meeting-audio-purge.js';
 import { embedOne, warmUp, getEmbedDim, getModelId, setEmbedderLogger, embedderStats } from './embedder/index.js';
 import { ensureWiki } from './wiki/scaffolding.js';
 import { runSeed, hasSeeded } from './corpus/seed.js';
@@ -144,6 +145,39 @@ async function main(): Promise<void> {
     if (typeof repeat.unref === 'function') repeat.unref();
   }, 60_000);
   if (typeof cullTimer.unref === 'function') cullTimer.unref();
+
+  /* Wave 2 carry-over #3: meeting audio purge cron. Daily sweep next
+   * to the raw-chunks cull (BF-17: meeting audio expires after
+   * DEVNEURAL_MEETING_AUDIO_MAX_AGE_DAYS, default 30d). Skips rows
+   * pinned via keep_audio=1; deletes the WAV + .cues.json sidecar and
+   * clears audio_path so /meetings/:id stops reporting a path that no
+   * longer exists. */
+  const meetingAudioPurgeIntervalMs = Number(
+    process.env.DEVNEURAL_MEETING_AUDIO_PURGE_INTERVAL_MS ?? 24 * 60 * 60 * 1000,
+  );
+  const meetingAudioPurgeTimer = setTimeout(() => {
+    try {
+      const r = purgeMeetingAudio(store, { log: logger });
+      logger(
+        `[meeting-audio-purge] scanned=${r.scanned} purged=${r.purged} kept=${r.skipped_keep_audio} not-due=${r.skipped_not_due} errors=${r.errors}`,
+      );
+    } catch (err) {
+      logger(`[meeting-audio-purge] failed: ${(err as Error).message}`);
+    }
+    const repeat = setInterval(() => {
+      try {
+        const r = purgeMeetingAudio(store, { log: logger });
+        logger(
+          `[meeting-audio-purge] scanned=${r.scanned} purged=${r.purged} kept=${r.skipped_keep_audio} not-due=${r.skipped_not_due} errors=${r.errors}`,
+        );
+      } catch (err) {
+        logger(`[meeting-audio-purge] failed: ${(err as Error).message}`);
+      }
+    }, meetingAudioPurgeIntervalMs);
+    if (typeof repeat.unref === 'function') repeat.unref();
+  }, 90_000);
+  if (typeof meetingAudioPurgeTimer.unref === 'function')
+    meetingAudioPurgeTimer.unref();
 
   /* Self-audit periodic (Wave 2 day 4 step 16 / Karpathy steal 3 / A8).
    * Runs at +15min after boot then every DEVNEURAL_SELF_AUDIT_INTERVAL_MS
