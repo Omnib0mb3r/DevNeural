@@ -1,5 +1,82 @@
-# Handover: Phase Two Wave 1 day 1 (2026-05-10)
+# Handover: Phase Two Wave 1 days 1, 2, 3 (2026-05-10)
 
+> **2026-05-10 evening update:** Days 2 and 3 also shipped on `phase-two` (step 20 explicitly skipped per user directive; Wave 2 boundary respected). Pick up at **Wave 2 day 1** (prerequisite migrations 010 through 013 + 013a) per spec section 11.
+>
+> The original Day 1 handover content is preserved below.
+>
+> ## Day 2 / Day 3 commits (most recent last)
+>
+> ```
+> c44d593 feat(retrieval): BF-1 source-classed reweight + BF-16 meeting class
+> b3e51a3 feat(wiki): WI-2 frozen flag honour + WI-1/WI-3/WI-4 frontmatter cascade
+> 9f459ee feat(reinforcement): WI-5 pause mode
+> 6f47a6e feat(privacy,ingest): outbound guard + cross-project N=3 + voice-source skip
+> 9590be0 feat(curator): CI-1+CI-2+CI-5 instrumentation, prompt_id, confidence
+> 1e0a2f3 feat(stats): KPI endpoints for curator-health, brainstorm-kpi, outbound
+> f7293f5 feat(canary): CI-7 synthetic curator canary
+> dff90d8 test(schema-regression): CI-8 Pass 2 schema regression suite scaffold
+> 0b35ac7 docs: brainstormer-first README + outbound.md at repo root
+> 2b37fc7 test(integration): TC-1 brainstorm + curator golden paths
+> ```
+>
+> ## Day 2 / Day 3 highlights
+>
+> - **Step 13 BF-1 source-class weights** (4.2 spec defaults) live in `07-daemon/src/dashboard/search-all.ts` (`DEFAULT_SOURCE_CLASS_WEIGHTS`). Brainstorm > wiki > meeting > draft > project > raw > reference. Identity-defining ranking flip.
+> - **Step 14 + 18 frozen + frontmatter cascade.** `PageFrontmatter` carries the seven Phase Two fields; render + parse + decay + ingest all honor them.
+> - **Step 15 + 16 + 17 outbound rule + cross-project N>=3 + schema-as-living-config.** New `07-daemon/src/db/outbound-guard.ts` wraps every off-host call. Cross-project verifier raised from N>=2 to N>=3, skipped entirely on voice-session-derived pages. Schema-as-living-config was already done (existing `schemaText` injection at every Pass 2 call); commit body documents the verified state.
+> - **Step 19 pause mode.** `DEVNEURAL_PAUSE_MODE` (auto / on / off) gates `decayInactivePages`.
+> - **Step 21 + 22 curator instrumentation.** Curator at `UserPromptSubmit` writes a `curator_log` row for every decision with prompt_id (UUID), score, threshold, confidence ((score-threshold)/(1-threshold) clamped), source_class. `IndexDb` gains `insertCuratorLog`, `insertCuratorSignal`, `curatorHealthWindow`.
+> - **Step 23 + 24 + 25 KPI endpoints.** `/stats/curator-health`, `/stats/brainstorm-kpi`, `/stats/outbound` all live and return the spec section 4.1 shapes. React components NOT yet built (Wave 2 polish).
+> - **Step 26 synthetic canary.** `npm run canary` runs `scripts/canary.ts` against `docs/spec/canary-fixtures.json`. Seed fixture is a placeholder; real fixtures accumulate as wiki pages stabilise.
+> - **Step 27 schema regression suite scaffold.** `tests/schema-regression/` with 3 seed fixtures and a discovery runner. 47 more fixtures to add over time.
+> - **Step 28 + 29 docs.** README updated with the accurate privacy posture and brainstormer-first paragraph. New `outbound.md` at repo root documents every off-host code path and the three layers of voice-session enforcement.
+> - **Step 30 integration tests.** `tests/integration/brainstorm.int.test.ts` (2 cases) + `tests/integration/curator.int.test.ts` (2 cases). Hermetic temp data root, fresh migrations, no mocks.
+>
+> ## Step 20 status
+>
+> **Explicitly skipped this session.** The session-end pipeline 8-step ordered flush plus `wiki_drafts` write is the keystone work and deserves a fresh context window. Spec section 11 day 2 step 20 has the exact 8-step ordering. Without it, the auto-distillation half of BF-7 is not live; manual promote-to-wiki via `/admin/wiki/promote/:id` still works.
+>
+> ## Test + typecheck state at handover
+>
+> - Full suite: 85 of 85 green (53 pre-existing + 32 new).
+> - tsc --noEmit: clean.
+> - Migrations applied to a copy of the live backup; idempotent re-run no-op.
+> - One incident this session: a draft `pause-mode.test.ts` ran decay against the live wiki dir and applied one decay cycle (0.5 percent weight reduction) plus the new Phase Two frontmatter to 167 pages. Recovered by running migration 009 directly against the live data root so all 173 pages have consistent frontmatter. Documented in commit 9f459ee body. Test was rewritten to remove the dangerous mode=off branch.
+>
+> ## Wave 1 sign-off checklist update
+>
+> - [x] All migrations 001-009 applied; data root validated.
+> - [x] `npm test` green (85 of 85).
+> - [x] New integration tests green: brainstorm.int (2 cases), curator.int (2 cases).
+> - [x] Schema regression suite runs and passes against a baseline (3 fixtures).
+> - [ ] Curator Health card renders on the dashboard with non-zero data after 24 hours. **Endpoint exists; React component pending.**
+> - [ ] Brainstorm KPI tiles render with correct counts. **Endpoint exists; React component pending.**
+> - [ ] Outbound card renders; brainstorm-outbound-count shows 0. **Endpoint exists; React component pending.**
+> - [x] Outbound log captures at least one Pass 2 fallback or verifier call. **outbound-guard tested in tests/outbound-guard.test.ts.**
+> - [x] Privacy regression test passes (BF-4 brainstorm forbidden assertion). **migration runner test asserts trigger; outbound-guard test asserts application-layer refusal.**
+> - [x] README and `outbound.md` updated.
+> - [ ] `TODO.md` Phase Two queue replaced with a pointer to this file. **Not done; one-line edit for the next session.**
+> - [x] Backup taken; commit hash recorded.
+>
+> ## What Wave 2 must do first
+>
+> Per spec section 11 Wave 2 day 1:
+>
+> 1. Apply migrations P2-W2-D1-010 through 013 plus 013a. Files do NOT yet exist on disk; create them per the DDL in spec section 11 Wave 2 prerequisite migrations + section 3.9 (the 013a `meeting_action_items` table per CODEX-002 B3 adoption).
+> 2. GPU job queue (`07-daemon/src/gpu/queue.ts`) with priority lanes 0-3.
+> 3. VRAM monitor (NVIDIA-SMI is on PATH per Q-20).
+> 4. External heartbeat (`07-daemon/src/heartbeat/poster.ts`) plus the standalone watcher service per Appendix I option A.
+> 5. Native OS toast fallback (`BurntToast` PowerShell module).
+> 6. Raw chunks cull rule (180-day age, brainstorm chunks exempt).
+>
+> Then day 2: `/brainstorms` route + components + audio retention + player. Day 3: lineage + backfill. Day 4: lint nightly + LLM self-audit + last_verified flag + pause mode dashboard. Day 5: Lex track B (prompt versioning, A/B replay, per-mode few-shot, refusal contract, meeting routes UI, three-level awareness scaffolding, thumbs UI, random artifact sampling).
+>
+> Step 20 (Wave 1 day 2 keystone) should land BEFORE Wave 2 day 5 (which depends on auto-distillation working).
+>
+> ---
+>
+> ## Original Day 1 handover follows
+>
 > Pick up here for Phase Two Wave 1 **day 2**. Day 1 is fully shipped on the `phase-two` branch.
 >
 > Worktree: `C:/dev/Projects/DevNeural-phase-two/`. Branch: `phase-two`. Master is untouched and remains the live daemon's branch.
