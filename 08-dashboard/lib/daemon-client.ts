@@ -344,12 +344,15 @@ export interface PtyEntry {
 }
 export const listPtys = () =>
   request<{ ok: boolean; ptys: PtyEntry[] }>("/pty");
-export const spawnLex = (cwd?: string) =>
-  request<{ ok: boolean; ptyId?: string; pid?: number; cwd?: string; error?: string }>(
+export const spawnLex = (cwd?: string, resumeSessionId?: string) =>
+  request<{ ok: boolean; ptyId?: string; pid?: number; cwd?: string; resumed?: boolean; error?: string }>(
     "/pty/spawn-lex",
     {
       method: "POST",
-      body: JSON.stringify(cwd ? { cwd } : {}),
+      body: JSON.stringify({
+        ...(cwd ? { cwd } : {}),
+        ...(resumeSessionId ? { resume_session_id: resumeSessionId } : {}),
+      }),
     },
   );
 export const ptyInject = (id: string, text: string, commit = true) =>

@@ -1083,6 +1083,12 @@ export async function registerDashboardRoutes(
       args?: string[];
       cols?: number;
       rows?: number;
+      /* When set, claude is launched with --resume <id> so the past
+       * conversation is restored verbatim. Skipped if missing OR if
+       * the brainstorm row never bound a claude_session_id (PTY died
+       * before its jsonl appeared). The dashboard's "resume" button
+       * passes row.claude_session_id when present. */
+      resume_session_id?: string;
     };
     const cwd =
       body.cwd ?? path.posix.join(DATA_ROOT.replace(/\\/g, '/'), 'brainstorm');
@@ -1106,6 +1112,20 @@ export async function registerDashboardRoutes(
        * tile, and no claude_session_id binding). Skip permissions by
        * default; callers can override by passing explicit args. */
       const baseArgs = body.args ?? ['--dangerously-skip-permissions'];
+      /* Real conversational resume via claude --resume <session-id>.
+       * Validate the session id shape so we don't shell-inject; CLI
+       * just ignores unknown ids but a malformed one could escape
+       * quoting on Windows. */
+      const resumeId =
+        typeof body.resume_session_id === 'string' &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+          body.resume_session_id,
+        )
+          ? body.resume_session_id
+          : null;
+      if (resumeId) {
+        baseArgs.push('--resume', resumeId);
+      }
       const r = spawnLex({
         cwd,
         command: body.command,
@@ -1114,12 +1134,19 @@ export async function registerDashboardRoutes(
         rows: body.rows,
         systemPrompt,
       });
-      log(`[lex] spawn ptyId=${r.ptyId} pid=${r.pid} cwd=${cwd}`);
+      log(
+        `[lex] spawn ptyId=${r.ptyId} pid=${r.pid} cwd=${cwd}${
+          resumeId ? ` resume=${resumeId}` : ''
+        }`,
+      );
       /* Fresh spawns get an autonomous first-turn greeting via the
-       * [seed] protocol. No resume primitive exists yet so every
-       * spawn-lex is treated as a fresh greeting opportunity. */
-      seedFirstTurn(r.ptyId);
-      return { ok: true, ...r, cwd };
+       * [seed] protocol. Resumed spawns SKIP the seed: claude is
+       * already restoring the prior conversation and a synthetic
+       * greeting on top would confuse both Lex and the user. */
+      if (!resumeId) {
+        seedFirstTurn(r.ptyId);
+      }
+      return { ok: true, ...r, cwd, resumed: Boolean(resumeId) };
     } catch (err) {
       reply.code(500);
       return { ok: false, error: (err as Error).message };

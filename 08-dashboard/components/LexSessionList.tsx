@@ -59,29 +59,26 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
     },
   });
 
-  /* Resume note: true conversational resume needs `claude --resume <id>`
-   * which /pty/spawn-lex doesn't currently expose. For now "resume"
-   * just opens a fresh PTY in the same brainstorm cwd and copies the
-   * prior session's user_label onto the new row so the user sees the
-   * topic carry forward. */
+  /* Resume passes the prior brainstorm's claude_session_id to
+   * /pty/spawn-lex, which appends --resume <id> to the claude CLI
+   * args so the conversation history is restored verbatim. Rows
+   * with no claude_session_id (PTY died before its jsonl appeared)
+   * fall back to "open fresh PTY in same cwd with the same label";
+   * the tooltip on the button reflects the difference. */
   const resumeM = useMutation({
     mutationFn: async (row: BrainstormSessionRow) => {
       const cwd = row.cwd?.replace(/\//g, "\\");
-      const spawned = await spawnLex(cwd ?? undefined);
+      const resumeSid = row.claude_session_id ?? undefined;
+      const spawned = await spawnLex(cwd ?? undefined, resumeSid);
       if (!spawned.ok || !spawned.ptyId) {
         throw new Error(spawned.error ?? "spawn failed");
       }
       const carry = row.user_label ?? row.derived_label ?? null;
-      if (carry) {
-        /* Best-effort title-carry. The new brainstorm row is created
-         * in pty-host on spawn keyed by ptyId; we patch by querying
-         * the live list afterwards. The /lex-sessions invalidate
-         * below will refetch and the new row appears at top; the
-         * label is patched via a follow-up call from the consumer
-         * after activeBrainstormId resolves. We keep this primitive
-         * here; the page-level effect carries the rest. */
-      }
-      return { ptyId: spawned.ptyId, carryLabel: carry };
+      return {
+        ptyId: spawned.ptyId,
+        carryLabel: carry,
+        resumed: Boolean(spawned.resumed),
+      };
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ["lex-sessions"] });
@@ -265,7 +262,13 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
                           onClick={() => resumeM.mutate(row)}
                           disabled={resumeM.isPending || Boolean(activePtyId)}
                           className="text-nano px-2 py-1 rounded-pill bg-brand/10 hairline ring-1 ring-brand/30 text-brandSoft hover:bg-brand/20 disabled:opacity-40 disabled:cursor-not-allowed"
-                          title="Open a fresh PTY pre-titled with this label (Claude --resume not wired yet)"
+                          title={
+                            activePtyId
+                              ? "End the current Lex session before resuming a past one"
+                              : row.claude_session_id
+                                ? "Restore this conversation via claude --resume"
+                                : "Open a fresh PTY in the same cwd with this label (no claude_session_id was bound to this row, so verbatim resume is unavailable)"
+                          }
                         >
                           resume
                         </button>
