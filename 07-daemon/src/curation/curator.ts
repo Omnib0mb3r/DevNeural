@@ -37,6 +37,7 @@ import {
 import type { Validator } from '../llm/validator.js';
 import { recordInjection, recordRawInjection } from '../reinforcement/index.js';
 import * as path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { wikiPagesDir, wikiPendingDir } from '../paths.js';
 
 const COSINE_FLOOR_WIKI = Number(
@@ -77,6 +78,22 @@ export interface CurationInput {
 export interface CurationOutput {
   injection: string;
   byteCount: number;
+  /* CI-1: every curator decision carries a stable correlation token
+   * so dashboard signals (clicks, "this looks wrong" presses,
+   * follow-up classification) can attach back to the originating
+   * decision row in curator_log. */
+  prompt_id: string;
+  /* CI-5: 0..1 confidence on the injection. Computed from how far
+   * the matching score sits above the cosine floor:
+   *   confidence = (score - threshold) / (1.0 - threshold), clamped.
+   * A match exactly at the floor scores 0; the maximum achievable
+   * cosine of 1.0 scores 1.0. Surfaced inline in the InjectionRow
+   * confidence pill (Wave 2 day 4 step 17). */
+  confidence?: number;
+  /* The wiki page slug that won the injection. Null on silence or
+   * raw-only injections; surfaced in the GET /sessions/:id
+   * injected_pages array per spec section 4.2. */
+  page_slug?: string | null;
   components: {
     wiki_page_id?: string;
     wiki_score?: number;
@@ -92,8 +109,47 @@ export interface CurationOutput {
 const SKIPPED: CurationOutput = {
   injection: '',
   byteCount: 0,
+  prompt_id: '',
+  page_slug: null,
   components: { glossary_terms: [], used_session_summary: false, used_current_task: false },
 };
+
+function computeConfidence(score: number, threshold: number): number {
+  if (!Number.isFinite(score) || !Number.isFinite(threshold)) return 0;
+  if (threshold >= 1.0) return 0;
+  const c = (score - threshold) / (1.0 - threshold);
+  if (c < 0) return 0;
+  if (c > 1) return 1;
+  return c;
+}
+
+/* CI-1: write a curator_log row for every decision. Failure to log
+ * is non-fatal: the curator must always return its injection result
+ * even if telemetry fails. */
+function logCuratorDecision(
+  store: Store,
+  row: {
+    prompt_id: string;
+    session_id: string;
+    project_slug: string;
+    decision: 'inject' | 'silence';
+    page_slug: string | null;
+    score: number | null;
+    threshold: number;
+    confidence: number | null;
+    source_class: string | null;
+  },
+  log: (msg: string) => void,
+): void {
+  try {
+    store.db.insertCuratorLog({
+      id: randomUUID(),
+      ...row,
+    });
+  } catch (err) {
+    log(`[curator] insertCuratorLog failed: ${(err as Error).message}`);
+  }
+}
 
 const MIN_PROMPT_WORDS = 4;
 const SYNTAX_PROMPTS = [
@@ -118,9 +174,26 @@ export async function curate(
   input: CurationInput,
   log: (msg: string) => void = () => undefined,
 ): Promise<CurationOutput> {
+  const promptId = randomUUID();
   if (!shouldInject(input.prompt)) {
+    logCuratorDecision(
+      store,
+      {
+        prompt_id: promptId,
+        session_id: input.sessionId,
+        project_slug: input.projectId,
+        decision: 'silence',
+        page_slug: null,
+        score: null,
+        threshold: COSINE_FLOOR_WIKI,
+        confidence: null,
+        source_class: null,
+      },
+      log,
+    );
     return {
       ...SKIPPED,
+      prompt_id: promptId,
       components: { ...SKIPPED.components, skipped_reason: 'prompt_filter' },
     };
   }
@@ -181,8 +254,24 @@ export async function curate(
   const summaryBody = readSummary(input.sessionId);
 
   if (!bestWiki && !bestRaw && matched.length === 0 && !taskBody) {
+    logCuratorDecision(
+      store,
+      {
+        prompt_id: promptId,
+        session_id: input.sessionId,
+        project_slug: input.projectId,
+        decision: 'silence',
+        page_slug: null,
+        score: null,
+        threshold: COSINE_FLOOR_WIKI,
+        confidence: null,
+        source_class: null,
+      },
+      log,
+    );
     return {
       ...SKIPPED,
+      prompt_id: promptId,
       components: { ...SKIPPED.components, skipped_reason: 'no_signal' },
     };
   }
@@ -246,9 +335,54 @@ export async function curate(
     }
   }
 
+  /* CI-1 + CI-5: log the inject decision with confidence and the
+   * resolved source_class. The confidence formula is the simple
+   * (score - threshold) / (1 - threshold) heuristic; refinement to a
+   * calibrated logistic regression is Wave 3 work per Appendix H. */
+  const winner = bestWiki
+    ? {
+        page_slug: bestWiki.id,
+        score: bestWiki.score,
+        threshold: COSINE_FLOOR_WIKI,
+        source_class: bestWiki.metadata.status === 'canonical' ? 'wiki' : 'draft',
+      }
+    : bestRaw
+      ? {
+          page_slug: null,
+          score: bestRaw.score,
+          threshold: COSINE_FLOOR_RAW,
+          source_class: 'raw',
+        }
+      : {
+          page_slug: null,
+          score: null as number | null,
+          threshold: COSINE_FLOOR_WIKI,
+          source_class: matched.length > 0 ? 'glossary' : taskBody ? 'task' : null,
+        };
+  const confidence =
+    winner.score !== null ? computeConfidence(winner.score, winner.threshold) : null;
+  logCuratorDecision(
+    store,
+    {
+      prompt_id: promptId,
+      session_id: input.sessionId,
+      project_slug: input.projectId,
+      decision: 'inject',
+      page_slug: winner.page_slug,
+      score: winner.score,
+      threshold: winner.threshold,
+      confidence,
+      source_class: winner.source_class,
+    },
+    log,
+  );
+
   return {
     injection,
     byteCount: Buffer.byteLength(injection, 'utf-8'),
+    prompt_id: promptId,
+    page_slug: winner.page_slug,
+    ...(confidence !== null ? { confidence } : {}),
     components: {
       ...(bestWiki ? { wiki_page_id: bestWiki.id, wiki_score: bestWiki.score } : {}),
       ...(bestRaw ? { raw_chunk_id: bestRaw.id, raw_score: bestRaw.score } : {}),

@@ -186,6 +186,107 @@ export class IndexDb {
     `);
   }
 
+  // ── curator log (CI-1 / CI-2) ──────────────────────────────────
+  /* Records every curator decision (inject or silence) at
+   * UserPromptSubmit. Drives Curator Health card and the canary.
+   * The DB schema enforces UNIQUE prompt_id; callers must generate
+   * a fresh UUID per call. */
+  insertCuratorLog(row: {
+    id: string;
+    prompt_id: string;
+    session_id: string;
+    project_slug: string;
+    decision: 'inject' | 'silence';
+    page_slug: string | null;
+    score: number | null;
+    threshold: number;
+    confidence: number | null;
+    source_class: string | null;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO curator_log
+           (id, prompt_id, session_id, project_slug, decision, page_slug,
+            score, threshold, confidence, source_class)
+         VALUES (@id, @prompt_id, @session_id, @project_slug, @decision,
+            @page_slug, @score, @threshold, @confidence, @source_class)`,
+      )
+      .run(row);
+  }
+
+  /* CI-2: hits, corrections, clicks. Multiple rows per curator_log
+   * row are allowed; each follow-up signal appends. */
+  insertCuratorSignal(row: {
+    id: string;
+    curator_log_id: string;
+    prompt_id: string;
+    signal: 'hit' | 'correction' | 'click' | 'wrong';
+    source: 'regex-inferred' | 'user-explicit' | 'dashboard-click';
+    weight: number;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO curator_signal
+           (id, curator_log_id, prompt_id, signal, source, weight)
+         VALUES (@id, @curator_log_id, @prompt_id, @signal, @source, @weight)`,
+      )
+      .run(row);
+  }
+
+  /* CI-6: Curator Health KPI card aggregates over a rolling window.
+   * Returns counts for the spec's required dimensions; the route
+   * layer turns these into rates. Window is days, default 7. */
+  curatorHealthWindow(windowDays = 7): {
+    injections_per_day: Array<{ day: string; count: number }>;
+    inject_total: number;
+    silence_total: number;
+    hit_total: number;
+    correction_total: number;
+    click_total: number;
+    wrong_total: number;
+  } {
+    const since = `now('-${windowDays} days')`;
+    const perDay = this.db
+      .prepare(
+        `SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS count
+         FROM curator_log
+         WHERE decision = 'inject'
+           AND created_at >= datetime('now', ?)
+         GROUP BY day
+         ORDER BY day`,
+      )
+      .all(`-${windowDays} days`) as Array<{ day: string; count: number }>;
+    const counts = this.db
+      .prepare(
+        `SELECT decision, COUNT(*) AS n
+         FROM curator_log
+         WHERE created_at >= datetime('now', ?)
+         GROUP BY decision`,
+      )
+      .all(`-${windowDays} days`) as Array<{ decision: string; n: number }>;
+    const sigCounts = this.db
+      .prepare(
+        `SELECT signal, COUNT(*) AS n
+         FROM curator_signal
+         WHERE created_at >= datetime('now', ?)
+         GROUP BY signal`,
+      )
+      .all(`-${windowDays} days`) as Array<{ signal: string; n: number }>;
+    void since;
+    const inject = counts.find((c) => c.decision === 'inject')?.n ?? 0;
+    const silence = counts.find((c) => c.decision === 'silence')?.n ?? 0;
+    return {
+      injections_per_day: perDay,
+      inject_total: inject,
+      silence_total: silence,
+      hit_total: sigCounts.find((s) => s.signal === 'hit')?.n ?? 0,
+      correction_total:
+        sigCounts.find((s) => s.signal === 'correction')?.n ?? 0,
+      click_total: sigCounts.find((s) => s.signal === 'click')?.n ?? 0,
+      wrong_total: sigCounts.find((s) => s.signal === 'wrong')?.n ?? 0,
+    };
+  }
+
   // ── outbound log (PB-2 / BF-4) ────────────────────────────────
   /* Records every outbound call. The DB trigger
    * outbound_no_voice_session blocks any insert whose payload_class
