@@ -4,7 +4,9 @@
 
 DevNeural is a personal second brain for software work. It captures everything you do in Claude Code, builds a semantic search layer (RAG) over the raw record, compiles transferable insights into a maintained wiki, recommends relevant prior thinking to Claude in real time, learns from what actually works, and surfaces it all through a dashboard you can hit from anywhere via Tailscale.
 
-It runs entirely on your own hardware. No API costs. No cloud. Your data never leaves your machine.
+It runs entirely on your own hardware. By default no data leaves your machine. Two opt-in flags allow Anthropic API for Pass 2 schema fallback and cross-project pattern verification on non-voice content only. Voice brainstorm and meeting content never leaves the host. Every off-host call is logged in `outbound_log` and shown on the dashboard's Outbound card; see `outbound.md` at the repo root for the canonical list.
+
+DevNeural is **brainstormer-first**. Voice brainstorm conversations are the substrate of the system, not derivative artifacts of project work. Retrieval ranks brainstorms above the wiki, brainstorms never decay, and brainstorm content is the highest-sensitivity privacy class. The wiki is downstream of brainstorming. See `voice-review.md` and `docs/spec/PHASE-TWO-IMPLEMENTATION.md` for the full reframe.
 
 ---
 
