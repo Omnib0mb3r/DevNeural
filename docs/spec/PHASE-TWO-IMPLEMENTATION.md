@@ -1421,6 +1421,50 @@ Day 5 commit: `feat(lex): wave 2 day 5 personality + feedback loop`.
 
 ---
 
+### Wave 3 - Orb (Lane A)
+
+Wave 3 Lane A ships in one focused block: unified graph data layer, 4-type canvas renderer, filter chips, double-click side panel, and recent-activity glow. Step numbering continues from Wave 2 step 25.
+
+**Step 26. Backend: `GET /graph/unified` endpoint.**
+New file `07-daemon/src/dashboard/unified-graph.ts`. Returns nodes from brainstorm_sessions (kind=brainstorm), wiki pages (kind=wiki), projects from registry (kind=project), and meeting sessions (kind=meeting), plus edges from:
+- wiki frontmatter `source_brainstorms` (lineage edges)
+- wiki frontmatter `source_meetings` (lineage edges)
+- `brainstorm_sessions.project_slug` matched to project nodes (project-spawn edges)
+- wiki cross-reference sections (wiki-cross-ref edges)
+Response type: `UnifiedGraphPayload` with typed `UnifiedGraphNode` and `UnifiedGraphEdge`.
+
+**Step 27. Dashboard: `08-dashboard/src/orb/` directory.**
+Per plan conflict-avoidance rule, all new unified-orb logic lives in `08-dashboard/src/orb/`. Files:
+- `types.ts` - shared types for UnifiedGraphNode, UnifiedGraphEdge
+- `colors.ts` - color palette and shape constants for 4 node types
+- `UnifiedOrb.tsx` - main component, extends existing canvas-2d renderer idiom
+- `FilterChips.tsx` - chip row for brainstorm/wiki/project/meeting toggles
+- `SidePanel.tsx` - double-click connection panel with click-to-jump
+The existing `/orb` page (`08-dashboard/app/orb/page.tsx`) updated to render `UnifiedOrb` in place of the wiki-only `Orb`, with the wiki-only `Orb` remaining intact for embedded use on the home page.
+
+**Step 28. Render 4 node types in canvas-2d renderer.**
+- brainstorm nodes: warm amber (`oklch(75% 0.17 60)`), circle with slight inner glow, size by chunk_count proxy (started_ms age as weight fallback).
+- wiki nodes: cool blue (`oklch(64% 0.20 295)` canonical / `oklch(72% 0.13 270)` pending), existing status coloring preserved; draft state shown as muted ring variant.
+- project nodes: neutral slate (`oklch(58% 0.04 260)`), square drawn via canvas fillRect rotated 45deg (diamond shape to visually distinguish from circles).
+- meeting nodes: teal-green (`oklch(68% 0.14 175)`), circle with dashed outer ring to signal "archivable" nature.
+- Edge colors by kind: lineage=green, wiki-cross-ref=blue (existing heat gradient), project-spawn=purple.
+- Files are NEVER nodes. Drafts are a color variant on wiki nodes, not separate nodes.
+
+**Step 29. Double-click side panel.**
+`SidePanel.tsx` opens on double-click of any node. Lists all connected items grouped by kind. Each item is click-to-jump: wiki pages navigate to `/wiki?page=`, brainstorms to `/brainstorms/`, projects to `/projects`, meetings to `/meetings/`. Connection list sourced from edges plus side-channel: wiki pages include `source_files` frontmatter list as a "Source files" section (files listed but not graph nodes).
+
+**Step 30. Recent-activity glow.**
+Nodes touched in the last 24 hours receive the animated expanding-ring treatment (reuses existing `isRecentlyPromoted` pattern). Recency determined by: brainstorm `started_ms` or `ended_ms`, wiki page `last_modified`, project `last_seen`. Glow color matches node type (amber for brainstorm, blue-violet for wiki, slate for project, teal for meeting).
+
+**Step 31. Filter chips.**
+`FilterChips.tsx` renders 4 chip buttons: `[brainstorms] [wiki] [projects] [meetings]`. Each chip toggles visibility of its node type in the graph. All chips active by default. Chips follow existing pill-button styling from the orb controls row. Active chip has `bg-brand/20 ring-1 ring-brand/40` treatment per existing labels button.
+
+**Deferred (cut for scope):**
+- Search within the orb + keyboard node navigation: left as a TODO comment in `UnifiedOrb.tsx` and noted below.
+- TODO: add orb-level search (filter nodes by title match) and keyboard nav (arrow keys to hop between connected nodes, Enter to open side panel). Implement in Wave 4 or as a standalone polish commit.
+
+---
+
 ## 12. Wave 3 execution
 
 Effort: ~5 days. Gated on Wave 2 signals (specifically: Curator Health card green; CI-7 canary green for at least 7 days; backfill complete).
