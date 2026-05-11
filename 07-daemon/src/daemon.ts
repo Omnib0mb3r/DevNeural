@@ -269,6 +269,46 @@ async function main(): Promise<void> {
   }, 30_000);
   if (typeof reminderTimer.unref === 'function') reminderTimer.unref();
 
+  /* Memory janitor (Wave 3 Lane B step 37 / LX-14). Runs weekly at
+   * +20min after boot; staggered so it does not compete with the
+   * self-audit and lint timers. Weekly cadence is controlled by
+   * DEVNEURAL_JANITOR_INTERVAL_MS (default 7 days). */
+  const janitorIntervalMs = Number(
+    process.env.DEVNEURAL_JANITOR_INTERVAL_MS ?? 7 * 24 * 60 * 60 * 1000,
+  );
+  const janitorTimer = setTimeout(() => {
+    void (async () => {
+      const { runMemoryJanitor } = await import('./lex/memory-janitor.js');
+      await runMemoryJanitor(store, logger).catch((err) =>
+        logger(`[janitor] failed: ${(err as Error).message}`),
+      );
+    })();
+    const repeat = setInterval(() => {
+      void (async () => {
+        const { runMemoryJanitor } = await import('./lex/memory-janitor.js');
+        await runMemoryJanitor(store, logger).catch((err) =>
+          logger(`[janitor] failed: ${(err as Error).message}`),
+        );
+      })();
+    }, janitorIntervalMs);
+    if (typeof repeat.unref === 'function') repeat.unref();
+  }, 20 * 60 * 1000);
+  if (typeof janitorTimer.unref === 'function') janitorTimer.unref();
+
+  /* Personality guard (Wave 3 Lane B step 42 / LX-17). Watches
+   * lex-prompts/ for unexpected writes to protected files and applies
+   * best-effort icacls deny-write on Windows. Both are fire-and-forget;
+   * errors are logged but never block the daemon. */
+  let stopPersonalityGuard: (() => void) | null = null;
+  try {
+    const { startPersonalityGuardWatcher, applyIcacls } = await import('./lex/personality-guard.js');
+    stopPersonalityGuard = startPersonalityGuardWatcher(logger);
+    applyIcacls(logger);
+  } catch (err) {
+    logger(`[personality-guard] init failed: ${(err as Error).message}`);
+  }
+  void stopPersonalityGuard;
+
   const scaffold = ensureWiki();
   logger(
     `wiki scaffold: created=${scaffold.created.length} updated=${scaffold.updated.length} present=${scaffold.alreadyPresent.length}`,

@@ -1396,6 +1396,30 @@ export async function registerDashboardRoutes(
     };
   });
 
+  /* Wave 3 Lane B step 31 (LX-10): bounded brainstorm-chunk search.
+   * POST /lex/chunk-search { q, limit?, brainstorm_id? }
+   * Returns top-N brainstorm_chunks rows by cosine similarity using
+   * the Xenova embedder pipeline. Falls back to FTS when no embeddings
+   * are available for a session. Lex uses this to ground answers in
+   * prior brainstorm content before resorting to web search. */
+  app.post('/lex/chunk-search', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      q?: string;
+      limit?: number;
+      brainstorm_id?: string;
+    };
+    if (!body.q || !body.q.trim()) {
+      reply.code(400);
+      return { ok: false, error: 'q required' };
+    }
+    const { chunkSearch } = await import('../lex/chunk-retrieval.js');
+    const result = await chunkSearch(store, body.q.trim(), {
+      limit: typeof body.limit === 'number' ? body.limit : 3,
+      brainstorm_id: body.brainstorm_id,
+    });
+    return { ok: true, ...result };
+  });
+
   /* Slice E: Lex supervisor primitives. /lex/steer wraps ptyInject
    * so Lex can direct a worker session by either session_id or
    * pty_id without going through the lower-level /sessions or /pty
@@ -3028,6 +3052,28 @@ export async function registerDashboardRoutes(
     return { ok: true, mode: body.mode };
   });
 
+  /* ── /lex/retrieval-trace (Wave 3 Lane B step 35 / LX-12b) ────────
+   * Lists recent retrieval log rows for dashboard observability.
+   * Query params: brainstorm_id (filter to session), kind (grep|chunks|wiki|web), limit. */
+  app.get('/lex/retrieval-trace', async (req) => {
+    const q = (req.query ?? {}) as {
+      brainstorm_id?: string;
+      kind?: string;
+      limit?: string;
+    };
+    const limit = Math.min(200, Math.max(1, Number(q.limit ?? 50)));
+    const kind =
+      q.kind === 'grep' || q.kind === 'chunks' || q.kind === 'wiki' || q.kind === 'web'
+        ? (q.kind as 'grep' | 'chunks' | 'wiki' | 'web')
+        : undefined;
+    const rows = store.db.listRetrievalLogs({
+      brainstorm_id: q.brainstorm_id,
+      kind,
+      limit,
+    });
+    return { ok: true, rows, total: rows.length };
+  });
+
   /* ── /lex/prompts (Wave 2 day 5 step 20 / LX-1) ──────────────────
    * Disk archive of every Lex system-prompt revision. The dashboard
    * LexReplayViewer lists versions and reads bodies. */
@@ -3086,7 +3132,7 @@ export async function registerDashboardRoutes(
     } else {
       opts.status = 'open';
     }
-    if (q.source === 'lint' || q.source === 'self-audit' || q.source === 'canary' || q.source === 'user-flag' || q.source === 'schema-regression') {
+    if (q.source === 'lint' || q.source === 'self-audit' || q.source === 'canary' || q.source === 'user-flag' || q.source === 'schema-regression' || q.source === 'janitor') {
       opts.source = q.source;
     }
     if (q.severity === 'low' || q.severity === 'medium' || q.severity === 'high') {
@@ -3138,6 +3184,107 @@ export async function registerDashboardRoutes(
     const { runSelfAudit } = await import('../wiki/self-audit.js');
     const r = await runSelfAudit(store, { sample: body.sample, log });
     return { ok: true, result: r };
+  });
+
+  /* POST /admin/janitor/run (Wave 3 Lane B step 37 / LX-14). Manual
+   * trigger for the memory janitor. Scans brainstorm_chunks for merge
+   * candidates and contradictions; writes findings to audit_findings
+   * with source='janitor'. */
+  app.post('/admin/janitor/run', async () => {
+    const { runMemoryJanitor } = await import('../lex/memory-janitor.js');
+    const r = await runMemoryJanitor(store, log);
+    return { ok: true, result: r };
+  });
+
+  /* ── Cross-session prompt injection (Wave 3 Lane B step 38 / LX-15) ──
+   *
+   * POST /lex/inject-cross-session
+   *   Body: { target_session, token, text, caller_label?, commit? }
+   *   token = HMAC-SHA256(auth_secret, `${target_session}:${unix_minute}`)
+   *
+   * POST /auth/cross-session-token
+   *   Body: { target_session }
+   *   Requires valid dn_session cookie. Returns a short-lived token.
+   *
+   * GET /lex/injection-log
+   *   Query: target_session?, decision?, limit?
+   *   Returns audit records from cross_session_injection_log.
+   */
+  app.post('/lex/inject-cross-session', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      target_session?: string;
+      token?: string;
+      text?: string;
+      caller_label?: string;
+      commit?: boolean;
+    };
+    if (!body.target_session || typeof body.target_session !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'target_session required' };
+    }
+    if (!body.token || typeof body.token !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'token required' };
+    }
+    if (!body.text || typeof body.text !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'text required' };
+    }
+    if (body.text.length > 4096) {
+      reply.code(400);
+      return { ok: false, error: 'text too long (max 4096 chars)' };
+    }
+    const { crossSessionInject } = await import('../lex/cross-session-inject.js');
+    const result = crossSessionInject(
+      {
+        target_session: body.target_session,
+        token: body.token,
+        text: body.text,
+        caller_label: body.caller_label,
+        commit: body.commit !== false,
+      },
+      store.db,
+    );
+    if (!result.ok) {
+      const code =
+        result.decision === 'rejected_auth'
+          ? 401
+          : result.decision === 'rejected_allowlist'
+            ? 403
+            : 422;
+      reply.code(code);
+    }
+    return result;
+  });
+
+  app.post('/auth/cross-session-token', async (req, reply) => {
+    const body = (req.body ?? {}) as { target_session?: string };
+    if (!body.target_session || typeof body.target_session !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'target_session required' };
+    }
+    const { issueToken } = await import('../lex/cross-session-inject.js');
+    return {
+      ok: true,
+      token: issueToken(body.target_session),
+      target_session: body.target_session,
+      valid_for_s: 120,
+    };
+  });
+
+  app.get('/lex/injection-log', async (req) => {
+    const q = (req.query ?? {}) as {
+      target_session?: string;
+      decision?: string;
+      limit?: string;
+    };
+    const opts: Parameters<typeof store.db.listCrossSessionLogs>[0] = {};
+    if (q.target_session) opts.target_session = q.target_session;
+    if (q.decision) {
+      opts.decision = q.decision as 'accepted' | 'rejected_auth' | 'rejected_allowlist' | 'rejected_pty';
+    }
+    if (q.limit) opts.limit = Number(q.limit);
+    return { ok: true, logs: store.db.listCrossSessionLogs(opts) };
   });
 
   /* POST /curator/wrong (Wave 2 day 4 step 17 / CI-5 / A9). The

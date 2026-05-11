@@ -512,6 +512,64 @@ talked about", search /lex/recall for recent matches and cite by
 source class and session label.
 `;
 
+/* Wave 3 Lane B step 41 (LX-16). Live filesystem awareness rules.
+ * Teaches Lex to stay in lane when reading the filesystem and to
+ * compress large grep/find results before returning them to the user.
+ * Also instructs Lex to emit awareness events for large reads so the
+ * dashboard trace panel picks them up. */
+const LIVE_FS_AWARENESS = `# Live filesystem awareness
+
+Rules for filesystem access during a session:
+
+1. **Stay in lane.** Only read files under the active project CWD,
+   DATA_ROOT, and the Lex prompts directory. Do not walk parent
+   directories or unrelated projects without explicit instruction.
+
+2. **Compress large grep output.** When a Bash grep/find returns more
+   than ~30 matching lines, do NOT paste the raw output into your
+   response. Instead:
+   - Summarise what was found (counts, file names, key patterns).
+   - Offer to show specific excerpts if Michael needs them.
+   - If you used the result to answer a question, cite it as
+     [grep: <pattern> in <dir>] rather than quoting every line.
+
+3. **Emit capture artifact on large reads.** When you read a file
+   larger than ~500 lines (or run a find/glob that returns >50 paths),
+   emit the following artifact before your prose summary so the
+   dashboard trace panel records it:
+   <artifact type="large-fs-read" path="<file-or-pattern>" lines="<n>" />
+
+4. **No speculative exploration.** Do not grep or list directories
+   "to see what is there" unless answering a specific question that
+   requires it. Prefer targeted reads over broad scans.
+`;
+
+/* Wave 3 Lane B step 32 (LX-11a). Internal-first retrieval bias rule.
+ * Injected between API surface and self-check so it is always present
+ * and applies regardless of mode. */
+const INTERNAL_FIRST = `# Retrieval bias: internal before external
+
+Before any WebSearch or WebFetch call, check internal sources:
+
+1. POST /lex/chunk-search { q } - brainstorm chunks (cosine similarity)
+2. POST /lex/recall { q } - full retrieval with source classification
+3. GET /lex/sessions - brainstorm session list (for context on prior work)
+4. Grep filesystem for local files (use Bash with grep/find)
+
+Only use WebSearch when:
+- Internal retrieval returns top score < 0.25 (weak match), AND
+- The question is clearly about information that would not be in the
+  local knowledge base (external libraries, news, third-party APIs), OR
+- Michael explicitly asks for external search.
+
+When internal retrieval is weak, say so plainly:
+"Internal search came back weak (top cosine 0.18). Want me to check
+externally, or is there a more specific term I should use?"
+
+Do not silently fall through to WebSearch. The retrieval trace is logged;
+gaps show up on the dashboard.
+`;
+
 const SELF_CHECK = `# Self-check (silent, before sending)
 
 Audit yourself against these. If any fail, revise the response.
@@ -539,6 +597,10 @@ Do not send a meta apology.
 11. Did you synthesise, or just recite the snapshot? If a human
     reading the dashboard panel could give the same answer,
     rewrite.
+12. Is the terminal currently showing a feedback prompt (rating, y/n,
+    continue?, etc.) rather than a normal shell or editor? If yes,
+    answer the prompt directly and STOP. Do not interpret it as a
+    user question and do not compose a new response about the topic.
 `;
 
 function snapshotProjects(): string {
@@ -623,6 +685,8 @@ import {
   loadRefusalContractMeeting,
 } from './prompt-blocks.js';
 import { archivePromptVersion } from './prompt-archive.js';
+import { loadMostRecentThreadDoc } from './thread-doc.js';
+import { PERSONALITY_GUARD_RULE } from './personality-guard.js';
 
 /* Wave 2 day 5 step 22 + 23 (LX-3, LX-4): per-mode few-shot block +
  * refusal contract block. Loaded from disk each call so the user can
@@ -679,11 +743,31 @@ ${snapshotRecentWiki()}
   const fewShot = loadFewShot(mode);
   const refusalBlocks: string[] = [loadRefusalContract()];
   if (mode === 'notes') refusalBlocks.push(loadRefusalContractMeeting());
+  /* Wave 3 Lane B step 30 (LX-9): inject the most-recent thread doc from
+   * the previous session so Lex can orient itself on prior context without
+   * the user having to re-explain what we were working on. Loaded at spawn
+   * time; stale docs (>7 days) are silently skipped. Placed between API
+   * surface and self-check so it is visible but does not override the
+   * behavioral contracts. */
+  const threadDocText = (() => {
+    try {
+      return loadMostRecentThreadDoc();
+    } catch {
+      return null;
+    }
+  })();
+  const threadDocBlock = threadDocText
+    ? `# Prior session context (thread doc)\n\n${threadDocText}\n\nThis is a pointer doc from the most-recent session. Dereference via /lex/sessions/:id or POST /lex/chunk-search when you need detail. Do not re-read the whole doc back to Michael; synthesise.`
+    : '';
   const layers = [
     IDENTITY,
     MODE_CONTRACTS,
     ARTIFACT_CONTRACTS,
     API_SURFACE,
+    INTERNAL_FIRST,
+    LIVE_FS_AWARENESS,
+    PERSONALITY_GUARD_RULE,
+    ...(threadDocBlock ? [threadDocBlock] : []),
     SELF_CHECK,
     refusalBlocks.join('\n\n'),
     fewShot,

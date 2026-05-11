@@ -113,7 +113,7 @@ export interface MeetingActionItemRow {
  * lint + self-audit + user-flag writers. */
 export interface AuditFindingRow {
   id: string;
-  source: 'lint' | 'self-audit' | 'canary' | 'user-flag' | 'schema-regression';
+  source: 'lint' | 'self-audit' | 'canary' | 'user-flag' | 'schema-regression' | 'janitor';
   severity: 'low' | 'medium' | 'high';
   page_slug: string | null;
   brainstorm_id: string | null;
@@ -122,6 +122,36 @@ export interface AuditFindingRow {
   status: 'open' | 'acknowledged' | 'resolved' | 'dismissed';
   created_at: string;
   resolved_at: string | null;
+}
+
+/* lex_retrieval_log row. Wave 3 Lane B step 34 (LX-12a). Records every
+ * retrieval decision made during a Lex session so the dashboard can show
+ * a trace of what was searched and whether internal or external retrieval
+ * was used. Written by chunkSearch, the wiki recall hook, and the tool
+ * gate middleware. */
+export interface LexRetrievalLogRow {
+  id: string;
+  brainstorm_id: string | null;
+  ts: string;
+  query: string;
+  kind: 'grep' | 'chunks' | 'wiki' | 'web';
+  results_json: string | null;
+  decision: string | null;
+}
+
+/* cross_session_injection_log row. Wave 3 Lane B step 38 (LX-15).
+ * Audit trail for every POST /lex/inject-cross-session call; records
+ * whether the attempt was accepted or rejected and why. */
+export interface CrossSessionInjectionLogRow {
+  id: string;
+  ts: string;
+  target_session: string;
+  caller_label: string | null;
+  text_preview: string;
+  text_length: number;
+  decision: 'accepted' | 'rejected_auth' | 'rejected_allowlist' | 'rejected_pty';
+  reject_reason: string | null;
+  brainstorm_id: string | null;
 }
 
 /* runtime_config row. Wave 2 day 4 step 19 (A15) pause-mode toggle
@@ -639,7 +669,7 @@ export class IndexDb {
    * same finding for the same page. */
   insertAuditFinding(row: {
     id: string;
-    source: 'lint' | 'self-audit' | 'canary' | 'user-flag' | 'schema-regression';
+    source: 'lint' | 'self-audit' | 'canary' | 'user-flag' | 'schema-regression' | 'janitor';
     severity: 'low' | 'medium' | 'high';
     page_slug?: string | null;
     brainstorm_id?: string | null;
@@ -685,7 +715,7 @@ export class IndexDb {
 
   listAuditFindings(opts: {
     status?: 'open' | 'acknowledged' | 'resolved' | 'dismissed';
-    source?: 'lint' | 'self-audit' | 'canary' | 'user-flag' | 'schema-regression';
+    source?: 'lint' | 'self-audit' | 'canary' | 'user-flag' | 'schema-regression' | 'janitor';
     severity?: 'low' | 'medium' | 'high';
     page_slug?: string;
     limit?: number;
@@ -1386,6 +1416,146 @@ export class IndexDb {
     }
     visited.delete(pageId);
     return visited;
+  }
+
+  // ── lex_retrieval_log (Wave 3 Lane B step 34 / LX-12a) ──────────
+  /* Insert a retrieval trace row. Called by chunkSearch, wiki recall
+   * hook, and the tool gate middleware. Best-effort; never throws. */
+  insertRetrievalLog(row: {
+    id: string;
+    brainstorm_id?: string | null;
+    query: string;
+    kind: 'grep' | 'chunks' | 'wiki' | 'web';
+    results_json?: string | null;
+    decision?: string | null;
+  }): void {
+    try {
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO lex_retrieval_log
+             (id, brainstorm_id, query, kind, results_json, decision)
+           VALUES (@id, @brainstorm_id, @query, @kind, @results_json, @decision)`,
+        )
+        .run({
+          brainstorm_id: null,
+          results_json: null,
+          decision: null,
+          ...row,
+        });
+    } catch {
+      /* table may not exist if migration 015 has not run yet; silently skip */
+    }
+  }
+
+  listRetrievalLogs(opts: {
+    brainstorm_id?: string;
+    kind?: 'grep' | 'chunks' | 'wiki' | 'web';
+    limit?: number;
+  } = {}): LexRetrievalLogRow[] {
+    try {
+      const limit = Math.min(500, Math.max(1, opts.limit ?? 50));
+      if (opts.brainstorm_id) {
+        const rows = this.db
+          .prepare(
+            `SELECT * FROM lex_retrieval_log
+             WHERE brainstorm_id = ?
+             ORDER BY ts DESC LIMIT ?`,
+          )
+          .all(opts.brainstorm_id, limit);
+        return rows as LexRetrievalLogRow[];
+      }
+      if (opts.kind) {
+        const rows = this.db
+          .prepare(
+            `SELECT * FROM lex_retrieval_log
+             WHERE kind = ?
+             ORDER BY ts DESC LIMIT ?`,
+          )
+          .all(opts.kind, limit);
+        return rows as LexRetrievalLogRow[];
+      }
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM lex_retrieval_log ORDER BY ts DESC LIMIT ?`,
+        )
+        .all(limit);
+      return rows as LexRetrievalLogRow[];
+    } catch {
+      /* table may not exist yet */
+      return [];
+    }
+  }
+
+  /** Write one cross-session injection audit record. Silently swallowed if
+   * the table doesn't exist yet (migration 017 not run). */
+  insertCrossSessionLog(row: {
+    id: string;
+    target_session: string;
+    caller_label?: string | null;
+    text_preview: string;
+    text_length: number;
+    decision: 'accepted' | 'rejected_auth' | 'rejected_allowlist' | 'rejected_pty';
+    reject_reason?: string | null;
+    brainstorm_id?: string | null;
+  }): void {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO cross_session_injection_log
+             (id, target_session, caller_label, text_preview, text_length, decision, reject_reason, brainstorm_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          row.id,
+          row.target_session,
+          row.caller_label ?? null,
+          row.text_preview,
+          row.text_length,
+          row.decision,
+          row.reject_reason ?? null,
+          row.brainstorm_id ?? null,
+        );
+    } catch {
+      /* table may not exist yet; not fatal */
+    }
+  }
+
+  listCrossSessionLogs(opts: {
+    target_session?: string;
+    decision?: 'accepted' | 'rejected_auth' | 'rejected_allowlist' | 'rejected_pty';
+    limit?: number;
+  } = {}): CrossSessionInjectionLogRow[] {
+    try {
+      const limit = Math.min(200, Math.max(1, opts.limit ?? 50));
+      if (opts.target_session) {
+        const rows = this.db
+          .prepare(
+            `SELECT * FROM cross_session_injection_log
+             WHERE target_session = ?
+             ORDER BY ts DESC LIMIT ?`,
+          )
+          .all(opts.target_session, limit);
+        return rows as CrossSessionInjectionLogRow[];
+      }
+      if (opts.decision) {
+        const rows = this.db
+          .prepare(
+            `SELECT * FROM cross_session_injection_log
+             WHERE decision = ?
+             ORDER BY ts DESC LIMIT ?`,
+          )
+          .all(opts.decision, limit);
+        return rows as CrossSessionInjectionLogRow[];
+      }
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM cross_session_injection_log ORDER BY ts DESC LIMIT ?`,
+        )
+        .all(limit);
+      return rows as CrossSessionInjectionLogRow[];
+    } catch {
+      return [];
+    }
   }
 
   close(): void {

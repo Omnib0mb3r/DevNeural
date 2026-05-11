@@ -122,6 +122,19 @@ export function lockSession(): void {
   /* nothing server-side; client clears cookie */
 }
 
+/**
+ * Returns the raw HMAC secret from auth.json so other modules (e.g.
+ * cross-session injection) can derive their own keyed MACs without
+ * duplicating the file-load logic.  Empty string when auth not yet set up.
+ */
+export function getAuthSecret(): string {
+  try {
+    return load().secret;
+  } catch {
+    return '';
+  }
+}
+
 export function regenerateSecret(): void {
   const state = load();
   state.secret = crypto.randomBytes(32).toString('hex');
