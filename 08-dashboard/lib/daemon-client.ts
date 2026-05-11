@@ -25,9 +25,17 @@ interface RequestOptions {
 
 async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   const isForm = opts.body instanceof FormData;
+  /* Only send Content-Type: application/json when there's an actual
+   * JSON body to ship. Fastify v5's default content-type parser
+   * rejects any request that declares Content-Type: application/json
+   * but carries no body with FST_ERR_CTP_EMPTY_JSON_BODY -> 400. That
+   * blew up body-less DELETEs like ptyKill (DELETE /pty/<id>), so
+   * clicking "+ new brainstorm" got a 400 trying to kill the active
+   * PTY and the resume / new-session flow died on the first step. */
+  const hasJsonBody = !isForm && opts.body !== undefined;
   const headers: Record<string, string> = {
     Accept: "application/json",
-    ...(isForm ? {} : { "Content-Type": "application/json" }),
+    ...(hasJsonBody ? { "Content-Type": "application/json" } : {}),
     ...(opts.headers ?? {}),
   };
   const res = await fetch(path, {
