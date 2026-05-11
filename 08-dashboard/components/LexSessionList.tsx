@@ -80,13 +80,31 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
         } catch {
           /* if it was already gone, spawn still proceeds */
         }
-        if (activeBrainstormId && activeBrainstormId !== row.id) {
-          try {
-            await patchLexSession(activeBrainstormId, { status: "ended" });
-          } catch {
-            /* observability only */
-          }
-        }
+      }
+      /* End every other active brainstorm row before spawning the
+       * resumed PTY. The parent's `activeBrainstormId` prop derives
+       * from a 5s-refetched query that often hasn't caught up to the
+       * auto-spawned PTY at the moment the user clicks switch-to, so
+       * relying on it alone leaves the previously-active row stuck at
+       * status='active'. Fetching the live active set here closes the
+       * race: any row that is still 'active' (except the one the user
+       * is resuming) gets patched to 'ended' before /pty/spawn-lex
+       * runs and registers the new active row. */
+      try {
+        const active = await lexSessions({ status: "active", limit: 50 });
+        await Promise.all(
+          (active.sessions ?? [])
+            .filter((r) => r.id !== row.id)
+            .map((r) =>
+              patchLexSession(r.id, { status: "ended" }).catch(() => {
+                /* observability only; never block the resume */
+              }),
+            ),
+        );
+      } catch {
+        /* observability only; never block the resume */
+      }
+      if (activePtyId) {
         await new Promise((r) => setTimeout(r, 400));
       }
       const cwd = row.cwd?.replace(/\//g, "\\");

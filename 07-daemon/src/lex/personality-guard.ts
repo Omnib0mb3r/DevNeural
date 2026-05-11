@@ -126,17 +126,32 @@ export function applyIcacls(log: (msg: string) => void = () => undefined): void 
     return;
   }
   const dir = lexPromptsRoot();
-  const targets = [
+  const fewShotDir = path.join(dir, 'few-shot');
+  const targets: string[] = [
     path.join(dir, 'refusal-contract.md'),
     path.join(dir, 'refusal-contract-meeting.md'),
-    path.join(dir, 'few-shot'),
   ];
+  /* Lock individual files inside few-shot/, not the directory itself.
+   * Denying (W) on the directory blocks daemon-side seed-file creation
+   * in readOrSeed(), which throws EACCES out of buildLexSystemPrompt
+   * and causes /pty/spawn-lex to 500. Files inside can still be
+   * protected without breaking first-run seeding. */
+  if (fs.existsSync(fewShotDir) && fs.statSync(fewShotDir).isDirectory()) {
+    try {
+      for (const name of fs.readdirSync(fewShotDir)) {
+        const full = path.join(fewShotDir, name);
+        if (fs.statSync(full).isFile()) targets.push(full);
+      }
+    } catch (err) {
+      log(`[personality-guard] could not enumerate few-shot/: ${(err as Error).message}`);
+    }
+  }
   const user = os.userInfo().username;
   for (const target of targets) {
     if (!fs.existsSync(target)) continue;
     execFile(
       'icacls.exe',
-      [target, '/deny', `${user}:(W)`, '/T', '/Q'],
+      [target, '/deny', `${user}:(W)`, '/Q'],
       {
         windowsHide: true,
         timeout: 5_000,

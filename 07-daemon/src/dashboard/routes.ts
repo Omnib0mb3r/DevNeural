@@ -401,9 +401,21 @@ export async function registerDashboardRoutes(
      * directory, which is the cwd with `:`, `\`, `/` flattened to `-`. */
     const { listProjects } = await import('../identity/registry.js');
     const projects = listProjects();
+    /* "Live" for idle-project filtering means the daemon owns a PTY
+     * for that session. Externally-launched claude.exe sessions (e.g.,
+     * VS Code terminal) show up as active in the registry but cannot
+     * be steered via /sessions/:id/inject or /lex/inject-cross-session
+     * because the daemon has no PTY handle. Treat those projects as
+     * still idle so the dashboard offers Start Claude buttons that
+     * spawn a daemon-owned session. */
+    const daemonOwnedSessionIds = new Set(
+      listPtys()
+        .filter((p) => !p.exited && p.sessionId)
+        .map((p) => p.sessionId as string),
+    );
     const liveSlugs = new Set(
       sessions
-        .filter((s) => s.active)
+        .filter((s) => s.active && daemonOwnedSessionIds.has(s.session_id))
         .map((s) => s.project_slug.toLowerCase()),
     );
     /* Mirror the bridge's path canonicalisation so a registry root
@@ -1209,8 +1221,10 @@ export async function registerDashboardRoutes(
         prompt_version: promptVersion,
       };
     } catch (err) {
+      const message = (err as Error).message;
+      log(`[lex] spawn failed: ${message}`);
       reply.code(500);
-      return { ok: false, error: (err as Error).message };
+      return { ok: false, error: message };
     }
   });
 

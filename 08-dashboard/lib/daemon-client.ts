@@ -53,6 +53,17 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   if (!res.ok) {
     throw new DaemonError(res.status, payload, `daemon ${res.status} on ${path}`);
   }
+  // Guard against the daemon serving the SPA index.html (or any other
+  // non-JSON body) for a path that's expected to return JSON. Without
+  // this check the caller would receive HTML typed as `T` and crash on
+  // the first property access. Surface a clear DaemonError instead.
+  if (!ct.includes("application/json")) {
+    throw new DaemonError(
+      res.status,
+      payload,
+      `daemon ${res.status} on ${path}: expected JSON, got ${ct || "unknown content-type"}`,
+    );
+  }
   return payload as T;
 }
 

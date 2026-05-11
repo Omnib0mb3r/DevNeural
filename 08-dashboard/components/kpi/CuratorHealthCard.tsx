@@ -99,7 +99,7 @@ export function CuratorHealthCard() {
   });
   const d = q.data;
   const total =
-    d?.injections_per_day.reduce((a, b) => a + b, 0) ?? 0;
+    d?.injections_per_day?.reduce((a, b) => a + b, 0) ?? 0;
 
   return (
     <div className="min-w-[220px] flex flex-col gap-1.5 px-3 py-2.5 rounded-md bg-bg2 border border-bd2">

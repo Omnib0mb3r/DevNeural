@@ -769,6 +769,17 @@ async function main(): Promise<void> {
           reply.code(404).send({ ok: false, error: 'not found' });
           return;
         }
+        // Only fall back to SPA HTML for actual browser navigations.
+        // If a JSON caller hits an unknown path (e.g. an API endpoint
+        // that didn't register because the daemon dist is stale, or a
+        // typo), serving index.html with 200 silently masks the bug
+        // and the caller parses HTML as JSON. Return a real 404 JSON
+        // so the failure is visible.
+        const accept = (req.headers.accept ?? '').toLowerCase();
+        if (!accept.includes('text/html')) {
+          reply.code(404).send({ ok: false, error: 'not found' });
+          return;
+        }
         const url = (req.url ?? '/').split('?')[0] ?? '/';
         if (url.includes('.')) {
           reply.code(404).send({ ok: false, error: 'not found' });

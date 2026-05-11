@@ -69,26 +69,40 @@ interface PtyHandle {
 }
 
 /* Regexes that identify a CC native feedback / prompt overlay in the
- * stdout stream. Conservative on purpose: false positives would mute
- * legitimate voice traffic. The first three cover the documented bug
- * symptom (rating prompt); the y/n + continue patterns cover the
- * related "press enter to continue" prompts that show up after long
- * tool runs. */
+ * stdout stream. The phrase regex alone is not enough: Lex renders his
+ * own reply text back into the PTY, and ordinary prose like "I can
+ * rate this session" or "press enter to continue" tripped the latch,
+ * holding voice inject closed for 90s and silencing Lex on every turn
+ * after the first. CC's native prompts always render inside a
+ * box-drawing UI (╭─╮ │ ╰─╯, U+2500..U+257F); Lex prose never does.
+ * Require BOTH a phrase hit AND a box-drawing char in the same chunk
+ * before stamping the gate. */
 const CC_SYSTEM_PROMPT_RE = new RegExp(
   [
     'How would you rate',
     '1 = thumbs down',
     'Rate this interaction',
     'rate this session',
-    'Press Enter to continue',
     'Continue\\? \\(y/n\\)',
   ].join('|'),
   'i',
 );
-const SYSTEM_PROMPT_HOLD_MS = 90_000;
+const CC_BOX_CHARS_RE = /[\u2500-\u257F]/;
+/* Hold drops from 90s to 30s. The earlier value covered worst-case
+ * prompt-scroll-off-screen scenarios, but combined with the now-strict
+ * box-drawing requirement the false-positive risk is gone, so the
+ * window can shrink. If a real prompt sits open longer than 30s the
+ * next stdout chunk that still contains the prompt re-stamps it. */
+const SYSTEM_PROMPT_HOLD_MS = 30_000;
+
+export function isCcSystemPromptChunk(data: string): boolean {
+  return CC_SYSTEM_PROMPT_RE.test(data) && CC_BOX_CHARS_RE.test(data);
+}
+
 /* Test-only re-exports for tests/cc-feedback-prompt-detect.test.ts.
  * Underscored to discourage runtime use. */
 export const __CC_SYSTEM_PROMPT_RE_FOR_TEST = CC_SYSTEM_PROMPT_RE;
+export const __CC_BOX_CHARS_RE_FOR_TEST = CC_BOX_CHARS_RE;
 export const __SYSTEM_PROMPT_HOLD_MS_FOR_TEST = SYSTEM_PROMPT_HOLD_MS;
 
 const ptys = new Map<string, PtyHandle>();
@@ -288,12 +302,12 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
   pty.onData((data) => {
     handle.lastActivity = Date.now();
     /* Wave 3 fixup (bug: 2026-05-10-cc-feedback-prompt-unanswerable).
-     * Stamp the awaiting-system-prompt window every time the regex
-     * matches incoming stdout. The window auto-closes 90s after the
-     * last hit, which covers the typical interaction even if the
-     * prompt scrolls partway off-screen. ptyInject consults this gate
-     * before forwarding voice-side text. */
-    if (CC_SYSTEM_PROMPT_RE.test(data)) {
+     * Stamp the awaiting-system-prompt window only when the chunk
+     * contains BOTH a known CC prompt phrase AND a box-drawing char.
+     * Phrase-alone matched Lex's own reply text rendering back into
+     * the PTY ("rate this session", "continue?") and silenced him on
+     * every turn after the first. */
+    if (isCcSystemPromptChunk(data)) {
       handle.awaitingSystemPromptUntil = Date.now() + SYSTEM_PROMPT_HOLD_MS;
     }
     /* If we've already bound, push directly into the ring. Otherwise

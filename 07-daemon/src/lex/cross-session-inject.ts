@@ -32,6 +32,7 @@ import * as crypto from 'node:crypto';
 import { randomUUID } from 'node:crypto';
 import { getAuthSecret } from '../dashboard/auth.js';
 import { ptyInject, listPtys } from '../dashboard/pty-host.js';
+import { queueSessionPrompt, queueSessionSuggestion } from '../dashboard/sessions.js';
 import type { IndexDb } from '../store/index-db.js';
 
 /* Allowlist env var. Comma-separated name/id prefixes. Empty = allow all. */
@@ -88,6 +89,8 @@ export interface InjectRequest {
 export interface InjectResult {
   ok: boolean;
   decision: 'accepted' | 'rejected_auth' | 'rejected_allowlist' | 'rejected_pty';
+  /** When 'accepted', which transport delivered the prompt. */
+  transport?: 'pty' | 'bridge';
   error?: string;
 }
 
@@ -147,30 +150,46 @@ export function crossSessionInject(
     }
   }
 
-  /* 3. Find PTY */
+  /* 3. Prefer direct PTY inject when daemon owns the session's PTY
+   * (faster, no bridge round-trip). Falls through to the bridge
+   * marker-drop path for sessions launched outside daemon-owned
+   * spawns (e.g. dashboard "Sessions" button → VS Code terminal). */
   const ptys = listPtys();
   const live = ptys.find(
     (p) => !p.exited && (p.ptyId === target_session || p.sessionId === target_session),
   );
-  if (!live) {
-    audit('rejected_pty', `no live PTY for "${target_session}"`);
+  if (live) {
+    const injectResult = ptyInject(live.ptyId, text, commit);
+    if (!injectResult.ok) {
+      const reason = (injectResult as { ok: false; error: string }).error;
+      audit('rejected_pty', reason);
+      return { ok: false, decision: 'rejected_pty', error: reason };
+    }
+    audit('accepted');
+    return { ok: true, decision: 'accepted', transport: 'pty' };
+  }
+
+  /* 4. Bridge fallback. queueSessionPrompt requires a session-id (not
+   * a ptyId), so we only attempt this when target_session looks like
+   * a UUID prefix or full UUID — the same shape sessions.ts resolves
+   * via .claude jsonl scan. */
+  const bridgeResult = commit
+    ? queueSessionPrompt(target_session, text)
+    : queueSessionSuggestion(target_session, text);
+  if (!bridgeResult.ok) {
+    audit(
+      'rejected_pty',
+      `no live PTY and bridge fallback failed: ${bridgeResult.error}`,
+    );
     return {
       ok: false,
       decision: 'rejected_pty',
-      error: `no live PTY session matching "${target_session}"`,
+      error: `no live PTY for "${target_session}" and bridge fallback failed: ${bridgeResult.error}`,
     };
   }
 
-  /* 4. Inject */
-  const injectResult = ptyInject(live.ptyId, text, commit);
-  if (!injectResult.ok) {
-    const reason = (injectResult as { ok: false; error: string }).error;
-    audit('rejected_pty', reason);
-    return { ok: false, decision: 'rejected_pty', error: reason };
-  }
-
   audit('accepted');
-  return { ok: true, decision: 'accepted' };
+  return { ok: true, decision: 'accepted', transport: 'bridge' };
 }
 
 /**

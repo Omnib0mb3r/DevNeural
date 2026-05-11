@@ -37,7 +37,10 @@ describe('DEVNEURAL_IDENTITY_FRESH_MS env override', () => {
   it('falls back to default when unset', async () => {
     delete process.env.DEVNEURAL_IDENTITY_FRESH_MS;
     const v = await loadConst();
-    expect(v).toBe(60 * 60 * 1000);
+    /* Default tightened from 60min -> 2min on 2026-05-11 to kill
+     * ghost tiles within two deck heartbeats of VS Code window
+     * close (bug: 2026-05-11-ghost-session-tiles). */
+    expect(v).toBe(2 * 60 * 1000);
   });
 
   it('honors an in-range integer (15s)', async () => {
@@ -49,18 +52,18 @@ describe('DEVNEURAL_IDENTITY_FRESH_MS env override', () => {
   it('rejects values under the floor', async () => {
     process.env.DEVNEURAL_IDENTITY_FRESH_MS = '500';
     const v = await loadConst();
-    expect(v).toBe(60 * 60 * 1000);
+    expect(v).toBe(2 * 60 * 1000);
   });
 
   it('rejects values over the ceiling (>24h)', async () => {
     process.env.DEVNEURAL_IDENTITY_FRESH_MS = String(48 * 60 * 60 * 1000);
     const v = await loadConst();
-    expect(v).toBe(60 * 60 * 1000);
+    expect(v).toBe(2 * 60 * 1000);
   });
 
   it('rejects non-numeric input', async () => {
     process.env.DEVNEURAL_IDENTITY_FRESH_MS = 'forever';
     const v = await loadConst();
-    expect(v).toBe(60 * 60 * 1000);
+    expect(v).toBe(2 * 60 * 1000);
   });
 });

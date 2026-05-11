@@ -41,12 +41,19 @@ export default function LexPage() {
     refetchInterval: 3_000,
   });
 
-  /* Pick the active Lex PTY: any non-exited PTY whose cwd ends in
-   * /brainstorm. We scope to that path so a daemon-PTY spawned for
-   * some other project (Start Claude buttons) doesn't show up here. */
-  const lexPty: PtyEntry | undefined = (ptysQ.data?.ptys ?? []).find(
-    (p) => !p.exited && /\/brainstorm\/?$/i.test(p.cwd.replace(/\\/g, "/")),
-  );
+  /* Pick the active Lex PTY: the most-recently-started non-exited PTY
+   * whose cwd ends in /brainstorm. We scope to that path so a daemon-
+   * PTY spawned for some other project (Start Claude buttons) doesn't
+   * show up here. The startedAt sort matters during a switch-to: while
+   * the old PTY is still finishing taskkill /F /T teardown (a few
+   * seconds on Windows) both ptys briefly satisfy the filter; picking
+   * the newest one ensures the terminal mirror, voice client, and
+   * inject all re-target the new session immediately. */
+  const lexPty: PtyEntry | undefined = (ptysQ.data?.ptys ?? [])
+    .filter(
+      (p) => !p.exited && /\/brainstorm\/?$/i.test(p.cwd.replace(/\\/g, "/")),
+    )
+    .sort((a, b) => b.startedAt - a.startedAt)[0];
 
   const spawnM = useMutation({
     mutationFn: () => spawnLex(),

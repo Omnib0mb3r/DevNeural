@@ -20,38 +20,29 @@ const SESSIONS_ROOT = path
   .join(os.homedir(), '.claude', 'projects')
   .replace(/\\/g, '/');
 const BRIDGE_DIR = path.posix.join(DATA_ROOT, 'session-bridge');
-/* "Active" used to be a heuristic on jsonl mtime. mtime lies: a session
- * gets a final write on /clear, on hook fires from another shell that
- * accidentally references the same id, etc. The truth lives in the
- * StreamDeck.App identity directory: one file per session whose host
- * process the deck app considers alive. We read that set and use it as
- * the authoritative liveness signal.
+/* Liveness is authoritative from the StreamDeck.App identity directory:
+ * one file per session whose VS Code window the deck app considers
+ * open. The daemon reads that set strictly. No mtime fallback: a jsonl
+ * file's mtime advances on /clear, on hook side-effects, and on cross-
+ * shell writes that have nothing to do with whether the VS Code window
+ * is still alive. Trusting mtime produces phantom tiles after the user
+ * closes the terminal. The deck identity directory is the only signal
+ * that maps to "VS Code terminal is currently open."
  *
- * The deck app isn't required, though. When the identity directory
- * doesn't exist, fall back to a generous mtime window so users who
- * never installed the deck still see their sessions. */
-/* Mtime-fallback freshness window. Used when the StreamDeck.App identity
- * dir is missing/empty so the daemon falls back to jsonl mtime. Keep
- * short — 24h was wide enough that any session opened in the last day
- * showed as "active" forever, including post-mortem zombies the deck
- * never cleaned. 30min covers a normal typing pause; longer gaps mean
- * the user actually walked away. */
-const ACTIVE_THRESHOLD_MS = 30 * 60 * 1000;
-/* Identity-file freshness window. StreamDeck.App's CleanStaleFiles uses
- * a 1h identity-mtime threshold (or VS-Code-window match) to decide
- * dead-vs-alive, but it only runs at app startup, not on the periodic
- * 60s sweep. Until that ships, the daemon applies its own gate so an
- * orphaned identity file from a session whose host died ungracefully
- * doesn't paint a phantom-active tile until the deck app restarts.
- *
- * Wave 3 fixup (bug: 2026-05-10-state-tracker-loses-live-sessions):
- * the constant is now overridable via `DEVNEURAL_IDENTITY_FRESH_MS` so
- * hosts with deck-tray re-registration windows wider than the default
- * (slow filesystem journal, headless boot, etc.) can extend the
- * liveness gate without a code change. Read at module load; daemon
- * restart picks up env changes. Values outside [1000, 24h] fall back
- * to the default to avoid foot-guns. */
-const DEFAULT_IDENTITY_FRESH_MS = 60 * 60 * 1000;
+ * Bug fix (2026-05-11): user-reported ghost tiles for sessions whose
+ * VS Code windows were already closed. The 30min mtime fallback and
+ * 1h identity-freshness window let dead sessions linger on both the
+ * virtual deck (dashboard) and the physical Elgato deck. We now
+ * require a fresh identity file and drop dead sessions from the
+ * listSessions response entirely, so both decks see the same truth. */
+/* Identity-file freshness window. StreamDeck.App refreshes each
+ * identity file on its window-presence heartbeat. A 2-minute window
+ * covers one missed heartbeat without flickering live tiles, but
+ * kills ghost tiles within two heartbeats of window close.
+ * Overridable via `DEVNEURAL_IDENTITY_FRESH_MS` for hosts with slower
+ * deck cadence. Values outside [1000, 24h] fall back to the default
+ * to avoid foot-guns. */
+const DEFAULT_IDENTITY_FRESH_MS = 2 * 60 * 1000;
 const IDENTITY_FRESH_MS = (() => {
   const raw = process.env.DEVNEURAL_IDENTITY_FRESH_MS;
   if (!raw) return DEFAULT_IDENTITY_FRESH_MS;
@@ -76,8 +67,14 @@ const STREAMDECK_IDENTITY_DIR = (() => {
   );
 })();
 
-function readLiveSessionIds(): Set<string> | null {
-  if (!fs.existsSync(STREAMDECK_IDENTITY_DIR)) return null;
+function readLiveSessionIds(): Set<string> {
+  /* Strict identity-only liveness. Returns the set of session ids
+   * whose identity file is fresh (mtime within IDENTITY_FRESH_MS).
+   * Empty set when the deck dir is missing/unreadable: no fallback,
+   * because no other signal reliably maps to "VS Code terminal is
+   * currently open." Without the deck tray running, both decks
+   * legitimately have no live data to display. */
+  if (!fs.existsSync(STREAMDECK_IDENTITY_DIR)) return new Set();
   try {
     const ids = new Set<string>();
     const now = Date.now();
@@ -94,16 +91,9 @@ function readLiveSessionIds(): Set<string> | null {
       }
       ids.add(sid);
     }
-    /* Empty set means the deck tray app is running but has not (yet)
-     * registered any session for this boot. Treat the same as "deck
-     * not running" so the mtime fallback kicks in instead of marking
-     * every session inactive. Otherwise a daemon-restart-before-deck-
-     * registers race makes the entire sessions list show inactive
-     * even though jsonls are being appended live. */
-    if (ids.size === 0) return null;
     return ids;
   } catch {
-    return null;
+    return new Set();
   }
 }
 
@@ -461,7 +451,6 @@ export function listSessions(): SessionListItem[] {
   if (!fs.existsSync(SESSIONS_ROOT)) return [];
   const out: SessionListItem[] = [];
   const slugs = fs.readdirSync(SESSIONS_ROOT, { withFileTypes: true });
-  const now = Date.now();
   const liveIds = readLiveSessionIds();
   for (const slug of slugs) {
     if (!slug.isDirectory()) continue;
@@ -479,6 +468,12 @@ export function listSessions(): SessionListItem[] {
       // Claude Code but should not show up as active tiles. The
       // SessionStart hook records them in the superseded store.
       if (isSuperseded(sessionId)) continue;
+      // Strict liveness: only sessions whose StreamDeck.App identity
+      // file is fresh appear in the response. Sessions whose VS Code
+      // window has closed (no fresh identity file) are omitted
+      // entirely. Both physical deck and virtual deck consume this
+      // list, so omission removes the tile from both surfaces.
+      if (!liveIds.has(sessionId)) continue;
       const file = path.posix.join(slugDir, e.name);
       let stat: fs.Stats;
       try {
@@ -486,19 +481,11 @@ export function listSessions(): SessionListItem[] {
       } catch {
         continue;
       }
-      // Authoritative liveness from the deck app's identity dir when
-      // available; mtime fallback otherwise.
-      const isActive = liveIds
-        ? liveIds.has(sessionId)
-        : now - stat.mtimeMs < ACTIVE_THRESHOLD_MS;
-      // For active sessions, tail-derive phase so the dashboard reflects
-      // current reality even when chokidar misses change events. Stale
-      // sessions just take whatever the in-memory tracker last knew.
+      // Tail-derive phase so the dashboard reflects current reality
+      // even when chokidar misses change events.
       let phase = getPhase(sessionId);
-      if (isActive) {
-        const derived = derivePhaseFromTail(file);
-        if (derived !== 'unknown') phase = derived;
-      }
+      const derived = derivePhaseFromTail(file);
+      if (derived !== 'unknown') phase = derived;
       const pending = getPending(sessionId);
       // Pending prompt overrides tail-derived phase: if Claude is waiting
       // for an answer, the tile / detail must show 'permission' even
@@ -514,12 +501,12 @@ export function listSessions(): SessionListItem[] {
         jsonl_path: file,
         bytes: stat.size,
         last_modified_ms: stat.mtimeMs,
-        active: isActive,
+        active: true,
         has_summary: Boolean(readSummary(sessionId)),
         has_task: Boolean(readCurrentTask(sessionId)),
         phase,
         pending_prompt: pending,
-        context: isActive ? deriveContextFromTail(file) : null,
+        context: deriveContextFromTail(file),
         user_label: brainstorm?.user_label ?? null,
         derived_label: brainstorm?.derived_label ?? null,
       });

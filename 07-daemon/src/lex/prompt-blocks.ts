@@ -102,11 +102,28 @@ function ensurePromptsRoot(): void {
 }
 
 function readOrSeed(filePath: string, defaultText: string): string {
-  ensurePromptsRoot();
-  if (fs.existsSync(filePath)) {
-    return fs.readFileSync(filePath, 'utf-8');
+  try {
+    ensurePromptsRoot();
+  } catch {
+    /* mkdir may fail under personality-guard ACLs; fall through */
   }
-  fs.writeFileSync(filePath, defaultText, 'utf-8');
+  try {
+    if (fs.existsSync(filePath)) {
+      return fs.readFileSync(filePath, 'utf-8');
+    }
+  } catch {
+    return defaultText;
+  }
+  /* First-run seed write. If the parent directory is ACL-locked
+   * (e.g. personality-guard applied DENY:W), fall back to the in-memory
+   * default rather than throwing out of system-prompt assembly and
+   * breaking /pty/spawn-lex. The next operator-managed seed write will
+   * still land on disk once the ACL is corrected. */
+  try {
+    fs.writeFileSync(filePath, defaultText, 'utf-8');
+  } catch {
+    /* swallow; return default below */
+  }
   return defaultText;
 }
 
