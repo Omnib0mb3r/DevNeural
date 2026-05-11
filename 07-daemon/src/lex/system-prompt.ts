@@ -542,6 +542,14 @@ Rules for filesystem access during a session:
 4. **No speculative exploration.** Do not grep or list directories
    "to see what is there" unless answering a specific question that
    requires it. Prefer targeted reads over broad scans.
+
+5. **Host shell tooling.** This is a Windows host. Do NOT pipe to
+   \`python\`, \`python3\`, \`bash -c\` (in cmd.exe contexts), or any
+   POSIX-only utility that isn't on PATH. Confirmed-available tools:
+   \`curl\`, \`grep\`, \`sed\`, \`awk\`, \`find\` (git-bash), \`node -e\`,
+   \`gh\`, \`git\`. For JSON parsing in shell, use \`node -e "..."\` or
+   pipe to a Read tool that already returns JSON. \`jq\` is NOT
+   installed; pick \`node -e\` for ad-hoc shaping. Never \`python -c\`.
 `;
 
 /* Wave 3 Lane B step 32 (LX-11a). Internal-first retrieval bias rule.
