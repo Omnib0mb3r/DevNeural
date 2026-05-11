@@ -6,6 +6,12 @@
 
 ---
 
+## Changelog
+
+- **2026-05-11 (Wave 3 fixup sprint).** Bug-fix sprint between Wave 3 push and Wave 4 kickoff closed every open dashboard / voice / state-tracker bug. Items that this plan had implicitly tagged as Wave 4 carry-overs no longer apply: `brainstorm-picker-and-transcripts`, `cc-feedback-prompt-unanswerable`, and `state-tracker-loses-live-sessions` are all "fixed (pending soak)". The leftover-session-tiles bug also closed (24h soak satisfied). Test count baseline shifts from 146 to **162** because three of the fixup commits added vitest coverage (brainstorm-chunks +3, identity-fresh-env +5, cc-feedback-prompt-detect +8). Update the "Test count baseline" line under acceptance criteria accordingly. The `BrainstormTranscript` subcomponent (under `BrainstormDetail.tsx`) and the `GET /brainstorms/:id/chunks` route shipped here, so Wave 4 transcript-related work can build on them instead of recreating them.
+
+---
+
 ## Headline goals
 
 Two anchors for Wave 4:
@@ -53,9 +59,16 @@ Per feature:
 
 - **Spec only in Wave 4, no implementation.** Document the sync strategy: which tables sync, which stay per-host, conflict resolution policy. Implementation defers to Wave 5 unless a real second host appears.
 
-### Carry-overs from Wave 3 (none expected)
+### Carry-overs from Wave 3
 
-If the Wave 3 verification pass surfaces fails that weren't fixed in-place, they roll into Wave 4 as fixup items. Confirm at Wave 4 kickoff after verification report comes back.
+The 2026-05-11 fixup sprint absorbed every carry-over the original
+Wave 3 verification report flagged (brainstorm picker + transcripts,
+state-tracker live-session loss, cc-feedback prompt). Plus three
+2026-05-11-dated dashboard bugs (PTT release, resume action, narrow
+viewport overflow). Plus a closed 2026-05-05 leftover-session-tiles
+bug whose soak window expired. So no carry-overs are expected at
+Wave 4 kickoff. The fixup sprint commits are on origin/master ahead
+of Wave 4 work.
 
 ---
 
@@ -105,7 +118,7 @@ Conflict surface is small (Lane A: `08-dashboard/src/orb/**`, Lane B: `07-daemon
 - **Permission tier audit complete.** Doc in `docs/spec/PERMISSION-AUDIT.md` reports whether enforcement is filesystem-level or prompt-level, with remediation if prompt-only.
 - **Approval batching live.** Curator panel shows grouped proposals. Trust delegation toggle works.
 - **Cross-host sync spec exists** at `docs/spec/CROSS-HOST-SYNC.md`. Implementation NOT required, spec only.
-- **Test count baseline.** Wave 4 entry: 146 (post Wave 3 verification). Wave 4 exit target: 170+.
+- **Test count baseline.** Wave 4 entry: 162 (post Wave 3 verification + 2026-05-11 fixup sprint). Wave 4 exit target: 185+.
 
 ---
 
