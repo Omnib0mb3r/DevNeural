@@ -133,6 +133,21 @@ export interface LexRetrievalLogRow {
   decision: string | null;
 }
 
+/* cross_session_injection_log row. Wave 3 Lane B step 38 (LX-15).
+ * Audit trail for every POST /lex/inject-cross-session call; records
+ * whether the attempt was accepted or rejected and why. */
+export interface CrossSessionInjectionLogRow {
+  id: string;
+  ts: string;
+  target_session: string;
+  caller_label: string | null;
+  text_preview: string;
+  text_length: number;
+  decision: 'accepted' | 'rejected_auth' | 'rejected_allowlist' | 'rejected_pty';
+  reject_reason: string | null;
+  brainstorm_id: string | null;
+}
+
 /* runtime_config row. Wave 2 day 4 step 19 (A15) pause-mode toggle
  * lives here so a daemon restart is not required to flip the gate.
  * Generic key/value JSON so future toggles (lint cadence override,
@@ -1417,6 +1432,78 @@ export class IndexDb {
       return rows as LexRetrievalLogRow[];
     } catch {
       /* table may not exist yet */
+      return [];
+    }
+  }
+
+  /** Write one cross-session injection audit record. Silently swallowed if
+   * the table doesn't exist yet (migration 017 not run). */
+  insertCrossSessionLog(row: {
+    id: string;
+    target_session: string;
+    caller_label?: string | null;
+    text_preview: string;
+    text_length: number;
+    decision: 'accepted' | 'rejected_auth' | 'rejected_allowlist' | 'rejected_pty';
+    reject_reason?: string | null;
+    brainstorm_id?: string | null;
+  }): void {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO cross_session_injection_log
+             (id, target_session, caller_label, text_preview, text_length, decision, reject_reason, brainstorm_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          row.id,
+          row.target_session,
+          row.caller_label ?? null,
+          row.text_preview,
+          row.text_length,
+          row.decision,
+          row.reject_reason ?? null,
+          row.brainstorm_id ?? null,
+        );
+    } catch {
+      /* table may not exist yet; not fatal */
+    }
+  }
+
+  listCrossSessionLogs(opts: {
+    target_session?: string;
+    decision?: 'accepted' | 'rejected_auth' | 'rejected_allowlist' | 'rejected_pty';
+    limit?: number;
+  } = {}): CrossSessionInjectionLogRow[] {
+    try {
+      const limit = Math.min(200, Math.max(1, opts.limit ?? 50));
+      if (opts.target_session) {
+        const rows = this.db
+          .prepare(
+            `SELECT * FROM cross_session_injection_log
+             WHERE target_session = ?
+             ORDER BY ts DESC LIMIT ?`,
+          )
+          .all(opts.target_session, limit);
+        return rows as CrossSessionInjectionLogRow[];
+      }
+      if (opts.decision) {
+        const rows = this.db
+          .prepare(
+            `SELECT * FROM cross_session_injection_log
+             WHERE decision = ?
+             ORDER BY ts DESC LIMIT ?`,
+          )
+          .all(opts.decision, limit);
+        return rows as CrossSessionInjectionLogRow[];
+      }
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM cross_session_injection_log ORDER BY ts DESC LIMIT ?`,
+        )
+        .all(limit);
+      return rows as CrossSessionInjectionLogRow[];
+    } catch {
       return [];
     }
   }

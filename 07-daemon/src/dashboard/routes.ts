@@ -3157,6 +3157,97 @@ export async function registerDashboardRoutes(
     return { ok: true, result: r };
   });
 
+  /* ── Cross-session prompt injection (Wave 3 Lane B step 38 / LX-15) ──
+   *
+   * POST /lex/inject-cross-session
+   *   Body: { target_session, token, text, caller_label?, commit? }
+   *   token = HMAC-SHA256(auth_secret, `${target_session}:${unix_minute}`)
+   *
+   * POST /auth/cross-session-token
+   *   Body: { target_session }
+   *   Requires valid dn_session cookie. Returns a short-lived token.
+   *
+   * GET /lex/injection-log
+   *   Query: target_session?, decision?, limit?
+   *   Returns audit records from cross_session_injection_log.
+   */
+  app.post('/lex/inject-cross-session', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      target_session?: string;
+      token?: string;
+      text?: string;
+      caller_label?: string;
+      commit?: boolean;
+    };
+    if (!body.target_session || typeof body.target_session !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'target_session required' };
+    }
+    if (!body.token || typeof body.token !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'token required' };
+    }
+    if (!body.text || typeof body.text !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'text required' };
+    }
+    if (body.text.length > 4096) {
+      reply.code(400);
+      return { ok: false, error: 'text too long (max 4096 chars)' };
+    }
+    const { crossSessionInject } = await import('../lex/cross-session-inject.js');
+    const result = crossSessionInject(
+      {
+        target_session: body.target_session,
+        token: body.token,
+        text: body.text,
+        caller_label: body.caller_label,
+        commit: body.commit !== false,
+      },
+      store.db,
+    );
+    if (!result.ok) {
+      const code =
+        result.decision === 'rejected_auth'
+          ? 401
+          : result.decision === 'rejected_allowlist'
+            ? 403
+            : 422;
+      reply.code(code);
+    }
+    return result;
+  });
+
+  app.post('/auth/cross-session-token', async (req, reply) => {
+    const body = (req.body ?? {}) as { target_session?: string };
+    if (!body.target_session || typeof body.target_session !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'target_session required' };
+    }
+    const { issueToken } = await import('../lex/cross-session-inject.js');
+    return {
+      ok: true,
+      token: issueToken(body.target_session),
+      target_session: body.target_session,
+      valid_for_s: 120,
+    };
+  });
+
+  app.get('/lex/injection-log', async (req) => {
+    const q = (req.query ?? {}) as {
+      target_session?: string;
+      decision?: string;
+      limit?: string;
+    };
+    const opts: Parameters<typeof store.db.listCrossSessionLogs>[0] = {};
+    if (q.target_session) opts.target_session = q.target_session;
+    if (q.decision) {
+      opts.decision = q.decision as 'accepted' | 'rejected_auth' | 'rejected_allowlist' | 'rejected_pty';
+    }
+    if (q.limit) opts.limit = Number(q.limit);
+    return { ok: true, logs: store.db.listCrossSessionLogs(opts) };
+  });
+
   /* POST /curator/wrong (Wave 2 day 4 step 17 / CI-5 / A9). The
    * dashboard "this looks wrong" button posts here. Does the same
    * weight drop + archive-on-3 work as /admin/wiki/correct/:id, plus
