@@ -53,7 +53,7 @@ import {
 } from '../lex/brainstorm-store.js';
 import { processAssistantTurn } from '../lex/artifact-parser.js';
 import { buildVoiceSnapshot } from '../lex/snapshot-context.js';
-import { checkToolGate } from '../lex/tool-gate.js';
+import { checkToolGate, notifyLargeFsRead, LARGE_FS_READ_LINE_THRESHOLD } from '../lex/tool-gate.js';
 import { runSessionEndPipeline } from '../lex/session-end-pipeline.js';
 import { appendUtterance as appendSessionAudio } from './audio-bundle.js';
 
@@ -484,6 +484,32 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       }
     } catch {
       /* artifact extraction is observational; never block speak() */
+    }
+    /* Wave 3 Lane B step 41 (LX-16). Heuristic large-fs-read detector.
+     * When Lex returns a Bash tool result that looks like a grep/find
+     * dump exceeding LARGE_FS_READ_LINE_THRESHOLD lines, emit an
+     * awareness event so the dashboard trace shows the read. The
+     * detection is line-count only; it does not parse tool_use blocks. */
+    try {
+      const lineCount = text.split('\n').length;
+      if (lineCount >= LARGE_FS_READ_LINE_THRESHOLD) {
+        /* Extract first word-like pattern as a proxy for the grep arg. */
+        const patternMatch = text.match(/grep\s+(?:-[a-z]+\s+)*["']?([^\s"']+)["']?/i);
+        const pattern = patternMatch?.[1] ?? '(large output)';
+        let brainstormId: string | null = null;
+        try {
+          const handle = state.bindKey
+            ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
+            : undefined;
+          if (handle?.sessionId) {
+            const bs = getBrainstormByClaudeSessionId(handle.sessionId);
+            if (bs) brainstormId = bs.id;
+          }
+        } catch { /* best-effort */ }
+        notifyLargeFsRead({ pattern, line_count: lineCount, brainstorm_id: brainstormId });
+      }
+    } catch {
+      /* observational; never block turn */
     }
     if (state.mode === 'notes') {
       /* Surface a short ack so the panel can show "captured" — but

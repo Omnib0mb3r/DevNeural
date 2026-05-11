@@ -512,6 +512,38 @@ talked about", search /lex/recall for recent matches and cite by
 source class and session label.
 `;
 
+/* Wave 3 Lane B step 41 (LX-16). Live filesystem awareness rules.
+ * Teaches Lex to stay in lane when reading the filesystem and to
+ * compress large grep/find results before returning them to the user.
+ * Also instructs Lex to emit awareness events for large reads so the
+ * dashboard trace panel picks them up. */
+const LIVE_FS_AWARENESS = `# Live filesystem awareness
+
+Rules for filesystem access during a session:
+
+1. **Stay in lane.** Only read files under the active project CWD,
+   DATA_ROOT, and the Lex prompts directory. Do not walk parent
+   directories or unrelated projects without explicit instruction.
+
+2. **Compress large grep output.** When a Bash grep/find returns more
+   than ~30 matching lines, do NOT paste the raw output into your
+   response. Instead:
+   - Summarise what was found (counts, file names, key patterns).
+   - Offer to show specific excerpts if Michael needs them.
+   - If you used the result to answer a question, cite it as
+     [grep: <pattern> in <dir>] rather than quoting every line.
+
+3. **Emit capture artifact on large reads.** When you read a file
+   larger than ~500 lines (or run a find/glob that returns >50 paths),
+   emit the following artifact before your prose summary so the
+   dashboard trace panel records it:
+   <artifact type="large-fs-read" path="<file-or-pattern>" lines="<n>" />
+
+4. **No speculative exploration.** Do not grep or list directories
+   "to see what is there" unless answering a specific question that
+   requires it. Prefer targeted reads over broad scans.
+`;
+
 /* Wave 3 Lane B step 32 (LX-11a). Internal-first retrieval bias rule.
  * Injected between API surface and self-check so it is always present
  * and applies regardless of mode. */
@@ -565,6 +597,10 @@ Do not send a meta apology.
 11. Did you synthesise, or just recite the snapshot? If a human
     reading the dashboard panel could give the same answer,
     rewrite.
+12. Is the terminal currently showing a feedback prompt (rating, y/n,
+    continue?, etc.) rather than a normal shell or editor? If yes,
+    answer the prompt directly and STOP. Do not interpret it as a
+    user question and do not compose a new response about the topic.
 `;
 
 function snapshotProjects(): string {
@@ -728,6 +764,7 @@ ${snapshotRecentWiki()}
     ARTIFACT_CONTRACTS,
     API_SURFACE,
     INTERNAL_FIRST,
+    LIVE_FS_AWARENESS,
     ...(threadDocBlock ? [threadDocBlock] : []),
     SELF_CHECK,
     refusalBlocks.join('\n\n'),

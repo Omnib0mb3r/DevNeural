@@ -139,5 +139,34 @@ function buildBlockNote(term: string, vocabKind: string): string {
   );
 }
 
+/**
+ * Emit an awareness event when the voice WS detects that Lex returned
+ * a large filesystem read (grep output exceeding the line threshold).
+ * Called from lex-voice-ws.ts after receiving a Lex turn containing
+ * a large-fs-read artifact tag or raw grep output over the limit.
+ *
+ * Threshold: 30+ lines of grep output or a file read of 500+ lines.
+ * Detection is heuristic (line count of the injected text) since the
+ * PTY output is not structured.
+ */
+export function notifyLargeFsRead(opts: {
+  pattern: string;
+  line_count: number;
+  brainstorm_id?: string | null;
+}): void {
+  emitAwarenessEvent({
+    kind: 'capture',
+    label: `large-fs-read: "${opts.pattern}" (${opts.line_count} lines)`,
+    detail: {
+      pattern: opts.pattern,
+      line_count: opts.line_count,
+    },
+    brainstorm_id: opts.brainstorm_id ?? null,
+  });
+}
+
+/** Threshold above which a Bash result is considered a "large read". */
+export const LARGE_FS_READ_LINE_THRESHOLD = 30;
+
 /* Export for use in tests and route handlers. */
 export { buildDynamicVocab };
