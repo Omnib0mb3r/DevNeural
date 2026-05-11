@@ -120,9 +120,9 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
         resumed: Boolean(spawned.resumed),
       };
     },
-    onSettled: () => {
+    onSettled: async () => {
+      await qc.refetchQueries({ queryKey: ["pty-list"] });
       qc.invalidateQueries({ queryKey: ["lex-sessions"] });
-      qc.invalidateQueries({ queryKey: ["pty-list"] });
     },
   });
 
@@ -147,7 +147,13 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
   /* Start a fresh brainstorm. If a Lex PTY is already live we kill it
    * first so spawn-lex doesn't end up with two competing tiles in the
    * brainstorm cwd, then spawn a clean session. The 400ms gap matches
-   * the page-level newSessionM mutation in app/lex/page.tsx. */
+   * the page-level newSessionM mutation in app/lex/page.tsx.
+   *
+   * onSettled awaits the pty-list refetch so the mutation's isPending
+   * flag stays true until the parent page sees the new PTY. Without
+   * the await, the page's empty-state condition flickered to true for
+   * a 0-3s window while the dashboard waited on the next 3s tick,
+   * unmounting the voice panel the user just opened. */
   const newM = useMutation({
     mutationFn: async () => {
       if (activePtyId) {
@@ -164,9 +170,9 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
       }
       return spawned;
     },
-    onSettled: () => {
+    onSettled: async () => {
+      await qc.refetchQueries({ queryKey: ["pty-list"] });
       qc.invalidateQueries({ queryKey: ["lex-sessions"] });
-      qc.invalidateQueries({ queryKey: ["pty-list"] });
     },
   });
 

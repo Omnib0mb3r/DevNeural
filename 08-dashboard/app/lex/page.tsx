@@ -55,13 +55,26 @@ export default function LexPage() {
     )
     .sort((a, b) => b.startedAt - a.startedAt)[0];
 
+  /* All three mutations await the pty-list refetch in onSettled so the
+   * mutation's isPending flag stays true until ptysQ has actually
+   * caught up to the new state. Without the await, isPending flipped
+   * back to false immediately after the POST returned while ptysQ
+   * still showed the stale (empty) list, so the page evaluated
+   * `(!lexPty && !spawnM.isPending)` to true for a 0-3s window and
+   * unmounted the voice panel. The user saw the panel briefly open,
+   * then disappear with no input. Awaiting the refetch closes the
+   * gap so the panel stays mounted across the spawn handoff. */
   const spawnM = useMutation({
     mutationFn: () => spawnLex(),
-    onSettled: () => qc.invalidateQueries({ queryKey: ["pty-list"] }),
+    onSettled: async () => {
+      await qc.refetchQueries({ queryKey: ["pty-list"] });
+    },
   });
   const killM = useMutation({
     mutationFn: (id: string) => ptyKill(id),
-    onSettled: () => qc.invalidateQueries({ queryKey: ["pty-list"] }),
+    onSettled: async () => {
+      await qc.refetchQueries({ queryKey: ["pty-list"] });
+    },
   });
   /* "New session" = end the current Lex (if any) then spawn a fresh
    * one. Sequenced so the new spawn doesn't race the kill's exit
@@ -76,7 +89,9 @@ export default function LexPage() {
       }
       return spawnLex();
     },
-    onSettled: () => qc.invalidateQueries({ queryKey: ["pty-list"] }),
+    onSettled: async () => {
+      await qc.refetchQueries({ queryKey: ["pty-list"] });
+    },
   });
 
   const [pendingText, setPendingText] = useState("");
