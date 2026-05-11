@@ -108,22 +108,18 @@ const SESSION_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /* Spoken end-session command. Matched against the transcript before we
- * inject into Lex so the user can stop the voice loop hands-free.
- * Every matching pattern now requires an explicit "lex" mention so
- * Whisper hallucinations on short noisy clips ("stop listening",
- * "thank you, bye", "end of conversation") can no longer kill an
- * active session by accident.
- *
- * Bug fix (2026-05-11-lex-resets-after-first-utterance): the previous
- * regex tripped on common Whisper trailing-silence hallucinations,
- * so the very first real utterance after a resume was followed by
- * a phantom session-end frame, tearing down the panel.
+ * inject into Lex so the user can stop the voice loop hands-free —
+ * "end session", "stop voice", "goodbye Lex" all close the panel
+ * without Lex generating a normal text reply that the user would then
+ * have to interrupt. Conversation mode tears down immediately; notes
+ * mode routes through the existing finalize-notes path so the
+ * dictation summary still ships.
  *
  * Whisper transcripts come back lower-cased after our normalize pass
- * (punctuation stripped, whitespace collapsed). Patterns use word
- * boundaries so "extend session" / "Alexa" / "annex" don't false-fire. */
+ * (punctuation stripped, whitespace collapsed). Patterns are matched
+ * with word boundaries so "extend session" doesn't false-fire. */
 const END_SESSION_RE =
-  /\b(?:end|stop|finish|close)\s+(?:the\s+|this\s+|our\s+)?(?:session|chat|conversation)\s+(?:with\s+)?lex\b|\b(?:goodbye|bye)\s+lex\b|\bhey\s+lex[, ]+(?:stop|end|goodbye|bye)\b|\blex[, ]+(?:stop|end|goodbye|bye)(?:\s+listening)?\b/;
+  /\b(?:end|stop|finish|close)\s+(?:the\s+|this\s+|our\s+)?(?:session|chat|conversation|voice|listening)\b|\b(?:goodbye|bye)\s+lex\b|\bstop\s+listening\b/;
 
 function matchesEndSession(text: string): boolean {
   const norm = text
@@ -859,34 +855,14 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * detected disconnect): the first call sets sessionEndFired and any
    * subsequent calls no-op so a brainstorm session never gets a
    * double-summary or a redundant force-ingest. Best-effort: failures
-   * are logged not thrown so teardown always proceeds.
-   *
-   * Bug fix (2026-05-11-lex-resets-after-first-utterance): WS close
-   * is NOT a reliable signal that the brainstorm is over. The voice
-   * panel can disconnect for a dozen reasons that do not end the
-   * session: user mutes the mic, browser tab loses focus, network
-   * blip, page navigation, or the dashboard rebinds the WS after a
-   * resume picks a new PTY. Previously every one of those paths fired
-   * runSessionEndPipeline -> endBrainstorm, so the brainstorm row
-   * flipped to status='ended' while the underlying Lex PTY was still
-   * happily running. The dashboard then snapped to the "Lex isn't
-   * running" empty state. Only fire on ws-close when the bound PTY
-   * is actually gone; pty-host's onExit handler already covers the
-   * "PTY died for real" path with reason='pty-exit'. */
+   * are logged not thrown so teardown always proceeds. */
   async function fireSessionEndPipeline(reason: string): Promise<void> {
     if (state.sessionEndFired) return;
-    const handle = state.bindKey
-      ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
-      : null;
-    if (reason === 'ws-close' && handle && !handle.exited) {
-      /* PTY is still alive; the user just disconnected the voice
-       * client. Leave the brainstorm row active so the dashboard
-       * keeps rendering and the next voice connect (or text inject)
-       * can resume without losing the session. */
-      return;
-    }
     state.sessionEndFired = true;
     try {
+      const handle = state.bindKey
+        ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
+        : null;
       const claudeSessionId =
         handle?.sessionId ?? state.watchSessionId ?? null;
       const ptyId = handle?.ptyId ?? null;
