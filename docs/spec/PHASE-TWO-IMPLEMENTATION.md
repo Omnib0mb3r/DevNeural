@@ -1421,6 +1421,57 @@ Day 5 commit: `feat(lex): wave 2 day 5 personality + feedback loop`.
 
 ---
 
+### Wave 3 - Lex (Lane B parallel track)
+
+Parallel lane running alongside the Wave 3 orb/graph/awareness work in Lane A.
+Steps 30+ to avoid conflicts with Lane A numbering (adjust if Lane A ships fewer steps).
+
+30. **Thread doc handoff (LX-9).** `lex/thread-doc.ts` llama job runs at session end and writes a pointer-style doc to `<DATA_ROOT>/lex/thread-docs/<brainstormId>.md`. Fields: what we worked on, decisions reached, blockers encountered, who Claude is right now. Hook wired into `session-end-pipeline.ts` as step 9. Next Lex spawn loads the most-recent thread doc and injects it into the system prompt via a new `threadDoc` prompt block in `system-prompt.ts`. Pointers only: Lex dereferences the underlying brainstorm on demand via `/lex/sessions/:id`. Commit: `feat(lex): wave 3 step 30 thread-doc handoff`.
+
+31. **Bounded chunk retrieval (LX-10).** `lex/chunk-retrieval.ts` helper takes a query string and returns top 2-3 `brainstorm_chunks` rows by cosine similarity using the existing Xenova embedder infra. Exposed via daemon route `POST /lex/chunk-search { q, limit? }` and as a Lex bash-callable helper function. Commit: `feat(lex): wave 3 step 31 bounded chunk retrieval`.
+
+32. **Internal-first retrieval bias - prompt rule (LX-11a).** New prompt block injected into `system-prompt.ts` stating: "Before any web search, check filesystem grep, brainstorm chunks, and wiki pages. External search is the fallback, not the default. If internal retrieval yields weak results (top cosine < 0.25), say so explicitly and offer external as a next step." Commit: `feat(lex): wave 3 step 32a internal-first prompt rule`.
+
+33. **Internal-first retrieval bias - tool gate (LX-11b).** Middleware in `voice/lex-voice-ws.ts` (or sibling `lex/tool-gate.ts`) that intercepts WebSearch tool invocations when the user's input contains a term from the project vocabulary list. Vocabulary list auto-generated from project registry (same data the orb uses). Gate blocks external until internal retrieval confirms low results; surfaces block reason via `emitAwarenessEvent({kind:'manual', label:'web-search blocked: internal vocab match: <term>'})`. Commit: `feat(lex): wave 3 step 33 tool-gate middleware`.
+
+34. **Retrieval trace log (LX-12a) - migration 015.** New table `lex_retrieval_log (id TEXT PRIMARY KEY, brainstorm_id TEXT, ts TEXT, query TEXT, kind TEXT CHECK(kind IN ('grep','chunks','wiki','web')), results_json TEXT, decision TEXT)`. Migration file `015-lex-retrieval-log.sql`. IndexDb methods: `insertRetrievalLog`, `listRetrievalLogs`. Commit: `feat(lex): wave 3 step 34 retrieval-log migration`.
+
+35. **Retrieval trace observability (LX-12b).** All retrieval helpers (chunk search, wiki recall, web search gate) write rows into `lex_retrieval_log`. Daemon route `GET /lex/retrieval-trace?brainstorm_id=<id>&limit=<n>` lists recent rows. Dashboard panel `08-dashboard/src/system/RetrievalTracePanel.tsx` polls the route and renders a timeline of retrieval decisions. Commit: `feat(lex,dashboard): wave 3 step 35 retrieval trace panel`.
+
+36. **Curator events in live_state (LX-13).** Extend `lex/snapshot-context.ts` (`buildVoiceSnapshot`) to include open audit findings (high-severity, open status), recent lint flags, and draft conflicts in the `<live_state>` block. Read from SQLite via existing `IndexDb` helpers. Surface only actionable items (count + worst-severity label). Commit: `feat(lex): wave 3 step 36 curator events in live_state`.
+
+37. **Janitor memory consolidation (LX-14).** `lex/memory-janitor.ts` walks `brainstorm_chunks`, proposes merge candidates (high cosine between chunk pairs) and flags potential contradictions (same topic, divergent sentiment). Writes to `audit_findings` with `source='janitor'` (extend the source enum). Batched approval UI at `08-dashboard/src/system/JanitorApprovalsPanel.tsx`. Manual trigger `POST /admin/janitor/run`; daemon weekly timer. Commit: `feat(lex): wave 3 step 37 memory janitor`.
+
+38. **Permission tiers on personality files (LX-15).** On daemon boot: set Windows ACLs via `icacls` (execFile with `windowsHide:true` and validated-path allowlist) or POSIX `chmod` on non-Windows hosts on personality file directories. Tiers: read-only for `lex-prompts/`, refusal-contract files, voice contract; read-write-proposal for feedback memories and few-shots (gated by approval flow); auto-write for session logs, awareness events. Model documented in comment block in `lex/permission-tiers.ts`. Commit: `feat(lex): wave 3 step 38 personality-file permission tiers`.
+
+39. **Cross-session prompt injection (LX-16).** Extend RemoteTrigger (or pty-host) so brainstorm Lex can inject prompts into named live Claude Code worker sessions by session-name pattern. Auth: PIN-derived HMAC token checked against session allowlist (configurable env `DEVNEURAL_CROSS_SESSION_ALLOWLIST`). New table `cross_session_injection_log (id, src_brainstorm_id, target_session_pattern, prompt_text, injected_at, auth_method)`. Route `POST /lex/inject-cross-session`. Commit: `feat(lex): wave 3 step 39 cross-session injection`.
+
+40. **Heartbeat watcher Windows Service (OP-1 carry-over).** Script `07-daemon/heartbeat-watcher/src/watcher.js`. Standalone Node process: listens on port 3748, accepts `POST /heartbeat`, tracks last-beat timestamp in memory and in `heartbeat-watcher/data/last-beat.json`, fires Windows toast (via BurntToast PowerShell) and webhook when no beat in `WATCHER_TIMEOUT_SECONDS` (default 600). `package.json` with install/uninstall scripts via nssm. `README.md` with install, uninstall, and smoke-test commands. Commit: `feat(heartbeat): wave 3 step 40 heartbeat watcher service`.
+
+#### Bug triage (Wave 3 Lane B)
+
+41. **Bug: state-tracker-loses-live-sessions.** Analysis and fix for the session-state tracker losing live session registration on certain disconnect/reconnect paths. See `docs/bugs/2026-05-10-state-tracker-loses-live-sessions.md`. Commit: `fix(sessions): wave 3 step 41 state-tracker live-session loss`.
+
+42. **Bug: cc-feedback-prompt-unanswerable.** Analysis and fix for the Claude Code feedback prompt being delivered in a form Lex cannot answer (context missing or prompt malformed). See `docs/bugs/2026-05-10-cc-feedback-prompt-unanswerable.md`. Commit: `fix(lex): wave 3 step 42 cc-feedback prompt`.
+
+43. **Bug: brainstorm-picker-and-transcripts.** Analysis and fix for the brainstorm picker not loading transcripts correctly (stale cursor, partial read, or missing brainstorm_chunks rows). See `docs/bugs/2026-05-10-brainstorm-picker-and-transcripts.md`. Commit: `fix(brainstorm): wave 3 step 43 picker transcript load`.
+
+### Wave 3 Lane B sign-off checklist
+
+- [ ] Thread doc written at session end; injected into next Lex spawn system prompt.
+- [ ] `POST /lex/chunk-search` returns ranked brainstorm_chunks rows by cosine.
+- [ ] Internal-first prompt rule present in system prompt; verified by tsc + manual review.
+- [ ] Tool gate blocks WebSearch when internal vocab match; awareness event emitted.
+- [ ] Migration 015 (`lex_retrieval_log`) applied.
+- [ ] Retrieval trace route returns rows; dashboard panel renders timeline.
+- [ ] Curator events (high-severity findings, lint flags, draft conflicts) visible in live_state block.
+- [ ] Janitor runs manually via `POST /admin/janitor/run`; writes `audit_findings` rows with `source='janitor'`.
+- [ ] Janitor approval UI renders and updates finding status.
+- [ ] Heartbeat watcher script installable; smoke-test command documented.
+- [ ] Bug triage: all three bug docs marked resolved or deferred with reason.
+
+---
+
 ## 12. Wave 3 execution
 
 Effort: ~5 days. Gated on Wave 2 signals (specifically: Curator Health card green; CI-7 canary green for at least 7 days; backfill complete).
