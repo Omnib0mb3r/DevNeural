@@ -10,7 +10,7 @@
 | 2026-05-10 | [State tracker loses live sessions](./2026-05-10-state-tracker-loses-live-sessions.md) | open | medium |
 | 2026-05-11 | [Push-to-talk not releasing mic](./2026-05-11-push-to-talk-not-releasing-mic.md) | fixed (pending soak) | medium |
 | 2026-05-11 | [Cannot resume past brainstorms](./2026-05-11-cannot-resume-past-brainstorms.md) | fixed (pending soak) | medium |
-| 2026-05-11 | [Dashboard small screen overflow](./2026-05-11-dashboard-small-screen-overflow.md) | open | medium |
+| 2026-05-11 | [Dashboard small screen overflow](./2026-05-11-dashboard-small-screen-overflow.md) | fixed (pending soak) | medium |
 
 Update this table whenever a bug is added, fixed, or its status changes.
 

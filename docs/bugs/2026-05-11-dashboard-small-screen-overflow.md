@@ -33,4 +33,34 @@ Header content fits within the viewport at all common breakpoints. On narrow scr
 
 ## Status
 
-Open. Should be picked up alongside any dashboard polish pass. Belongs in Wave 4 or earlier if user lands on a small screen often.
+Fixed (pending soak) — 2026-05-11, Wave 3 fixup sprint.
+
+## Fixes shipped
+
+- `08-dashboard/components/TopBar.tsx`:
+  - Header wrapper now uses `gap-2 min-w-0` so all children participate
+    in flex-shrinking; horizontal padding drops from `px-5` to `px-3`
+    below `sm`.
+  - Brand wordmark ("DevNeural" + "Hub") hides below `sm`; the icon
+    badge remains as the clickable anchor.
+  - Search bar collapses to an icon-only `lift` button below `md`;
+    the wide placeholder copy ("Search wiki, sessions, projects...")
+    only renders at `md` and up.
+  - Right cluster (notifications, settings, auth pill, rollup pill)
+    drops the inline text labels below `sm` and falls back to
+    `title=` tooltips so the icons + status dots stay readable.
+  - Bottom nav row gains `overflow-x-auto` + `whitespace-nowrap` so
+    the 11 tabs scroll horizontally instead of wrapping or overflowing.
+
+## Verification
+
+Manual:
+1. Resize the browser to 360px wide (typical mobile portrait).
+2. Header fits inside the viewport; no horizontal page scroll.
+3. Tab row scrolls horizontally; every tab remains reachable.
+4. Search icon opens the command palette via the same `open-cmdk`
+   event the wide button used.
+5. Resize back to >=768px and confirm the wide search bar and full
+   auth + rollup labels re-appear.
+
+`tsc --noEmit` clean on `08-dashboard`.

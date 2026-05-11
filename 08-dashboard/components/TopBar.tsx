@@ -136,7 +136,7 @@ export function TopBar({ activeTab }: { activeTab: string }) {
 
   return (
     <header className="flex flex-col">
-      <div className="flex items-center h-14 px-5 hairline-soft">
+      <div className="flex items-center h-14 px-3 sm:px-5 hairline-soft gap-2 min-w-0">
         <button
           type="button"
           onClick={() =>
@@ -148,19 +148,22 @@ export function TopBar({ activeTab }: { activeTab: string }) {
           <div className="w-8 h-8 rounded-card bg-brand/10 ring-1 ring-brand/30 grid place-items-center">
             <Icon name="Brain" className="text-brandSoft" size={20} />
           </div>
-          <div className="font-display font-semibold tracking-tight text-[15px] text-txt1">
+          <div className="hidden sm:block font-display font-semibold tracking-tight text-[15px] text-txt1">
             DevNeural
           </div>
-          <div className="text-txt3 text-[11px] uppercase tracking-[0.14em] font-medium ml-1 mt-0.5">
+          <div className="hidden sm:block text-txt3 text-[11px] uppercase tracking-[0.14em] font-medium ml-1 mt-0.5">
             Hub
           </div>
         </button>
 
-        <div className="flex-1 max-w-2xl mx-4">
+        {/* Search collapses to an icon-only button below the md
+         * breakpoint so the wide placeholder copy does not push the
+         * right-cluster controls off-screen on narrow viewports. */}
+        <div className="flex-1 max-w-2xl mx-1 sm:mx-4 min-w-0">
           <button
             type="button"
             onClick={openCmdK}
-            className="group w-full flex items-center gap-2.5 h-9 px-3 rounded-card bg-surface1 hairline focus-within:ring-1 focus-within:ring-brand/60 transition text-left"
+            className="hidden md:flex group w-full items-center gap-2.5 h-9 px-3 rounded-card bg-surface1 hairline focus-within:ring-1 focus-within:ring-brand/60 transition text-left"
             aria-label="Open command palette"
           >
             <Icon name="Search" className="text-txt3" size={16} />
@@ -170,6 +173,15 @@ export function TopBar({ activeTab }: { activeTab: string }) {
             <kbd className="hidden md:inline-flex items-center gap-1 px-1.5 h-5 rounded border border-border1 bg-surface2 text-[11px] font-mono text-txt2">
               ⌘ K
             </kbd>
+          </button>
+          <button
+            type="button"
+            onClick={openCmdK}
+            className="md:hidden lift w-9 h-9 rounded-card hairline grid place-items-center text-txt2 hover:text-txt1 ml-auto"
+            aria-label="Open command palette"
+            title="Search wiki, sessions, projects, reference docs"
+          >
+            <Icon name="Search" size={16} />
           </button>
         </div>
 
@@ -272,35 +284,36 @@ export function TopBar({ activeTab }: { activeTab: string }) {
             <Link
               href="/unlock"
               aria-label="Locked: click to unlock"
-              className="flex items-center gap-1.5 h-9 px-3 rounded-pill hairline text-[11px] font-mono text-err hover:bg-err/10"
+              className="flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline text-[11px] font-mono text-err hover:bg-err/10"
               title="Session expired or missing. Click to unlock."
             >
               <Icon name="Lock" size={12} />
-              locked
+              <span className="hidden sm:inline">locked</span>
             </Link>
           ) : (
             <div
-              className="flex items-center gap-1.5 h-9 px-3 rounded-pill hairline text-[11px] font-mono text-ok"
+              className="flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline text-[11px] font-mono text-ok"
               title="Authenticated session active"
             >
               <Icon name="Unlock" size={12} />
-              unlocked
+              <span className="hidden sm:inline">unlocked</span>
             </div>
           )}
 
           <div
-            className={`flex items-center gap-1.5 h-9 px-3 rounded-pill hairline shimmer-pill text-[11px] font-mono ${
+            className={`flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline shimmer-pill text-[11px] font-mono ${
               rollup === "ok" ? "text-ok" : rollup === "warn" ? "text-warn" : "text-err"
             }`}
+            title={rollupLabel}
           >
             <StatusDot status={rollup === "fail" ? "fail" : rollup} pulse={rollup === "ok"} />
-            {rollupLabel}
+            <span className="hidden sm:inline">{rollupLabel}</span>
           </div>
         </div>
       </div>
 
-      <nav className="flex items-center h-11 px-5 hairline-soft border-t border-border2">
-        <div className="flex gap-6 -mb-px">
+      <nav className="flex items-center h-11 px-3 sm:px-5 hairline-soft border-t border-border2 overflow-x-auto scrollbar-none">
+        <div className="flex gap-4 sm:gap-6 -mb-px whitespace-nowrap">
           {TABS.map((t) => {
             const isActive = t.href === activeTab;
             return (
