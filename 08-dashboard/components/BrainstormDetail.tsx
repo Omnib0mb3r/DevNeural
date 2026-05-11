@@ -57,7 +57,11 @@ export function BrainstormDetail({ id }: { id: string }) {
   const dec = detail.data.brainstorm;
   const bs = dec.brainstorm;
   const cueList: AudioCue[] = cues.data?.cues ?? [];
-  const label = bs.user_label || bs.derived_label || "(untitled)";
+  /* Match LexSessionList / BrainstormList: fall back to the row id
+   * prefix instead of "(untitled)" so the same row reads the same
+   * across every surface. */
+  const label =
+    bs.user_label?.trim() || bs.derived_label?.trim() || bs.id.slice(0, 8);
 
   return (
     <div className="flex flex-col gap-4 p-4">

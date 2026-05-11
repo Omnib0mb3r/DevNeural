@@ -131,7 +131,14 @@ function BrainstormRow({ item }: { item: BrainstormDecorated }) {
   const bs = item.brainstorm;
   const started = new Date(bs.started_ms).toISOString().replace("T", " ").slice(0, 16);
   const ended = bs.ended_ms ? new Date(bs.ended_ms).toISOString().slice(11, 16) : "live";
-  const label = bs.user_label || bs.derived_label || "(untitled)";
+  /* Same label rule as LexSessionList so a row reads the same on both
+   * the Brainstorm tab and the /lex Past Sessions panel: prefer the
+   * user's rename, then the daemon-derived label, then the first 8
+   * chars of the row id. Avoids the dual-identity confusion where the
+   * /lex panel showed "4854016c" and the /brainstorms list called the
+   * same row "(untitled)". */
+  const label =
+    bs.user_label?.trim() || bs.derived_label?.trim() || bs.id.slice(0, 8);
   return (
     <li className="rounded border border-border1 bg-surface1 p-3">
       <div className="flex items-center justify-between">
