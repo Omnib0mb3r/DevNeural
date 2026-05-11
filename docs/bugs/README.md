@@ -2,9 +2,18 @@
 
 ## Open bugs
 
+_None._ Wave 3 fixup sprint (2026-05-11) closed every entry that had been
+open at the start of the sprint. See "Recently closed" for the audit
+trail; new bugs go here when reported.
+
 | Date | Bug | Status | Severity |
 |------|-----|--------|----------|
-| 2026-05-05 | [Leftover session tiles](./2026-05-05-leftover-session-tiles.md) | open | low |
+
+## Recently closed
+
+| Date | Bug | Status | Severity |
+|------|-----|--------|----------|
+| 2026-05-05 | [Leftover session tiles](./2026-05-05-leftover-session-tiles.md) | closed | low |
 | 2026-05-10 | [Brainstorm picker and transcripts](./2026-05-10-brainstorm-picker-and-transcripts.md) | fixed (pending soak) | medium |
 | 2026-05-10 | [CC feedback prompt unanswerable](./2026-05-10-cc-feedback-prompt-unanswerable.md) | fixed (pending soak) | medium |
 | 2026-05-10 | [State tracker loses live sessions](./2026-05-10-state-tracker-loses-live-sessions.md) | fixed (pending soak) | medium |

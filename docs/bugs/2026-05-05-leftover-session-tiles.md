@@ -1,8 +1,9 @@
 # Leftover Session Ghost Tiles
 
-**Status:** Fixed (pending soak)
+**Status:** Closed
 **Reported:** 2026-05-04
 **Last seen:** 2026-05-05 09:30 ET
+**Closed:** 2026-05-11 (Wave 3 fixup sprint, soak window passed; no recurrences logged in 6 days of active use)
 **Affected surfaces:** Virtual deck (08-dashboard), Physical Stream Deck (stream-deck repo)
 
 ## Symptoms
@@ -61,7 +62,13 @@ On Windows, every Claude Code hook fires through `wscript.exe → node → hook-
 
 ## Open Items
 
-- Long soak (24 h) to confirm flicker is gone under typical activity.
+Long soak (24 h) requirement satisfied as of 2026-05-11; no recurrence of
+the flicker or phantom-tile symptoms across 6 days of active use. Bug
+closed in the Wave 3 fixup sprint.
+
+Residual follow-ups (not blockers; tracked for future polish, not in any
+specific wave scope):
+
 - The hook-bash pid problem deserves a real fix: capture a more stable identifier (CC TUI process, VS Code workspace process) instead of the ephemeral hook bash. Current workaround relies on the state-file freshness window.
 - Consider exposing a manual "purge dead tiles" button on the virtual deck and an REPL command on the physical deck for when the heuristics fail.
 - Test fixture state files (`t.json`, `test.json`) should be added to a `.streamdeckignore` or similar so they never auto-register; currently filtered only by liveness.
