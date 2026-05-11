@@ -317,25 +317,35 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
                           end
                         </button>
                       )}
-                      {!isActive && (
+                      {/* Switch-to renders for every non-current row,
+                       * including stale active rows. Earlier this was
+                       * gated on `!isActive`, which meant a previous
+                       * "active" row whose end-patch raced or failed
+                       * during a switch-to would render no button at
+                       * all (no end because not current, no switch
+                       * because not ended), trapping the user with no
+                       * way back. */}
+                      {!isCurrent && (
                         <button
                           type="button"
                           onClick={() => resumeM.mutate(row)}
                           disabled={resumeM.isPending}
                           className="text-nano px-2 py-1 rounded-pill bg-brand/10 hairline ring-1 ring-brand/30 text-brandSoft hover:bg-brand/20 disabled:opacity-40 disabled:cursor-not-allowed"
                           title={
-                            activePtyId
-                              ? row.claude_session_id
-                                ? "End the current Lex and restore this conversation via claude --resume"
-                                : "End the current Lex and open a fresh PTY in the same cwd (no claude_session_id was bound to this row, so verbatim resume is unavailable)"
-                              : row.claude_session_id
-                                ? "Restore this conversation via claude --resume"
-                                : "Open a fresh PTY in the same cwd with this label (no claude_session_id was bound to this row, so verbatim resume is unavailable)"
+                            isActive
+                              ? "This brainstorm is still flagged active. End the current Lex and re-bind to this row."
+                              : activePtyId
+                                ? row.claude_session_id
+                                  ? "End the current Lex and restore this conversation via claude --resume"
+                                  : "End the current Lex and open a fresh PTY in the same cwd (no claude_session_id was bound to this row, so verbatim resume is unavailable)"
+                                : row.claude_session_id
+                                  ? "Restore this conversation via claude --resume"
+                                  : "Open a fresh PTY in the same cwd with this label (no claude_session_id was bound to this row, so verbatim resume is unavailable)"
                           }
                         >
                           {resumeM.isPending
                             ? "resuming..."
-                            : activePtyId
+                            : activePtyId || isActive
                               ? "switch to"
                               : "resume"}
                         </button>

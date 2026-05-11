@@ -4,7 +4,6 @@ import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AppShell } from "@/components/AppShell";
 import { TerminalMirror } from "@/components/TerminalMirror";
-import { VoiceClient } from "@/components/VoiceClient";
 import { Icon } from "@/components/Icon";
 import {
   listPtys,
@@ -283,7 +282,13 @@ export default function LexPage() {
 
         {(lexPty || spawnM.isPending) && (
           <>
-            <VoiceClient sessionId={lexPty?.sessionId ?? null} />
+            {/* Voice panel mount target. The actual VoiceClient
+             * component is mounted once at the application root in
+             * app/providers.tsx so its WS / mic / AudioContext
+             * survive in-app navigation; on /lex it portals the
+             * full panel UI into this div, and on every other
+             * route a floating mini-badge takes over. */}
+            <div id="voice-panel-mount" />
             {/* Reuse the existing TerminalMirror — it expects a session
              * id and pulls from the same terminal-stream ring the
              * daemon-PTY pumps into post-binding. Before binding we

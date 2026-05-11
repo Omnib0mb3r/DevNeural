@@ -1,8 +1,19 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { usePathname } from "next/navigation";
+import { useQuery } from "@tanstack/react-query";
 import { Icon } from "./Icon";
 import { LexThumbs } from "./LexThumbs";
+import { listPtys, type PtyEntry } from "@/lib/daemon-client";
+
+/* DOM id rendered by app/lex/page.tsx where the full voice panel UI
+ * portals into. Other routes don't render this element, in which case
+ * the engine still runs (mounted globally in app/providers.tsx) and
+ * the floating mini-badge takes over so the user can see / control
+ * voice without navigating back to /lex. */
+const PANEL_MOUNT_ID = "voice-panel-mount";
 
 /**
  * Hands-free voice client for Lex.
@@ -104,12 +115,6 @@ function vadThresholds(sensitivity: number): {
   return { positive, negative };
 }
 
-interface Props {
-  /** Auto-bind to a specific Lex session. When omitted, the daemon
-   * resolves the active brainstorm PTY. */
-  sessionId?: string | null;
-}
-
 /* Cap on a single utterance. After this many milliseconds of
  * continuous speech we force an utterance-end so the user gets a
  * response even if they're still mid-sentence. Also protects the
@@ -123,41 +128,54 @@ const MAX_UTTERANCE_MS = 30_000;
  * 4MB. Used as a defensive abort if VAD never fires speech-end. */
 const MAX_UTTERANCE_SAMPLES = 30 * 16000;
 
-/* Survive in-app navigation and tab eviction. iOS Safari can evict
- * the page subtree at any time; React state alone resets to defaults
- * on remount, leaving the button stuck on "Start" while the original
- * WS + mic stream are still alive in the browser (Lex still hears).
- * Persisting the two user-facing toggles lets the UI reflect truth on
- * remount, and the existing useEffect on [enabled] auto-reopens the
- * pipeline if voice was running. */
-const ENABLED_STORAGE_KEY = "lex-voice-enabled";
-const MUTED_STORAGE_KEY = "lex-voice-muted";
+/* Voice enable/mute toggles are intentionally NOT persisted across
+ * page loads. A page refresh is treated as an explicit reset: voice
+ * starts off and the user re-clicks "start voice" to grant mic
+ * access. Persisting `enabled` previously caused voice to silently
+ * resurrect on every reload whenever a teardown path (tab close,
+ * crash, navigation) skipped the explicit stop handler, which left
+ * the localStorage flag stuck at "1" forever. */
 
-function readStoredFlag(key: string): boolean {
-  if (typeof window === "undefined") return false;
-  return window.localStorage.getItem(key) === "1";
-}
+export function VoiceClient() {
+  /* Voice engine is mounted once at the application root (see
+   * app/providers.tsx) so the WS, mic stream, and AudioContext
+   * survive in-app navigation between /lex, /brainstorms, /wiki,
+   * etc. The full panel UI portals to a per-route mount target
+   * declared by /lex; on every other route a floating mini-badge
+   * surfaces status + mute + stop so the user can see and control
+   * voice without losing their place.
+   *
+   * sessionId is resolved from the same pty-list query the /lex
+   * page uses: the most-recently-started non-exited PTY whose cwd
+   * ends in /brainstorm. There's only one Lex at a time so binding
+   * the engine to "whichever brainstorm PTY is live right now" is
+   * the correct behaviour regardless of route. */
+  const ptysQ = useQuery({
+    queryKey: ["pty-list"],
+    queryFn: listPtys,
+    refetchInterval: 3_000,
+  });
+  const lexPty: PtyEntry | undefined = (ptysQ.data?.ptys ?? [])
+    .filter(
+      (p) => !p.exited && /\/brainstorm\/?$/i.test(p.cwd.replace(/\\/g, "/")),
+    )
+    .sort((a, b) => b.startedAt - a.startedAt)[0];
+  const sessionId: string | null = lexPty?.sessionId ?? null;
 
-export function VoiceClient({ sessionId }: Props) {
+  /* Portal target. /lex renders <div id={PANEL_MOUNT_ID} />; other
+   * routes don't. The effect re-resolves the target on every route
+   * change so the panel re-portals when the user navigates back to
+   * /lex without unmounting the engine. */
+  const pathname = usePathname();
+  const [mountEl, setMountEl] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    setMountEl(document.getElementById(PANEL_MOUNT_ID));
+  }, [pathname]);
+
   const [status, setStatus] = useState<Status>("idle");
-  const [enabled, setEnabledState] = useState<boolean>(() =>
-    readStoredFlag(ENABLED_STORAGE_KEY),
-  );
-  function setEnabled(next: boolean): void {
-    setEnabledState(next);
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(ENABLED_STORAGE_KEY, next ? "1" : "0");
-    }
-  }
-  const [muted, setMutedState] = useState<boolean>(() =>
-    readStoredFlag(MUTED_STORAGE_KEY),
-  );
-  function setMuted(next: boolean): void {
-    setMutedState(next);
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(MUTED_STORAGE_KEY, next ? "1" : "0");
-    }
-  }
+  const [enabled, setEnabled] = useState<boolean>(false);
+  const [muted, setMuted] = useState<boolean>(false);
   const [lastTranscript, setLastTranscript] = useState<string>("");
   const [lastReply, setLastReply] = useState<string>("");
   /* Wave 2 carry-over #1: per-turn thumbs vote on Lex's last reply.
@@ -1197,7 +1215,44 @@ export function VoiceClient({ sessionId }: Props) {
     error: "text-err",
   };
 
-  return (
+  /* Floating mini-badge: rendered in-place (fixed bottom-right) on
+   * every route that doesn't host the full panel. Visible whenever
+   * voice is enabled OR there's something to surface (error, last
+   * reply within reason). Keeps the user aware that the mic is hot
+   * and gives them a one-click stop without navigating to /lex. */
+  const floatingBadge =
+    enabled || status === "error" ? (
+      <div className="fixed bottom-4 right-4 z-50 rounded-pill bg-surface1 hairline ring-1 ring-border1 shadow-lg px-3 py-2 flex items-center gap-2">
+        <Icon name="Mic" className="text-brandSoft" size={14} />
+        <span className={`text-nano font-mono ${statusTone[status]}`}>
+          {statusLabel[status]}
+        </span>
+        {enabled && (
+          <button
+            type="button"
+            onClick={() => setMicMuted(!muted)}
+            className={`text-nano px-2 py-0.5 rounded-pill hairline font-emphasized ${
+              muted
+                ? "bg-attn/15 text-attn ring-1 ring-attn/30 hover:bg-attn/25"
+                : "bg-surface2 text-txt2 hover:bg-surface3"
+            }`}
+            title="Mute mic without ending the session."
+          >
+            {muted ? "muted" : "mute"}
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={toggleEnabled}
+          className="text-nano px-2 py-0.5 rounded-pill hairline font-emphasized bg-err/15 text-err ring-1 ring-err/30 hover:bg-err/25"
+          title="Stop voice."
+        >
+          stop
+        </button>
+      </div>
+    ) : null;
+
+  const fullPanel = (
     <section className="rounded-panel bg-surface1 hairline">
       <div className="px-5 py-3 border-b border-border1 flex items-center gap-3">
         <Icon name="Mic" className="text-brandSoft" size={16} />
@@ -1358,4 +1413,12 @@ export function VoiceClient({ sessionId }: Props) {
       )}
     </section>
   );
+
+  /* When the route exposes the panel mount target (only /lex today),
+   * portal the full panel into it so the visual layout is identical
+   * to before the engine was hoisted to the root. On every other
+   * route, render the floating badge in place so the user can still
+   * see status and stop voice without navigating. */
+  if (mountEl) return createPortal(fullPanel, mountEl);
+  return floatingBadge;
 }

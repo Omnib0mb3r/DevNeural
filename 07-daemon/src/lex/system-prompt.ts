@@ -482,6 +482,13 @@ Most-used:
 - GET  /lex/sessions[?status=active|ended]
     Brainstorm session list (your own conversation history). Pull
     in the long ongoing threads before adding new takes.
+- PATCH /lex/sessions/:id { user_label?, status? }
+    Rename or end a brainstorm row. Canonical write surface for
+    everything the daemon owns about a brainstorm. The underlying
+    SQLite file is private to the daemon; do NOT shell out to
+    \`sqlite3\` or edit the DB file directly. Always use this
+    endpoint so triggers, label propagation, and the dashboard
+    refetch all fire correctly.
 - POST /lex/steer/:session_id { text, commit? }
     Inject a prompt directly into a worker daemon-PTY.
 - POST /lex/capture { kind: "reminder"|"next-action", title, due_at?, brainstorm_id? }
