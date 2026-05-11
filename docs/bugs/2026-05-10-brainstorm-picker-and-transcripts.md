@@ -1,6 +1,6 @@
 # Bug: brainstorm-picker-and-transcripts
 
-**Status:** Deferred (Wave 3 Lane B step 43)
+**Status:** Deferred to Wave 4 (transcript endpoint + BrainstormTranscript component)
 
 **Date opened:** 2026-05-10
 
@@ -74,7 +74,7 @@ chunks as a conversation transcript (user/lex turns, timestamps, mode badges).
 
 ## Deferred
 
-**Wave 3 Lane B, step 43.** Both fixes require dashboard component changes.
+**Wave 4 carry-over.** Both fixes require dashboard component changes.
 Issue 1 is trivial (staleTime change). Issue 2 requires a new API endpoint plus
 a new component; the component belongs in `08-dashboard/src/system/` per the
 Lane B conflict-avoidance rule (not in `components/` which may conflict with

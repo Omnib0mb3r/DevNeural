@@ -1,6 +1,6 @@
 # Bug: state-tracker loses live sessions
 
-**Status:** Deferred (Wave 3 Lane B step 41)
+**Status:** Deferred to Wave 4 (env override + troubleshooting doc)
 
 **Date opened:** 2026-05-10
 
@@ -86,7 +86,7 @@ the window for the bug is 0-4s after a deck write.
 
 ## Deferred
 
-**Wave 3 Lane B, step 41.** The fix is low-risk but requires observing the deck
+**Wave 4 carry-over.** The fix is low-risk but requires observing the deck
 identity directory behavior on the live host. The workaround is to set
 `IDENTITY_FRESH_MS` to 15s (3x the current default) via env override
 `DEVNEURAL_IDENTITY_FRESH_MS=15000`. This makes the liveness window robust to
