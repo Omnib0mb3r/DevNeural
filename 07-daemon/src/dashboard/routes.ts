@@ -3093,7 +3093,7 @@ export async function registerDashboardRoutes(
     } else {
       opts.status = 'open';
     }
-    if (q.source === 'lint' || q.source === 'self-audit' || q.source === 'canary' || q.source === 'user-flag' || q.source === 'schema-regression') {
+    if (q.source === 'lint' || q.source === 'self-audit' || q.source === 'canary' || q.source === 'user-flag' || q.source === 'schema-regression' || q.source === 'janitor') {
       opts.source = q.source;
     }
     if (q.severity === 'low' || q.severity === 'medium' || q.severity === 'high') {
@@ -3144,6 +3144,16 @@ export async function registerDashboardRoutes(
     const body = (req.body ?? {}) as { sample?: number };
     const { runSelfAudit } = await import('../wiki/self-audit.js');
     const r = await runSelfAudit(store, { sample: body.sample, log });
+    return { ok: true, result: r };
+  });
+
+  /* POST /admin/janitor/run (Wave 3 Lane B step 37 / LX-14). Manual
+   * trigger for the memory janitor. Scans brainstorm_chunks for merge
+   * candidates and contradictions; writes findings to audit_findings
+   * with source='janitor'. */
+  app.post('/admin/janitor/run', async () => {
+    const { runMemoryJanitor } = await import('../lex/memory-janitor.js');
+    const r = await runMemoryJanitor(store, log);
     return { ok: true, result: r };
   });
 

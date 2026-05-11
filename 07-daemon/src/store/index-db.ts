@@ -107,7 +107,7 @@ export interface MeetingActionItemRow {
  * lint + self-audit + user-flag writers. */
 export interface AuditFindingRow {
   id: string;
-  source: 'lint' | 'self-audit' | 'canary' | 'user-flag' | 'schema-regression';
+  source: 'lint' | 'self-audit' | 'canary' | 'user-flag' | 'schema-regression' | 'janitor';
   severity: 'low' | 'medium' | 'high';
   page_slug: string | null;
   brainstorm_id: string | null;
@@ -647,7 +647,7 @@ export class IndexDb {
    * same finding for the same page. */
   insertAuditFinding(row: {
     id: string;
-    source: 'lint' | 'self-audit' | 'canary' | 'user-flag' | 'schema-regression';
+    source: 'lint' | 'self-audit' | 'canary' | 'user-flag' | 'schema-regression' | 'janitor';
     severity: 'low' | 'medium' | 'high';
     page_slug?: string | null;
     brainstorm_id?: string | null;
@@ -672,7 +672,7 @@ export class IndexDb {
 
   listAuditFindings(opts: {
     status?: 'open' | 'acknowledged' | 'resolved' | 'dismissed';
-    source?: 'lint' | 'self-audit' | 'canary' | 'user-flag' | 'schema-regression';
+    source?: 'lint' | 'self-audit' | 'canary' | 'user-flag' | 'schema-regression' | 'janitor';
     severity?: 'low' | 'medium' | 'high';
     page_slug?: string;
     limit?: number;
