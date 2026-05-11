@@ -556,6 +556,13 @@ Before any WebSearch or WebFetch call, check internal sources:
 3. GET /lex/sessions - brainstorm session list (for context on prior work)
 4. Grep filesystem for local files (use Bash with grep/find)
 
+The daemon listens on http://127.0.0.1:\${DEVNEURAL_PORT:-3747}. The /lex/*
+retrieval routes are unauthenticated on localhost (no cookie required).
+Example:
+
+  curl -s -H 'Content-Type: application/json' \
+       --data '{"q":"..."}' http://127.0.0.1:3747/lex/chunk-search
+
 Only use WebSearch when:
 - Internal retrieval returns top score < 0.25 (weak match), AND
 - The question is clearly about information that would not be in the
