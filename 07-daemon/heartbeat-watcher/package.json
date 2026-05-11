@@ -1,0 +1,19 @@
+{
+  "name": "devneural-heartbeat-watcher",
+  "version": "1.0.0",
+  "description": "Standalone watcher process for DevNeural daemon heartbeat (Option A, same-host)",
+  "main": "src/watcher.js",
+  "scripts": {
+    "start": "node src/watcher.js",
+    "install-service": "nssm install DevNeuralHeartbeatWatcher node \"%cd%\\src\\watcher.js\"",
+    "start-service": "nssm start DevNeuralHeartbeatWatcher",
+    "stop-service": "nssm stop DevNeuralHeartbeatWatcher",
+    "remove-service": "nssm remove DevNeuralHeartbeatWatcher confirm",
+    "smoke-test": "node -e \"const h=require('http');const req=h.request({hostname:'127.0.0.1',port:3748,path:'/status',method:'GET'},res=>{let b='';res.on('data',c=>b+=c);res.on('end',()=>{console.log('Status:',b);process.exit(res.statusCode===200?0:1)});});req.on('error',e=>{console.error('FAIL:',e.message);process.exit(1)});req.end();\""
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": ["devneural", "heartbeat", "monitoring"],
+  "license": "MIT"
+}
