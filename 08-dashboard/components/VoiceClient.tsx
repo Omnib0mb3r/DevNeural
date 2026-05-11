@@ -350,21 +350,42 @@ export function VoiceClient({ sessionId }: Props) {
     return true;
   }
 
-  /* Mute keeps the WS open and the mic stream alive so unmuting is
-   * instant. If the user mutes mid-utterance (status === listening),
-   * flush whatever the parallel capture rig already has so Lex
-   * still gets the audio and replies. Otherwise mute just gates
-   * future VAD events. */
+  /* Hard mute. The WS stays open so unmuting is instant, but every
+   * audio path is shut down: MediaStream tracks disabled (so the
+   * mic hardware stops capturing), parallel capture buffer dropped
+   * (NOT flushed to Lex — user explicitly said don't listen), any
+   * in-flight utterance timers cleared. Unmute re-enables the
+   * track. Without this the previous "soft mute" still let Lex
+   * hear: it only gated future VAD events, while flushing the
+   * captured audio buffer to the server on mute-mid-utterance and
+   * leaving track.enabled=true on the hardware.
+   * Bug: 2026-05-11-mute-still-hears. */
   function setMicMuted(next: boolean): void {
     mutedRef.current = next;
     setMuted(next);
+    const stream = captureStreamRef.current;
+    if (stream) {
+      for (const track of stream.getAudioTracks()) {
+        track.enabled = !next;
+      }
+    }
     if (next) {
-      if (statusRef.current === "listening") {
-        flushParallelCapture();
-      } else if (utteranceTimerRef.current) {
+      /* Drop the parallel capture buffer rather than shipping it.
+       * Any partial utterance still in memory is intentionally
+       * discarded so Lex never sees audio captured while muted. */
+      captureCapturingRef.current = false;
+      captureBufRef.current = [];
+      if (utteranceTimerRef.current) {
         clearInterval(utteranceTimerRef.current);
         utteranceTimerRef.current = null;
-        setUtteranceMs(0);
+      }
+      if (utteranceCapRef.current) {
+        clearTimeout(utteranceCapRef.current);
+        utteranceCapRef.current = null;
+      }
+      setUtteranceMs(0);
+      if (statusRef.current === "listening") {
+        setStatus("ready");
       }
     }
   }
