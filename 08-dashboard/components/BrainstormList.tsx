@@ -131,24 +131,27 @@ function BrainstormRow({ item }: { item: BrainstormDecorated }) {
   const bs = item.brainstorm;
   const started = new Date(bs.started_ms).toISOString().replace("T", " ").slice(0, 16);
   const ended = bs.ended_ms ? new Date(bs.ended_ms).toISOString().slice(11, 16) : "live";
-  /* Same label rule as LexSessionList so a row reads the same on both
-   * the Brainstorm tab and the /lex Past Sessions panel: prefer the
-   * user's rename, then the daemon-derived label, then the first 8
-   * chars of the row id. Avoids the dual-identity confusion where the
-   * /lex panel showed "4854016c" and the /brainstorms list called the
-   * same row "(untitled)". */
-  const label =
-    bs.user_label?.trim() || bs.derived_label?.trim() || bs.id.slice(0, 8);
+  /* Match LexSessionList row layout: top line is the human name
+   * (user_label or derived_label, "unnamed" placeholder when neither
+   * is set), the row id sits on its own dim line below, then the
+   * meta line (started/ended + mode + turns + flags). Keeps the id
+   * stable as a reference handle without conflating it with the
+   * editable name. */
+  const name = bs.user_label?.trim() || bs.derived_label?.trim() || "";
+  const shortId = bs.id.slice(0, 8);
   return (
     <li className="rounded border border-border1 bg-surface1 p-3">
-      <div className="flex items-center justify-between">
-        <Link
-          href={`/brainstorms/detail?id=${encodeURIComponent(bs.id)}`}
-          className="font-mono text-sm hover:text-brandSoft"
-        >
-          {label}
-        </Link>
-        <span className="text-xs font-mono text-txt3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <Link
+            href={`/brainstorms/detail?id=${encodeURIComponent(bs.id)}`}
+            className="text-sm hover:text-brandSoft truncate block"
+          >
+            {name || <span className="text-txt3 italic">unnamed</span>}
+          </Link>
+          <div className="text-[11px] font-mono text-txt3 truncate">{shortId}</div>
+        </div>
+        <span className="text-xs font-mono text-txt3 flex-shrink-0">
           {started} → {ended}
         </span>
       </div>

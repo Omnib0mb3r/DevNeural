@@ -57,11 +57,11 @@ export function BrainstormDetail({ id }: { id: string }) {
   const dec = detail.data.brainstorm;
   const bs = dec.brainstorm;
   const cueList: AudioCue[] = cues.data?.cues ?? [];
-  /* Match LexSessionList / BrainstormList: fall back to the row id
-   * prefix instead of "(untitled)" so the same row reads the same
-   * across every surface. */
-  const label =
-    bs.user_label?.trim() || bs.derived_label?.trim() || bs.id.slice(0, 8);
+  /* Title is the human name only. The full session id stays in the
+   * meta line below so it never doubles as the title. Matches the
+   * LexSessionList / BrainstormList row layout: name on top,
+   * id + meta underneath. */
+  const name = bs.user_label?.trim() || bs.derived_label?.trim() || "";
 
   return (
     <div className="flex flex-col gap-4 p-4">
@@ -69,7 +69,9 @@ export function BrainstormDetail({ id }: { id: string }) {
         <Link href="/brainstorms" className="text-xs text-txt3 hover:text-brandSoft">
           ← brainstorms
         </Link>
-        <h1 className="mt-1 text-xl font-semibold">{label}</h1>
+        <h1 className="mt-1 text-xl font-semibold">
+          {name || <span className="text-txt3 italic">unnamed</span>}
+        </h1>
         <p className="text-xs font-mono text-txt3">
           {bs.id} · mode {bs.mode} · {bs.turn_count} turns ·{" "}
           {new Date(bs.started_ms).toISOString().slice(0, 16).replace("T", " ")}

@@ -28,8 +28,12 @@ function shortId(id: string): string {
   return id.slice(0, 8);
 }
 
-function labelFor(row: BrainstormSessionRow): string {
-  return row.user_label?.trim() || row.derived_label?.trim() || shortId(row.id);
+/* Display name for the rename row. Empty when neither the user nor the
+ * daemon has set a label, so the input field can show a placeholder
+ * instead of pre-filling with the row id (which is rendered on its own
+ * line below and should never double as the editable name). */
+function nameFor(row: BrainstormSessionRow): string {
+  return row.user_label?.trim() || row.derived_label?.trim() || "";
 }
 
 export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
@@ -251,6 +255,11 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
                       status={isActive ? "live" : "idle"}
                       pulse={isActive}
                     />
+                    {/* Three lines: editable name, read-only session
+                      * id, then meta (last-active + status + turns).
+                      * Name is what the user (or Lex) renames; the
+                      * id below stays stable so it can be referenced
+                      * from logs or other surfaces. */}
                     <div className="min-w-0 flex-1">
                       {editing ? (
                         <input
@@ -267,7 +276,8 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
                               setEditingId(null);
                             }
                           }}
-                          className="w-full px-2 py-1 rounded-input bg-surface2 hairline text-xs text-txt1 outline-none focus:ring-1 focus:ring-brand/60 font-mono"
+                          placeholder="name this session"
+                          className="w-full px-2 py-1 rounded-input bg-surface2 hairline text-xs text-txt1 outline-none focus:ring-1 focus:ring-brand/60"
                         />
                       ) : (
                         <button
@@ -276,9 +286,14 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
                           className="text-left w-full text-xs text-txt1 hover:text-brandSoft truncate"
                           title="Click to rename"
                         >
-                          {labelFor(row)}
+                          {nameFor(row) || (
+                            <span className="text-txt3 italic">unnamed</span>
+                          )}
                         </button>
                       )}
+                      <div className="text-nano text-txt3 font-mono truncate">
+                        {shortId(row.id)}
+                      </div>
                       <div className="text-nano text-txt3 font-mono flex items-center gap-2">
                         <span>{relTime(row.started_ms)} ago</span>
                         <span>{row.status}</span>
