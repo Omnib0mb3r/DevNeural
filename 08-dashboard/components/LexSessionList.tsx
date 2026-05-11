@@ -48,6 +48,13 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
     refetchInterval: 5_000,
   });
 
+  /* Per-row pending state. Without this every row's switch-to /
+   * resume button shared `resumeM.isPending`, so clicking one made
+   * all of them flash "resuming..." and disabled together — looked
+   * like a UI bug ("they all react"). Tracking the clicked id keeps
+   * feedback scoped to the actual row. */
+  const [pendingRowId, setPendingRowId] = useState<string | null>(null);
+
   const patchM = useMutation({
     mutationFn: (vars: {
       id: string;
@@ -113,7 +120,11 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
       }
       const cwd = row.cwd?.replace(/\//g, "\\");
       const resumeSid = row.claude_session_id ?? undefined;
-      const spawned = await spawnLex(cwd ?? undefined, resumeSid);
+      /* Pass row.id so the daemon rebinds this brainstorm row to
+       * the new PTY instead of inserting a duplicate. Without this
+       * the past-sessions list grew a new active row on every
+       * "switch to" while the original row stayed put. */
+      const spawned = await spawnLex(cwd ?? undefined, resumeSid, row.id);
       if (!spawned.ok || !spawned.ptyId) {
         throw new Error(spawned.error ?? "spawn failed");
       }
@@ -125,6 +136,7 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
       };
     },
     onSettled: async () => {
+      setPendingRowId(null);
       await qc.refetchQueries({ queryKey: ["pty-list"] });
       qc.invalidateQueries({ queryKey: ["lex-sessions"] });
     },
@@ -317,38 +329,44 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
                           end
                         </button>
                       )}
-                      {/* Switch-to renders for every non-current row,
-                       * including stale active rows. Earlier this was
-                       * gated on `!isActive`, which meant a previous
-                       * "active" row whose end-patch raced or failed
-                       * during a switch-to would render no button at
-                       * all (no end because not current, no switch
-                       * because not ended), trapping the user with no
-                       * way back. */}
-                      {!isCurrent && (
+                      {/* Switch-to renders for every non-current row.
+                       * Rows with no claude_session_id can't be
+                       * resumed (claude needs the session id to
+                       * locate the jsonl transcript), so render a
+                       * disabled "no transcript" pill instead of a
+                       * misleading switch-to that would silently
+                       * spawn a fresh conversation. Per-row pending
+                       * state means clicking one row no longer
+                       * toggles every other row's button. */}
+                      {!isCurrent && row.claude_session_id && (
                         <button
                           type="button"
-                          onClick={() => resumeM.mutate(row)}
+                          onClick={() => {
+                            setPendingRowId(row.id);
+                            resumeM.mutate(row);
+                          }}
                           disabled={resumeM.isPending}
                           className="text-nano px-2 py-1 rounded-pill bg-brand/10 hairline ring-1 ring-brand/30 text-brandSoft hover:bg-brand/20 disabled:opacity-40 disabled:cursor-not-allowed"
                           title={
-                            isActive
-                              ? "This brainstorm is still flagged active. End the current Lex and re-bind to this row."
-                              : activePtyId
-                                ? row.claude_session_id
-                                  ? "End the current Lex and restore this conversation via claude --resume"
-                                  : "End the current Lex and open a fresh PTY in the same cwd (no claude_session_id was bound to this row, so verbatim resume is unavailable)"
-                                : row.claude_session_id
-                                  ? "Restore this conversation via claude --resume"
-                                  : "Open a fresh PTY in the same cwd with this label (no claude_session_id was bound to this row, so verbatim resume is unavailable)"
+                            activePtyId
+                              ? "End the current Lex and restore this conversation via claude --resume"
+                              : "Restore this conversation via claude --resume"
                           }
                         >
-                          {resumeM.isPending
+                          {pendingRowId === row.id
                             ? "resuming..."
                             : activePtyId || isActive
                               ? "switch to"
                               : "resume"}
                         </button>
+                      )}
+                      {!isCurrent && !row.claude_session_id && (
+                        <span
+                          className="text-nano px-2 py-1 rounded-pill bg-surface2 hairline text-txt3 cursor-not-allowed"
+                          title="No claude_session_id was ever bound to this row (the PTY exited before the jsonl transcript appeared). There is no conversation to restore, so switching to it would just open a fresh session."
+                        >
+                          no transcript
+                        </span>
                       )}
                     </div>
                   </li>

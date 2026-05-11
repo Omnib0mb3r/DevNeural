@@ -226,15 +226,21 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   const [enabled, setEnabled] = useState<boolean>(false);
   const [muted, setMuted] = useState<boolean>(false);
 
-  /* Auto-stop voice the moment the Lex PTY goes away. Without this
-   * the WS keeps re-binding to "no session" after the user ends
-   * Lex, the server returns "pty not found", and the panel flips
-   * to ERROR while the mic is still hot. Watching `hasLex` keeps
-   * the engine in lock-step with Lex's lifecycle. */
+  /* Auto-stop voice when Lex disappears, but debounced so a kill→
+   * respawn cycle (switch-to / new-session) doesn't tear the engine
+   * down between the old PTY dying and the new one registering.
+   * Without the debounce, every "switch to" turned voice off and
+   * the user had to manually start voice again on the new session.
+   * 2500ms covers the 400ms inter-spawn gap plus typical spawn
+   * latency on Windows. */
   useEffect(() => {
-    if (enabled && !hasLex && !ptysQ.isLoading) {
-      setEnabled(false);
-    }
+    if (!enabled) return;
+    if (hasLex) return;
+    if (ptysQ.isLoading) return;
+    const t = setTimeout(() => {
+      if (!hasLexRef.current) setEnabled(false);
+    }, 2500);
+    return () => clearTimeout(t);
   }, [enabled, hasLex, ptysQ.isLoading]);
   const [lastTranscript, setLastTranscript] = useState<string>("");
   const [lastReply, setLastReply] = useState<string>("");

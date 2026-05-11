@@ -131,6 +131,27 @@ export function bindBrainstormSessionId(
   });
 }
 
+/* Rebind an existing brainstorm row to a freshly-spawned PTY. Used by
+ * the "switch to" flow: instead of creating a brand-new row every time
+ * Lex is respawned for an existing brainstorm (which left orphan rows
+ * and duplicate active sessions), the row the user clicked is reused.
+ * Updates pty_id, flips status back to active, and clears ended_ms so
+ * the row resurfaces in the active set. claude_session_id is left
+ * alone here; if claude is launched with --resume, the new jsonl will
+ * carry the same id and bindBrainstormSessionId will be a no-op
+ * (matching), and if not, the next jsonl will overwrite it via
+ * bindBrainstormSessionId. */
+export function rebindBrainstormToPty(
+  brainstormId: string,
+  ptyId: string,
+): BrainstormSessionRow | null {
+  return db().updateBrainstorm(brainstormId, {
+    pty_id: ptyId,
+    status: 'active',
+    ended_ms: null,
+  });
+}
+
 export function setLabel(
   id: string,
   patch: { user_label?: string | null; derived_label?: string | null },

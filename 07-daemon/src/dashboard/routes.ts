@@ -1155,6 +1155,12 @@ export async function registerDashboardRoutes(
        * before its jsonl appeared). The dashboard's "resume" button
        * passes row.claude_session_id when present. */
       resume_session_id?: string;
+      /* When set, the existing brainstorm row identified by this id
+       * is rebound to the new PTY (status flipped back to active,
+       * pty_id updated) instead of inserting a fresh row. Required
+       * for "switch to" so the past-sessions list doesn't accumulate
+       * duplicate rows on every resume. */
+      brainstorm_id?: string;
     };
     const cwd =
       body.cwd ?? path.posix.join(DATA_ROOT.replace(/\\/g, '/'), 'brainstorm');
@@ -1201,11 +1207,15 @@ export async function registerDashboardRoutes(
         cols: body.cols,
         rows: body.rows,
         systemPrompt,
+        rebindBrainstormId:
+          typeof body.brainstorm_id === 'string' && body.brainstorm_id.length > 0
+            ? body.brainstorm_id
+            : undefined,
       });
       log(
         `[lex] spawn ptyId=${r.ptyId} pid=${r.pid} cwd=${cwd}${
           resumeId ? ` resume=${resumeId}` : ''
-        }`,
+        }${body.brainstorm_id ? ` rebind=${body.brainstorm_id}` : ''}`,
       );
       /* Wave 2 carry-over #1: pin the system-prompt version onto the
        * brainstorm row that pty-host registered. setBrainstormPhaseTwo

@@ -206,16 +206,24 @@ export default function LexPage() {
   const activeBrainstormId =
     (activeLexQ.data?.sessions ?? []).find((row) => row.pty_id === lexPty?.ptyId)?.id ?? null;
 
-  /* Auto-spawn Lex on first visit if no live brainstorm PTY exists.
-   * One-shot so a manual kill doesn't immediately respawn. */
-  const [autoSpawned, setAutoSpawned] = useState(false);
+  /* One-shot bootstrap: on first visit, if the daemon has no live
+   * brainstorm PTY, spawn one. The guard latches the first time the
+   * pty-list query reports a settled result (isFetched) regardless
+   * of whether we actually spawned, so a later transient gap in
+   * lexPty (kill→respawn during a switch-to, daemon restart, etc.)
+   * doesn't get misread as "first visit" and trigger an uninvited
+   * second spawn. The previous version latched only on the spawn
+   * call itself, so a switch that briefly dropped lexPty to
+   * undefined raced this effect and produced two PTYs (one from
+   * resumeM with brainstorm_id, one from autoSpawn without it,
+   * which left an orphan brainstorm row at the top of the list). */
+  const [initialAutoSpawnChecked, setInitialAutoSpawnChecked] = useState(false);
   useEffect(() => {
-    if (autoSpawned) return;
-    if (ptysQ.isLoading) return;
-    if (lexPty) return;
-    setAutoSpawned(true);
-    spawnM.mutate();
-  }, [autoSpawned, ptysQ.isLoading, lexPty, spawnM]);
+    if (initialAutoSpawnChecked) return;
+    if (!ptysQ.isFetched) return;
+    setInitialAutoSpawnChecked(true);
+    if (!lexPty) spawnM.mutate();
+  }, [initialAutoSpawnChecked, ptysQ.isFetched, lexPty, spawnM]);
 
   return (
     <AppShell>

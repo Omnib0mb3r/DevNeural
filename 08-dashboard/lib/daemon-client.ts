@@ -59,6 +59,21 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   }
 
   if (!res.ok) {
+    /* Auto-redirect to /unlock on any 401. Without this the dashboard
+     * happily sat on a stale "unlocked" pill until react-query's next
+     * scheduled refetch (up to 5s + retry delays) flagged the error,
+     * during which every other API call also failed silently. The
+     * /auth and /unlock paths must be excluded so the unlock flow
+     * itself doesn't loop. */
+    if (
+      res.status === 401 &&
+      typeof window !== "undefined" &&
+      !path.startsWith("/auth/") &&
+      window.location.pathname !== "/unlock"
+    ) {
+      const here = window.location.pathname + window.location.search;
+      window.location.replace(`/unlock?from=${encodeURIComponent(here)}`);
+    }
     throw new DaemonError(res.status, payload, `daemon ${res.status} on ${path}`);
   }
   // Guard against the daemon serving the SPA index.html (or any other
@@ -486,7 +501,11 @@ export interface OutboundStats {
 }
 export const statsOutbound = () => request<OutboundStats>("/stats/outbound");
 
-export const spawnLex = (cwd?: string, resumeSessionId?: string) =>
+export const spawnLex = (
+  cwd?: string,
+  resumeSessionId?: string,
+  brainstormId?: string,
+) =>
   request<{ ok: boolean; ptyId?: string; pid?: number; cwd?: string; resumed?: boolean; error?: string }>(
     "/pty/spawn-lex",
     {
@@ -494,6 +513,7 @@ export const spawnLex = (cwd?: string, resumeSessionId?: string) =>
       body: JSON.stringify({
         ...(cwd ? { cwd } : {}),
         ...(resumeSessionId ? { resume_session_id: resumeSessionId } : {}),
+        ...(brainstormId ? { brainstorm_id: brainstormId } : {}),
       }),
     },
   );

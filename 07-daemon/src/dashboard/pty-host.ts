@@ -26,6 +26,7 @@ import { spawn as ptySpawn, type IPty } from 'node-pty';
 import { pushTerminalData } from './terminal-stream.js';
 import {
   registerBrainstorm,
+  rebindBrainstormToPty,
   bindBrainstormSessionId,
   isBrainstormCwd,
   getBrainstormByPty,
@@ -123,6 +124,11 @@ export interface SpawnLexOptions {
   rows?: number;
   /** Extra env vars merged onto process.env. */
   env?: Record<string, string>;
+  /** When set, the brainstorm row identified by this id is rebound to
+   * the new PTY instead of inserting a fresh row. Used by the
+   * /lex past-sessions "switch to" flow so resumed sessions don't
+   * leave a duplicate active row. */
+  rebindBrainstormId?: string;
 }
 
 export interface SpawnLexResult {
@@ -286,14 +292,25 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
    * cwd matches the brainstorm convention. Lex spawns get a record
    * the moment they start, with status=active and no claude_session_id
    * yet. Once the jsonl appears and we bind, we patch the record with
-   * the claude_session_id so retrieval can join the two. */
+   * the claude_session_id so retrieval can join the two.
+   *
+   * When rebindBrainstormId is supplied (the past-sessions "switch to"
+   * flow), reuse the existing row instead of inserting a new one. The
+   * old code created a duplicate row on every resume, which is why
+   * "switch to" looked like "new session" in the UI: the original row
+   * stayed put while a fresh row appeared at the top. */
   try {
     if (isBrainstormCwd(cwd)) {
-      registerBrainstorm({
-        ptyId,
-        cwd,
-        startedMs: handle.startedAt,
-      });
+      const rebound = opts.rebindBrainstormId
+        ? rebindBrainstormToPty(opts.rebindBrainstormId, ptyId)
+        : null;
+      if (!rebound) {
+        registerBrainstorm({
+          ptyId,
+          cwd,
+          startedMs: handle.startedAt,
+        });
+      }
     }
   } catch {
     /* brainstorm registration is observability, never block spawn */
