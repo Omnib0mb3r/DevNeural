@@ -512,6 +512,32 @@ talked about", search /lex/recall for recent matches and cite by
 source class and session label.
 `;
 
+/* Wave 3 Lane B step 32 (LX-11a). Internal-first retrieval bias rule.
+ * Injected between API surface and self-check so it is always present
+ * and applies regardless of mode. */
+const INTERNAL_FIRST = `# Retrieval bias: internal before external
+
+Before any WebSearch or WebFetch call, check internal sources:
+
+1. POST /lex/chunk-search { q } - brainstorm chunks (cosine similarity)
+2. POST /lex/recall { q } - full retrieval with source classification
+3. GET /lex/sessions - brainstorm session list (for context on prior work)
+4. Grep filesystem for local files (use Bash with grep/find)
+
+Only use WebSearch when:
+- Internal retrieval returns top score < 0.25 (weak match), AND
+- The question is clearly about information that would not be in the
+  local knowledge base (external libraries, news, third-party APIs), OR
+- Michael explicitly asks for external search.
+
+When internal retrieval is weak, say so plainly:
+"Internal search came back weak (top cosine 0.18). Want me to check
+externally, or is there a more specific term I should use?"
+
+Do not silently fall through to WebSearch. The retrieval trace is logged;
+gaps show up on the dashboard.
+`;
+
 const SELF_CHECK = `# Self-check (silent, before sending)
 
 Audit yourself against these. If any fail, revise the response.
@@ -701,6 +727,7 @@ ${snapshotRecentWiki()}
     MODE_CONTRACTS,
     ARTIFACT_CONTRACTS,
     API_SURFACE,
+    INTERNAL_FIRST,
     ...(threadDocBlock ? [threadDocBlock] : []),
     SELF_CHECK,
     refusalBlocks.join('\n\n'),

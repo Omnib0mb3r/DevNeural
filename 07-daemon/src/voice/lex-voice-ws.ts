@@ -53,6 +53,7 @@ import {
 } from '../lex/brainstorm-store.js';
 import { processAssistantTurn } from '../lex/artifact-parser.js';
 import { buildVoiceSnapshot } from '../lex/snapshot-context.js';
+import { checkToolGate } from '../lex/tool-gate.js';
 import { runSessionEndPipeline } from '../lex/session-end-pipeline.js';
 import { appendUtterance as appendSessionAudio } from './audio-bundle.js';
 
@@ -628,9 +629,23 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       /* observability only; fall back to no snapshot rather than
        * blocking the turn */
     }
+    /* Wave 3 Lane B step 33 (LX-11b): tool gate check. When the user's
+     * transcript matches an internal-vocabulary term, prepend a note
+     * instructing Lex to check internal sources before WebSearch. The
+     * gate does NOT hard-block the inject; it prepends a note only.
+     * Awareness event is emitted by checkToolGate itself. */
+    let gateNote = '';
+    try {
+      const gate = checkToolGate(result.text);
+      if (gate.blocked && gate.note) {
+        gateNote = gate.note + '\n\n';
+      }
+    } catch {
+      /* gate is observational; never block the turn */
+    }
     const ir = ptyInject(
       state.bindKey,
-      snapshotBlock + voiceTag + result.text,
+      snapshotBlock + gateNote + voiceTag + result.text,
       true,
     );
     if (!ir.ok) {
