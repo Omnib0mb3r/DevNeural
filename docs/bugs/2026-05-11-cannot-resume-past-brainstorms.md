@@ -39,4 +39,39 @@ User should be able to pick any past brainstorm session and resume it as the act
 
 ## Status
 
-Open. Belongs in Wave 4 scope, important for brainstorm threading story.
+Fixed (pending soak) — 2026-05-11, Wave 3 fixup sprint.
+
+## Root cause
+
+The resume button in `08-dashboard/components/LexSessionList.tsx` was
+gated on `disabled={resumeM.isPending || Boolean(activePtyId)}`. The
+`/lex` page auto-spawns a fresh Lex on mount, so `activePtyId` is
+effectively always truthy whenever the user can see the resume
+buttons. The tooltip ("End the current Lex session before resuming
+a past one") explained the gate but provided no in-row way to act on
+it.
+
+## Fixes shipped
+
+- `LexSessionList.tsx`: drop the `activePtyId` part of the disabled
+  check. The resume mutation now does the same kill-then-spawn dance
+  as the page-level "new session" button (`ptyKill` + patch the old
+  brainstorm row to `status: 'ended'` + 400ms gap so Windows
+  taskkill /F /T tree unwind completes before the new spawn).
+- The button label switches to "switch to" when an active PTY exists,
+  signalling that the action will end the current session first.
+- Tooltip rewritten to mention both the resume target and the
+  switch-from semantics; preserves the existing
+  `claude_session_id`-vs-fresh-PTY distinction.
+
+## Verification
+
+Manual:
+1. Open `/lex`, observe auto-spawned Lex.
+2. Open `/brainstorms`, locate a past session.
+3. Click resume / switch to.
+4. Observe: active Lex ends, new PTY spawns with `--resume <session_id>`
+   when the row had a `claude_session_id`, or in the same cwd with the
+   carried label when it did not.
+
+`tsc --noEmit` clean on `08-dashboard`.

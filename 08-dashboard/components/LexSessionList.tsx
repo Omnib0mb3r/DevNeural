@@ -64,9 +64,31 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
    * args so the conversation history is restored verbatim. Rows
    * with no claude_session_id (PTY died before its jsonl appeared)
    * fall back to "open fresh PTY in same cwd with the same label";
-   * the tooltip on the button reflects the difference. */
+   * the tooltip on the button reflects the difference.
+   *
+   * If a live Lex PTY is already running we end it first (kill +
+   * patch its brainstorm row to status='ended') so /pty/spawn-lex
+   * does not race a competing tile in the same brainstorm cwd. The
+   * 400ms gap matches the page-level newSessionM mutation in
+   * app/lex/page.tsx; without it the new spawn can land before the
+   * old taskkill /F /T tree unwind finishes on Windows. */
   const resumeM = useMutation({
     mutationFn: async (row: BrainstormSessionRow) => {
+      if (activePtyId) {
+        try {
+          await ptyKill(activePtyId);
+        } catch {
+          /* if it was already gone, spawn still proceeds */
+        }
+        if (activeBrainstormId && activeBrainstormId !== row.id) {
+          try {
+            await patchLexSession(activeBrainstormId, { status: "ended" });
+          } catch {
+            /* observability only */
+          }
+        }
+        await new Promise((r) => setTimeout(r, 400));
+      }
       const cwd = row.cwd?.replace(/\//g, "\\");
       const resumeSid = row.claude_session_id ?? undefined;
       const spawned = await spawnLex(cwd ?? undefined, resumeSid);
@@ -260,17 +282,23 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
                         <button
                           type="button"
                           onClick={() => resumeM.mutate(row)}
-                          disabled={resumeM.isPending || Boolean(activePtyId)}
+                          disabled={resumeM.isPending}
                           className="text-nano px-2 py-1 rounded-pill bg-brand/10 hairline ring-1 ring-brand/30 text-brandSoft hover:bg-brand/20 disabled:opacity-40 disabled:cursor-not-allowed"
                           title={
                             activePtyId
-                              ? "End the current Lex session before resuming a past one"
+                              ? row.claude_session_id
+                                ? "End the current Lex and restore this conversation via claude --resume"
+                                : "End the current Lex and open a fresh PTY in the same cwd (no claude_session_id was bound to this row, so verbatim resume is unavailable)"
                               : row.claude_session_id
                                 ? "Restore this conversation via claude --resume"
                                 : "Open a fresh PTY in the same cwd with this label (no claude_session_id was bound to this row, so verbatim resume is unavailable)"
                           }
                         >
-                          resume
+                          {resumeM.isPending
+                            ? "resuming..."
+                            : activePtyId
+                              ? "switch to"
+                              : "resume"}
                         </button>
                       )}
                     </div>
