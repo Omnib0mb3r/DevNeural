@@ -218,6 +218,20 @@ async function main(): Promise<void> {
   }, 20 * 60 * 1000);
   if (typeof janitorTimer.unref === 'function') janitorTimer.unref();
 
+  /* Personality guard (Wave 3 Lane B step 42 / LX-17). Watches
+   * lex-prompts/ for unexpected writes to protected files and applies
+   * best-effort icacls deny-write on Windows. Both are fire-and-forget;
+   * errors are logged but never block the daemon. */
+  let stopPersonalityGuard: (() => void) | null = null;
+  try {
+    const { startPersonalityGuardWatcher, applyIcacls } = await import('./lex/personality-guard.js');
+    stopPersonalityGuard = startPersonalityGuardWatcher(logger);
+    applyIcacls(logger);
+  } catch (err) {
+    logger(`[personality-guard] init failed: ${(err as Error).message}`);
+  }
+  void stopPersonalityGuard;
+
   const scaffold = ensureWiki();
   logger(
     `wiki scaffold: created=${scaffold.created.length} updated=${scaffold.updated.length} present=${scaffold.alreadyPresent.length}`,

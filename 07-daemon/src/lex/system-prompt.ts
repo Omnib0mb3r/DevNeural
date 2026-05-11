@@ -686,6 +686,7 @@ import {
 } from './prompt-blocks.js';
 import { archivePromptVersion } from './prompt-archive.js';
 import { loadMostRecentThreadDoc } from './thread-doc.js';
+import { PERSONALITY_GUARD_RULE } from './personality-guard.js';
 
 /* Wave 2 day 5 step 22 + 23 (LX-3, LX-4): per-mode few-shot block +
  * refusal contract block. Loaded from disk each call so the user can
@@ -765,6 +766,7 @@ ${snapshotRecentWiki()}
     API_SURFACE,
     INTERNAL_FIRST,
     LIVE_FS_AWARENESS,
+    PERSONALITY_GUARD_RULE,
     ...(threadDocBlock ? [threadDocBlock] : []),
     SELF_CHECK,
     refusalBlocks.join('\n\n'),
