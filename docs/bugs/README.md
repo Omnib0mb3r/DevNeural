@@ -5,7 +5,7 @@
 | Date | Bug | Status | Severity |
 |------|-----|--------|----------|
 | 2026-05-05 | [Leftover session tiles](./2026-05-05-leftover-session-tiles.md) | open | low |
-| 2026-05-10 | [Brainstorm picker and transcripts](./2026-05-10-brainstorm-picker-and-transcripts.md) | open | medium |
+| 2026-05-10 | [Brainstorm picker and transcripts](./2026-05-10-brainstorm-picker-and-transcripts.md) | fixed (pending soak) | medium |
 | 2026-05-10 | [CC feedback prompt unanswerable](./2026-05-10-cc-feedback-prompt-unanswerable.md) | open | medium |
 | 2026-05-10 | [State tracker loses live sessions](./2026-05-10-state-tracker-loses-live-sessions.md) | open | medium |
 | 2026-05-11 | [Push-to-talk not releasing mic](./2026-05-11-push-to-talk-not-releasing-mic.md) | fixed (pending soak) | medium |

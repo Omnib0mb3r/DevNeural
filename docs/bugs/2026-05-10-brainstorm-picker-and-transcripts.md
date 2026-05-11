@@ -1,6 +1,6 @@
 # Bug: brainstorm-picker-and-transcripts
 
-**Status:** Deferred to Wave 4 (transcript endpoint + BrainstormTranscript component)
+**Status:** Fixed (pending soak) — 2026-05-11, Wave 3 fixup sprint.
 
 **Date opened:** 2026-05-10
 
@@ -72,23 +72,34 @@ chunks as a conversation transcript (user/lex turns, timestamps, mode badges).
 
 ---
 
-## Deferred
+## Fixes shipped
 
-**Wave 4 carry-over.** Both fixes require dashboard component changes.
-Issue 1 is trivial (staleTime change). Issue 2 requires a new API endpoint plus
-a new component; the component belongs in `08-dashboard/src/system/` per the
-Lane B conflict-avoidance rule (not in `components/` which may conflict with
-Lane A if Lane A touches BrainstormDetail.tsx).
+- Issue 1 (picker stale list): no fix required at code-review time.
+  `BrainstormList` already uses `refetchInterval: 5_000` with no
+  explicit `staleTime`, so the list refreshes every 5s automatically.
+  The 60s staleTime claim in the original root-cause analysis was
+  stale; the code path it described no longer exists. Verified by
+  re-reading `08-dashboard/components/BrainstormList.tsx`.
+- Issue 2 (transcript missing): shipped.
+  - Daemon: new `GET /brainstorms/:id/chunks?limit=N` (cap 1000,
+    default 200) in `07-daemon/src/dashboard/routes.ts`. Returns
+    `{ok, chunks: BrainstormChunkRow[]}` sourced from
+    `store.db.listBrainstormChunks`; embeddings stay server-side.
+  - Daemon: regression tests in
+    `07-daemon/tests/brainstorm-chunks.test.ts` cover ordering by
+    turn_index, the limit argument, and brainstorm_id isolation.
+  - Dashboard: `getBrainstormChunksApi` helper +
+    `BrainstormChunkRow` type added to `daemon-client.ts`.
+  - Dashboard: new `BrainstormTranscript` subcomponent inside
+    `BrainstormDetail.tsx` (kept in `components/` since the file was
+    already there; the Lane B conflict-avoidance rule expired with
+    Wave 3 lane merge). Renders chunks as a role-tagged list with
+    turn index, mode, and timestamp.
 
-Interim workaround for issue 1: the user can force-refresh the browser tab to
-bust the cache. For issue 2: the database is correct; the transcript can be
-queried directly via SQLite as a workaround until the component ships.
+## Verification
 
----
-
-## Verification plan
-
-1. Ship `GET /brainstorms/:id/chunks` returning `{ok, chunks: BrainstormChunkRow[]}`.
-2. Add `BrainstormTranscript` component, render in `BrainstormDetail.tsx` below audio.
-3. Reduce `BrainstormList` staleTime to 10s.
-4. Verify: fresh daemon restart, brainstorm list shows within 10s; session detail shows transcript.
+1. `tsc --noEmit` clean on both projects.
+2. `npx vitest run tests/brainstorm-chunks.test.ts`: 3/3 pass.
+3. Manual: load `/brainstorms/<id>` for a session that has chunks;
+   the new Transcript section renders user/lex turns under the audio
+   player.

@@ -13,8 +13,10 @@ import { AudioPlayer } from "./AudioPlayer";
 import {
   getBrainstormApi,
   getBrainstormCuesApi,
+  getBrainstormChunksApi,
   lexSessionArtifacts,
   type AudioCue,
+  type BrainstormChunkRow,
 } from "@/lib/daemon-client";
 
 export function BrainstormDetail({ id }: { id: string }) {
@@ -32,6 +34,16 @@ export function BrainstormDetail({ id }: { id: string }) {
     queryKey: ["brainstorm-cues", id],
     queryFn: () => getBrainstormCuesApi(id),
     enabled: Boolean(cuesUrl),
+  });
+  /* Wave 3 fixup (bug: 2026-05-10-brainstorm-picker-and-transcripts).
+   * Pull the brainstorm_chunks rows so the user can read the text
+   * transcript alongside the audio. Skips if the row is still
+   * mid-ingest (turn_count=0); refetches on the same cadence as the
+   * detail row so a live session updates as turns land. */
+  const chunks = useQuery({
+    queryKey: ["brainstorm-chunks", id],
+    queryFn: () => getBrainstormChunksApi(id, 500),
+    refetchInterval: 10_000,
   });
 
   if (detail.isLoading) return <p className="p-4 text-sm text-txt3">loading…</p>;
@@ -74,11 +86,55 @@ export function BrainstormDetail({ id }: { id: string }) {
           <p className="whitespace-pre-wrap text-sm text-txt2">{bs.last_summary}</p>
         </section>
       ) : null}
+      <BrainstormTranscript
+        chunks={chunks.data?.chunks ?? []}
+        loading={chunks.isLoading}
+      />
       <ArtifactsSection
         items={artifacts.data?.artifacts ?? []}
         loading={artifacts.isLoading}
       />
     </div>
+  );
+}
+
+function BrainstormTranscript(props: {
+  chunks: BrainstormChunkRow[];
+  loading: boolean;
+}) {
+  const roleStyle: Record<BrainstormChunkRow["role"], string> = {
+    user: "text-brandSoft",
+    lex: "text-txt1",
+    tool: "text-txt3",
+  };
+  return (
+    <section>
+      <h2 className="text-sm font-semibold">Transcript</h2>
+      {props.loading ? (
+        <p className="text-xs text-txt3">loading…</p>
+      ) : props.chunks.length === 0 ? (
+        <p className="text-xs text-txt3">no transcript chunks for this session.</p>
+      ) : (
+        <ol className="flex flex-col gap-2">
+          {props.chunks.map((c) => (
+            <li
+              key={c.id}
+              className="rounded border border-border1 bg-surface1 p-2 text-xs"
+            >
+              <div className="flex items-center gap-2 font-mono text-nano text-txt3">
+                <span className={roleStyle[c.role]}>{c.role}</span>
+                <span>turn {c.turn_index}</span>
+                <span>{c.mode}</span>
+                <span className="ml-auto">
+                  {new Date(c.created_at).toISOString().slice(11, 19)}
+                </span>
+              </div>
+              <p className="mt-1 whitespace-pre-wrap text-txt2">{c.text}</p>
+            </li>
+          ))}
+        </ol>
+      )}
+    </section>
   );
 }
 

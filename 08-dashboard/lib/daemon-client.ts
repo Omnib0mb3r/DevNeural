@@ -590,6 +590,26 @@ export interface BrainstormCues {
 export const getBrainstormCuesApi = (id: string) =>
   request<BrainstormCues>(`/brainstorms/${encodeURIComponent(id)}/cues`);
 
+/* Wave 3 fixup (bug: 2026-05-10-brainstorm-picker-and-transcripts).
+ * BrainstormChunkRow shape mirrors the daemon's table. The text
+ * surface (BrainstormTranscript component) renders these as
+ * user/lex/tool turns; embeddings are not transferred over the wire. */
+export interface BrainstormChunkRow {
+  id: string;
+  brainstorm_id: string;
+  turn_index: number;
+  role: "user" | "lex" | "tool";
+  mode: "conversation" | "notes" | "push-to-talk";
+  text: string;
+  model_id: string;
+  no_decay: number;
+  created_at: string;
+}
+export const getBrainstormChunksApi = (id: string, limit = 200) =>
+  request<{ ok: boolean; chunks: BrainstormChunkRow[] }>(
+    `/brainstorms/${encodeURIComponent(id)}/chunks?limit=${limit}`,
+  );
+
 /* Wave 2 day 3 step 13. Borderline-band candidates from
  * `npm run backfill-brainstorms` await one-click link / reject. */
 export interface BackfillReviewRow {

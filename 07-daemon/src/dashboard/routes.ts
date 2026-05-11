@@ -2684,6 +2684,25 @@ export async function registerDashboardRoutes(
     return { ok: true, brainstorm: decorateBrainstorm(row) };
   });
 
+  /* Wave 3 fixup (bug: 2026-05-10-brainstorm-picker-and-transcripts).
+   * Return the brainstorm_chunks rows for a session so the dashboard can
+   * render the text transcript alongside the audio player. limit is
+   * capped to 1000 (one chunk per turn; 1000 is well above any real
+   * session's turn count). Embedding vectors are not returned; only the
+   * text + metadata. */
+  app.get('/brainstorms/:id/chunks', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const q = req.query as { limit?: string };
+    const limit = Math.min(1000, Math.max(1, Number(q.limit ?? 200) || 200));
+    const row = store.db.getBrainstorm(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'not found' };
+    }
+    const chunks = store.db.listBrainstormChunks(id, limit);
+    return { ok: true, chunks };
+  });
+
   app.get('/brainstorms/:id/cues', async (req, reply) => {
     const id = (req.params as { id: string }).id;
     const row = store.db.getBrainstorm(id);
