@@ -27,4 +27,26 @@ Voice client PTT handler in `08-dashboard/src/voice/` (likely the keyup / button
 
 ## Status
 
-Open. Not yet triaged for fix.
+Fixed (pending soak) — 2026-05-11, Wave 3 fixup sprint.
+
+## Fixes shipped
+
+- `08-dashboard/components/VoiceClient.tsx`: PTT mode now disables the
+  mic tracks (`track.enabled = false`) at init and on every release;
+  `__pttStart` re-enables them on press. The OS mic indicator goes
+  dark between presses, the AudioContext processor stops receiving
+  audio (its `pttCapturing` gate already discarded buffered frames,
+  but the underlying media flow now stops at the browser layer),
+  and the next press has zero re-grant latency because the stream +
+  context stay alive.
+
+## Verification
+
+Manual:
+1. Switch voice mode to "push-to-talk".
+2. Press start voice (mic indicator turns on briefly while granting).
+3. Observe: indicator goes dark immediately (init sets enabled=false).
+4. Hold the talk button: indicator turns back on, audio captures.
+5. Release: indicator goes dark again, no further frames reach the server.
+
+`tsc --noEmit` clean on `08-dashboard`.

@@ -967,6 +967,15 @@ export function VoiceClient({ sessionId }: Props) {
           pttStream = await navigator.mediaDevices.getUserMedia({
             audio: { echoCancellation: true, noiseSuppression: true },
           });
+          /* Hold the mic in a disabled state until the user actually
+           * presses talk. getUserMedia activates the OS mic indicator
+           * the moment the stream is granted; flipping enabled=false
+           * on every track immediately dims that indicator on
+           * Chromium/Edge/Firefox and stops the underlying media flow.
+           * __pttStart re-enables before reading frames. */
+          pttStream.getAudioTracks().forEach((t) => {
+            t.enabled = false;
+          });
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const Cls: any =
             (window as unknown as { AudioContext?: typeof AudioContext })
@@ -1041,6 +1050,12 @@ export function VoiceClient({ sessionId }: Props) {
         }
         pttBuffer = [];
         pttCapturing = true;
+        /* Re-enable the mic tracks before the first onaudioprocess
+         * tick lands. Was set to enabled=false at init + on every
+         * release so the OS mic indicator is dark between presses. */
+        pttStream?.getAudioTracks().forEach((t) => {
+          t.enabled = true;
+        });
         sendJson({ t: "utterance-start" });
         setStatus("listening");
         utteranceStartRef.current = Date.now();
@@ -1057,6 +1072,13 @@ export function VoiceClient({ sessionId }: Props) {
         if (modeRef.current !== "push-to-talk") return;
         if (!pttCapturing) return;
         pttCapturing = false;
+        /* Disable the mic tracks the moment the user releases so the
+         * OS mic indicator goes dark and the underlying media flow
+         * stops. Stream + AudioContext stay alive so the next press
+         * has no re-grant latency. */
+        pttStream?.getAudioTracks().forEach((t) => {
+          t.enabled = false;
+        });
         if (utteranceTimerRef.current) {
           clearInterval(utteranceTimerRef.current);
           utteranceTimerRef.current = null;
