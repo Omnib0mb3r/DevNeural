@@ -16,12 +16,17 @@
  * cwd list".
  *
  * Cheap to build: one fs scan + one SQLite query + one in-memory list.
+ *
+ * Wave 3 Lane B step 36 (LX-13): extends the block with actionable
+ * curator events (high-severity audit findings, open lint flags,
+ * unresolved draft conflicts). Only surfaced when present; count and
+ * worst-severity label only, never full detail (that blows context).
  */
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { listSessions } from '../dashboard/sessions.js';
 import { listPtys } from '../dashboard/pty-host.js';
-import { listBrainstorms } from './brainstorm-store.js';
+import { listBrainstorms, getStore } from './brainstorm-store.js';
 import { listReminders } from '../dashboard/reminders.js';
 
 function friendlyProject(slug: string): string {
@@ -103,12 +108,51 @@ export function buildVoiceSnapshot(): string {
         .join('\n')
     : '  (none)';
 
+  /* Wave 3 Lane B step 36 (LX-13): curator events (audit findings, lint
+   * flags, draft conflicts). Read from SQLite via the brainstorm-store
+   * singleton's IndexDb. Best-effort: if the store is not initialised
+   * yet (early in daemon boot), silently skip. */
+  const curatorFlags = (() => {
+    try {
+      const store = getStore();
+      /* High-severity open audit findings only (lint + self-audit).
+       * Count and worst source label; never dump the full detail into
+       * the voice turn. */
+      const highFindings = store.db.listAuditFindings({
+        status: 'open',
+        severity: 'high',
+        limit: 10,
+      });
+      const lintFlags = highFindings.filter((f) => f.source === 'lint');
+      const auditFlags = highFindings.filter((f) => f.source === 'self-audit');
+      /* Open wiki drafts in conflict state (superseded status from
+       * promote-conflict; pending with high confidence that are > 14d
+       * old may also be a signal, but we keep it simple here). */
+      const conflictDrafts = store.db.listWikiDrafts({
+        status: 'superseded',
+        limit: 10,
+      });
+      const lines: string[] = [];
+      if (highFindings.length > 0) {
+        lines.push(
+          `  audit_findings_high: ${highFindings.length} open (lint=${lintFlags.length}, self-audit=${auditFlags.length})`,
+        );
+      }
+      if (conflictDrafts.length > 0) {
+        lines.push(`  draft_conflicts: ${conflictDrafts.length} superseded drafts need review`);
+      }
+      return lines.length > 0 ? lines.join('\n') : null;
+    } catch {
+      return null;
+    }
+  })();
+
   const ptyLine = `live_ptys: ${ptys.length}`;
   const remLine = `open_reminders: ${reminderCount}`;
   const hostLine = `host: ${os.hostname()} (${process.platform})`;
   const dataLine = `data_root_separator: backslash on Windows (C:\\dev\\data)`;
 
-  return [
+  const parts = [
     `<live_state ts="${ts}">`,
     'open_projects (live Claude Code sessions, this is the answer to "what projects do I have open"):',
     sessionLines,
@@ -118,6 +162,11 @@ export function buildVoiceSnapshot(): string {
     remLine,
     hostLine,
     dataLine,
-    '</live_state>',
-  ].join('\n');
+  ];
+  if (curatorFlags) {
+    parts.push('curator_flags (actionable - surface if asked about system health):');
+    parts.push(curatorFlags);
+  }
+  parts.push('</live_state>');
+  return parts.join('\n');
 }
