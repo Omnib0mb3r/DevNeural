@@ -3013,6 +3013,28 @@ export async function registerDashboardRoutes(
     return { ok: true, mode: body.mode };
   });
 
+  /* ── /lex/retrieval-trace (Wave 3 Lane B step 35 / LX-12b) ────────
+   * Lists recent retrieval log rows for dashboard observability.
+   * Query params: brainstorm_id (filter to session), kind (grep|chunks|wiki|web), limit. */
+  app.get('/lex/retrieval-trace', async (req) => {
+    const q = (req.query ?? {}) as {
+      brainstorm_id?: string;
+      kind?: string;
+      limit?: string;
+    };
+    const limit = Math.min(200, Math.max(1, Number(q.limit ?? 50)));
+    const kind =
+      q.kind === 'grep' || q.kind === 'chunks' || q.kind === 'wiki' || q.kind === 'web'
+        ? (q.kind as 'grep' | 'chunks' | 'wiki' | 'web')
+        : undefined;
+    const rows = store.db.listRetrievalLogs({
+      brainstorm_id: q.brainstorm_id,
+      kind,
+      limit,
+    });
+    return { ok: true, rows, total: rows.length };
+  });
+
   /* ── /lex/prompts (Wave 2 day 5 step 20 / LX-1) ──────────────────
    * Disk archive of every Lex system-prompt revision. The dashboard
    * LexReplayViewer lists versions and reads bodies. */

@@ -118,6 +118,21 @@ export interface AuditFindingRow {
   resolved_at: string | null;
 }
 
+/* lex_retrieval_log row. Wave 3 Lane B step 34 (LX-12a). Records every
+ * retrieval decision made during a Lex session so the dashboard can show
+ * a trace of what was searched and whether internal or external retrieval
+ * was used. Written by chunkSearch, the wiki recall hook, and the tool
+ * gate middleware. */
+export interface LexRetrievalLogRow {
+  id: string;
+  brainstorm_id: string | null;
+  ts: string;
+  query: string;
+  kind: 'grep' | 'chunks' | 'wiki' | 'web';
+  results_json: string | null;
+  decision: string | null;
+}
+
 /* runtime_config row. Wave 2 day 4 step 19 (A15) pause-mode toggle
  * lives here so a daemon restart is not required to flip the gate.
  * Generic key/value JSON so future toggles (lint cadence override,
@@ -1336,6 +1351,74 @@ export class IndexDb {
     }
     visited.delete(pageId);
     return visited;
+  }
+
+  // ── lex_retrieval_log (Wave 3 Lane B step 34 / LX-12a) ──────────
+  /* Insert a retrieval trace row. Called by chunkSearch, wiki recall
+   * hook, and the tool gate middleware. Best-effort; never throws. */
+  insertRetrievalLog(row: {
+    id: string;
+    brainstorm_id?: string | null;
+    query: string;
+    kind: 'grep' | 'chunks' | 'wiki' | 'web';
+    results_json?: string | null;
+    decision?: string | null;
+  }): void {
+    try {
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO lex_retrieval_log
+             (id, brainstorm_id, query, kind, results_json, decision)
+           VALUES (@id, @brainstorm_id, @query, @kind, @results_json, @decision)`,
+        )
+        .run({
+          brainstorm_id: null,
+          results_json: null,
+          decision: null,
+          ...row,
+        });
+    } catch {
+      /* table may not exist if migration 015 has not run yet; silently skip */
+    }
+  }
+
+  listRetrievalLogs(opts: {
+    brainstorm_id?: string;
+    kind?: 'grep' | 'chunks' | 'wiki' | 'web';
+    limit?: number;
+  } = {}): LexRetrievalLogRow[] {
+    try {
+      const limit = Math.min(500, Math.max(1, opts.limit ?? 50));
+      if (opts.brainstorm_id) {
+        const rows = this.db
+          .prepare(
+            `SELECT * FROM lex_retrieval_log
+             WHERE brainstorm_id = ?
+             ORDER BY ts DESC LIMIT ?`,
+          )
+          .all(opts.brainstorm_id, limit);
+        return rows as LexRetrievalLogRow[];
+      }
+      if (opts.kind) {
+        const rows = this.db
+          .prepare(
+            `SELECT * FROM lex_retrieval_log
+             WHERE kind = ?
+             ORDER BY ts DESC LIMIT ?`,
+          )
+          .all(opts.kind, limit);
+        return rows as LexRetrievalLogRow[];
+      }
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM lex_retrieval_log ORDER BY ts DESC LIMIT ?`,
+        )
+        .all(limit);
+      return rows as LexRetrievalLogRow[];
+    } catch {
+      /* table may not exist yet */
+      return [];
+    }
   }
 
   close(): void {
