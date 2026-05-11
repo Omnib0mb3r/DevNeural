@@ -117,6 +117,7 @@ import {
 } from './notifications.js';
 import { createProject } from './projects-new.js';
 import { buildGraph } from './graph.js';
+import { buildUnifiedGraph } from './unified-graph.js';
 import {
   vapidPublicKey,
   saveSubscription,
@@ -315,6 +316,9 @@ export async function registerDashboardRoutes(
 
   // ── Wiki graph for the orb ───────────────────────────────────────
   app.get('/graph', async () => buildGraph());
+
+  // ── Unified graph (all 4 node kinds) for the unified orb ─────────
+  app.get('/graph/unified', async () => buildUnifiedGraph(store.db));
 
   // ── Single wiki page fetch (for the search-result modal) ─────────
   app.get('/wiki/page/:id', async (req, reply) => {

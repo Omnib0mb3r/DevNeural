@@ -1165,6 +1165,34 @@ export interface GraphResponse {
 }
 export const graph = () => request<GraphResponse>("/graph");
 
+// ── unified graph (all 4 node kinds) ───────────────────────────
+export type UnifiedNodeKind = "brainstorm" | "wiki" | "project" | "meeting";
+export type UnifiedEdgeKind = "lineage" | "wiki-cross-ref" | "project-spawn";
+export interface UnifiedGraphNode {
+  id: string;
+  kind: UnifiedNodeKind;
+  title: string;
+  weight: number;
+  last_active: string;
+  wiki_status?: "canonical" | "pending" | "archived";
+  is_draft?: boolean;
+  project_slug?: string | null;
+  source_brainstorms?: string[];
+  source_meetings?: string[];
+}
+export interface UnifiedGraphEdge {
+  source: string;
+  target: string;
+  kind: UnifiedEdgeKind;
+  weight: number;
+}
+export interface UnifiedGraphResponse {
+  ok: boolean;
+  nodes: UnifiedGraphNode[];
+  edges: UnifiedGraphEdge[];
+}
+export const graphUnified = () => request<UnifiedGraphResponse>("/graph/unified");
+
 // ── single wiki page (for search-result modal) ─────────────────
 export interface WikiPageDetail {
   id: string;
