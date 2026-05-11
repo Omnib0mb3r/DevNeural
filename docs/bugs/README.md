@@ -1,5 +1,23 @@
 # Bug Log
 
+## Open bugs
+
+| Date | Bug | Status | Severity |
+|------|-----|--------|----------|
+| 2026-05-05 | [Leftover session tiles](./2026-05-05-leftover-session-tiles.md) | open | low |
+| 2026-05-10 | [Brainstorm picker and transcripts](./2026-05-10-brainstorm-picker-and-transcripts.md) | open | medium |
+| 2026-05-10 | [CC feedback prompt unanswerable](./2026-05-10-cc-feedback-prompt-unanswerable.md) | open | medium |
+| 2026-05-10 | [State tracker loses live sessions](./2026-05-10-state-tracker-loses-live-sessions.md) | open | medium |
+| 2026-05-11 | [Push-to-talk not releasing mic](./2026-05-11-push-to-talk-not-releasing-mic.md) | open | medium |
+| 2026-05-11 | [Cannot resume past brainstorms](./2026-05-11-cannot-resume-past-brainstorms.md) | open | medium |
+| 2026-05-11 | [Dashboard small screen overflow](./2026-05-11-dashboard-small-screen-overflow.md) | open | medium |
+
+Update this table whenever a bug is added, fixed, or its status changes.
+
+---
+
+## Conventions
+
 One file per investigation. Naming: `YYYY-MM-DD-short-slug.md`.
 
 Each bug doc captures:
