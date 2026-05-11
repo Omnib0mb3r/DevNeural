@@ -1357,6 +1357,30 @@ export async function registerDashboardRoutes(
     };
   });
 
+  /* Wave 3 Lane B step 31 (LX-10): bounded brainstorm-chunk search.
+   * POST /lex/chunk-search { q, limit?, brainstorm_id? }
+   * Returns top-N brainstorm_chunks rows by cosine similarity using
+   * the Xenova embedder pipeline. Falls back to FTS when no embeddings
+   * are available for a session. Lex uses this to ground answers in
+   * prior brainstorm content before resorting to web search. */
+  app.post('/lex/chunk-search', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      q?: string;
+      limit?: number;
+      brainstorm_id?: string;
+    };
+    if (!body.q || !body.q.trim()) {
+      reply.code(400);
+      return { ok: false, error: 'q required' };
+    }
+    const { chunkSearch } = await import('../lex/chunk-retrieval.js');
+    const result = await chunkSearch(store, body.q.trim(), {
+      limit: typeof body.limit === 'number' ? body.limit : 3,
+      brainstorm_id: body.brainstorm_id,
+    });
+    return { ok: true, ...result };
+  });
+
   /* Slice E: Lex supervisor primitives. /lex/steer wraps ptyInject
    * so Lex can direct a worker session by either session_id or
    * pty_id without going through the lower-level /sessions or /pty
