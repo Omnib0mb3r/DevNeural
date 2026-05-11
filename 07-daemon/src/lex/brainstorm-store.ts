@@ -196,17 +196,34 @@ export function listBrainstorms(opts: {
 /* Boot reaper. PTY exit handlers in pty-host close active rows, but a
  * daemon crash (SIGKILL, SqliteError fatal, etc.) skips them, leaving
  * rows stuck at status='active'. Call this once after the store opens
- * so the dashboard never starts with orphaned active sessions. */
+ * so the dashboard never starts with orphaned active sessions.
+ *
+ * Rows with zero substance (no chunks, no audio, no distilled summary)
+ * are deleted outright rather than marked ended. They are auto-spawn
+ * shells from the previous boot that the user never actually used;
+ * keeping them clutters the Past Sessions list and buries real
+ * sessions past the page limit. Substantive rows are still marked
+ * ended in place so their history is preserved.
+ * Bug: 2026-05-11-past-sessions-orphan-pollution. */
 export function reapAllActive(reason: string): number {
   const rows = db().listBrainstorms({ status: 'active', limit: 10_000 });
   const now = Date.now();
+  let touched = 0;
   for (const row of rows) {
-    db().updateBrainstorm(row.id, {
-      status: 'ended',
-      ended_ms: now,
-      last_summary: reason,
-      last_summary_ms: now,
-    });
+    const chunks = db().countBrainstormChunks(row.id);
+    const hasAudio = Boolean(row.audio_path);
+    const hasDistilled = Boolean(row.distilled_at);
+    if (chunks === 0 && !hasAudio && !hasDistilled) {
+      db().deleteBrainstorm(row.id);
+    } else {
+      db().updateBrainstorm(row.id, {
+        status: 'ended',
+        ended_ms: now,
+        last_summary: reason,
+        last_summary_ms: now,
+      });
+    }
+    touched += 1;
   }
-  return rows.length;
+  return touched;
 }

@@ -579,6 +579,20 @@ export class IndexDb {
          VALUES (@id, @brainstorm_id, @turn_index, @role, @mode, @text, @model_id, @no_decay)`,
       )
       .run({ no_decay: 1, ...row });
+    /* Keep brainstorm_sessions.turn_count in sync so the past-sessions
+     * list and the empty-row filter (listBrainstormsFiltered) can
+     * decide substance without a JOIN on every read. Recompute the
+     * full count rather than incrementing so INSERT OR REPLACE on an
+     * existing primary key stays correct (no double-count). */
+    this.db
+      .prepare(
+        `UPDATE brainstorm_sessions
+           SET turn_count = (
+             SELECT COUNT(*) FROM brainstorm_chunks WHERE brainstorm_id = ?
+           )
+         WHERE id = ?`,
+      )
+      .run(row.brainstorm_id, row.brainstorm_id);
   }
 
   countBrainstormChunks(brainstormId: string): number {
@@ -959,6 +973,11 @@ export class IndexDb {
     mode?: string;
     date?: string;
     limit?: number;
+    /* Default false: hide rows with zero turns AND no audio AND no
+     * distilled summary. These are typically daemon-restart orphans
+     * or auto-spawn shells that never got used. Pass true to surface
+     * them (admin / debug). */
+    includeEmpty?: boolean;
   } = {}): BrainstormSessionRow[] {
     const limit = Math.min(500, Math.max(1, opts.limit ?? 100));
     const where: string[] = [];
@@ -980,6 +999,11 @@ export class IndexDb {
         `substr(strftime('%Y-%m-%dT%H:%M:%SZ', started_ms / 1000.0, 'unixepoch'), 1, 10) = ?`,
       );
       params.push(opts.date);
+    }
+    if (!opts.includeEmpty) {
+      where.push(
+        `(turn_count > 0 OR audio_path IS NOT NULL OR distilled_at IS NOT NULL)`,
+      );
     }
     const sql =
       `SELECT * FROM brainstorm_sessions` +
@@ -1206,6 +1230,17 @@ export class IndexDb {
         .prepare(`SELECT * FROM brainstorm_sessions WHERE id = ?`)
         .get(id) as BrainstormSessionRow | undefined) ?? null
     );
+  }
+
+  /* Hard-delete a brainstorm row. Used by the boot reaper to drop
+   * orphan auto-spawn shells (zero turns, no audio, no distilled
+   * summary). Substantive rows are marked status='ended' instead.
+   * brainstorm_chunks rows for the id are removed first so the
+   * FK declaration in migration 003 stays satisfied even when
+   * pragma foreign_keys is on. */
+  deleteBrainstorm(id: string): void {
+    this.db.prepare(`DELETE FROM brainstorm_chunks WHERE brainstorm_id = ?`).run(id);
+    this.db.prepare(`DELETE FROM brainstorm_sessions WHERE id = ?`).run(id);
   }
 
   getBrainstormByClaudeSession(

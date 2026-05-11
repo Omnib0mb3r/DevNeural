@@ -2668,6 +2668,7 @@ export async function registerDashboardRoutes(
       mode?: string;
       date?: string;
       limit?: string;
+      include_empty?: string;
     };
     const kind = q.kind === 'meeting' ? 'meeting' : 'brainstorm';
     const opts: {
@@ -2676,11 +2677,15 @@ export async function registerDashboardRoutes(
       mode?: string;
       date?: string;
       limit?: number;
+      includeEmpty?: boolean;
     } = { kind };
     if (q.project) opts.project_slug = q.project;
     if (q.mode) opts.mode = q.mode;
     if (q.date) opts.date = q.date;
     if (q.limit) opts.limit = Math.min(500, Math.max(1, Number(q.limit)));
+    /* Default hides zero-substance rows (auto-spawn shells, daemon-
+     * restart orphans). Pass ?include_empty=1 to surface them. */
+    if (q.include_empty === '1') opts.includeEmpty = true;
     const rows = store.db.listBrainstormsFiltered(opts);
     return {
       ok: true,

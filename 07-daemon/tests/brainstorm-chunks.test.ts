@@ -132,3 +132,107 @@ describe('listBrainstormChunks (Wave 3 fixup: transcript surface)', () => {
     expect(db.listBrainstormChunks(bidB).map((c) => c.text)).toEqual(['b']);
   });
 });
+
+describe('insertBrainstormChunk turn_count backfill (bug: 2026-05-11-past-sessions-orphan-pollution)', () => {
+  it('updates brainstorm_sessions.turn_count on every chunk insert', () => {
+    const bid = seedSession();
+    expect(db.getBrainstorm(bid)?.turn_count).toBe(0);
+    db.insertBrainstormChunk({
+      id: randomUUID(),
+      brainstorm_id: bid,
+      turn_index: 0,
+      role: 'user',
+      mode: 'conversation',
+      text: 'one',
+      model_id: 'opus',
+    });
+    expect(db.getBrainstorm(bid)?.turn_count).toBe(1);
+    db.insertBrainstormChunk({
+      id: randomUUID(),
+      brainstorm_id: bid,
+      turn_index: 1,
+      role: 'lex',
+      mode: 'conversation',
+      text: 'two',
+      model_id: 'opus',
+    });
+    expect(db.getBrainstorm(bid)?.turn_count).toBe(2);
+  });
+
+  it('INSERT OR REPLACE on an existing chunk id does not double-count', () => {
+    const bid = seedSession();
+    const chunkId = randomUUID();
+    db.insertBrainstormChunk({
+      id: chunkId,
+      brainstorm_id: bid,
+      turn_index: 0,
+      role: 'user',
+      mode: 'conversation',
+      text: 'one',
+      model_id: 'opus',
+    });
+    db.insertBrainstormChunk({
+      id: chunkId,
+      brainstorm_id: bid,
+      turn_index: 0,
+      role: 'user',
+      mode: 'conversation',
+      text: 'one-rewritten',
+      model_id: 'opus',
+    });
+    expect(db.getBrainstorm(bid)?.turn_count).toBe(1);
+  });
+});
+
+describe('listBrainstormsFiltered includeEmpty (bug: 2026-05-11-past-sessions-orphan-pollution)', () => {
+  it('hides zero-turn no-audio rows by default', () => {
+    const empty = seedSession();
+    const substantive = seedSession();
+    db.insertBrainstormChunk({
+      id: randomUUID(),
+      brainstorm_id: substantive,
+      turn_index: 0,
+      role: 'user',
+      mode: 'conversation',
+      text: 'real',
+      model_id: 'opus',
+    });
+    const visible = db.listBrainstormsFiltered({});
+    const ids = visible.map((r) => r.id);
+    expect(ids).toContain(substantive);
+    expect(ids).not.toContain(empty);
+  });
+
+  it('surfaces empty rows when includeEmpty is true', () => {
+    const empty = seedSession();
+    const visible = db.listBrainstormsFiltered({ includeEmpty: true });
+    expect(visible.map((r) => r.id)).toContain(empty);
+  });
+
+  it('keeps a row with audio_path even when turn_count is zero', () => {
+    const id = seedSession();
+    db['db']
+      .prepare(`UPDATE brainstorm_sessions SET audio_path = ? WHERE id = ?`)
+      .run('/tmp/bundle.wav', id);
+    const visible = db.listBrainstormsFiltered({});
+    expect(visible.map((r) => r.id)).toContain(id);
+  });
+});
+
+describe('deleteBrainstorm (bug: 2026-05-11-past-sessions-orphan-pollution)', () => {
+  it('removes the row and its chunks', () => {
+    const bid = seedSession();
+    db.insertBrainstormChunk({
+      id: randomUUID(),
+      brainstorm_id: bid,
+      turn_index: 0,
+      role: 'user',
+      mode: 'conversation',
+      text: 'x',
+      model_id: 'opus',
+    });
+    db.deleteBrainstorm(bid);
+    expect(db.getBrainstorm(bid)).toBeNull();
+    expect(db.listBrainstormChunks(bid)).toEqual([]);
+  });
+});
