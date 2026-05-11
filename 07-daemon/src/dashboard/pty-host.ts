@@ -58,7 +58,38 @@ interface PtyHandle {
    * status-bar redraws instead of overwriting them. */
   cols: number;
   rows: number;
+  /** Wave 3 fixup (bug: 2026-05-10-cc-feedback-prompt-unanswerable).
+   * Set when claude code renders a native rating / y-n / continue
+   * prompt in the PTY (detected by stdout pattern). While set, voice
+   * WS injection refuses to forward transcribed text so the user does
+   * not accidentally answer the prompt with "1" / "yes" via voice.
+   * Cleared automatically 90s after the last pattern hit; sequential
+   * matches keep it alive. */
+  awaitingSystemPromptUntil: number;
 }
+
+/* Regexes that identify a CC native feedback / prompt overlay in the
+ * stdout stream. Conservative on purpose: false positives would mute
+ * legitimate voice traffic. The first three cover the documented bug
+ * symptom (rating prompt); the y/n + continue patterns cover the
+ * related "press enter to continue" prompts that show up after long
+ * tool runs. */
+const CC_SYSTEM_PROMPT_RE = new RegExp(
+  [
+    'How would you rate',
+    '1 = thumbs down',
+    'Rate this interaction',
+    'rate this session',
+    'Press Enter to continue',
+    'Continue\\? \\(y/n\\)',
+  ].join('|'),
+  'i',
+);
+const SYSTEM_PROMPT_HOLD_MS = 90_000;
+/* Test-only re-exports for tests/cc-feedback-prompt-detect.test.ts.
+ * Underscored to discourage runtime use. */
+export const __CC_SYSTEM_PROMPT_RE_FOR_TEST = CC_SYSTEM_PROMPT_RE;
+export const __SYSTEM_PROMPT_HOLD_MS_FOR_TEST = SYSTEM_PROMPT_HOLD_MS;
 
 const ptys = new Map<string, PtyHandle>();
 const sessionToPty = new Map<string, string>();
@@ -233,6 +264,7 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
     preBufferBytes: 0,
     cols,
     rows,
+    awaitingSystemPromptUntil: 0,
   };
   ptys.set(ptyId, handle);
 
@@ -255,6 +287,15 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
 
   pty.onData((data) => {
     handle.lastActivity = Date.now();
+    /* Wave 3 fixup (bug: 2026-05-10-cc-feedback-prompt-unanswerable).
+     * Stamp the awaiting-system-prompt window every time the regex
+     * matches incoming stdout. The window auto-closes 90s after the
+     * last hit, which covers the typical interaction even if the
+     * prompt scrolls partway off-screen. ptyInject consults this gate
+     * before forwarding voice-side text. */
+    if (CC_SYSTEM_PROMPT_RE.test(data)) {
+      handle.awaitingSystemPromptUntil = Date.now() + SYSTEM_PROMPT_HOLD_MS;
+    }
     /* If we've already bound, push directly into the ring. Otherwise
      * accumulate in the pre-buffer. We probe for the session-id every
      * chunk on the early side and every ~16 chunks once we've been
@@ -376,6 +417,22 @@ export function getPtyOutput(ptyId: string): string {
   const h = ptys.get(ptyId);
   if (!h) return '';
   return h.preBuffer.join('');
+}
+
+/**
+ * Wave 3 fixup (bug: 2026-05-10-cc-feedback-prompt-unanswerable).
+ * Report whether a PTY is currently rendering a CC native system
+ * prompt (rating, y/n, continue?). Callers that auto-inject text on
+ * the user's behalf (voice WS) should refuse to forward when this is
+ * true so the user does not accidentally answer the system prompt
+ * with their voice utterance. Typed-text paths are intentionally
+ * unrestricted because the user can see the prompt and chooses.
+ */
+export function isAwaitingSystemPrompt(ptyIdOrSession: string): boolean {
+  let handle = ptys.get(ptyIdOrSession);
+  if (!handle) handle = getPtyBySession(ptyIdOrSession);
+  if (!handle) return false;
+  return Date.now() < handle.awaitingSystemPromptUntil;
 }
 
 /**

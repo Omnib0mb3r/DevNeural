@@ -45,7 +45,13 @@ import * as os from 'node:os';
 import type { WebSocket as FastifyWS } from '@fastify/websocket';
 import { transcribeWav, pcm16ToWav } from './whisper.js';
 import { synthesize, piperStatus } from './piper.js';
-import { ptyInject, getPty, getPtyBySession, listPtys } from '../dashboard/pty-host.js';
+import {
+  ptyInject,
+  getPty,
+  getPtyBySession,
+  listPtys,
+  isAwaitingSystemPrompt,
+} from '../dashboard/pty-host.js';
 import {
   getBrainstormByClaudeSessionId,
   getBrainstormByPty,
@@ -694,6 +700,23 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       }
     } catch {
       /* gate is observational; never block the turn */
+    }
+    /* Wave 3 fixup (bug: 2026-05-10-cc-feedback-prompt-unanswerable).
+     * Refuse to forward the transcribed utterance when claude code is
+     * currently displaying a native rating / y-n / continue prompt.
+     * Otherwise the user's voice would land in the prompt response
+     * field and submit a bogus rating. Surface the block to the
+     * client so the panel can show "voice paused while CC prompt is
+     * open"; the user can still answer the prompt manually in the
+     * terminal. */
+    if (isAwaitingSystemPrompt(state.bindKey)) {
+      send({
+        t: 'error',
+        code: 'cc-feedback-prompt-active',
+        message:
+          'Claude Code system prompt is open in the terminal. Voice injection paused; answer the prompt in the terminal or wait for it to dismiss.',
+      });
+      return;
     }
     const ir = ptyInject(
       state.bindKey,

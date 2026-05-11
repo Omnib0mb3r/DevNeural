@@ -1,6 +1,6 @@
 # Bug: cc-feedback-prompt-unanswerable
 
-**Status:** Deferred (Wave 3 Lane B step 42)
+**Status:** Fixed (pending soak) — 2026-05-11, Wave 3 fixup sprint.
 
 **Date opened:** 2026-05-10
 
@@ -97,8 +97,41 @@ system-prompt.ts is updated in a follow-up commit).
 
 ---
 
-## Full fix target
+## Full fix shipped (Wave 3 fixup, 2026-05-11)
 
-Wave 4: implement PTY stdout pattern matching in `pty-host.ts` to set a
-`awaitingSystemPrompt` flag on the handle. Voice WS checks the flag and suppresses
-injection, surfaces a status message to the client.
+Option A from the mitigation list landed end-to-end:
+
+- `07-daemon/src/dashboard/pty-host.ts`:
+  - `PtyHandle` gains `awaitingSystemPromptUntil: number` (epoch ms).
+  - `CC_SYSTEM_PROMPT_RE` covers the rating prompts (`How would you
+    rate`, `1 = thumbs down`, `Rate this interaction`) and the
+    related `Continue? (y/n)` + `Press Enter to continue` overlays.
+  - `pty.onData` scans every stdout chunk; when the regex matches,
+    the handle's `awaitingSystemPromptUntil` is pushed forward by
+    `SYSTEM_PROMPT_HOLD_MS` (90s). Repeated hits keep the window
+    alive without re-entering the regex path on every byte.
+  - New public helper `isAwaitingSystemPrompt(ptyIdOrSession)` lets
+    auto-injection paths consult the gate.
+- `07-daemon/src/voice/lex-voice-ws.ts`: before forwarding a
+  transcribed utterance to `ptyInject`, call
+  `isAwaitingSystemPrompt(state.bindKey)`. If true, emit an
+  `{t:'error', code:'cc-feedback-prompt-active', message:...}` event
+  to the WS client and skip the inject. The user can still answer
+  the prompt manually in the terminal; typed-text paths in the
+  dashboard are intentionally not gated because the user has the
+  prompt visible and is choosing to send.
+- Tests in `07-daemon/tests/cc-feedback-prompt-detect.test.ts`
+  pin the regex contract (8 cases: 5 positive matches, 2 negatives,
+  1 sanity check on the hold window duration).
+
+The SELF_CHECK rule from the interim Wave 3 fix stays in place as a
+belt-and-suspenders layer in case the regex misses a new prompt
+variant.
+
+## Verification
+
+1. `npx vitest run tests/cc-feedback-prompt-detect.test.ts`: 8/8 pass.
+2. `tsc --noEmit` clean on `07-daemon`.
+3. Manual: trigger a CC rating prompt in a live PTY; voice WS now
+   surfaces the block message instead of injecting the next
+   transcribed utterance.
