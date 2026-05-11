@@ -54,6 +54,7 @@ import {
   finalize as finalizeAudioBundle,
   discard as discardAudioBundle,
 } from '../voice/audio-bundle.js';
+import { writeThreadDoc } from './thread-doc.js';
 
 export interface SessionEndInput {
   /** Brainstorm row id, used only for logging; the pipeline does not
@@ -90,6 +91,9 @@ export interface SessionEndResult {
    * changed because already terminated" from "nothing changed
    * because the pipeline really did nothing". */
   was_primary_runner: boolean;
+  /* Wave 3 Lane B step 30 (LX-9): thread doc written at session end. */
+  thread_doc_written: boolean;
+  thread_doc_path?: string;
 }
 
 /* Pull last N raw chunks for this session from raw_chunks_meta and
@@ -174,6 +178,7 @@ async function runOrderedPipeline(
     summary_embedded: false,
     drafts_created: 0,
     was_primary_runner: true,
+    thread_doc_written: false,
   };
   if (!input.claudeSessionId) {
     log(
@@ -386,6 +391,41 @@ async function runOrderedPipeline(
 
   /* Step 8: release lock. Handled automatically by withSessionEndLock's
    * finally branch on return. */
+
+  /* Step 9 (Wave 3 Lane B / LX-9): write thread doc pointer file so the
+   * next Lex spawn can orient itself on what this session worked on.
+   * Best-effort; failures are logged and never block teardown. */
+  try {
+    const row = store.db.getBrainstorm(input.brainstormId);
+    const summaryText = readSummary(input.claudeSessionId!).trim() || null;
+    const transcriptText = recentTranscriptText(
+      store,
+      projectId,
+      input.claudeSessionId!,
+    ).slice(0, 4000);
+    const docResult = await writeThreadDoc(
+      {
+        brainstormId: input.brainstormId,
+        mode: input.mode,
+        userLabel: row?.user_label ?? null,
+        derivedLabel: row?.derived_label ?? null,
+        summaryText,
+        transcriptText,
+        turnCount: row?.turn_count ?? 0,
+        startedMs: row?.started_ms ?? Date.now(),
+        endedMs: row?.ended_ms ?? null,
+      },
+      log,
+    );
+    out.thread_doc_written = docResult.generated;
+    if (docResult.filePath) out.thread_doc_path = docResult.filePath;
+    if (docResult.generated) {
+      log(`[session-end] thread doc written: ${docResult.filePath} (llm=${docResult.usedLlm})`);
+    }
+  } catch (err) {
+    log(`[session-end] thread doc failed: ${(err as Error).message}`);
+  }
+
   return out;
 }
 

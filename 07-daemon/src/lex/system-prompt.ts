@@ -623,6 +623,7 @@ import {
   loadRefusalContractMeeting,
 } from './prompt-blocks.js';
 import { archivePromptVersion } from './prompt-archive.js';
+import { loadMostRecentThreadDoc } from './thread-doc.js';
 
 /* Wave 2 day 5 step 22 + 23 (LX-3, LX-4): per-mode few-shot block +
  * refusal contract block. Loaded from disk each call so the user can
@@ -679,11 +680,28 @@ ${snapshotRecentWiki()}
   const fewShot = loadFewShot(mode);
   const refusalBlocks: string[] = [loadRefusalContract()];
   if (mode === 'notes') refusalBlocks.push(loadRefusalContractMeeting());
+  /* Wave 3 Lane B step 30 (LX-9): inject the most-recent thread doc from
+   * the previous session so Lex can orient itself on prior context without
+   * the user having to re-explain what we were working on. Loaded at spawn
+   * time; stale docs (>7 days) are silently skipped. Placed between API
+   * surface and self-check so it is visible but does not override the
+   * behavioral contracts. */
+  const threadDocText = (() => {
+    try {
+      return loadMostRecentThreadDoc();
+    } catch {
+      return null;
+    }
+  })();
+  const threadDocBlock = threadDocText
+    ? `# Prior session context (thread doc)\n\n${threadDocText}\n\nThis is a pointer doc from the most-recent session. Dereference via /lex/sessions/:id or POST /lex/chunk-search when you need detail. Do not re-read the whole doc back to Michael; synthesise.`
+    : '';
   const layers = [
     IDENTITY,
     MODE_CONTRACTS,
     ARTIFACT_CONTRACTS,
     API_SURFACE,
+    ...(threadDocBlock ? [threadDocBlock] : []),
     SELF_CHECK,
     refusalBlocks.join('\n\n'),
     fewShot,
