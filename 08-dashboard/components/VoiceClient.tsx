@@ -1,12 +1,39 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import * as React from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { usePathname } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { Icon } from "./Icon";
 import { LexThumbs } from "./LexThumbs";
 import { listPtys, type PtyEntry } from "@/lib/daemon-client";
+
+/* Voice control surface exposed to UI islands outside VoiceClient
+ * (TopBar mic pill, future status badges). VoiceClient wraps the
+ * whole tree in a provider so any descendant can read live state
+ * and stop / mute / start voice without prop drilling. */
+interface VoiceCtxValue {
+  status:
+    | "idle"
+    | "connecting"
+    | "ready"
+    | "listening"
+    | "transcribing"
+    | "thinking"
+    | "speaking"
+    | "error";
+  enabled: boolean;
+  muted: boolean;
+  hasLex: boolean;
+  toggleEnabled: () => void;
+  setMicMuted: (next: boolean) => void;
+}
+const VoiceCtx = createContext<VoiceCtxValue | null>(null);
+export function useVoice(): VoiceCtxValue | null {
+  return useContext(VoiceCtx);
+}
 
 /* DOM id rendered by app/lex/page.tsx where the full voice panel UI
  * portals into. Other routes don't render this element, in which case
@@ -101,6 +128,20 @@ const MIC_GAIN_MIN = 0;
 const MIC_GAIN_MAX = 3.0;
 const MIC_GAIN_DEFAULT = 1.0;
 
+/* VAD end-of-utterance redemption window in ms. Higher = more
+ * tolerance for mid-sentence pauses before silero declares end-of-
+ * utterance and Lex starts thinking. Was hardcoded as 24 frames
+ * (~768ms); now user-tunable from the voice panel. Server-persisted
+ * in voice-preferences.json; localStorage seeds the slider so it
+ * doesn't snap on remount. The slider's value is converted to silero
+ * frames (32ms each at 16kHz) at VAD init time, so changing it
+ * requires a voice-off / voice-on cycle to take effect. */
+const VAD_REDEMPTION_STORAGE_KEY = "lex-vad-redemption-ms";
+const VAD_REDEMPTION_MIN = 200;
+const VAD_REDEMPTION_MAX = 3000;
+const VAD_REDEMPTION_DEFAULT = 768;
+const SILERO_FRAME_MS = 32;
+
 /* Map a 0-1 sensitivity knob to silero positive/negative speech
  * thresholds. Higher knob = more sensitive = lower threshold. The
  * 0.1 delta between positive and negative matches the legacy tuning
@@ -136,7 +177,7 @@ const MAX_UTTERANCE_SAMPLES = 30 * 16000;
  * crash, navigation) skipped the explicit stop handler, which left
  * the localStorage flag stuck at "1" forever. */
 
-export function VoiceClient() {
+export function VoiceClient({ children }: { children?: ReactNode }) {
   /* Voice engine is mounted once at the application root (see
    * app/providers.tsx) so the WS, mic stream, and AudioContext
    * survive in-app navigation between /lex, /brainstorms, /wiki,
@@ -161,6 +202,14 @@ export function VoiceClient() {
     )
     .sort((a, b) => b.startedAt - a.startedAt)[0];
   const sessionId: string | null = lexPty?.sessionId ?? null;
+  const hasLex = Boolean(lexPty);
+
+  /* hasLex ref so the ws.onclose handler (which closes over its
+   * snapshot at WS-open time) can read the live value and suppress
+   * the "voice connection closed" error toast when the close was
+   * just the server reaping the WS along with a killed Lex PTY. */
+  const hasLexRef = useRef<boolean>(false);
+  hasLexRef.current = hasLex;
 
   /* Portal target. /lex renders <div id={PANEL_MOUNT_ID} />; other
    * routes don't. The effect re-resolves the target on every route
@@ -176,6 +225,17 @@ export function VoiceClient() {
   const [status, setStatus] = useState<Status>("idle");
   const [enabled, setEnabled] = useState<boolean>(false);
   const [muted, setMuted] = useState<boolean>(false);
+
+  /* Auto-stop voice the moment the Lex PTY goes away. Without this
+   * the WS keeps re-binding to "no session" after the user ends
+   * Lex, the server returns "pty not found", and the panel flips
+   * to ERROR while the mic is still hot. Watching `hasLex` keeps
+   * the engine in lock-step with Lex's lifecycle. */
+  useEffect(() => {
+    if (enabled && !hasLex && !ptysQ.isLoading) {
+      setEnabled(false);
+    }
+  }, [enabled, hasLex, ptysQ.isLoading]);
   const [lastTranscript, setLastTranscript] = useState<string>("");
   const [lastReply, setLastReply] = useState<string>("");
   /* Wave 2 carry-over #1: per-turn thumbs vote on Lex's last reply.
@@ -252,6 +312,23 @@ export function VoiceClient() {
   });
   const micGainRef = useRef<number>(MIC_GAIN_DEFAULT);
   micGainRef.current = micGain;
+  /* VAD redemption window. Read at VAD init via the ref; silero does
+   * not accept live updates so changes only take effect after a
+   * voice-off / voice-on cycle. The slider is wired to a debounced
+   * server write so dragging doesn't fire 20 POSTs. */
+  const [vadRedemptionMs, setVadRedemptionMs] = useState<number>(() => {
+    if (typeof window === "undefined") return VAD_REDEMPTION_DEFAULT;
+    const raw = window.localStorage.getItem(VAD_REDEMPTION_STORAGE_KEY);
+    const n = raw ? Number(raw) : NaN;
+    return Number.isFinite(n) &&
+      n >= VAD_REDEMPTION_MIN &&
+      n <= VAD_REDEMPTION_MAX
+      ? n
+      : VAD_REDEMPTION_DEFAULT;
+  });
+  const vadRedemptionRef = useRef<number>(VAD_REDEMPTION_DEFAULT);
+  vadRedemptionRef.current = vadRedemptionMs;
+  const vadRedemptionSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastTtsStartAtRef = useRef<number>(0);
   const [pttHolding, setPttHolding] = useState(false);
   const modeRef = useRef<Mode>("conversation");
@@ -542,6 +619,22 @@ export function VoiceClient() {
             );
           }
         }
+        if (
+          typeof j.vad_redemption_ms === "number" &&
+          Number.isFinite(j.vad_redemption_ms)
+        ) {
+          const clamped = Math.max(
+            VAD_REDEMPTION_MIN,
+            Math.min(VAD_REDEMPTION_MAX, j.vad_redemption_ms),
+          );
+          setVadRedemptionMs(clamped);
+          if (typeof window !== "undefined") {
+            window.localStorage.setItem(
+              VAD_REDEMPTION_STORAGE_KEY,
+              String(clamped),
+            );
+          }
+        }
       })
       .catch(() => undefined);
   }, []);
@@ -566,6 +659,34 @@ export function VoiceClient() {
     }, 250);
   }
 
+
+  /* User-tunable end-of-utterance redemption window. Updates
+   * localStorage immediately for cheap optimistic UI; debounced
+   * server write so dragging the slider doesn't fire 20 POSTs.
+   * silero VAD does not accept live updates, so the user must
+   * toggle voice off then on for a new value to take effect; the
+   * slider tooltip mentions this. */
+  function changeVadRedemption(next: number): void {
+    const clamped = Math.max(
+      VAD_REDEMPTION_MIN,
+      Math.min(VAD_REDEMPTION_MAX, next),
+    );
+    setVadRedemptionMs(clamped);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(VAD_REDEMPTION_STORAGE_KEY, String(clamped));
+    }
+    if (vadRedemptionSaveTimerRef.current) {
+      clearTimeout(vadRedemptionSaveTimerRef.current);
+    }
+    vadRedemptionSaveTimerRef.current = setTimeout(() => {
+      void fetch("/voice/set-vad-redemption", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ ms: clamped }),
+      }).catch(() => undefined);
+    }, 250);
+  }
 
   async function changeVoice(name: string): Promise<void> {
     const r = await fetch("/voice/set-voice", {
@@ -659,6 +780,16 @@ export function VoiceClient() {
       };
       ws.onclose = () => {
         if (cancelled) return;
+        /* If the close happened because Lex itself was just ended,
+         * the auto-stop effect is already on its way to flipping
+         * `enabled` off. Don't surface a noisy ERROR pill in that
+         * window — the user explicitly asked for the session to
+         * end, so this close is expected. */
+        if (!hasLexRef.current) {
+          setStatus("idle");
+          setErrMsg("");
+          return;
+        }
         setStatus("error");
         setErrMsg("voice connection closed");
       };
@@ -979,7 +1110,10 @@ export function VoiceClient() {
                 negativeSpeechThreshold: t.negative,
               };
             })(),
-            redemptionFrames: 24,
+            redemptionFrames: Math.max(
+              1,
+              Math.round(vadRedemptionRef.current / SILERO_FRAME_MS),
+            ),
             preSpeechPadFrames: 8,
             minSpeechFrames: 8,
           });
@@ -1215,43 +1349,6 @@ export function VoiceClient() {
     error: "text-err",
   };
 
-  /* Floating mini-badge: rendered in-place (fixed bottom-right) on
-   * every route that doesn't host the full panel. Visible whenever
-   * voice is enabled OR there's something to surface (error, last
-   * reply within reason). Keeps the user aware that the mic is hot
-   * and gives them a one-click stop without navigating to /lex. */
-  const floatingBadge =
-    enabled || status === "error" ? (
-      <div className="fixed bottom-4 right-4 z-50 rounded-pill bg-surface1 hairline ring-1 ring-border1 shadow-lg px-3 py-2 flex items-center gap-2">
-        <Icon name="Mic" className="text-brandSoft" size={14} />
-        <span className={`text-nano font-mono ${statusTone[status]}`}>
-          {statusLabel[status]}
-        </span>
-        {enabled && (
-          <button
-            type="button"
-            onClick={() => setMicMuted(!muted)}
-            className={`text-nano px-2 py-0.5 rounded-pill hairline font-emphasized ${
-              muted
-                ? "bg-attn/15 text-attn ring-1 ring-attn/30 hover:bg-attn/25"
-                : "bg-surface2 text-txt2 hover:bg-surface3"
-            }`}
-            title="Mute mic without ending the session."
-          >
-            {muted ? "muted" : "mute"}
-          </button>
-        )}
-        <button
-          type="button"
-          onClick={toggleEnabled}
-          className="text-nano px-2 py-0.5 rounded-pill hairline font-emphasized bg-err/15 text-err ring-1 ring-err/30 hover:bg-err/25"
-          title="Stop voice."
-        >
-          stop
-        </button>
-      </div>
-    ) : null;
-
   const fullPanel = (
     <section className="rounded-panel bg-surface1 hairline">
       <div className="px-5 py-3 border-b border-border1 flex items-center gap-3">
@@ -1355,6 +1452,26 @@ export function VoiceClient() {
           </>
         )}
       </div>
+      <div className="px-5 py-3 border-b border-border1 flex items-center gap-3">
+        <label
+          className="flex items-center gap-2 text-nano font-mono text-txt3 flex-1"
+          title="Pause tolerance after you stop talking before Lex starts thinking. Higher = more time to breathe mid-sentence without losing words. Takes effect on the next voice off / on cycle."
+        >
+          <span>pause tolerance</span>
+          <input
+            type="range"
+            min={VAD_REDEMPTION_MIN}
+            max={VAD_REDEMPTION_MAX}
+            step={50}
+            value={vadRedemptionMs}
+            onChange={(e) => changeVadRedemption(Number(e.target.value))}
+            className="flex-1 accent-brandSoft"
+          />
+          <span className="text-txt2 tabular-nums w-14 text-right">
+            {(vadRedemptionMs / 1000).toFixed(2)}s
+          </span>
+        </label>
+      </div>
       <div className="px-5 py-3 text-nano text-txt3">{MODE_HINT[mode]}</div>
       {enabled && mode === "push-to-talk" && (
         <div className="px-5 pb-4">
@@ -1414,11 +1531,97 @@ export function VoiceClient() {
     </section>
   );
 
-  /* When the route exposes the panel mount target (only /lex today),
-   * portal the full panel into it so the visual layout is identical
-   * to before the engine was hoisted to the root. On every other
-   * route, render the floating badge in place so the user can still
-   * see status and stop voice without navigating. */
-  if (mountEl) return createPortal(fullPanel, mountEl);
-  return floatingBadge;
+  /* Wrap children in a VoiceCtx provider so UI islands outside this
+   * component (TopBar mic pill, future badges) can read live status
+   * and call toggleEnabled / setMicMuted without prop drilling. The
+   * full panel UI portals into the /lex route's mount target; on
+   * every other route the TopBar's <VoiceTopBarPill /> consumes the
+   * same context and renders an inline status + mute + stop. */
+  const ctxValue: VoiceCtxValue = {
+    status,
+    enabled,
+    muted,
+    hasLex,
+    toggleEnabled,
+    setMicMuted,
+  };
+  return (
+    <VoiceCtx.Provider value={ctxValue}>
+      {children}
+      {mountEl ? createPortal(fullPanel, mountEl) : null}
+    </VoiceCtx.Provider>
+  );
+}
+
+/* Compact mic pill rendered in the TopBar's right cluster. Lives in
+ * this file so it shares the constants + context type with the
+ * engine. Renders nothing when there's no live Lex PTY so the bar
+ * stays clean on first launch; once Lex is alive the pill surfaces
+ * status + a start/stop toggle + a mute toggle. */
+export function VoiceTopBarPill(): React.ReactElement | null {
+  const v = useVoice();
+  if (!v) return null;
+  if (!v.hasLex && !v.enabled) return null;
+
+  const tone =
+    v.status === "error"
+      ? "text-err"
+      : v.status === "listening" || v.status === "ready"
+        ? "text-ok"
+        : v.status === "transcribing" || v.status === "thinking"
+          ? "text-attn"
+          : v.status === "speaking"
+            ? "text-brandSoft"
+            : "text-txt3";
+  const label =
+    v.status === "idle"
+      ? "off"
+      : v.status === "connecting"
+        ? "connecting"
+        : v.status === "ready"
+          ? "ready"
+          : v.status === "listening"
+            ? "listening"
+            : v.status === "transcribing"
+              ? "transcribing"
+              : v.status === "thinking"
+                ? "thinking"
+                : v.status === "speaking"
+                  ? "speaking"
+                  : "error";
+
+  return (
+    <div className="flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline">
+      <Icon name="Mic" className="text-brandSoft" size={12} />
+      <span className={`hidden sm:inline text-[11px] font-mono ${tone}`}>
+        {label}
+      </span>
+      {v.enabled && (
+        <button
+          type="button"
+          onClick={() => v.setMicMuted(!v.muted)}
+          className={`text-[11px] px-2 py-0.5 rounded-pill hairline font-emphasized ${
+            v.muted
+              ? "bg-attn/15 text-attn ring-1 ring-attn/30 hover:bg-attn/25"
+              : "bg-surface2 text-txt2 hover:bg-surface3"
+          }`}
+          title="Mute mic without ending the session."
+        >
+          {v.muted ? "muted" : "mute"}
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={v.toggleEnabled}
+        className={`text-[11px] px-2 py-0.5 rounded-pill hairline font-emphasized ${
+          v.enabled
+            ? "bg-err/15 text-err ring-1 ring-err/30 hover:bg-err/25"
+            : "bg-brand/15 text-brandSoft ring-1 ring-brand/30 hover:bg-brand/25"
+        }`}
+        title={v.enabled ? "Stop voice." : "Start voice."}
+      >
+        {v.enabled ? "stop" : "start"}
+      </button>
+    </div>
+  );
 }

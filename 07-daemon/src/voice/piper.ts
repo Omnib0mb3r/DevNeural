@@ -54,6 +54,7 @@ let cachedLengthScale: number | null = null;
 let cachedBargeCooldownMs: number | null = null;
 let cachedVadSensitivity: number | null = null;
 let cachedMicGain: number | null = null;
+let cachedVadRedemptionMs: number | null = null;
 
 /* Default barge-in cooldown after tts-start. Bedroom-mic feedback was
  * triggering self-barge: Lex's own audio bled into the mic, VAD fired
@@ -91,12 +92,24 @@ const DEFAULT_MIC_GAIN = 1.0;
 const MIN_MIC_GAIN = 0;
 const MAX_MIC_GAIN = 3.0;
 
+/* VAD end-of-utterance redemption window. How long after the last
+ * detected speech frame silero waits before declaring end-of-
+ * utterance and shipping the buffer. Higher = more tolerance for
+ * mid-sentence pauses (fewer cut-off words at the cost of more
+ * dead air before Lex starts thinking). 768ms reproduces the
+ * legacy hardcoded 24-frame value (silero frames are 32ms at
+ * 16kHz). The client converts ms → frames at VAD init time. */
+const DEFAULT_VAD_REDEMPTION_MS = 768;
+const MIN_VAD_REDEMPTION_MS = 200;
+const MAX_VAD_REDEMPTION_MS = 3000;
+
 function readPersistedPrefs(): {
   voice?: string;
   length_scale?: number;
   barge_cooldown_ms?: number;
   vad_sensitivity?: number;
   mic_gain?: number;
+  vad_redemption_ms?: number;
 } {
   if (!VOICE_PREF_FILE) return {};
   try {
@@ -128,6 +141,7 @@ function writePersistedPrefs(patch: {
   barge_cooldown_ms?: number;
   vad_sensitivity?: number;
   mic_gain?: number;
+  vad_redemption_ms?: number;
 }): void {
   if (!VOICE_PREF_FILE) return;
   try {
@@ -273,6 +287,40 @@ export function setMicGain(value: number): {
   return { ok: true, mic_gain: clamped };
 }
 
+function clampVadRedemptionMs(v: number): number {
+  if (!Number.isFinite(v)) return DEFAULT_VAD_REDEMPTION_MS;
+  if (v < MIN_VAD_REDEMPTION_MS) return MIN_VAD_REDEMPTION_MS;
+  if (v > MAX_VAD_REDEMPTION_MS) return MAX_VAD_REDEMPTION_MS;
+  return Math.round(v);
+}
+
+function readPersistedVadRedemptionMs(): number | null {
+  const v = Number(readPersistedPrefs().vad_redemption_ms);
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
+export function getVadRedemptionMs(): number {
+  if (cachedVadRedemptionMs !== null) return cachedVadRedemptionMs;
+  const persisted = readPersistedVadRedemptionMs();
+  cachedVadRedemptionMs = persisted !== null
+    ? clampVadRedemptionMs(persisted)
+    : DEFAULT_VAD_REDEMPTION_MS;
+  return cachedVadRedemptionMs;
+}
+
+export function setVadRedemptionMs(ms: number): {
+  ok: boolean;
+  vad_redemption_ms: number;
+} {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return { ok: false, vad_redemption_ms: getVadRedemptionMs() };
+  }
+  const clamped = clampVadRedemptionMs(ms);
+  cachedVadRedemptionMs = clamped;
+  writePersistedPrefs({ vad_redemption_ms: clamped });
+  return { ok: true, vad_redemption_ms: clamped };
+}
+
 export function setActiveSpeed(uiSpeed: number): {
   ok: boolean;
   speed: number;
@@ -416,6 +464,7 @@ export interface PiperStatus {
   barge_cooldown_ms: number;
   vad_sensitivity: number;
   mic_gain: number;
+  vad_redemption_ms: number;
   voices: VoicePack[];
 }
 
@@ -431,6 +480,7 @@ export function piperStatus(): PiperStatus {
     barge_cooldown_ms: getBargeCooldownMs(),
     vad_sensitivity: getVadSensitivity(),
     mic_gain: getMicGain(),
+    vad_redemption_ms: getVadRedemptionMs(),
     voices: listVoices(),
   };
 }

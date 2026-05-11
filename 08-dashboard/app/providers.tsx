@@ -17,15 +17,16 @@ export function Providers({ children }: { children: ReactNode }) {
         },
       }),
   );
-  /* VoiceClient is mounted once at the application root so the WS,
-   * mic stream, and AudioContext survive in-app navigation. /lex
-   * portals the panel UI into its own mount target; every other
-   * route gets a floating mini-badge from the same component so the
-   * user can stop / mute without losing their place. */
+  /* VoiceClient wraps the whole tree so its state context is
+   * available to UI islands (TopBar mic pill, future badges). The
+   * engine itself runs once at the root so the WS, mic stream, and
+   * AudioContext survive in-app navigation. /lex portals the full
+   * panel into its own mount target; the TopBar pill consumes the
+   * same VoiceCtx for a compact status + mute + stop on every
+   * route. */
   return (
     <QueryClientProvider client={client}>
-      {children}
-      <VoiceClient />
+      <VoiceClient>{children}</VoiceClient>
     </QueryClientProvider>
   );
 }

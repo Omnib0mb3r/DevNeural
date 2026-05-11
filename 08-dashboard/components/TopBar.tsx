@@ -11,6 +11,7 @@ import {
 } from "@/lib/daemon-client";
 import { Icon } from "./Icon";
 import { StatusDot } from "./StatusDot";
+import { VoiceTopBarPill } from "./VoiceClient";
 import { lexPickStable } from "@/lib/lex";
 
 const TABS = [
@@ -186,6 +187,13 @@ export function TopBar({ activeTab }: { activeTab: string }) {
         </div>
 
         <div className="flex items-center gap-2">
+          {/* Voice pill: status + mute + stop. Renders nothing
+           * until a Lex PTY is live so the bar stays clean on
+           * first launch. The actual VoiceClient engine is mounted
+           * at the root (app/providers.tsx); this pill consumes
+           * the same VoiceCtx for inline control. */}
+          <VoiceTopBarPill />
+
           {/* Notifications dropdown */}
           <div className="relative" ref={notifRef}>
             <button

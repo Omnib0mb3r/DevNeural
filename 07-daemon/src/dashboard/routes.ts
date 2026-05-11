@@ -84,6 +84,7 @@ import {
   setBargeCooldownMs,
   setMicGain,
   setVadSensitivity,
+  setVadRedemptionMs,
 } from '../voice/piper.js';
 import { attachLexVoiceWs } from '../voice/lex-voice-ws.js';
 import { lintQueueStatus } from '../wiki/lint-queue.js';
@@ -1036,6 +1037,21 @@ export async function registerDashboardRoutes(
     if (!r.ok) {
       reply.code(400);
       return { ok: false, error: 'value must be a finite number' };
+    }
+    return { ok: true, ...piperStatus() };
+  });
+
+  /* Persisted VAD end-of-utterance redemption window in ms. Higher
+   * values give the user more tolerance for mid-sentence pauses
+   * before silero declares end-of-utterance and ships the buffer to
+   * whisper. The client converts ms to silero frames (32ms each at
+   * 16kHz) at VAD init time. Range: 200-3000ms; default 768. */
+  app.post('/voice/set-vad-redemption', async (req, reply) => {
+    const body = (req.body ?? {}) as { ms?: number };
+    const r = setVadRedemptionMs(Number(body.ms));
+    if (!r.ok) {
+      reply.code(400);
+      return { ok: false, error: 'ms must be a positive number' };
     }
     return { ok: true, ...piperStatus() };
   });
