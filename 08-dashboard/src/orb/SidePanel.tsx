@@ -34,8 +34,8 @@ const EDGE_LABEL: Record<string, string> = {
 function jumpUrl(node: UnifiedGraphNode): string | null {
   switch (node.kind) {
     case "wiki":       return `/wiki?page=${encodeURIComponent(node.id)}`;
-    case "brainstorm": return `/brainstorms/${encodeURIComponent(node.id)}`;
-    case "meeting":    return `/meetings/${encodeURIComponent(node.id)}`;
+    case "brainstorm": return `/brainstorms/detail?id=${encodeURIComponent(node.id)}`;
+    case "meeting":    return `/meetings/detail?id=${encodeURIComponent(node.id)}`;
     case "project":    return `/projects`;
     default:           return null;
   }

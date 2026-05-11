@@ -75,7 +75,7 @@ export function MeetingList() {
             return (
               <li key={m.id} className="rounded border border-border1 bg-surface1 p-3">
                 <Link
-                  href={`/meetings/${encodeURIComponent(m.id)}`}
+                  href={`/meetings/detail?id=${encodeURIComponent(m.id)}`}
                   className="font-mono text-sm hover:text-brandSoft"
                 >
                   {label}

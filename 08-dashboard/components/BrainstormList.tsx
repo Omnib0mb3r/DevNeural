@@ -136,7 +136,7 @@ function BrainstormRow({ item }: { item: BrainstormDecorated }) {
     <li className="rounded border border-border1 bg-surface1 p-3">
       <div className="flex items-center justify-between">
         <Link
-          href={`/brainstorms/${encodeURIComponent(bs.id)}`}
+          href={`/brainstorms/detail?id=${encodeURIComponent(bs.id)}`}
           className="font-mono text-sm hover:text-brandSoft"
         >
           {label}

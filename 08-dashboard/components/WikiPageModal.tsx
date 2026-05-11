@@ -287,7 +287,7 @@ export function WikiPageModal({ id, onClose }: Props) {
                   {q.data.page.source_brainstorms!.map((bid) => (
                     <li key={bid} className="font-mono">
                       <a
-                        href={`/brainstorms/${encodeURIComponent(bid)}`}
+                        href={`/brainstorms/detail?id=${encodeURIComponent(bid)}`}
                         className="hover:text-brandSoft underline"
                       >
                         {bid}
@@ -310,7 +310,7 @@ export function WikiPageModal({ id, onClose }: Props) {
                   {q.data.page.source_meetings!.map((mid) => (
                     <li key={mid} className="font-mono">
                       <a
-                        href={`/brainstorms/${encodeURIComponent(mid)}`}
+                        href={`/meetings/detail?id=${encodeURIComponent(mid)}`}
                         className="hover:text-brandSoft underline"
                       >
                         {mid}
