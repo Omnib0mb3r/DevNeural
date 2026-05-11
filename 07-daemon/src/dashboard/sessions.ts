@@ -42,8 +42,29 @@ const ACTIVE_THRESHOLD_MS = 30 * 60 * 1000;
  * dead-vs-alive, but it only runs at app startup, not on the periodic
  * 60s sweep. Until that ships, the daemon applies its own gate so an
  * orphaned identity file from a session whose host died ungracefully
- * doesn't paint a phantom-active tile until the deck app restarts. */
-const IDENTITY_FRESH_MS = 60 * 60 * 1000;
+ * doesn't paint a phantom-active tile until the deck app restarts.
+ *
+ * Wave 3 fixup (bug: 2026-05-10-state-tracker-loses-live-sessions):
+ * the constant is now overridable via `DEVNEURAL_IDENTITY_FRESH_MS` so
+ * hosts with deck-tray re-registration windows wider than the default
+ * (slow filesystem journal, headless boot, etc.) can extend the
+ * liveness gate without a code change. Read at module load; daemon
+ * restart picks up env changes. Values outside [1000, 24h] fall back
+ * to the default to avoid foot-guns. */
+const DEFAULT_IDENTITY_FRESH_MS = 60 * 60 * 1000;
+const IDENTITY_FRESH_MS = (() => {
+  const raw = process.env.DEVNEURAL_IDENTITY_FRESH_MS;
+  if (!raw) return DEFAULT_IDENTITY_FRESH_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1000 || n > 24 * 60 * 60 * 1000) {
+    return DEFAULT_IDENTITY_FRESH_MS;
+  }
+  return n;
+})();
+/* Test-only export. Keeps the constant module-private to runtime
+ * callers while letting tests/identity-fresh-env.test.ts assert the
+ * env override resolution. Underscored to discourage casual use. */
+export const __IDENTITY_FRESH_MS_FOR_TEST = IDENTITY_FRESH_MS;
 const STREAMDECK_IDENTITY_DIR = (() => {
   const localAppData =
     process.env.LOCALAPPDATA ??

@@ -445,3 +445,19 @@ You should see `[ingest] pass2 fallback to anthropic after local exhaustion` fol
 - Different pattern → split into a new page, remove the misplaced evidence, set `flag_for_review: false`.
 
 If the verifier is firing too aggressively for your taste (e.g. local LLM is conservative), you can disable it by setting `DEVNEURAL_LLM_PROVIDER=none` for the verifier role only — but that defeats the purpose. Better to lean on the flag and triage manually.
+
+---
+
+## Sessions flip to inactive after daemon restart
+
+**Symptom:** After restarting the DevNeural daemon, the `/sessions` panel shows every session as inactive even though Claude Code jsonl files are being appended. Stream Deck tiles grey out. The state usually self-heals after the deck tray app re-registers identity files.
+
+**Why:** The daemon's session-liveness path prefers the deck tray identity directory (`%LOCALAPPDATA%/stream-deck/identity/`) as the authoritative live-set. The identity files have an mtime freshness window (default 1h). If the deck tray app is slow to re-register after a daemon restart, or the host's filesystem journal lags, every identity file can age past the window simultaneously and the daemon flips to the mtime fallback only after the entire window elapses.
+
+**Workaround:** widen the freshness window via `DEVNEURAL_IDENTITY_FRESH_MS` (milliseconds, clamped to `[1000, 86_400_000]`). 15s is overkill defensively; the daemon defaults to 1h.
+
+```powershell
+[Environment]::SetEnvironmentVariable("DEVNEURAL_IDENTITY_FRESH_MS", "15000", "User")
+```
+
+Restart the daemon. Subsequent identity-file reads accept files up to 15s old as live before falling back to mtime-based liveness.

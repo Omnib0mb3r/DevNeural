@@ -1,6 +1,6 @@
 # Bug: state-tracker loses live sessions
 
-**Status:** Deferred to Wave 4 (env override + troubleshooting doc)
+**Status:** Fixed (pending soak) — 2026-05-11, Wave 3 fixup sprint.
 
 **Date opened:** 2026-05-10
 
@@ -84,22 +84,35 @@ the window for the bug is 0-4s after a deck write.
 
 ---
 
-## Deferred
+## Fixes shipped
 
-**Wave 4 carry-over.** The fix is low-risk but requires observing the deck
-identity directory behavior on the live host. The workaround is to set
-`IDENTITY_FRESH_MS` to 15s (3x the current default) via env override
-`DEVNEURAL_IDENTITY_FRESH_MS=15000`. This makes the liveness window robust to
-Windows stat-cache lag and the deck re-registration window after daemon restart.
+Two corrections to the original root-cause analysis surfaced while
+implementing the fix:
 
-Target: implement the env override for `IDENTITY_FRESH_MS` and document it in
-`docs/install/07-troubleshooting.md`.
+- **`IDENTITY_FRESH_MS` was already 1 hour, not 5 seconds.** The
+  original deferral note read 5s from a draft of the analysis; the
+  shipped code has long carried a 1h window. So the worst symptoms
+  described above should not occur on default settings.
+- The proposed env override is still useful as an operator knob for
+  unusual hosts (slow filesystem journal, headless boot windows where
+  the deck tray app is even slower to re-register, etc.).
 
----
+Shipped:
 
-## Verification plan
+- `07-daemon/src/dashboard/sessions.ts`: `IDENTITY_FRESH_MS` now reads
+  from `DEVNEURAL_IDENTITY_FRESH_MS` (milliseconds). Clamped to
+  `[1000, 86_400_000]`; out-of-range or non-numeric input falls back
+  to the 1h default. Also exports `__IDENTITY_FRESH_MS_FOR_TEST` for
+  the env-resolution test below.
+- `07-daemon/tests/identity-fresh-env.test.ts`: 5 cases covering
+  unset, in-range, under-floor, over-ceiling, and non-numeric input.
+- `docs/install/07-troubleshooting.md`: new section "Sessions flip to
+  inactive after daemon restart" documenting the symptom and the
+  override.
 
-1. Set `DEVNEURAL_IDENTITY_FRESH_MS=15000`.
-2. Restart daemon while deck tray is running.
-3. Observe: sessions remain active in dashboard during the deck re-registration window.
-4. After 15s without deck writes, sessions flip to mtime fallback correctly.
+## Verification
+
+1. `npx vitest run tests/identity-fresh-env.test.ts`: 5/5 pass.
+2. `tsc --noEmit` clean on `07-daemon`.
+3. Manual: set `DEVNEURAL_IDENTITY_FRESH_MS=15000`, restart daemon,
+   confirm `/sessions` remains green during deck-tray restart.
