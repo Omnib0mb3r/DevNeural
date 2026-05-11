@@ -127,6 +127,11 @@ export interface SessionListItem {
    * key as user_label. Used as the second-tier fallback before the
    * project slug. */
   derived_label: string | null;
+  /** Lex anchor uuid (== legacy brainstorm row id by write-through)
+   * for sessions backed by a Lex brainstorm. Surfaced so Stream
+   * Deck and other UI can dedupe the underlying CC session against
+   * the anchor tile feed. Null for non-brainstorm sessions. */
+  lex_anchor_id: string | null;
 }
 
 /* Derive current phase by reading the last few KB of the jsonl. The
@@ -206,7 +211,7 @@ function deriveContextFromTail(
   return null;
 }
 
-function derivePhaseFromTail(file: string): 'thinking' | 'tool' | 'idle' | 'unknown' {
+export function derivePhaseFromTail(file: string): 'thinking' | 'tool' | 'idle' | 'unknown' {
   try {
     const stat = fs.statSync(file);
     if (stat.size === 0) return 'unknown';
@@ -509,6 +514,7 @@ export function listSessions(): SessionListItem[] {
         context: deriveContextFromTail(file),
         user_label: brainstorm?.user_label ?? null,
         derived_label: brainstorm?.derived_label ?? null,
+        lex_anchor_id: brainstorm?.id ?? null,
       });
     }
   }

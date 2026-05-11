@@ -479,16 +479,19 @@ Most-used:
     this before substantive answers about prior work.
 - POST /search/all { q, collections?, limit?, group_by_session? }
     Raw retrieval, no Lex defaults. Use when you need control.
-- GET  /lex/sessions[?status=active|ended]
-    Brainstorm session list (your own conversation history). Pull
-    in the long ongoing threads before adding new takes.
-- PATCH /lex/sessions/:id { user_label?, status? }
-    Rename or end a brainstorm row. Canonical write surface for
-    everything the daemon owns about a brainstorm. The underlying
-    SQLite file is private to the daemon; do NOT shell out to
-    \`sqlite3\` or edit the DB file directly. Always use this
-    endpoint so triggers, label propagation, and the dashboard
-    refetch all fire correctly.
+- GET  /lex/anchors[?status=live|dormant]
+    Brainstorm anchor list (your own conversation history). Each
+    anchor row carries id, title, status, transcript_count, and
+    last_activity_ms. Pull this before adding new takes so you
+    have the prior threads in context.
+- PATCH /lex/anchors/:id { title?, derived_title? }
+    Rename an anchor. Canonical write surface for the title field.
+    The underlying SQLite file is private to the daemon; do NOT
+    shell out to \`sqlite3\` or edit the DB file directly. Always
+    use this endpoint so the dashboard refetch fires correctly.
+- POST /lex/anchors/:id/end
+    End the anchor's live PTY and flip it dormant. Use when the
+    user asks to stop the current brainstorm.
 - POST /lex/steer/:session_id { text, commit? }
     Inject a prompt directly into a worker daemon-PTY.
 - POST /lex/capture { kind: "reminder"|"next-action", title, due_at?, brainstorm_id? }
@@ -568,7 +571,7 @@ Before any WebSearch or WebFetch call, check internal sources:
 
 1. POST /lex/chunk-search { q } - brainstorm chunks (cosine similarity)
 2. POST /lex/recall { q } - full retrieval with source classification
-3. GET /lex/sessions - brainstorm session list (for context on prior work)
+3. GET /lex/anchors - brainstorm anchor list (for context on prior work)
 4. Grep filesystem for local files (use Bash with grep/find)
 
 The daemon listens on http://127.0.0.1:\${DEVNEURAL_PORT:-3747}. The /lex/*
@@ -748,7 +751,7 @@ export function buildLexSystemPromptVersioned(
 This is the head-start so you do not have to ask "what are we
 working on" every time Michael says hi. Stale the moment it is
 rendered; for current state, hit GET /health, GET /sessions,
-GET /reminders, GET /lex/sessions, or GET /lex/snapshot.
+GET /reminders, GET /lex/anchors, or GET /lex/snapshot.
 
 ## Registered projects
 ${snapshotProjects()}

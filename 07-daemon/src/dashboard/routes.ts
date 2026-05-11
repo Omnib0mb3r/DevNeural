@@ -53,20 +53,31 @@ import {
   getPtyOutput,
   startSessionDiscoveryProbe,
   seedFirstTurn,
+  getLivePtyIds,
 } from './pty-host.js';
 import {
   buildLexSystemPrompt,
   buildLexSystemPromptVersioned,
 } from '../lex/system-prompt.js';
+import { buildLexSpawnPrompt } from '../lex/spawn-prompt.js';
+import { spawnLexSession } from '../lex/spawn-lex-session.js';
+import { listAnchorTiles } from '../lex/anchor-tiles.js';
+import {
+  getLexSession,
+  listLexSessions,
+  setLexSessionTitle,
+  setLexSessionStatus,
+  deleteLexSession,
+  listTranscriptRefs,
+} from '../lex/lex-session-store.js';
 import {
   listBrainstorms,
   getBrainstorm,
-  setLabel as setBrainstormLabel,
-  setMode as setBrainstormMode,
   endBrainstorm,
   appendArtifact as appendBrainstormArtifact,
   setStore as setBrainstormStore,
   reapAllActive as reapAllActiveBrainstorms,
+  reapOrphansAgainstLivePtys,
 } from '../lex/brainstorm-store.js';
 import {
   ensureServer as ensureWhisper,
@@ -157,6 +168,27 @@ export async function registerDashboardRoutes(
   } catch (err) {
     log(`brainstorm reaper failed: ${(err as Error).message}`);
   }
+
+  /* Continuous reaper. Sweeps active brainstorm rows whose pty_id
+   * is not in the live PTY map and marks them ended. Catches PTY
+   * deaths that bypassed the onExit handler (SIGKILL, daemon crash,
+   * OS teardown) without forcing a daemon restart. 30s cadence keeps
+   * the database honest while staying way under any user-visible
+   * latency cost. */
+  setInterval(() => {
+    try {
+      const live = getLivePtyIds();
+      const ended = reapOrphansAgainstLivePtys(
+        live,
+        'continuous reaper: pty no longer alive',
+      );
+      if (ended > 0) {
+        log(`brainstorm reaper: ended ${ended} orphan active row(s)`);
+      }
+    } catch (err) {
+      log(`continuous reaper failed: ${(err as Error).message}`);
+    }
+  }, 30_000);
 
   // Auth middleware on every request before route handlers
   app.addHook('preHandler', (req, reply, done) => {
@@ -736,57 +768,290 @@ export async function registerDashboardRoutes(
    * session-id (after binding). */
   app.get('/pty', async () => ({ ok: true, ptys: listPtys() }));
 
-  /* Brainstorm session endpoints (Slice A). First-class records so
-   * each Lex spawn gets a label, lifecycle, mode, and artifact list
-   * the dashboard + retrieval can use as a key into the transcript
-   * RAG. See codex review for context. */
-  app.get('/lex/sessions', async (req) => {
+  /* ── Lex anchor endpoints (PLAN-lex-session-rewrite.md, step 4)
+   *
+   * These are the new past-sessions surface. Each anchor is the
+   * durable identity returned by GET /lex/anchors. Click-to-open
+   * (POST /lex/anchors/:id/open) spawns a fresh CC PTY when the
+   * anchor is dormant (with the reopen-variant system prompt that
+   * lists every prior transcript jsonl + a Read instruction), or
+   * returns the live PTY when the anchor is already alive — voice
+   * WS bind follows the live PTY automatically since both endpoints
+   * resolve the active brainstorm by the same pty-list query the
+   * dashboard already uses.
+   *
+   * The legacy /lex/sessions block below stays in place during the
+   * migration window and will be retired in step 6.
+   */
+  /* In-flight open guard. Per-anchor promise memoisation collapses
+   * concurrent POST /lex/anchors/:id/open calls into a single spawn.
+   * Without this two callers can both observe "not live" and both
+   * spawn (codex finding #3). */
+  const openInFlight = new Map<string, Promise<unknown>>();
+
+  app.get('/lex/anchors', async (req) => {
     const q = (req.query ?? {}) as { status?: string; limit?: string };
     const status =
-      q.status === 'active' || q.status === 'ended' ? q.status : undefined;
+      q.status === 'live' || q.status === 'dormant' ? q.status : undefined;
     const limit = q.limit ? Math.min(200, Math.max(1, Number(q.limit))) : 50;
-    return { ok: true, sessions: listBrainstorms({ status, limit }) };
+    const rows = listLexSessions({ status, limit });
+    const liveSet = getLivePtyIds();
+    const out = rows.map((row) => {
+      const refs = listTranscriptRefs(row.id);
+      const last =
+        refs.reduce<number>((acc, r) => {
+          const t = r.ended_ms ?? r.started_ms;
+          return t > acc ? t : acc;
+        }, 0) || row.created_ms;
+      const live = Boolean(
+        row.current_pty_id && liveSet.has(row.current_pty_id),
+      );
+      return {
+        id: row.id,
+        title: row.title,
+        derived_title: row.derived_title,
+        status: live ? 'live' : 'dormant',
+        current_pty_id: live ? row.current_pty_id : null,
+        cwd: row.cwd,
+        created_ms: row.created_ms,
+        last_activity_ms: last,
+        transcript_count: refs.length,
+      };
+    });
+    return { ok: true, anchors: out };
   });
 
-  app.get('/lex/sessions/:id', async (req, reply) => {
+  app.get('/lex/anchors/:id', async (req, reply) => {
     const id = (req.params as { id: string }).id;
-    const row = getBrainstorm(id);
+    const row = getLexSession(id);
     if (!row) {
       reply.code(404);
       return { ok: false, error: 'not found' };
     }
-    return { ok: true, session: row };
+    const refs = listTranscriptRefs(id);
+    const liveSet = getLivePtyIds();
+    const live = Boolean(
+      row.current_pty_id && liveSet.has(row.current_pty_id),
+    );
+    return {
+      ok: true,
+      anchor: {
+        id: row.id,
+        title: row.title,
+        derived_title: row.derived_title,
+        status: live ? 'live' : 'dormant',
+        current_pty_id: live ? row.current_pty_id : null,
+        cwd: row.cwd,
+        created_ms: row.created_ms,
+        transcripts: refs,
+      },
+    };
   });
 
-  app.patch('/lex/sessions/:id', async (req, reply) => {
+  /* Create a fresh anchor and spawn its first CC session. Body:
+   *   { cwd?, title? }
+   * cwd defaults to <DATA_ROOT>/brainstorm. Returns the new anchor +
+   * spawned PTY id so the dashboard can immediately route to it. */
+  app.post('/lex/anchors', async (req, reply) => {
+    const body = (req.body ?? {}) as { cwd?: string; title?: string };
+    const cwd =
+      body.cwd ?? path.posix.join(DATA_ROOT.replace(/\\/g, '/'), 'brainstorm');
+    if (!fs.existsSync(cwd)) {
+      try {
+        fs.mkdirSync(cwd, { recursive: true });
+      } catch (err) {
+        reply.code(400);
+        return {
+          ok: false,
+          error: `cannot create cwd: ${(err as Error).message}`,
+        };
+      }
+    }
+    try {
+      const built = buildLexSpawnPrompt({
+        /* lexSessionId not yet known — anchor row is created inside
+         * spawnLexSession via prepareLexSpawn. Fill it in after the
+         * spawn returns by re-rendering with the real id. The PTY is
+         * launched with the placeholder, but the prompt template is
+         * identical for any new anchor (no lex_session_id substitution
+         * is used in the new variant header beyond display), so the
+         * placeholder vs real id doesn't change behaviour. */
+        lexSessionId: 'pending-new-anchor',
+        transcriptPaths: [],
+      });
+      const r = spawnLexSession({
+        cwd,
+        title: body.title,
+        extraArgs: ['--dangerously-skip-permissions'],
+        systemPrompt: built.prompt,
+      });
+      log(
+        `[lex-anchor] new anchor=${r.lexSessionId} cc=${r.ccSessionId} pty=${r.ptyId} cwd=${cwd}`,
+      );
+      return {
+        ok: true,
+        anchor_id: r.lexSessionId,
+        cc_session_id: r.ccSessionId,
+        pty_id: r.ptyId,
+        transcript_path: r.transcriptPath,
+        prompt_version: built.version,
+      };
+    } catch (err) {
+      log(`[lex-anchor] new failed: ${(err as Error).message}`);
+      reply.code(500);
+      return { ok: false, error: (err as Error).message };
+    }
+  });
+
+  /* Spawn-or-bind. If the anchor is already live, return the live
+   * PTY (voice + terminal mirror reconnect via the existing pty-list
+   * query). If dormant, spawn a fresh CC session under the SAME
+   * anchor with the reopen-variant system prompt that lists every
+   * prior transcript path and instructs Lex to Read each in order.
+   *
+   * Concurrency guard: openInFlight memoises the in-progress spawn
+   * promise per anchor. Codex flagged that two callers could both
+   * observe "not live" and both spawn, leaving two PTYs + two
+   * transcript refs against one anchor. Memoising the promise so a
+   * second caller awaits the first closes that race entirely. */
+  app.post('/lex/anchors/:id/open', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = getLexSession(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'anchor not found' };
+    }
+    const liveSet = getLivePtyIds();
+    if (row.current_pty_id && liveSet.has(row.current_pty_id)) {
+      return {
+        ok: true,
+        mode: 'bind',
+        anchor_id: id,
+        pty_id: row.current_pty_id,
+      };
+    }
+    const existing = openInFlight.get(id);
+    if (existing) return existing;
+    const inflight = (async () => {
+      try {
+        const refs = listTranscriptRefs(id);
+        const built = buildLexSpawnPrompt({
+          lexSessionId: id,
+          transcriptPaths: refs.map((r) => r.transcript_path),
+        });
+        const r = spawnLexSession({
+          lexSessionId: id,
+          cwd: row.cwd,
+          extraArgs: ['--dangerously-skip-permissions'],
+          systemPrompt: built.prompt,
+        });
+        log(
+          `[lex-anchor] reopen anchor=${id} cc=${r.ccSessionId} pty=${r.ptyId} transcripts=${refs.length}`,
+        );
+        return {
+          ok: true as const,
+          mode: 'spawn' as const,
+          anchor_id: id,
+          cc_session_id: r.ccSessionId,
+          pty_id: r.ptyId,
+          transcript_path: r.transcriptPath,
+          prompt_version: built.version,
+          prior_transcript_count: refs.length,
+        };
+      } catch (err) {
+        log(`[lex-anchor] reopen failed for ${id}: ${(err as Error).message}`);
+        reply.code(500);
+        return { ok: false as const, error: (err as Error).message };
+      }
+    })();
+    openInFlight.set(id, inflight);
+    try {
+      return await inflight;
+    } finally {
+      openInFlight.delete(id);
+    }
+  });
+
+  /* Rename / mark dormant. Body: { title?, derived_title? } */
+  app.patch('/lex/anchors/:id', async (req, reply) => {
     const id = (req.params as { id: string }).id;
     const body = (req.body ?? {}) as {
-      user_label?: string | null;
-      derived_label?: string | null;
-      mode?: string;
-      status?: 'ended';
-      summary?: string;
+      title?: string | null;
+      derived_title?: string | null;
     };
-    let row;
-    if (
-      body.user_label !== undefined ||
-      body.derived_label !== undefined
-    ) {
-      row = setBrainstormLabel(id, {
-        user_label: body.user_label,
-        derived_label: body.derived_label,
-      });
-    }
-    if (body.mode) row = setBrainstormMode(id, body.mode) ?? row;
-    if (body.status === 'ended') {
-      row = endBrainstorm(id, body.summary) ?? row;
-    }
+    const row = getLexSession(id);
     if (!row) {
       reply.code(404);
-      return { ok: false, error: 'not found' };
+      return { ok: false, error: 'anchor not found' };
     }
-    return { ok: true, session: row };
+    const updated = setLexSessionTitle(id, {
+      title: body.title,
+      derivedTitle: body.derived_title,
+    });
+    return { ok: true, anchor: updated };
   });
+
+  /* End the live PTY for an anchor and mark it dormant. The
+   * ON-EXIT handler in pty-host already flips status, but the user
+   * might click "end" on a row whose PTY died without firing the
+   * handler — flip it explicitly here so the UI is honest. */
+  app.post('/lex/anchors/:id/end', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = getLexSession(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'anchor not found' };
+    }
+    if (row.current_pty_id) {
+      try {
+        ptyKill(row.current_pty_id);
+      } catch {
+        /* best-effort; the status flip below still happens */
+      }
+    }
+    setLexSessionStatus(id, { status: 'dormant', currentPtyId: null });
+    return { ok: true };
+  });
+
+  /* Stream Deck tile feed for live anchors. Read-only; no tap
+   * action on the deck side. Phase reuses the /sessions vocab so
+   * the deck's existing tile colour mapping just works. */
+  app.get('/lex/anchor-tiles', async () => {
+    return { ok: true, tiles: listAnchorTiles() };
+  });
+
+  app.delete('/lex/anchors/:id', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = getLexSession(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'anchor not found' };
+    }
+    if (row.current_pty_id) {
+      try {
+        ptyKill(row.current_pty_id);
+      } catch {
+        /* best-effort */
+      }
+    }
+    deleteLexSession(id);
+    return { ok: true };
+  });
+
+  /* Legacy /lex/sessions list / get / patch endpoints retired in
+   * step 6 of PLAN-lex-session-rewrite.md. The canonical
+   * past-sessions surface is /lex/anchors above; renames now go
+   * through PATCH /lex/anchors/:id, status flips through
+   * /lex/anchors/:id/end, and the row id == lex_session.id thanks
+   * to the write-through in spawn-lex-session.ts so any caller
+   * hitting the old endpoints can swap to the new ones without an
+   * id translation step.
+   *
+   * The /lex/sessions/:id/artifacts subresource below is preserved
+   * intentionally — artifact storage still lives under the legacy
+   * brainstorm_sessions.artifacts_json column, and the lex_session
+   * id matches the brainstorm row id, so the same path keeps
+   * working transparently. */
 
   /* List artifacts attached to a brainstorm session.
    *
@@ -1150,16 +1415,17 @@ export async function registerDashboardRoutes(
       cols?: number;
       rows?: number;
       /* When set, claude is launched with --resume <id> so the past
-       * conversation is restored verbatim. Skipped if missing OR if
-       * the brainstorm row never bound a claude_session_id (PTY died
-       * before its jsonl appeared). The dashboard's "resume" button
-       * passes row.claude_session_id when present. */
+       * conversation is restored verbatim. The CLI may reject an
+       * unknown / stale id and mint a fresh one; either way the
+       * brainstorm row identified by brainstorm_id below gets its
+       * claude_session_id pointer updated to whatever actually
+       * lands in the jsonl, so the row itself is never duplicated. */
       resume_session_id?: string;
-      /* When set, the existing brainstorm row identified by this id
-       * is rebound to the new PTY (status flipped back to active,
-       * pty_id updated) instead of inserting a fresh row. Required
-       * for "switch to" so the past-sessions list doesn't accumulate
-       * duplicate rows on every resume. */
+      /* Brainstorm row uuid the new PTY should be bound to. Passed
+       * by the past-sessions "switch to" flow so the row the user
+       * clicked is the one that comes back to life. When omitted,
+       * the daemon mints a fresh row and returns its id so the
+       * dashboard can address it for renames etc. */
       brainstorm_id?: string;
     };
     const cwd =
@@ -1207,7 +1473,7 @@ export async function registerDashboardRoutes(
         cols: body.cols,
         rows: body.rows,
         systemPrompt,
-        rebindBrainstormId:
+        brainstormId:
           typeof body.brainstorm_id === 'string' && body.brainstorm_id.length > 0
             ? body.brainstorm_id
             : undefined,
@@ -1215,7 +1481,7 @@ export async function registerDashboardRoutes(
       log(
         `[lex] spawn ptyId=${r.ptyId} pid=${r.pid} cwd=${cwd}${
           resumeId ? ` resume=${resumeId}` : ''
-        }${body.brainstorm_id ? ` rebind=${body.brainstorm_id}` : ''}`,
+        }${r.brainstormId ? ` brainstorm=${r.brainstormId}` : ''}`,
       );
       /* Wave 2 carry-over #1: pin the system-prompt version onto the
        * brainstorm row that pty-host registered. setBrainstormPhaseTwo
@@ -1242,6 +1508,7 @@ export async function registerDashboardRoutes(
       return {
         ok: true,
         ...r,
+        brainstorm_id: r.brainstormId,
         cwd,
         resumed: Boolean(resumeId),
         prompt_version: promptVersion,

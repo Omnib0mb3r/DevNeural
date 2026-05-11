@@ -211,16 +211,19 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   const hasLexRef = useRef<boolean>(false);
   hasLexRef.current = hasLex;
 
-  /* Portal target. /lex renders <div id={PANEL_MOUNT_ID} />; other
-   * routes don't. The effect re-resolves the target on every route
-   * change so the panel re-portals when the user navigates back to
-   * /lex without unmounting the engine. */
+  /* Portal target. /lex renders <div id={PANEL_MOUNT_ID} /> only
+   * once a Lex PTY exists (or a spawn is pending); on cold load
+   * with no Lex the page shows an empty state and no mount div.
+   * Re-resolving the target on pathname OR live-PTY change covers
+   * both navigation back to /lex and the user clicking "start lex"
+   * from the empty state — without a re-resolve trigger the panel
+   * stayed unportaled even after the spawn landed. */
   const pathname = usePathname();
   const [mountEl, setMountEl] = useState<HTMLElement | null>(null);
   useEffect(() => {
     if (typeof document === "undefined") return;
     setMountEl(document.getElementById(PANEL_MOUNT_ID));
-  }, [pathname]);
+  }, [pathname, lexPty?.ptyId]);
 
   const [status, setStatus] = useState<Status>("idle");
   const [enabled, setEnabled] = useState<boolean>(false);

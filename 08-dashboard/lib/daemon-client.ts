@@ -343,6 +343,11 @@ export interface SessionSummary {
   context: ContextUsage | null;
   user_label: string | null;
   derived_label: string | null;
+  /** Lex anchor uuid for sessions backed by a brainstorm anchor.
+   * Stream Deck dedupes the underlying CC session against the
+   * anchor tile feed using this id. Null for non-brainstorm
+   * sessions. */
+  lex_anchor_id: string | null;
 }
 export interface IdleProject {
   id: string;
@@ -501,22 +506,12 @@ export interface OutboundStats {
 }
 export const statsOutbound = () => request<OutboundStats>("/stats/outbound");
 
-export const spawnLex = (
-  cwd?: string,
-  resumeSessionId?: string,
-  brainstormId?: string,
-) =>
-  request<{ ok: boolean; ptyId?: string; pid?: number; cwd?: string; resumed?: boolean; error?: string }>(
-    "/pty/spawn-lex",
-    {
-      method: "POST",
-      body: JSON.stringify({
-        ...(cwd ? { cwd } : {}),
-        ...(resumeSessionId ? { resume_session_id: resumeSessionId } : {}),
-        ...(brainstormId ? { brainstorm_id: brainstormId } : {}),
-      }),
-    },
-  );
+/* spawnLex retired in step 6 of PLAN-lex-session-rewrite.md. The
+ * /pty/spawn-lex POST is still served by the daemon as a backstop
+ * for legacy callers (replay-pty harness etc.); the dashboard now
+ * spawns Lex exclusively through createLexAnchor / openLexAnchor
+ * below, both of which go through spawn-lex-session.ts on the
+ * daemon side. */
 export const ptyInject = (id: string, text: string, commit = true) =>
   request<{ ok: boolean; error?: string }>(
     `/pty/${encodeURIComponent(id)}/inject`,
@@ -543,33 +538,114 @@ export interface BrainstormSessionRow {
   last_summary: string | null;
   last_summary_ms: number | null;
 }
-export const lexSessions = (opts: { status?: "active" | "ended"; limit?: number } = {}) => {
+/* lexSessions / lexSession / patchLexSession retired in step 6;
+ * past-sessions list now goes through lexAnchors below.
+ * BrainstormSessionRow stays exported because MeetingRow extends
+ * it and the meetings surface still uses the legacy table. */
+
+/* ── Lex anchors (PLAN-lex-session-rewrite.md, step 4) ─────────────
+ * New past-sessions surface. Each anchor is the durable session id
+ * the dashboard surfaces everywhere; opening one either binds to
+ * the live PTY (when status='live') or spawns a fresh CC session
+ * with the reopen-variant system prompt (when status='dormant'). */
+export interface LexAnchor {
+  id: string;
+  title: string | null;
+  derived_title: string | null;
+  status: "live" | "dormant";
+  current_pty_id: string | null;
+  cwd: string;
+  created_ms: number;
+  last_activity_ms: number;
+  transcript_count: number;
+}
+export interface LexAnchorTranscriptRef {
+  id: number;
+  lex_session_id: string;
+  cc_session_id: string;
+  transcript_path: string;
+  started_ms: number;
+  ended_ms: number | null;
+  ordering: number;
+}
+export const lexAnchors = (opts: { status?: "live" | "dormant"; limit?: number } = {}) => {
   const qs = new URLSearchParams();
   if (opts.status) qs.set("status", opts.status);
   if (opts.limit) qs.set("limit", String(opts.limit));
   const q = qs.toString();
-  return request<{ ok: boolean; sessions: BrainstormSessionRow[] }>(
-    `/lex/sessions${q ? `?${q}` : ""}`,
+  return request<{ ok: boolean; anchors: LexAnchor[] }>(
+    `/lex/anchors${q ? `?${q}` : ""}`,
   );
 };
-export const lexSession = (id: string) =>
-  request<{ ok: boolean; session: BrainstormSessionRow; error?: string }>(
-    `/lex/sessions/${encodeURIComponent(id)}`,
-  );
-export const patchLexSession = (
+export const lexAnchor = (id: string) =>
+  request<{
+    ok: boolean;
+    anchor: LexAnchor & { transcripts: LexAnchorTranscriptRef[] };
+    error?: string;
+  }>(`/lex/anchors/${encodeURIComponent(id)}`);
+export const createLexAnchor = (opts: { cwd?: string; title?: string } = {}) =>
+  request<{
+    ok: boolean;
+    anchor_id?: string;
+    cc_session_id?: string;
+    pty_id?: string;
+    transcript_path?: string;
+    prompt_version?: string;
+    error?: string;
+  }>(`/lex/anchors`, { method: "POST", body: opts });
+export const openLexAnchor = (id: string) =>
+  request<{
+    ok: boolean;
+    mode?: "bind" | "spawn";
+    anchor_id?: string;
+    cc_session_id?: string;
+    pty_id?: string;
+    transcript_path?: string;
+    prompt_version?: string;
+    prior_transcript_count?: number;
+    error?: string;
+  }>(`/lex/anchors/${encodeURIComponent(id)}/open`, {
+    method: "POST",
+    body: {},
+  });
+export const patchLexAnchor = (
   id: string,
-  patch: {
-    user_label?: string | null;
-    derived_label?: string | null;
-    mode?: string;
-    status?: "ended";
-    summary?: string;
-  },
+  patch: { title?: string | null; derived_title?: string | null },
 ) =>
-  request<{ ok: boolean; session?: BrainstormSessionRow; error?: string }>(
-    `/lex/sessions/${encodeURIComponent(id)}`,
+  request<{ ok: boolean; anchor?: LexAnchor; error?: string }>(
+    `/lex/anchors/${encodeURIComponent(id)}`,
     { method: "PATCH", body: patch },
   );
+export const endLexAnchor = (id: string) =>
+  request<{ ok: boolean; error?: string }>(
+    `/lex/anchors/${encodeURIComponent(id)}/end`,
+    { method: "POST", body: {} },
+  );
+export const deleteLexAnchor = (id: string) =>
+  request<{ ok: boolean; error?: string }>(
+    `/lex/anchors/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+
+/* Stream Deck anchor tile feed. Each live anchor renders as a
+ * read-only tile alongside CC project tiles; phase reuses the
+ * /sessions vocab. The 'dormant' status is included for
+ * completeness but the daemon endpoint only returns live anchors. */
+export interface AnchorTile {
+  anchor_id: string;
+  title: string | null;
+  derived_title: string | null;
+  status: "live" | "dormant";
+  current_pty_id: string | null;
+  current_cc_session_id: string | null;
+  transcript_path: string | null;
+  phase: "thinking" | "tool" | "permission" | "idle" | "unknown";
+  pending_prompt: PendingPrompt | null;
+  last_activity_ms: number;
+  transcript_count: number;
+}
+export const lexAnchorTiles = () =>
+  request<{ ok: boolean; tiles: AnchorTile[] }>(`/lex/anchor-tiles`);
 
 /* Wave 2 day 2 (BF-5 / A1, BF-7 review / A2). The /brainstorms +
  * /drafts route family lives alongside the older /lex/sessions

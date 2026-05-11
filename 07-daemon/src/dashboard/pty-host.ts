@@ -25,18 +25,29 @@ import { execSync } from 'node:child_process';
 import { spawn as ptySpawn, type IPty } from 'node-pty';
 import { pushTerminalData } from './terminal-stream.js';
 import {
-  registerBrainstorm,
-  rebindBrainstormToPty,
   bindBrainstormSessionId,
   isBrainstormCwd,
   getBrainstormByPty,
   endBrainstorm,
   getStore as getBrainstormStore,
+  registerBrainstorm,
+  reapOrphansAgainstLivePtys,
+  getBrainstorm,
 } from '../lex/brainstorm-store.js';
+import {
+  setLexSessionStatus,
+  closeTranscriptRef,
+} from '../lex/lex-session-store.js';
 import { runSessionEndPipeline } from '../lex/session-end-pipeline.js';
 
 interface PtyHandle {
   ptyId: string;
+  /** Brainstorm row uuid this PTY is bound to. Set at spawn time
+   * (either passed in by the caller for a switch-to flow, or freshly
+   * minted by spawn-lex when no row id was provided). The bind +
+   * exit handlers use this to update the right row regardless of
+   * what claude_session_id eventually appears in the jsonl. */
+  brainstormId: string | null;
   /** Bound once we discover the session-id from claude's jsonl dir.
    * Mirror data is pushed into the terminal-stream ring under this id
    * so the existing /sessions/:id/terminal-* endpoints work. */
@@ -110,6 +121,20 @@ const ptys = new Map<string, PtyHandle>();
 const sessionToPty = new Map<string, string>();
 const PRE_BUFFER_MAX = 256 * 1024;
 
+/* Live PTY id snapshot for the continuous brainstorm reaper. Returns
+ * the set of pty_ids that are currently registered AND not yet
+ * exited. The reaper compares this against status='active' brainstorm
+ * rows and ends any whose PTY isn't in here, so a daemon SIGKILL or
+ * any other path that bypasses the onExit handler doesn't leave a
+ * phantom active row in the past-sessions list forever. */
+export function getLivePtyIds(): ReadonlySet<string> {
+  const out = new Set<string>();
+  for (const handle of ptys.values()) {
+    if (!handle.exited) out.add(handle.ptyId);
+  }
+  return out;
+}
+
 export interface SpawnLexOptions {
   cwd: string;
   /** Full command to run. Defaults to `claude`. We pass through to
@@ -124,16 +149,25 @@ export interface SpawnLexOptions {
   rows?: number;
   /** Extra env vars merged onto process.env. */
   env?: Record<string, string>;
-  /** When set, the brainstorm row identified by this id is rebound to
-   * the new PTY instead of inserting a fresh row. Used by the
-   * /lex past-sessions "switch to" flow so resumed sessions don't
-   * leave a duplicate active row. */
-  rebindBrainstormId?: string;
+  /** Brainstorm row uuid (which since the lex_session rewrite is
+   * also the lex_session uuid; same value, write-through into both
+   * tables). spawn-lex-session.ts always passes this so the PTY's
+   * onExit handler can flip the right anchor dormant. */
+  brainstormId?: string;
+  /** When true, pty-host skips the legacy brainstorm_sessions
+   * registration / rebind block. spawnLexSession sets this so the
+   * legacy table is only ever written through the lex_session
+   * code path (single source of truth for new spawns). */
+  skipLegacyBrainstormRegister?: boolean;
 }
 
 export interface SpawnLexResult {
   ptyId: string;
   pid: number;
+  /** The brainstorm row uuid this PTY is bound to. Either the value
+   * passed in via opts.brainstormId, or the freshly-minted row id
+   * for a fresh start. Always present for brainstorm-cwd spawns. */
+  brainstormId: string | null;
 }
 
 function claudeProjectsRoot(): string {
@@ -195,12 +229,19 @@ function tryDiscoverSession(handle: PtyHandle): void {
     handle.preBuffer = [];
     handle.preBufferBytes = 0;
   }
-  /* Patch the brainstorm_session record (if any) with the just-bound
-   * claude session_id. Subsequent retrieval can join brainstorm_sessions
-   * to raw_chunks_meta on session_id and surface "this is brainstorm
-   * session named X" instead of orphan transcript chunks. */
+  /* Stamp the discovered claude_session_id onto both the legacy
+   * brainstorm_sessions row and the lex_session row this PTY was
+   * bound to at spawn time. The row id is the canonical identity;
+   * the claude_session_id is a mutable pointer. If a --resume was
+   * rejected by the CLI and a new id was minted, this call repoints
+   * the existing rows at the new id instead of forking a duplicate.
+   * The lex_session model also tracks the cc_session_id per-spawn
+   * via lex_transcript_ref, which spawn-lex-session.ts already
+   * inserted; this is just the legacy mirror. */
   try {
-    bindBrainstormSessionId(handle.ptyId, sessionId);
+    if (handle.brainstormId) {
+      bindBrainstormSessionId(handle.brainstormId, handle.ptyId, sessionId);
+    }
   } catch {
     /* ignore */
   }
@@ -273,6 +314,7 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
   const rows = opts.rows ?? 34;
   const handle: PtyHandle = {
     ptyId,
+    brainstormId: null,
     sessionId: null,
     pty,
     cwd,
@@ -288,32 +330,30 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
   };
   ptys.set(ptyId, handle);
 
-  /* Register a first-class brainstorm_session record if this PTY's
-   * cwd matches the brainstorm convention. Lex spawns get a record
-   * the moment they start, with status=active and no claude_session_id
-   * yet. Once the jsonl appears and we bind, we patch the record with
-   * the claude_session_id so retrieval can join the two.
-   *
-   * When rebindBrainstormId is supplied (the past-sessions "switch to"
-   * flow), reuse the existing row instead of inserting a new one. The
-   * old code created a duplicate row on every resume, which is why
-   * "switch to" looked like "new session" in the UI: the original row
-   * stayed put while a fresh row appeared at the top. */
-  try {
-    if (isBrainstormCwd(cwd)) {
-      const rebound = opts.rebindBrainstormId
-        ? rebindBrainstormToPty(opts.rebindBrainstormId, ptyId)
-        : null;
-      if (!rebound) {
-        registerBrainstorm({
-          ptyId,
-          cwd,
-          startedMs: handle.startedAt,
-        });
-      }
+  /* Stamp the brainstorm/lex_session id on the handle so the
+   * onExit handler can flip the right anchor dormant. New spawns
+   * go exclusively through spawn-lex-session.ts which mints the
+   * lex_session row + the write-through brainstorm_sessions row
+   * before calling us; the legacy in-line registration block has
+   * been retired. */
+  if (opts.brainstormId) {
+    handle.brainstormId = opts.brainstormId;
+  } else if (isBrainstormCwd(cwd) && !opts.skipLegacyBrainstormRegister) {
+    /* Backstop for any external caller (replay-pty harness, ad-hoc
+     * /pty/spawn-lex POST during transition) that did not route
+     * through spawn-lex-session.ts. Same legacy behaviour as
+     * before: mint a brainstorm_sessions row and stamp its id on
+     * the handle so onExit closes it. */
+    try {
+      const fresh = registerBrainstorm({
+        ptyId,
+        cwd,
+        startedMs: handle.startedAt,
+      });
+      handle.brainstormId = fresh.id;
+    } catch {
+      /* observability only; never block spawn */
     }
-  } catch {
-    /* brainstorm registration is observability, never block spawn */
   }
 
   pty.onData((data) => {
@@ -364,7 +404,12 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
      * tier-up while the chunk is being written. Best-effort: errors
      * from the pipeline never block cleanup. */
     try {
-      const bs = getBrainstormByPty(handle.ptyId);
+      /* Resolve via handle.brainstormId (stable PTY-lifetime identity)
+       * with a getBrainstormByPty fallback for any legacy PTY that
+       * pre-dates the brainstormId stamp. */
+      const bs = handle.brainstormId
+        ? getBrainstorm(handle.brainstormId)
+        : getBrainstormByPty(handle.ptyId);
       if (bs && bs.status === 'active') {
         void runSessionEndPipeline(
           getBrainstormStore(),
@@ -392,12 +437,31 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
     } catch {
       /* observability: never block exit cleanup */
     }
+    /* Sync the lex_session model on exit too: flip the anchor
+     * dormant + clear current_pty_id, and close the live transcript
+     * ref by cc_session_id. Codex flagged that without these, a
+     * natural PTY exit (or daemon crash) left lex_session.status
+     * = 'live' even after the underlying process was gone, which
+     * caused /lex/anchor-tiles to surface ghost tiles on the deck. */
+    try {
+      if (handle.brainstormId) {
+        setLexSessionStatus(handle.brainstormId, {
+          status: 'dormant',
+          currentPtyId: null,
+        });
+      }
+      if (handle.sessionId) {
+        closeTranscriptRef(handle.sessionId);
+      }
+    } catch {
+      /* observability only */
+    }
     /* Keep the entry around briefly so the dashboard can read final
      * status; reaper sweeps it in 60s. */
     setTimeout(() => ptys.delete(ptyId), 60_000);
   });
 
-  return { ptyId, pid: pty.pid };
+  return { ptyId, pid: pty.pid, brainstormId: handle.brainstormId };
 }
 
 function quoteWindowsArg(arg: string): string {

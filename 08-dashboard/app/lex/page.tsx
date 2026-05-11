@@ -1,17 +1,17 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AppShell } from "@/components/AppShell";
 import { TerminalMirror } from "@/components/TerminalMirror";
 import { Icon } from "@/components/Icon";
 import {
   listPtys,
-  spawnLex,
   ptyInject,
-  ptyKill,
   uploadScreenshot,
-  lexSessions,
+  lexAnchors,
+  createLexAnchor,
+  endLexAnchor,
   DaemonError,
   type PtyEntry,
 } from "@/lib/daemon-client";
@@ -54,42 +54,25 @@ export default function LexPage() {
     )
     .sort((a, b) => b.startedAt - a.startedAt)[0];
 
-  /* All three mutations await the pty-list refetch in onSettled so the
-   * mutation's isPending flag stays true until ptysQ has actually
-   * caught up to the new state. Without the await, isPending flipped
-   * back to false immediately after the POST returned while ptysQ
-   * still showed the stale (empty) list, so the page evaluated
-   * `(!lexPty && !spawnM.isPending)` to true for a 0-3s window and
-   * unmounted the voice panel. The user saw the panel briefly open,
-   * then disappear with no input. Awaiting the refetch closes the
-   * gap so the panel stays mounted across the spawn handoff. */
-  const spawnM = useMutation({
-    mutationFn: () => spawnLex(),
+  /* Spawn / end now go through the new /lex/anchors API.
+   * createLexAnchor mints a fresh anchor + spawns its first CC
+   * session; endLexAnchor kills the live PTY and flips the anchor
+   * to dormant. Awaiting the pty-list refetch in onSettled keeps
+   * each mutation's isPending true until the page's lexPty
+   * resolution has caught up — without the await the voice panel
+   * mount target briefly disappears across the handoff. */
+  const newAnchorM = useMutation({
+    mutationFn: () => createLexAnchor({}),
     onSettled: async () => {
       await qc.refetchQueries({ queryKey: ["pty-list"] });
+      qc.invalidateQueries({ queryKey: ["lex-anchors"] });
     },
   });
-  const killM = useMutation({
-    mutationFn: (id: string) => ptyKill(id),
+  const endAnchorM = useMutation({
+    mutationFn: (id: string) => endLexAnchor(id),
     onSettled: async () => {
       await qc.refetchQueries({ queryKey: ["pty-list"] });
-    },
-  });
-  /* "New session" = end the current Lex (if any) then spawn a fresh
-   * one. Sequenced so the new spawn doesn't race the kill's exit
-   * cleanup. The 400ms gap matches the typical taskkill /F /T tear-down
-   * window on Windows; the daemon's `seedFirstTurn` greeting then fires
-   * 600ms after the new spawn returns. */
-  const newSessionM = useMutation({
-    mutationFn: async () => {
-      if (lexPty) {
-        await ptyKill(lexPty.ptyId);
-        await new Promise((r) => setTimeout(r, 400));
-      }
-      return spawnLex();
-    },
-    onSettled: async () => {
-      await qc.refetchQueries({ queryKey: ["pty-list"] });
+      qc.invalidateQueries({ queryKey: ["lex-anchors"] });
     },
   });
 
@@ -194,36 +177,28 @@ export default function LexPage() {
     e.target.value = "";
   }
 
-  /* Resolve the active brainstorm row keyed off the live PTY so the
-   * artifacts panel and the session list highlight stay in sync. The
-   * /lex/sessions list is filtered to active rows so the lookup is a
-   * simple match by pty_id. */
-  const activeLexQ = useQuery({
-    queryKey: ["lex-sessions", "active"],
-    queryFn: () => lexSessions({ status: "active", limit: 20 }),
+  /* Resolve the active anchor keyed off the live PTY so the
+   * artifacts panel and the past-sessions row highlight stay in
+   * sync. /lex/anchors carries each anchor's current_pty_id, so a
+   * simple find on the live ptyId returns the right anchor. */
+  const activeAnchorsQ = useQuery({
+    queryKey: ["lex-anchors", "live"],
+    queryFn: () => lexAnchors({ status: "live", limit: 20 }),
     refetchInterval: 5_000,
   });
-  const activeBrainstormId =
-    (activeLexQ.data?.sessions ?? []).find((row) => row.pty_id === lexPty?.ptyId)?.id ?? null;
+  const activeAnchorId =
+    (activeAnchorsQ.data?.anchors ?? []).find(
+      (a) => a.current_pty_id === lexPty?.ptyId,
+    )?.id ?? null;
 
-  /* One-shot bootstrap: on first visit, if the daemon has no live
-   * brainstorm PTY, spawn one. The guard latches the first time the
-   * pty-list query reports a settled result (isFetched) regardless
-   * of whether we actually spawned, so a later transient gap in
-   * lexPty (kill→respawn during a switch-to, daemon restart, etc.)
-   * doesn't get misread as "first visit" and trigger an uninvited
-   * second spawn. The previous version latched only on the spawn
-   * call itself, so a switch that briefly dropped lexPty to
-   * undefined raced this effect and produced two PTYs (one from
-   * resumeM with brainstorm_id, one from autoSpawn without it,
-   * which left an orphan brainstorm row at the top of the list). */
-  const [initialAutoSpawnChecked, setInitialAutoSpawnChecked] = useState(false);
-  useEffect(() => {
-    if (initialAutoSpawnChecked) return;
-    if (!ptysQ.isFetched) return;
-    setInitialAutoSpawnChecked(true);
-    if (!lexPty) spawnM.mutate();
-  }, [initialAutoSpawnChecked, ptysQ.isFetched, lexPty, spawnM]);
+  /* No auto-spawn. Landing on /lex with no live brainstorm PTY
+   * renders the empty state ("Lex isn't running. Click start lex")
+   * below. The user explicitly starts a session by clicking
+   * "start lex" / "new brainstorm" or switching to a past row.
+   * Previous auto-spawn races created an unwanted session every
+   * time the page mounted, polluted past-sessions with one-turn
+   * orphans, and made "switch to" feel broken because a fresh
+   * spawn was already in flight. */
 
   return (
     <AppShell>
@@ -236,32 +211,30 @@ export default function LexPage() {
             </h1>
           </div>
           <div className="flex items-center gap-2">
-            {lexPty ? (
+            {lexPty && activeAnchorId ? (
               <button
                 type="button"
-                onClick={() => killM.mutate(lexPty.ptyId)}
-                disabled={killM.isPending || newSessionM.isPending}
+                onClick={() => endAnchorM.mutate(activeAnchorId)}
+                disabled={endAnchorM.isPending || newAnchorM.isPending}
                 className="text-xs px-3 py-1.5 rounded-pill bg-surface2 hairline hover:bg-surface3 text-txt2 disabled:opacity-40 disabled:cursor-not-allowed"
                 title="End this brainstorm session"
               >
-                {killM.isPending ? "ending…" : "end session"}
+                {endAnchorM.isPending ? "ending…" : "end session"}
               </button>
             ) : null}
             <button
               type="button"
-              onClick={() => (lexPty ? newSessionM.mutate() : spawnM.mutate())}
-              disabled={spawnM.isPending || newSessionM.isPending || killM.isPending}
+              onClick={() => newAnchorM.mutate()}
+              disabled={newAnchorM.isPending || endAnchorM.isPending}
               className="text-xs px-3 py-1.5 rounded-pill bg-brand/10 hairline ring-1 ring-brand/30 text-brandSoft hover:bg-brand/15 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
-              title={lexPty ? "End the current Lex and start a fresh one" : "Spawn Lex"}
+              title={lexPty ? "Spawn a fresh Lex anchor (the current one stays alive)" : "Spawn Lex"}
             >
               <Icon name="Plus" size={12} />
-              {newSessionM.isPending
-                ? "swapping…"
-                : spawnM.isPending
-                  ? "starting…"
-                  : lexPty
-                    ? "new session"
-                    : "start lex"}
+              {newAnchorM.isPending
+                ? "starting…"
+                : lexPty
+                  ? "new session"
+                  : "start lex"}
             </button>
           </div>
         </div>
@@ -275,11 +248,11 @@ export default function LexPage() {
         </p>
 
         <LexSessionList
-          activeBrainstormId={activeBrainstormId}
+          activeAnchorId={activeAnchorId}
           activePtyId={lexPty?.ptyId ?? null}
         />
 
-        {!lexPty && !spawnM.isPending && (
+        {!lexPty && !newAnchorM.isPending && (
           <div className="rounded-panel bg-surface1 hairline p-8 text-center">
             <p className="text-sm text-txt3 mb-3">
               Lex isn&apos;t running. Click <strong>start lex</strong> above
@@ -288,7 +261,7 @@ export default function LexPage() {
           </div>
         )}
 
-        {(lexPty || spawnM.isPending) && (
+        {(lexPty || newAnchorM.isPending) && (
           <>
             {/* Voice panel mount target. The actual VoiceClient
              * component is mounted once at the application root in
@@ -304,7 +277,7 @@ export default function LexPage() {
              * once the session-id appears. */}
             <TerminalMirror sessionId={lexPty?.sessionId ?? ""} />
             <LexArtifactsPanel
-              brainstormId={activeBrainstormId}
+              brainstormId={activeAnchorId}
               active={Boolean(lexPty)}
             />
             <div className="rounded-panel bg-surface1 hairline">

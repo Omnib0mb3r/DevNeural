@@ -3,24 +3,38 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  lexSessions,
-  patchLexSession,
-  spawnLex,
-  ptyKill,
-  type BrainstormSessionRow,
+  lexAnchors,
+  patchLexAnchor,
+  createLexAnchor,
+  openLexAnchor,
+  endLexAnchor,
+  type LexAnchor,
 } from "@/lib/daemon-client";
 import { relTime } from "@/lib/session-helpers";
 import { Icon } from "./Icon";
 import { StatusDot } from "./StatusDot";
 
+/**
+ * Past Sessions panel for /lex (PLAN-lex-session-rewrite.md, step 4).
+ *
+ * Backed by the new /lex/anchors endpoint. Each row is a durable Lex
+ * anchor (lex_session). Click "switch to" / "resume" → POST
+ * /lex/anchors/:id/open. The daemon either binds to the live PTY
+ * (status='live') or spawns a fresh CC session under the same
+ * anchor with the reopen-variant system prompt that lists every
+ * prior transcript jsonl + the catch-up Read instruction. No more
+ * one-row-per-spawn pollution; the anchor row is the canonical
+ * identity.
+ */
 interface Props {
-  /* Currently bound active brainstorm row id (if known). Used so the
-   * row matching the live PTY can be highlighted and the End button
-   * surfaced inline. */
-  activeBrainstormId?: string | null;
-  /* PTY id of the live Lex session, threaded down so the End button
-   * can also kill the underlying PTY (status PATCH alone leaves the
-   * PTY running). */
+  /* Anchor id of the currently bound Lex session, if any. The /lex
+   * page derives this from the live PTY's mapping and threads it
+   * down so the row can be highlighted and the End button surfaced
+   * inline. */
+  activeAnchorId?: string | null;
+  /* PTY id of the live Lex session. Threaded down so the End
+   * button kills the underlying PTY in addition to flipping the
+   * anchor's status. */
   activePtyId?: string | null;
 }
 
@@ -28,175 +42,81 @@ function shortId(id: string): string {
   return id.slice(0, 8);
 }
 
-/* Display name for the rename row. Empty when neither the user nor the
- * daemon has set a label, so the input field can show a placeholder
- * instead of pre-filling with the row id (which is rendered on its own
- * line below and should never double as the editable name). */
-function nameFor(row: BrainstormSessionRow): string {
-  return row.user_label?.trim() || row.derived_label?.trim() || "";
+function displayId(anchor: LexAnchor): string {
+  return shortId(anchor.id);
 }
 
-export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
+function nameFor(anchor: LexAnchor): string {
+  return anchor.title?.trim() || anchor.derived_title?.trim() || "";
+}
+
+export function LexSessionList({ activeAnchorId, activePtyId }: Props) {
   const qc = useQueryClient();
   const [open, setOpen] = useState(true);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftLabel, setDraftLabel] = useState("");
+  /* Per-row pending state. Without this every row's open button
+   * shared the mutation's isPending, so clicking one made all of
+   * them flash "opening…" and disabled together. */
+  const [pendingRowId, setPendingRowId] = useState<string | null>(null);
 
   const q = useQuery({
-    queryKey: ["lex-sessions"],
-    queryFn: () => lexSessions({ limit: 50 }),
+    queryKey: ["lex-anchors"],
+    queryFn: () => lexAnchors({ limit: 50 }),
     refetchInterval: 5_000,
   });
-
-  /* Per-row pending state. Without this every row's switch-to /
-   * resume button shared `resumeM.isPending`, so clicking one made
-   * all of them flash "resuming..." and disabled together — looked
-   * like a UI bug ("they all react"). Tracking the clicked id keeps
-   * feedback scoped to the actual row. */
-  const [pendingRowId, setPendingRowId] = useState<string | null>(null);
 
   const patchM = useMutation({
     mutationFn: (vars: {
       id: string;
-      patch: Parameters<typeof patchLexSession>[1];
-    }) => patchLexSession(vars.id, vars.patch),
+      patch: Parameters<typeof patchLexAnchor>[1];
+    }) => patchLexAnchor(vars.id, vars.patch),
     onSettled: () => {
-      qc.invalidateQueries({ queryKey: ["lex-sessions"] });
-      /* Stream Deck and Nav tiles join brainstorm labels onto the
+      qc.invalidateQueries({ queryKey: ["lex-anchors"] });
+      /* Stream Deck + Nav tiles join anchor titles onto the
        * /sessions response, so a rename also has to refresh that
-       * query for the deck to reflect the new title without a page
+       * query for the deck to reflect the new title without a
        * reload. */
       qc.invalidateQueries({ queryKey: ["sessions"] });
     },
   });
 
-  /* Resume passes the prior brainstorm's claude_session_id to
-   * /pty/spawn-lex, which appends --resume <id> to the claude CLI
-   * args so the conversation history is restored verbatim. Rows
-   * with no claude_session_id (PTY died before its jsonl appeared)
-   * fall back to "open fresh PTY in same cwd with the same label";
-   * the tooltip on the button reflects the difference.
-   *
-   * If a live Lex PTY is already running we end it first (kill +
-   * patch its brainstorm row to status='ended') so /pty/spawn-lex
-   * does not race a competing tile in the same brainstorm cwd. The
-   * 400ms gap matches the page-level newSessionM mutation in
-   * app/lex/page.tsx; without it the new spawn can land before the
-   * old taskkill /F /T tree unwind finishes on Windows. */
-  const resumeM = useMutation({
-    mutationFn: async (row: BrainstormSessionRow) => {
-      if (activePtyId) {
-        try {
-          await ptyKill(activePtyId);
-        } catch {
-          /* if it was already gone, spawn still proceeds */
-        }
-      }
-      /* End every other active brainstorm row before spawning the
-       * resumed PTY. The parent's `activeBrainstormId` prop derives
-       * from a 5s-refetched query that often hasn't caught up to the
-       * auto-spawned PTY at the moment the user clicks switch-to, so
-       * relying on it alone leaves the previously-active row stuck at
-       * status='active'. Fetching the live active set here closes the
-       * race: any row that is still 'active' (except the one the user
-       * is resuming) gets patched to 'ended' before /pty/spawn-lex
-       * runs and registers the new active row. */
-      try {
-        const active = await lexSessions({ status: "active", limit: 50 });
-        await Promise.all(
-          (active.sessions ?? [])
-            .filter((r) => r.id !== row.id)
-            .map((r) =>
-              patchLexSession(r.id, { status: "ended" }).catch(() => {
-                /* observability only; never block the resume */
-              }),
-            ),
-        );
-      } catch {
-        /* observability only; never block the resume */
-      }
-      if (activePtyId) {
-        await new Promise((r) => setTimeout(r, 400));
-      }
-      const cwd = row.cwd?.replace(/\//g, "\\");
-      const resumeSid = row.claude_session_id ?? undefined;
-      /* Pass row.id so the daemon rebinds this brainstorm row to
-       * the new PTY instead of inserting a duplicate. Without this
-       * the past-sessions list grew a new active row on every
-       * "switch to" while the original row stayed put. */
-      const spawned = await spawnLex(cwd ?? undefined, resumeSid, row.id);
-      if (!spawned.ok || !spawned.ptyId) {
-        throw new Error(spawned.error ?? "spawn failed");
-      }
-      const carry = row.user_label ?? row.derived_label ?? null;
-      return {
-        ptyId: spawned.ptyId,
-        carryLabel: carry,
-        resumed: Boolean(spawned.resumed),
-      };
-    },
+  /* Spawn-or-bind. Server flips between binding to the live PTY (if
+   * the anchor's current_pty_id is alive) and spawning a fresh CC
+   * session with the reopen-variant system prompt. The dashboard
+   * reacts to the resulting pty-list change automatically — voice
+   * and the terminal mirror re-target the new ptyId without any
+   * extra client wiring. */
+  const openM = useMutation({
+    mutationFn: (id: string) => openLexAnchor(id),
     onSettled: async () => {
       setPendingRowId(null);
       await qc.refetchQueries({ queryKey: ["pty-list"] });
-      qc.invalidateQueries({ queryKey: ["lex-sessions"] });
+      qc.invalidateQueries({ queryKey: ["lex-anchors"] });
     },
   });
 
-  const killM = useMutation({
-    mutationFn: async (vars: { brainstormId: string; ptyId?: string | null }) => {
-      await patchLexSession(vars.brainstormId, { status: "ended" });
-      if (vars.ptyId) {
-        try {
-          await ptyKill(vars.ptyId);
-        } catch {
-          /* If the PTY is already gone, the row patch is enough. */
-        }
-      }
-      return true;
-    },
+  const endM = useMutation({
+    mutationFn: (id: string) => endLexAnchor(id),
     onSettled: () => {
-      qc.invalidateQueries({ queryKey: ["lex-sessions"] });
+      qc.invalidateQueries({ queryKey: ["lex-anchors"] });
       qc.invalidateQueries({ queryKey: ["pty-list"] });
     },
   });
 
-  /* Start a fresh brainstorm. If a Lex PTY is already live we kill it
-   * first so spawn-lex doesn't end up with two competing tiles in the
-   * brainstorm cwd, then spawn a clean session. The 400ms gap matches
-   * the page-level newSessionM mutation in app/lex/page.tsx.
-   *
-   * onSettled awaits the pty-list refetch so the mutation's isPending
-   * flag stays true until the parent page sees the new PTY. Without
-   * the await, the page's empty-state condition flickered to true for
-   * a 0-3s window while the dashboard waited on the next 3s tick,
-   * unmounting the voice panel the user just opened. */
   const newM = useMutation({
-    mutationFn: async () => {
-      if (activePtyId) {
-        try {
-          await ptyKill(activePtyId);
-        } catch {
-          /* PTY may already be gone; spawn anyway. */
-        }
-        await new Promise((r) => setTimeout(r, 400));
-      }
-      const spawned = await spawnLex();
-      if (!spawned.ok) {
-        throw new Error(spawned.error ?? "spawn failed");
-      }
-      return spawned;
-    },
+    mutationFn: () => createLexAnchor({}),
     onSettled: async () => {
       await qc.refetchQueries({ queryKey: ["pty-list"] });
-      qc.invalidateQueries({ queryKey: ["lex-sessions"] });
+      qc.invalidateQueries({ queryKey: ["lex-anchors"] });
     },
   });
 
-  const rows: BrainstormSessionRow[] = q.data?.sessions ?? [];
+  const rows: LexAnchor[] = q.data?.anchors ?? [];
 
-  function startEdit(row: BrainstormSessionRow) {
-    setEditingId(row.id);
-    setDraftLabel(row.user_label ?? row.derived_label ?? "");
+  function startEdit(anchor: LexAnchor) {
+    setEditingId(anchor.id);
+    setDraftLabel(anchor.title ?? anchor.derived_title ?? "");
   }
 
   function commitEdit(rowId: string) {
@@ -204,7 +124,7 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
     setEditingId(null);
     patchM.mutate({
       id: rowId,
-      patch: { user_label: next.length > 0 ? next : null },
+      patch: { title: next.length > 0 ? next : null },
     });
   }
 
@@ -227,7 +147,7 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
           onClick={() => newM.mutate()}
           disabled={newM.isPending}
           className="text-xs px-3 py-1.5 rounded-pill bg-brand/15 text-brandSoft hairline ring-1 ring-brand/30 hover:bg-brand/25 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
-          title="End the current Lex (if any) and start a fresh brainstorm"
+          title="Spawn a fresh Lex anchor"
         >
           <Icon name="Plus" size={12} />
           {newM.isPending ? "starting…" : "new brainstorm"}
@@ -251,10 +171,10 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
           {!q.isLoading && rows.length > 0 && (
             <ul className="divide-y divide-border2">
               {rows.map((row) => {
-                const isActive = row.status === "active";
+                const isLive = row.status === "live";
                 const isCurrent =
-                  activeBrainstormId === row.id ||
-                  (activePtyId && row.pty_id === activePtyId);
+                  activeAnchorId === row.id ||
+                  (activePtyId && row.current_pty_id === activePtyId);
                 const editing = editingId === row.id;
                 return (
                   <li
@@ -264,14 +184,9 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
                     }`}
                   >
                     <StatusDot
-                      status={isActive ? "live" : "idle"}
-                      pulse={isActive}
+                      status={isLive ? "live" : "idle"}
+                      pulse={isLive}
                     />
-                    {/* Three lines: editable name, read-only session
-                      * id, then meta (last-active + status + turns).
-                      * Name is what the user (or Lex) renames; the
-                      * id below stays stable so it can be referenced
-                      * from logs or other surfaces. */}
                     <div className="min-w-0 flex-1">
                       {editing ? (
                         <input
@@ -304,69 +219,54 @@ export function LexSessionList({ activeBrainstormId, activePtyId }: Props) {
                         </button>
                       )}
                       <div className="text-nano text-txt3 font-mono truncate">
-                        {shortId(row.id)}
+                        {displayId(row)}
                       </div>
                       <div className="text-nano text-txt3 font-mono flex items-center gap-2">
-                        <span>{relTime(row.started_ms)} ago</span>
+                        <span>{relTime(row.last_activity_ms)} ago</span>
                         <span>{row.status}</span>
-                        {row.turn_count > 0 && <span>{row.turn_count} turns</span>}
+                        {row.transcript_count > 0 && (
+                          <span>
+                            {row.transcript_count} session
+                            {row.transcript_count === 1 ? "" : "s"}
+                          </span>
+                        )}
                       </div>
                     </div>
                     <div className="flex items-center gap-1 flex-shrink-0">
-                      {isActive && isCurrent && (
+                      {isLive && isCurrent && (
                         <button
                           type="button"
-                          onClick={() =>
-                            killM.mutate({
-                              brainstormId: row.id,
-                              ptyId: activePtyId ?? row.pty_id,
-                            })
-                          }
-                          disabled={killM.isPending}
+                          onClick={() => endM.mutate(row.id)}
+                          disabled={endM.isPending}
                           className="text-nano px-2 py-1 rounded-pill bg-surface2 hairline hover:bg-surface3 text-txt2 disabled:opacity-40"
-                          title="End this session and kill the PTY"
+                          title="End the live PTY for this anchor and mark it dormant"
                         >
                           end
                         </button>
                       )}
-                      {/* Switch-to renders for every non-current row.
-                       * Rows with no claude_session_id can't be
-                       * resumed (claude needs the session id to
-                       * locate the jsonl transcript), so render a
-                       * disabled "no transcript" pill instead of a
-                       * misleading switch-to that would silently
-                       * spawn a fresh conversation. Per-row pending
-                       * state means clicking one row no longer
-                       * toggles every other row's button. */}
-                      {!isCurrent && row.claude_session_id && (
+                      {!isCurrent && (
                         <button
                           type="button"
                           onClick={() => {
                             setPendingRowId(row.id);
-                            resumeM.mutate(row);
+                            openM.mutate(row.id);
                           }}
-                          disabled={resumeM.isPending}
+                          disabled={openM.isPending}
                           className="text-nano px-2 py-1 rounded-pill bg-brand/10 hairline ring-1 ring-brand/30 text-brandSoft hover:bg-brand/20 disabled:opacity-40 disabled:cursor-not-allowed"
                           title={
-                            activePtyId
-                              ? "End the current Lex and restore this conversation via claude --resume"
-                              : "Restore this conversation via claude --resume"
+                            isLive
+                              ? "Bind to the live PTY for this anchor"
+                              : row.transcript_count > 0
+                                ? "Spawn a fresh CC session under this anchor; Lex will Read every prior transcript before responding"
+                                : "Spawn a fresh CC session under this anchor (no prior transcripts to load)"
                           }
                         >
                           {pendingRowId === row.id
-                            ? "resuming..."
-                            : activePtyId || isActive
+                            ? "opening…"
+                            : isLive
                               ? "switch to"
-                              : "resume"}
+                              : "open"}
                         </button>
-                      )}
-                      {!isCurrent && !row.claude_session_id && (
-                        <span
-                          className="text-nano px-2 py-1 rounded-pill bg-surface2 hairline text-txt3 cursor-not-allowed"
-                          title="No claude_session_id was ever bound to this row (the PTY exited before the jsonl transcript appeared). There is no conversation to restore, so switching to it would just open a fresh session."
-                        >
-                          no transcript
-                        </span>
                       )}
                     </div>
                   </li>

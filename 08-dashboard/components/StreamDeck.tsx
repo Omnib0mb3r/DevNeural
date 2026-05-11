@@ -2,7 +2,13 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { focusSession, sessions as sessionsClient, type SessionSummary } from "@/lib/daemon-client";
+import {
+  focusSession,
+  sessions as sessionsClient,
+  lexAnchorTiles,
+  type SessionSummary,
+  type AnchorTile,
+} from "@/lib/daemon-client";
 import { projectFromSlug, relTime } from "@/lib/session-helpers";
 import { Icon } from "./Icon";
 import { StatusDot } from "./StatusDot";
@@ -81,6 +87,19 @@ export function StreamDeck() {
     queryFn: sessionsClient,
     refetchInterval: 5_000,
   });
+  /* Live Lex anchors render as their own read-only tiles alongside
+   * CC project tiles. Phase reuses the same vocab as /sessions, so
+   * the existing tileState helpers handle them after a thin
+   * SessionSummary-shaped adapter. The deck dedupes by hiding any
+   * /sessions row whose session_id matches a live anchor's
+   * current_cc_session_id — without that, the brainstorm
+   * conversation would render twice (once as project, once as
+   * anchor). */
+  const anchorsQ = useQuery({
+    queryKey: ["lex-anchor-tiles"],
+    queryFn: lexAnchorTiles,
+    refetchInterval: 5_000,
+  });
   /* Default: show only sessions the daemon flags as active. The flag
    * uses a 24h jsonl-mtime window, so a live session stays visible
    * through normal idle gaps. Toggle pulls in older history when
@@ -91,7 +110,15 @@ export function StreamDeck() {
   const [navSessionId, setNavSessionId] = useState<string | null>(null);
   const lastFocusRef = useRef<{ id: string; ts: number } | null>(null);
 
-  const all: SessionSummary[] = q.data?.sessions ?? [];
+  const tiles: AnchorTile[] = anchorsQ.data?.tiles ?? [];
+  const tileCcIds = new Set(
+    tiles.map((t) => t.current_cc_session_id).filter((s): s is string => Boolean(s)),
+  );
+  /* Hide CC sessions that an anchor already represents to avoid
+   * the same brainstorm rendering twice. */
+  const all: SessionSummary[] = (q.data?.sessions ?? []).filter(
+    (s) => !tileCcIds.has(s.session_id),
+  );
   const active = all.filter((s) => s.active);
   const inactive = all.filter((s) => !s.active);
   const visible = [...(showStale ? all : active)].sort((a, b) => {
@@ -153,7 +180,7 @@ export function StreamDeck() {
       <div className="flex items-center justify-between mb-1">
         <div className="text-nano text-txt3">Stream deck</div>
         <span className="text-nano text-txt3 font-mono">
-          {active.length} live
+          {active.length + tiles.length} live
         </span>
       </div>
 
@@ -177,9 +204,25 @@ export function StreamDeck() {
             </div>
           )}
 
-          {!q.isLoading && visible.length === 0 && (
+          {!q.isLoading && visible.length === 0 && tiles.length === 0 && (
             <div className="text-xs text-txt3 px-2 py-3">
               {lexPickStable("empty_sessions", "stream-deck-rail")}
+            </div>
+          )}
+
+          {tiles.length > 0 && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between px-1 pt-1">
+                <div className="text-nano text-txt2 font-emphasized">
+                  Brainstorms
+                </div>
+                <span className="text-nano text-txt3 font-mono">
+                  {tiles.length} live
+                </span>
+              </div>
+              {tiles.map((t) => (
+                <AnchorDeckTile key={t.anchor_id} tile={t} />
+              ))}
             </div>
           )}
 
@@ -294,7 +337,10 @@ function DeckTile({ session: s, onTap }: DeckTileProps) {
       </div>
       <div className="text-xs text-txt2 font-mono mb-1">{stateLabel}</div>
       <div className="flex items-center justify-between text-[11px] font-mono text-txt3">
-        <span className="truncate">{s.session_id.slice(0, 8)}</span>
+        {/* Prefer the lex anchor uuid for brainstorm sessions
+         * (matches /lex Past Sessions and Lex's own self-report);
+         * fall back to claude session id for everything else. */}
+        <span className="truncate">{(s.lex_anchor_id ?? s.session_id).slice(0, 8)}</span>
         <span className="flex items-center gap-2">
           <span>
             {focusM.isPending
@@ -308,5 +354,66 @@ function DeckTile({ session: s, onTap }: DeckTileProps) {
         </span>
       </div>
     </button>
+  );
+}
+
+/* Read-only anchor tile. No tap action — open / switch lives on the
+ * /lex Past Sessions panel. Status reuses the project tile vocab
+ * (thinking/tool/permission/idle) plus the daemon-level dormant
+ * label, even though the tile feed only returns live anchors today. */
+function AnchorDeckTile({ tile: t }: { tile: AnchorTile }) {
+  const phaseToTileState = (
+    phase: AnchorTile["phase"],
+  ): TileState => {
+    if (phase === "thinking") return "thinking";
+    if (phase === "tool") return "tool";
+    if (phase === "permission") return "permission";
+    if (phase === "idle") return "idle";
+    return "idle"; // 'unknown' falls back to idle for the visual
+  };
+  const state =
+    t.status === "dormant" ? "inactive" : phaseToTileState(t.phase);
+  const led = ledStatus(state);
+  const ring = ringClass(state);
+  const stateLabel =
+    t.status === "dormant"
+      ? "dormant"
+      : state === "thinking"
+        ? "thinking"
+        : state === "tool"
+          ? "running tool"
+          : state === "permission"
+            ? "needs input"
+            : state === "idle"
+              ? "idle"
+              : "stale";
+  const label = t.title?.trim() || t.derived_title?.trim() || "unnamed";
+  const pulseOnLed =
+    state === "thinking" ||
+    state === "tool" ||
+    state === "permission" ||
+    state === "idle";
+  return (
+    <div
+      className={`w-full block text-left p-3 rounded-card bg-surface1 hairline ${ring}`}
+      aria-label={`Brainstorm ${label} (${stateLabel}); read-only`}
+    >
+      <div className="flex items-center justify-between mb-1.5">
+        <div className="font-display text-sm font-emphasized truncate text-txt1">
+          {label}
+        </div>
+        <StatusDot status={led} pulse={pulseOnLed} />
+      </div>
+      <div className="text-xs text-txt2 font-mono mb-1">{stateLabel}</div>
+      <div className="flex items-center justify-between text-[11px] font-mono text-txt3">
+        <span className="truncate">{t.anchor_id.slice(0, 8)}</span>
+        <span className="flex items-center gap-2">
+          <span>last {relTime(t.last_activity_ms)} ago</span>
+          {t.transcript_count > 1 && (
+            <span>{t.transcript_count} sessions</span>
+          )}
+        </span>
+      </div>
+    </div>
   );
 }

@@ -180,6 +180,37 @@ export interface BrainstormChunkRow {
   created_at: string;
 }
 
+/* lex_session row. The durable Lex brainstorm anchor introduced in
+ * PLAN-lex-session-rewrite.md step 1. The id is daemon-owned and
+ * surfaces as the canonical session identifier everywhere (Past
+ * Sessions list, Stream Deck tile, Lex's own self-report). Every CC
+ * jsonl ever produced under this anchor is recorded in
+ * lex_transcript_ref so reopens can Read every prior transcript and
+ * reconstruct the full conversation without summarisation. */
+export interface LexSessionRow {
+  id: string;
+  created_ms: number;
+  title: string | null;
+  derived_title: string | null;
+  status: 'live' | 'dormant';
+  current_pty_id: string | null;
+  cwd: string;
+}
+
+/* lex_transcript_ref row. Ordered list of CC jsonl pointers per
+ * lex_session. ordering is 0-based and strictly increasing per
+ * lex_session_id; the unique index on cc_session_id guarantees no
+ * jsonl appears under two anchors. */
+export interface LexTranscriptRefRow {
+  id: number;
+  lex_session_id: string;
+  cc_session_id: string;
+  transcript_path: string;
+  started_ms: number;
+  ended_ms: number | null;
+  ordering: number;
+}
+
 /* backfill_review_queue row. Populated by npm run backfill-brainstorms
  * with one (page, brainstorm) candidate pair per band; the dashboard
  * empties the queue at /brainstorms/backfill-review. */
@@ -1219,9 +1250,29 @@ export class IndexDb {
   ): BrainstormSessionRow | null {
     const existing = this.getBrainstorm(id);
     if (!existing) return null;
-    const merged: BrainstormSessionRow = { ...existing, ...patch, id };
-    this.insertBrainstorm(merged);
-    return merged;
+    /* Targeted UPDATE rather than INSERT OR REPLACE. The latter
+     * silently clobbered every column not enumerated in
+     * insertBrainstorm's INSERT statement (audio_path,
+     * distilled_at, project_slug, kind, attendees, etc.) which got
+     * exposed once the long-tail reaper started checking those
+     * columns to decide cruft vs substance. */
+    const sets: string[] = [];
+    const params: Array<string | number | null> = [];
+    for (const [k, v] of Object.entries(patch)) {
+      if (k === 'id') continue;
+      if (v === undefined) continue;
+      sets.push(`${k} = ?`);
+      params.push(v as string | number | null);
+    }
+    if (sets.length > 0) {
+      params.push(id);
+      this.db
+        .prepare(
+          `UPDATE brainstorm_sessions SET ${sets.join(', ')} WHERE id = ?`,
+        )
+        .run(...params);
+    }
+    return this.getBrainstorm(id);
   }
 
   getBrainstorm(id: string): BrainstormSessionRow | null {
@@ -1280,6 +1331,144 @@ export class IndexDb {
         `SELECT * FROM brainstorm_sessions ORDER BY started_ms DESC LIMIT ?`,
       )
       .all(limit) as BrainstormSessionRow[];
+  }
+
+  /* ── lex_session ────────────────────────────────────────────────
+   * New session model from PLAN-lex-session-rewrite.md. lex_session
+   * is the durable anchor; lex_transcript_ref is the ordered list of
+   * CC jsonl pointers per anchor. The legacy brainstorm_sessions
+   * table is still populated by the old code path during the
+   * migration window; both feeds coexist until the rip-out step. */
+  insertLexSession(row: LexSessionRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO lex_session
+           (id, created_ms, title, derived_title, status, current_pty_id, cwd)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        row.id,
+        row.created_ms,
+        row.title,
+        row.derived_title,
+        row.status,
+        row.current_pty_id,
+        row.cwd,
+      );
+  }
+
+  updateLexSession(
+    id: string,
+    patch: Partial<Omit<LexSessionRow, 'id' | 'created_ms'>>,
+  ): LexSessionRow | null {
+    const sets: string[] = [];
+    const params: Array<string | number | null> = [];
+    for (const [k, v] of Object.entries(patch)) {
+      if (v === undefined) continue;
+      sets.push(`${k} = ?`);
+      params.push(v as string | number | null);
+    }
+    if (sets.length === 0) return this.getLexSession(id);
+    params.push(id);
+    this.db
+      .prepare(`UPDATE lex_session SET ${sets.join(', ')} WHERE id = ?`)
+      .run(...params);
+    return this.getLexSession(id);
+  }
+
+  getLexSession(id: string): LexSessionRow | null {
+    return (
+      (this.db
+        .prepare(`SELECT * FROM lex_session WHERE id = ?`)
+        .get(id) as LexSessionRow | undefined) ?? null
+    );
+  }
+
+  listLexSessions(opts: {
+    status?: 'live' | 'dormant';
+    limit?: number;
+  } = {}): LexSessionRow[] {
+    const limit = opts.limit ?? 50;
+    if (opts.status) {
+      return this.db
+        .prepare(
+          `SELECT * FROM lex_session WHERE status = ? ORDER BY created_ms DESC LIMIT ?`,
+        )
+        .all(opts.status, limit) as LexSessionRow[];
+    }
+    return this.db
+      .prepare(`SELECT * FROM lex_session ORDER BY created_ms DESC LIMIT ?`)
+      .all(limit) as LexSessionRow[];
+  }
+
+  deleteLexSession(id: string): void {
+    /* ON DELETE CASCADE on lex_transcript_ref drops the children. */
+    this.db.prepare(`DELETE FROM lex_session WHERE id = ?`).run(id);
+  }
+
+  /* ── lex_transcript_ref ────────────────────────────────────────── */
+  insertLexTranscriptRef(
+    row: Omit<LexTranscriptRefRow, 'id'>,
+  ): LexTranscriptRefRow {
+    const r = this.db
+      .prepare(
+        `INSERT INTO lex_transcript_ref
+           (lex_session_id, cc_session_id, transcript_path, started_ms, ended_ms, ordering)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        row.lex_session_id,
+        row.cc_session_id,
+        row.transcript_path,
+        row.started_ms,
+        row.ended_ms,
+        row.ordering,
+      );
+    return { id: Number(r.lastInsertRowid), ...row };
+  }
+
+  updateLexTranscriptRef(
+    id: number,
+    patch: Partial<Pick<LexTranscriptRefRow, 'ended_ms'>>,
+  ): void {
+    const sets: string[] = [];
+    const params: Array<number | null> = [];
+    for (const [k, v] of Object.entries(patch)) {
+      if (v === undefined) continue;
+      sets.push(`${k} = ?`);
+      params.push(v as number | null);
+    }
+    if (sets.length === 0) return;
+    params.push(id);
+    this.db
+      .prepare(`UPDATE lex_transcript_ref SET ${sets.join(', ')} WHERE id = ?`)
+      .run(...params);
+  }
+
+  listLexTranscriptRefs(lexSessionId: string): LexTranscriptRefRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM lex_transcript_ref WHERE lex_session_id = ?
+         ORDER BY ordering ASC, started_ms ASC`,
+      )
+      .all(lexSessionId) as LexTranscriptRefRow[];
+  }
+
+  getLexTranscriptRefByCc(ccSessionId: string): LexTranscriptRefRow | null {
+    return (
+      (this.db
+        .prepare(`SELECT * FROM lex_transcript_ref WHERE cc_session_id = ?`)
+        .get(ccSessionId) as LexTranscriptRefRow | undefined) ?? null
+    );
+  }
+
+  countLexTranscriptRefs(lexSessionId: string): number {
+    const r = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM lex_transcript_ref WHERE lex_session_id = ?`,
+      )
+      .get(lexSessionId) as { n: number } | undefined;
+    return r?.n ?? 0;
   }
 
   upsertRawChunk(row: RawChunkRow): void {

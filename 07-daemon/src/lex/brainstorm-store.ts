@@ -117,30 +117,11 @@ export function registerBrainstorm(opts: {
   return row;
 }
 
-/* Patch the brainstorm record once the underlying claude session
- * uuid is known (jsonl appears). Resolves by ptyId (set at spawn);
- * returns null if no record exists for that pty. */
-export function bindBrainstormSessionId(
-  ptyId: string,
-  claudeSessionId: string,
-): BrainstormSessionRow | null {
-  const existing = db().getBrainstormByPty(ptyId);
-  if (!existing) return null;
-  return db().updateBrainstorm(existing.id, {
-    claude_session_id: claudeSessionId,
-  });
-}
-
-/* Rebind an existing brainstorm row to a freshly-spawned PTY. Used by
- * the "switch to" flow: instead of creating a brand-new row every time
- * Lex is respawned for an existing brainstorm (which left orphan rows
- * and duplicate active sessions), the row the user clicked is reused.
- * Updates pty_id, flips status back to active, and clears ended_ms so
- * the row resurfaces in the active set. claude_session_id is left
- * alone here; if claude is launched with --resume, the new jsonl will
- * carry the same id and bindBrainstormSessionId will be a no-op
- * (matching), and if not, the next jsonl will overwrite it via
- * bindBrainstormSessionId. */
+/* Pre-bind a row to a freshly-spawned PTY before claude has written
+ * its first jsonl. Used by the switch-to flow so the dashboard
+ * stops showing the previous (now-dead) PTY id immediately. The
+ * subsequent bindBrainstormSessionId call (when jsonl appears) will
+ * also stamp the claude_session_id. */
 export function rebindBrainstormToPty(
   brainstormId: string,
   ptyId: string,
@@ -150,6 +131,71 @@ export function rebindBrainstormToPty(
     status: 'active',
     ended_ms: null,
   });
+}
+
+/* Update the brainstorm row identified by brainstormId with the
+ * claude_session_id that just appeared in the PTY's jsonl. This is
+ * called from tryDiscoverSession in pty-host once claude writes its
+ * first turn. The pty_id is also re-stamped so a row resumed onto a
+ * fresh PTY ends up pointing at the live process. status is bumped
+ * back to 'active' and ended_ms cleared for the resume case.
+ *
+ * The brainstorm row is the canonical session identity. The
+ * claude_session_id is a mutable pointer at the underlying jsonl —
+ * if claude --resume is rejected by the CLI and a fresh session id
+ * is minted, this call simply repoints the row at the new id; the
+ * row itself does not split. */
+export function bindBrainstormSessionId(
+  brainstormId: string,
+  ptyId: string,
+  claudeSessionId: string,
+): BrainstormSessionRow | null {
+  return db().updateBrainstorm(brainstormId, {
+    pty_id: ptyId,
+    claude_session_id: claudeSessionId,
+    status: 'active',
+    ended_ms: null,
+  });
+}
+
+/* Sweep active rows whose pty_id is not in the live PTY map. Called
+ * on a periodic interval (in addition to once at boot) so a PTY that
+ * died without firing its onExit handler — daemon SIGKILL, OS
+ * teardown, anything that bypasses graceful exit — gets reaped
+ * within the interval rather than sitting as a phantom active row
+ * with no live process behind it.
+ *
+ * Sweeps BOTH the legacy brainstorm_sessions table and the new
+ * lex_session table so the post-rip-out world stays honest about
+ * anchor liveness even when the daemon crashed before onExit fired. */
+export function reapOrphansAgainstLivePtys(
+  livePtyIds: ReadonlySet<string>,
+  reason: string,
+): number {
+  const rows = db().listBrainstorms({ status: 'active', limit: 10_000 });
+  const now = Date.now();
+  let touched = 0;
+  for (const row of rows) {
+    if (row.pty_id && livePtyIds.has(row.pty_id)) continue;
+    db().updateBrainstorm(row.id, {
+      status: 'ended',
+      ended_ms: now,
+      last_summary: reason,
+      last_summary_ms: now,
+    });
+    touched += 1;
+  }
+  /* lex_session sweep mirror. */
+  const liveAnchors = db().listLexSessions({ status: 'live', limit: 10_000 });
+  for (const row of liveAnchors) {
+    if (row.current_pty_id && livePtyIds.has(row.current_pty_id)) continue;
+    db().updateLexSession(row.id, {
+      status: 'dormant',
+      current_pty_id: null,
+    });
+    touched += 1;
+  }
+  return touched;
 }
 
 export function setLabel(
@@ -225,6 +271,13 @@ export function listBrainstorms(opts: {
  * keeping them clutters the Past Sessions list and buries real
  * sessions past the page limit. Substantive rows are still marked
  * ended in place so their history is preserved.
+ *
+ * Also sweeps long-tail cruft: ENDED rows with null claude_session_id
+ * AND zero substance. Those are pre-bind orphans from the legacy
+ * "register at spawn" path that bind-on-jsonl made obsolete. They
+ * have no transcript to load, so they can't be resumed anyway —
+ * deleting them collapses the past-sessions list to real
+ * conversations only.
  * Bug: 2026-05-11-past-sessions-orphan-pollution. */
 export function reapAllActive(reason: string): number {
   const rows = db().listBrainstorms({ status: 'active', limit: 10_000 });
@@ -245,6 +298,20 @@ export function reapAllActive(reason: string): number {
       });
     }
     touched += 1;
+  }
+  /* Long-tail cruft sweep: ended rows that never bound a claude
+   * session (PTY died before jsonl) and have no substance. They
+   * cannot be resumed and just bury real sessions in the UI. */
+  const ended = db().listBrainstorms({ status: 'ended', limit: 10_000 });
+  for (const row of ended) {
+    if (row.claude_session_id) continue;
+    const chunks = db().countBrainstormChunks(row.id);
+    const hasAudio = Boolean(row.audio_path);
+    const hasDistilled = Boolean(row.distilled_at);
+    if (chunks === 0 && !hasAudio && !hasDistilled) {
+      db().deleteBrainstorm(row.id);
+      touched += 1;
+    }
   }
   return touched;
 }
