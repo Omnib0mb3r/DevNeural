@@ -8,8 +8,12 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Other"],
-  "activationEvents": ["onStartupFinished"],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./dist/extension.js",
   "enabledApiProposals": [
     "terminalDataWriteEvent"
@@ -57,12 +61,14 @@
     "build": "tsc -p .",
     "watch": "tsc -p . --watch",
     "package": "vsce package --no-dependencies -o devneural-bridge.vsix",
-    "build:check": "tsc -p . --noEmit"
+    "build:check": "tsc -p . --noEmit",
+    "test": "vitest run"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^3.2.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.6"
   }
 }

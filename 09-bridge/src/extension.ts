@@ -23,6 +23,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { execFile } from 'node:child_process';
+import { writePresenceFiles, presenceFilename } from './presence.js';
 
 const channel = vscode.window.createOutputChannel('DevNeural Bridge');
 
@@ -656,48 +657,27 @@ function getPresenceDir(): string {
   return path.posix.join(getBridgeDir(), '.bridge-presence');
 }
 
-function presenceFilename(workspace: string): string {
-  return workspace.replace(/[\\/:*?"<>|]/g, '_') || 'no-workspace';
-}
-
 let presenceContext: vscode.ExtensionContext | undefined;
 function writePresence(): void {
   if (!presenceContext) return;
   const folders = vscode.workspace.workspaceFolders ?? [];
   if (folders.length === 0) return;
-  const dir = getPresenceDir();
-  if (!fs.existsSync(dir)) {
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-    } catch {
-      return;
-    }
-  }
   const bridgeId = getBridgeId(presenceContext);
   /* One presence file per top-level workspace folder. Multi-root
    * windows declare presence for every root; the daemon dedupes by
    * cwd. */
-  for (const folder of folders) {
-    const cwd = folder.uri.fsPath.replace(/\\/g, '/');
-    const filename = `${presenceFilename(cwd)}.json`;
-    const file = path.posix.join(dir, filename);
-    const payload: Record<string, unknown> = {
-      workspace: cwd,
-      cwd,
-      bridge_id: bridgeId,
-      updated_at: new Date().toISOString(),
-    };
-    /* Best-effort CC session id from the daemon /sessions cache the
-     * mirror loop already maintains. */
-    const slug = cwd.replace(/[\\/:]/g, '-').toLowerCase();
-    const ccSession = daemonActiveSessions.get(slug);
-    if (ccSession) payload.cc_session_ids = [ccSession];
-    try {
-      fs.writeFileSync(file, JSON.stringify(payload), 'utf-8');
-    } catch {
-      /* ignore */
-    }
-  }
+  writePresenceFiles({
+    presenceDir: getPresenceDir(),
+    folders: folders.map((f) => ({ fsPath: f.uri.fsPath })),
+    bridgeId,
+    now: new Date(),
+    ccSessionLookup: (cwd) => {
+      /* Best-effort CC session id from the daemon /sessions cache the
+       * mirror loop already maintains. */
+      const slug = cwd.replace(/[\\/:]/g, '-').toLowerCase();
+      return daemonActiveSessions.get(slug);
+    },
+  });
 }
 
 function clearPresence(): void {
