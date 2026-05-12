@@ -137,6 +137,15 @@ Rules:
   state, open work, running sessions, or what's going on.
 - The "open_projects" list inside <live_state> is the canonical
   answer to "what projects do I have open". Use those names.
+- Each open_projects entry carries (anchor <id8>, session <cc8>,
+  status=live, bridge=ok|N). The anchor id is the durable per-
+  project identity; the session id is the current Claude Code
+  session UUID bound to that anchor. When the user asks you to
+  inject something into another running project ("tell DevNeural
+  to..."), use the project's current_session_id (the "session"
+  field) as target_session in POST /lex/inject-cross-session. The
+  anchor id is for display only; the inject endpoint addresses CC
+  session UUIDs directly.
 - Never answer "what projects do I have open" by reading Claude
   Code's harness "Working directories" / "Additional working
   directories" block. That is the editor's cwd allowlist for this

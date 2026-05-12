@@ -28,6 +28,8 @@ import { listSessions } from '../dashboard/sessions.js';
 import { listPtys } from '../dashboard/pty-host.js';
 import { listBrainstorms, getStore } from './brainstorm-store.js';
 import { listReminders } from '../dashboard/reminders.js';
+import { decodeBridgeMarker } from '../dashboard/bridge-presence.js';
+import type { ProjectSessionRow } from '../store/index-db.js';
 
 function friendlyProject(slug: string): string {
   /* Claude Code project slugs encode cwd as `<drive>--<seg>-<seg>...`
@@ -54,6 +56,18 @@ function ageHuman(ms: number): string {
  */
 export function buildVoiceSnapshot(): string {
   const ts = new Date().toISOString();
+  /* Project anchor surface from docs/spec/PROJECT-ANCHORS.md step 5.
+   * project_session WHERE status='live' is now the authoritative
+   * source for "what projects are open". Legacy listSessions() stays
+   * available as a soft fallback during the migration window; step 6
+   * removes the fallback. */
+  const projectAnchors = (() => {
+    try {
+      return getStore().db.listProjectSessions({ status: 'live', limit: 200 });
+    } catch {
+      return [] as ProjectSessionRow[];
+    }
+  })();
   const sessions = (() => {
     try {
       return listSessions().filter((s) => s.active);
@@ -84,7 +98,29 @@ export function buildVoiceSnapshot(): string {
     }
   })();
 
-  const sessionLines = sessions.length
+  /* Anchor-backed open_projects lines. Format per spec:
+   *   - <slug> (anchor <id8>, session <cc8>, status=live, bridge=ok|N)
+   * where bridge=ok for single-window connections and bridge=N when
+   * multiple VS Code windows are bound to the same anchor. */
+  const anchorLines = projectAnchors.length
+    ? projectAnchors
+        .slice(0, 12)
+        .map((a) => {
+          const anchorShort = a.id.slice(0, 8);
+          const ccShort = a.current_session_id
+            ? a.current_session_id.slice(0, 8)
+            : 'none';
+          const decoded = decodeBridgeMarker(a.current_bridge_id);
+          const bridge =
+            decoded.count > 1 ? `bridge=${decoded.count}` : 'bridge=ok';
+          return `  - ${a.project_slug} (anchor ${anchorShort}, session ${ccShort}, status=live, ${bridge})`;
+        })
+        .join('\n')
+    : null;
+
+  /* Legacy fallback. Used only when no anchors are live yet; rip-out
+   * in step 6 will remove this entire path. */
+  const legacySessionLines = sessions.length
     ? sessions
         .slice(0, 8)
         .map((s) => {
@@ -96,7 +132,9 @@ export function buildVoiceSnapshot(): string {
           return `  - ${name} (session ${idShort}, ${s.phase}${ctx})`;
         })
         .join('\n')
-    : '  (none)';
+    : null;
+
+  const sessionLines = anchorLines ?? legacySessionLines ?? '  (none)';
 
   const brainstormLines = brainstorms.length
     ? brainstorms
