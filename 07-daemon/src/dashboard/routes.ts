@@ -145,6 +145,12 @@ export async function registerDashboardRoutes(
 ): Promise<void> {
   const referenceStore = await ReferenceStore.open(log);
 
+  /* Project anchor REST surface (PROJECT-ANCHORS.md step 3 of 6).
+   * Registered up front so route ordering is independent of the rest
+   * of this file. */
+  const { registerProjectAnchorRoutes } = await import('./projects-routes.js');
+  registerProjectAnchorRoutes(app, store.db, log);
+
   /* Background poll that binds a daemon-owned PTY to its claude
    * session_id once the .jsonl file appears. Single global timer; no
    * cost when no PTYs are unbound. */
