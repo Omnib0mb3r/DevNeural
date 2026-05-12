@@ -42,6 +42,8 @@ import {
   firePushForReminder,
   loadPushedReminderIds,
 } from './dashboard/reminder-push.js';
+import { runDistillationBackfill, BACKFILL_DEFAULT_LIMIT } from './lex/sibling-distillation-backfill.js';
+import { createLlmDistillationGenerator } from './lex/distillation-generator.js';
 import { startBridgePresenceLoop } from './dashboard/bridge-presence.js';
 import { startWorkerEventListener } from './dashboard/worker-event-listener.js';
 import { emitAwarenessEvent } from './lex/awareness.js';
@@ -319,6 +321,51 @@ async function main(): Promise<void> {
     if (typeof repeat.unref === 'function') repeat.unref();
   }, 30_000);
   if (typeof reminderTimer.unref === 'function') reminderTimer.unref();
+
+  /* Sibling distillation backfill scheduler. Wires the LLM-backed
+   * generator (createLlmDistillationGenerator) into runDistillationBackfill
+   * so older brainstorm_sessions with a null last_summary get a one-line
+   * distillation in the background. Cap is N=5 per run by default so a
+   * cold start cannot melt ollama. Default cadence 6h; configurable via
+   * DEVNEURAL_DISTILL_BACKFILL_INTERVAL_MS. Skipped entirely when the
+   * provider is unconfigured or BF-4-blocked (anthropic); the generator
+   * returns null and the job logs the skip without touching rows. */
+  const distillBackfillIntervalMs = Number(
+    process.env.DEVNEURAL_DISTILL_BACKFILL_INTERVAL_MS ??
+      6 * 60 * 60 * 1000,
+  );
+  const distillBackfillLimit = Number(
+    process.env.DEVNEURAL_DISTILL_BACKFILL_LIMIT ?? BACKFILL_DEFAULT_LIMIT,
+  );
+  async function tickDistillBackfill(): Promise<void> {
+    try {
+      const generator = createLlmDistillationGenerator({
+        db: store.db,
+        log: (m) => logger(m),
+      });
+      const r = await runDistillationBackfill({
+        db: store.db,
+        generator,
+        limit: distillBackfillLimit,
+      });
+      logger(
+        `[distill-backfill] processed=${r.processed.length} skipped=${r.skipped.length} errors=${r.errors.length} hit_cap=${r.hit_cap}`,
+      );
+    } catch (err) {
+      logger(`[distill-backfill] tick failed: ${(err as Error).message}`);
+    }
+  }
+  const distillBackfillTimer = setTimeout(() => {
+    void tickDistillBackfill();
+    const repeat = setInterval(
+      () => void tickDistillBackfill(),
+      distillBackfillIntervalMs,
+    );
+    if (typeof repeat.unref === 'function') repeat.unref();
+  }, 60_000);
+  if (typeof distillBackfillTimer.unref === 'function') {
+    distillBackfillTimer.unref();
+  }
 
   /* Memory janitor (Wave 3 Lane B step 37 / LX-14). Runs weekly at
    * +20min after boot; staggered so it does not compete with the
