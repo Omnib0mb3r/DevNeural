@@ -30,7 +30,9 @@
  * Stream Deck identity files.
  */
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import type { IndexDb, ProjectSessionRow } from '../store/index-db.js';
 import { DATA_ROOT } from '../paths.js';
 
@@ -67,10 +69,42 @@ export interface ReconcileOptions {
   freshMs?: number;
   /** Clock injection for tests. */
   now?: () => number;
+  /** Resolve a CC session id to its on-disk jsonl path. Defaults to
+   * scanning ~/.claude/projects/<slug>/<cc>.jsonl. Tests can override
+   * to avoid touching the user's transcript dir. */
+  resolveJsonlPath?: (ccSessionId: string) => string;
 }
 
 function normalizeCwd(cwd: string): string {
   return cwd.replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+function defaultClaudeProjectsDir(): string {
+  return path.posix.join(
+    os.homedir().replace(/\\/g, '/'),
+    '.claude',
+    'projects',
+  );
+}
+
+function defaultResolveJsonlPath(ccSessionId: string): string {
+  const root = defaultClaudeProjectsDir();
+  if (fs.existsSync(root)) {
+    let slugs: string[] = [];
+    try {
+      slugs = fs.readdirSync(root);
+    } catch {
+      slugs = [];
+    }
+    for (const slug of slugs) {
+      const candidate = path.posix.join(root, slug, `${ccSessionId}.jsonl`);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
+  /* Fall back to a deterministic path under the projects root so the
+   * tile renderer's tail-phase resolver can quietly return 'unknown'
+   * for sessions whose jsonl hasn't been written yet. */
+  return path.posix.join(root, 'unknown', `${ccSessionId}.jsonl`);
 }
 
 export function defaultPresenceDir(): string {
@@ -172,6 +206,7 @@ export function reconcileBridgePresence(
   const dir = opts.presenceDir ?? defaultPresenceDir();
   const fresh = opts.freshMs ?? DEFAULT_BRIDGE_TIMEOUT_MS;
   const now = (opts.now ?? Date.now)();
+  const resolveJsonlPath = opts.resolveJsonlPath ?? defaultResolveJsonlPath;
   const records = readPresenceDir(dir, now, fresh);
   const byCwd = groupByCwd(records);
 
@@ -191,7 +226,8 @@ export function reconcileBridgePresence(
      * first cc session id. If none reports one, leave the existing
      * value alone so we don't blank out a known UUID just because
      * the bridge hasn't shipped that field yet. */
-    let currentSession = anchor.current_session_id;
+    const priorSession = anchor.current_session_id;
+    let currentSession = priorSession;
     if (primary.ccSessionIds.length > 0) {
       currentSession = primary.ccSessionIds[0]!;
     }
@@ -201,16 +237,43 @@ export function reconcileBridgePresence(
       current_session_id: currentSession,
       last_seen_ms: now,
     });
+    /* Transcript-ref bookkeeping. Anchor just bound a CC session UUID,
+     * either fresh from dormant or because the bridge reported a new
+     * session id. Close any prior open ref for this anchor whose
+     * cc_session_id differs, then insert (idempotent on UNIQUE
+     * cc_session_id) so the open_projects snapshot has something to
+     * read. */
+    if (currentSession) {
+      if (priorSession && priorSession !== currentSession) {
+        db.closeProjectTranscriptRef(priorSession, now);
+      }
+      const existing = db.getProjectTranscriptRefByCc(currentSession);
+      if (!existing) {
+        db.insertProjectTranscriptRef({
+          id: randomUUID(),
+          anchor_id: anchor.id,
+          cc_session_id: currentSession,
+          jsonl_path: resolveJsonlPath(currentSession),
+          opened_ms: now,
+          closed_ms: null,
+        });
+      }
+    }
     liveCwds.push(cwd);
     liveAnchorIds.push(anchor.id);
     touched.add(anchor.id);
   }
 
   /* Pass 2: every anchor that's currently live but didn't get touched
-   * has lost its bridge connection. Flip dormant, clear current_*. */
+   * has lost its bridge connection. Flip dormant, clear current_*, and
+   * close any open transcript_ref so the JSONL doesn't show as
+   * perpetually open in the dashboard. */
   const live = db.listProjectSessions({ status: 'live', limit: 1000 });
   for (const row of live) {
     if (touched.has(row.id)) continue;
+    if (row.current_session_id) {
+      db.closeProjectTranscriptRef(row.current_session_id, now);
+    }
     db.updateProjectSession(row.id, {
       status: 'dormant',
       current_bridge_id: null,

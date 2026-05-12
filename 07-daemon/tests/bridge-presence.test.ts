@@ -363,6 +363,128 @@ describe('reconcileBridgePresence', () => {
     expect(db.getProjectSession('anchor-B')!.status).toBe('live');
   });
 
+  it('inserts project_transcript_ref on live transition with cc_session_id', () => {
+    const now = 9_000_000;
+    writePresence(
+      'window1.json',
+      {
+        cwd: 'C:/dev/Projects/proj-a',
+        bridge_id: 'b-1',
+        cc_session_ids: ['cc-live-1'],
+      },
+      now,
+    );
+
+    reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => now,
+    });
+
+    const refs = db.listProjectTranscriptRefs('anchor-A');
+    expect(refs.length).toBe(1);
+    expect(refs[0]!.cc_session_id).toBe('cc-live-1');
+    expect(refs[0]!.anchor_id).toBe('anchor-A');
+    expect(refs[0]!.opened_ms).toBe(now);
+    expect(refs[0]!.closed_ms).toBeNull();
+  });
+
+  it('does not duplicate project_transcript_ref across repeated reconciles', () => {
+    const now = 9_100_000;
+    writePresence(
+      'window1.json',
+      {
+        cwd: 'C:/dev/Projects/proj-a',
+        bridge_id: 'b-1',
+        cc_session_ids: ['cc-live-1'],
+      },
+      now,
+    );
+
+    reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => now,
+    });
+    reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => now + 1,
+    });
+
+    expect(db.listProjectTranscriptRefs('anchor-A').length).toBe(1);
+  });
+
+  it('closes project_transcript_ref when anchor flips dormant', () => {
+    const now = 9_200_000;
+    const filename = writePresence(
+      'window1.json',
+      {
+        cwd: 'C:/dev/Projects/proj-a',
+        bridge_id: 'b-1',
+        cc_session_ids: ['cc-live-1'],
+      },
+      now,
+    );
+
+    reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => now,
+    });
+    fs.unlinkSync(filename);
+    const later = now + 1000;
+    reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => later,
+    });
+
+    const refs = db.listProjectTranscriptRefs('anchor-A');
+    expect(refs.length).toBe(1);
+    expect(refs[0]!.closed_ms).toBe(later);
+  });
+
+  it('closes prior transcript_ref and opens new one when cc_session_id changes', () => {
+    const t1 = 9_300_000;
+    writePresence(
+      'window1.json',
+      {
+        cwd: 'C:/dev/Projects/proj-a',
+        bridge_id: 'b-1',
+        cc_session_ids: ['cc-old'],
+      },
+      t1,
+    );
+    reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => t1,
+    });
+
+    const t2 = t1 + 5000;
+    writePresence(
+      'window1.json',
+      {
+        cwd: 'C:/dev/Projects/proj-a',
+        bridge_id: 'b-1',
+        cc_session_ids: ['cc-new'],
+      },
+      t2,
+    );
+    reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => t2,
+    });
+
+    const refs = db.listProjectTranscriptRefs('anchor-A');
+    expect(refs.length).toBe(2);
+    const byCc = new Map(refs.map((r) => [r.cc_session_id, r]));
+    expect(byCc.get('cc-old')!.closed_ms).toBe(t2);
+    expect(byCc.get('cc-new')!.closed_ms).toBeNull();
+  });
+
   it('preserves existing current_session_id when bridge omits cc_session_ids', () => {
     const now = 8_000_000;
     db.updateProjectSession('anchor-A', {
