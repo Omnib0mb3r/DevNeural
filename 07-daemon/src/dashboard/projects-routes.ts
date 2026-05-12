@@ -28,6 +28,7 @@ import { spawn } from 'node:child_process';
 import type { IndexDb, ProjectSessionRow } from '../store/index-db.js';
 import { decodeBridgeMarker } from './bridge-presence.js';
 import { queueProjectBootstrap } from './projects-new.js';
+import { listProjectAnchorTiles } from './projects-anchor-tiles.js';
 
 const DEFAULT_OPEN_WAIT_MS = 5_000;
 const DEFAULT_OPEN_POLL_MS = 200;
@@ -283,6 +284,13 @@ export function registerProjectAnchorRoutes(
   log: (msg: string) => void = () => undefined,
 ): void {
   const inflight = createOpenInFlightMap();
+
+  /* Stream Deck feed. One tile per live anchor, deduped so multiple
+   * VS Code windows on the same cwd render as a single tile with a
+   * bridge_connection_count badge. Mirrors /lex/anchor-tiles. */
+  app.get('/projects/anchor-tiles', async () => {
+    return { ok: true, tiles: listProjectAnchorTiles(db) };
+  });
 
   app.get('/projects', async (req) => {
     const q = (req.query ?? {}) as { status?: string; limit?: string };
