@@ -257,6 +257,35 @@ $env:NODE_ENV='production'; npx next build       # static export to out/, daemon
 
 ---
 
+## How-tos (architecture deep dives)
+
+Sequenced for anyone (or any Lex) rebuilding context on a cold start.
+Each doc is the canonical reference for its surface; spec docs under
+`docs/spec/` capture the design intent, these capture what is wired
+in the daemon today.
+
+- [docs/HOW-TO-supervision-pipelines.md](docs/HOW-TO-supervision-pipelines.md)
+  Bridge presence + project anchor reconcile, cross-session injection
+  pipeline (HMAC + allowlist + audit), smart compact orchestration,
+  event-driven supervision (router + detectors + kill-switch +
+  chokidar listener + supervision_mode toggle), brainstorm threading
+  (sibling index + Phase 2 preload + N=5 backfill).
+- [docs/HOW-TO-dashboard-ux.md](docs/HOW-TO-dashboard-ux.md)
+  Global panic button + `Ctrl+Alt+.` keybind + audit panel, Lex
+  transcript history panel (rolling 10 turns + thinking placeholder
+  + collapse toggle), Past Sessions compact pattern (capped height
+  + collapse-to-strip), shared `createCollapseStore` helper,
+  responsive top-bar collapse, mic-gate indicator during TTS
+  playback.
+- [docs/HOW-TO-voice-and-push.md](docs/HOW-TO-voice-and-push.md)
+  Voice / TTS speed knob and the five-knob persistence pattern,
+  text-input-bypasses-TTS feature note, UUID pronunciation rule,
+  reminders → web push end-to-end with cross-restart dedupe ledger,
+  5-minute iOS PWA push smoke test, shared supervision warn
+  channel.
+
+---
+
 ## Why this exists
 
 Because Claude forgets between sessions, and you forget between projects. Together you keep solving the same problems in slightly different ways. DevNeural is the persistent layer that makes both of you smarter at your actual work, while keeping every byte on your own machine.

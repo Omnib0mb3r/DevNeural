@@ -39,6 +39,13 @@ Plus topic-specific docs:
 - [docs/install/TAILSCALE.md](docs/install/TAILSCALE.md) — remote access from your phone
 - [docs/install/AUDIO-VIDEO.md](docs/install/AUDIO-VIDEO.md) — whisper.cpp + ffmpeg for audio/video uploads
 
+Operating-the-stack docs (read after install, when something breaks
+or before you touch a wired-in surface):
+
+- [docs/HOW-TO-supervision-pipelines.md](docs/HOW-TO-supervision-pipelines.md) — bridge presence, cross-session inject, smart compact, event-driven supervision, brainstorm threading
+- [docs/HOW-TO-dashboard-ux.md](docs/HOW-TO-dashboard-ux.md) — panic button, transcript history, Past Sessions compact, collapse helper
+- [docs/HOW-TO-voice-and-push.md](docs/HOW-TO-voice-and-push.md) — voice/TTS knobs, text-input-bypasses-TTS, UUID rule, reminders → web push + iOS smoke test
+
 ---
 
 ## At-a-glance checklist
