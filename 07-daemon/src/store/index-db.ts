@@ -246,6 +246,8 @@ export interface LexTranscriptRefRow {
  * key against bridge presence files; project_slug is the folder
  * basename (with hash suffix on collision). Inserted dormant on
  * boot/seed; flipped live by the bridge presence resolver. */
+export type SupervisionMode = 'polling' | 'event' | 'off';
+
 export interface ProjectSessionRow {
   id: string;
   project_slug: string;
@@ -257,7 +259,18 @@ export interface ProjectSessionRow {
   current_pty_id: string | null;
   created_ms: number;
   last_seen_ms: number;
+  /* EVENT-DRIVEN-SUPERVISION.md. 'polling' = legacy cron; 'event' =
+   * daemon-driven push to Lex; 'off' = disabled. Migration 022 adds
+   * the column with default 'polling'. Optional on write so legacy
+   * call sites still compile; reads always populate the field. */
+  supervision_mode?: SupervisionMode;
 }
+
+export const VALID_SUPERVISION_MODES: ReadonlySet<SupervisionMode> = new Set([
+  'polling',
+  'event',
+  'off',
+]);
 
 /* project_transcript_ref row. Ordered list of CC jsonl pointers per
  * project_session anchor. cc_session_id is UNIQUE across the table so
@@ -1541,8 +1554,8 @@ export class IndexDb {
         `INSERT INTO project_session
            (id, project_slug, cwd, title, status,
             current_session_id, current_bridge_id, current_pty_id,
-            created_ms, last_seen_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            created_ms, last_seen_ms, supervision_mode)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         row.id,
@@ -1555,6 +1568,7 @@ export class IndexDb {
         row.current_pty_id,
         row.created_ms,
         row.last_seen_ms,
+        row.supervision_mode ?? 'polling',
       );
   }
 

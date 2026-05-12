@@ -46,6 +46,7 @@ export interface ProjectAnchorView {
   created_ms: number;
   last_seen_ms: number;
   exists_on_disk: boolean;
+  supervision_mode: 'polling' | 'event' | 'off';
 }
 
 export function toAnchorView(row: ProjectSessionRow): ProjectAnchorView {
@@ -69,6 +70,10 @@ export function toAnchorView(row: ProjectSessionRow): ProjectAnchorView {
     created_ms: row.created_ms,
     last_seen_ms: row.last_seen_ms,
     exists_on_disk: exists,
+    supervision_mode: (row.supervision_mode ?? 'polling') as
+      | 'polling'
+      | 'event'
+      | 'off',
   };
 }
 
@@ -257,6 +262,7 @@ export function endProjectAnchor(
 
 export interface PatchOptions {
   title?: string | null;
+  supervision_mode?: 'polling' | 'event' | 'off';
 }
 
 export function patchProjectAnchor(
@@ -266,8 +272,20 @@ export function patchProjectAnchor(
 ): ProjectAnchorView | null {
   const row = db.getProjectSession(id);
   if (!row) return null;
-  if (patch.title === undefined) return toAnchorView(row);
-  const updated = db.updateProjectSession(id, { title: patch.title });
+  const updates: Partial<typeof row> = {};
+  if (patch.title !== undefined) updates.title = patch.title;
+  if (patch.supervision_mode !== undefined) {
+    if (
+      patch.supervision_mode !== 'polling' &&
+      patch.supervision_mode !== 'event' &&
+      patch.supervision_mode !== 'off'
+    ) {
+      return toAnchorView(row);
+    }
+    updates.supervision_mode = patch.supervision_mode;
+  }
+  if (Object.keys(updates).length === 0) return toAnchorView(row);
+  const updated = db.updateProjectSession(id, updates);
   return updated ? toAnchorView(updated) : null;
 }
 
@@ -340,8 +358,16 @@ export function registerProjectAnchorRoutes(
 
   app.patch('/projects/:id', async (req, reply) => {
     const id = (req.params as { id: string }).id;
-    const body = (req.body ?? {}) as { title?: string | null };
-    const view = patchProjectAnchor(db, id, { title: body.title });
+    const body = (req.body ?? {}) as {
+      title?: string | null;
+      supervision_mode?: 'polling' | 'event' | 'off';
+    };
+    const view = patchProjectAnchor(db, id, {
+      ...(body.title !== undefined ? { title: body.title } : {}),
+      ...(body.supervision_mode !== undefined
+        ? { supervision_mode: body.supervision_mode }
+        : {}),
+    });
     if (!view) {
       reply.code(404);
       return { ok: false, error: 'anchor not found' };
