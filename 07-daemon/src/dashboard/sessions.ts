@@ -14,11 +14,18 @@ import { readSummary, readCurrentTask } from '../curation/index.js';
 import { getPhase } from './session-phase.js';
 import { getPending, type PendingPrompt } from './pending-prompt.js';
 import { isSuperseded, markSuperseded } from './superseded.js';
-import { getBrainstormByClaudeSessionId } from '../lex/brainstorm-store.js';
+import {
+  getBrainstormByClaudeSessionId,
+  getStore,
+} from '../lex/brainstorm-store.js';
 
-const SESSIONS_ROOT = path
-  .join(os.homedir(), '.claude', 'projects')
-  .replace(/\\/g, '/');
+/* Read at call time so tests can override USERPROFILE/HOME without
+ * having to time the import against module load. The module-load
+ * caching of homedir produced silent test mis-targeting (looked at
+ * production ~/.claude even when the test set up a temp HOME). */
+function sessionsRoot(): string {
+  return path.join(os.homedir(), '.claude', 'projects').replace(/\\/g, '/');
+}
 const BRIDGE_DIR = path.posix.join(DATA_ROOT, 'session-bridge');
 /* Liveness is authoritative from the StreamDeck.App identity directory:
  * one file per session whose VS Code window the deck app considers
@@ -68,33 +75,72 @@ const STREAMDECK_IDENTITY_DIR = (() => {
 })();
 
 function readLiveSessionIds(): Set<string> {
-  /* Strict identity-only liveness. Returns the set of session ids
-   * whose identity file is fresh (mtime within IDENTITY_FRESH_MS).
-   * Empty set when the deck dir is missing/unreadable: no fallback,
-   * because no other signal reliably maps to "VS Code terminal is
-   * currently open." Without the deck tray running, both decks
-   * legitimately have no live data to display. */
-  if (!fs.existsSync(STREAMDECK_IDENTITY_DIR)) return new Set();
+  /* Anchor-backed liveness (PROJECT-ANCHORS.md step 6).
+   *
+   * Authoritative source for "this CC session is currently bound to
+   * an open VS Code window" is now the bridge-presence-driven
+   * project_session table. A jsonl is live iff some live anchor's
+   * current_session_id points at it.
+   *
+   * The legacy StreamDeck.App identity-file path remains usable for
+   * editor-detection (which VS Code window to focus on a tile click;
+   * see readIdentityFileWindowMap below), but is no longer the
+   * authority for whether to surface a session as active. Identity
+   * files lag bridge presence and produced ghost tiles whenever the
+   * tray app was slow to heartbeat. */
   try {
+    const live = getStore().db.listProjectSessions({
+      status: 'live',
+      limit: 500,
+    });
     const ids = new Set<string>();
+    for (const row of live) {
+      if (row.current_session_id) ids.add(row.current_session_id);
+    }
+    return ids;
+  } catch {
+    /* Store not initialised yet (early daemon boot, or tests that
+     * forgot to setBrainstormStore): return empty so no tiles surface
+     * rather than mis-flagging every jsonl as live. */
+    return new Set();
+  }
+}
+
+/* Editor-detection use case retained per spec: which VS Code window
+ * the focus action should target on a tile click. Reads the
+ * StreamDeck.App identity dir directly. Not consulted by listSessions
+ * for liveness — callers wanting to focus a window should use this
+ * helper explicitly. */
+export function readIdentityFileWindowMap(): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!fs.existsSync(STREAMDECK_IDENTITY_DIR)) return out;
+  try {
     const now = Date.now();
     for (const e of fs.readdirSync(STREAMDECK_IDENTITY_DIR)) {
       if (!e.endsWith('.json')) continue;
       const sid = e.slice(0, -'.json'.length);
+      const full = path.posix.join(STREAMDECK_IDENTITY_DIR, e);
       try {
-        const stat = fs.statSync(
-          path.posix.join(STREAMDECK_IDENTITY_DIR, e),
-        );
+        const stat = fs.statSync(full);
         if (now - stat.mtimeMs > IDENTITY_FRESH_MS) continue;
       } catch {
         continue;
       }
-      ids.add(sid);
+      try {
+        const raw = JSON.parse(fs.readFileSync(full, 'utf-8')) as {
+          Cwd?: string;
+        };
+        if (typeof raw.Cwd === 'string' && raw.Cwd) {
+          out.set(sid, raw.Cwd);
+        }
+      } catch {
+        /* skip malformed */
+      }
     }
-    return ids;
   } catch {
-    return new Set();
+    /* ignore */
   }
+  return out;
 }
 
 export interface SessionListItem {
@@ -325,21 +371,21 @@ export function buildLexPulseFromTail(
 ): { severity: 'info' | 'warn'; title: string; body: string } | null {
   let slugDir: string | null = null;
   if (cwd) {
-    const dir = path.posix.join(SESSIONS_ROOT, cwd.replace(/[\\/:]/g, '-'));
+    const dir = path.posix.join(sessionsRoot(), cwd.replace(/[\\/:]/g, '-'));
     if (fs.existsSync(dir)) slugDir = dir;
   }
   if (!slugDir) {
     // Fallback: scan slugs for the session id.
-    const slugs = fs.readdirSync(SESSIONS_ROOT, { withFileTypes: true });
+    const slugs = fs.readdirSync(sessionsRoot(), { withFileTypes: true });
     for (const slug of slugs) {
       if (!slug.isDirectory()) continue;
       const candidate = path.posix.join(
-        SESSIONS_ROOT,
+        sessionsRoot(),
         slug.name,
         `${sessionId}.jsonl`,
       );
       if (fs.existsSync(candidate)) {
-        slugDir = path.posix.join(SESSIONS_ROOT, slug.name);
+        slugDir = path.posix.join(sessionsRoot(), slug.name);
         break;
       }
     }
@@ -391,25 +437,25 @@ export function recordClearSupersede(
   cwd?: string,
 ): { ok: true; superseded: string | null } | { ok: false; error: string } {
   if (!newSessionId) return { ok: false, error: 'session_id required' };
-  if (!fs.existsSync(SESSIONS_ROOT)) {
+  if (!fs.existsSync(sessionsRoot())) {
     return { ok: false, error: 'no claude projects dir' };
   }
   const now = Date.now();
   const candidateSlugs: string[] = [];
   if (cwd) {
     const slug = cwdToSlug(cwd);
-    const slugDir = path.posix.join(SESSIONS_ROOT, slug);
+    const slugDir = path.posix.join(sessionsRoot(), slug);
     if (fs.existsSync(slugDir)) candidateSlugs.push(slug);
   }
   // Fallback: scan slugs and pick whichever contains the new session's
   // jsonl. Used only if cwd is missing or the encoded slug doesn't
   // exist (CC versions could change the encoding).
   if (candidateSlugs.length === 0) {
-    const slugs = fs.readdirSync(SESSIONS_ROOT, { withFileTypes: true });
+    const slugs = fs.readdirSync(sessionsRoot(), { withFileTypes: true });
     for (const slug of slugs) {
       if (!slug.isDirectory()) continue;
       const candidate = path.posix.join(
-        SESSIONS_ROOT,
+        sessionsRoot(),
         slug.name,
         `${newSessionId}.jsonl`,
       );
@@ -422,7 +468,7 @@ export function recordClearSupersede(
   if (candidateSlugs.length === 0) {
     return { ok: true, superseded: null };
   }
-  const slugDir = path.posix.join(SESSIONS_ROOT, candidateSlugs[0]!);
+  const slugDir = path.posix.join(sessionsRoot(), candidateSlugs[0]!);
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(slugDir, { withFileTypes: true });
@@ -453,13 +499,13 @@ export function recordClearSupersede(
 }
 
 export function listSessions(): SessionListItem[] {
-  if (!fs.existsSync(SESSIONS_ROOT)) return [];
+  if (!fs.existsSync(sessionsRoot())) return [];
   const out: SessionListItem[] = [];
-  const slugs = fs.readdirSync(SESSIONS_ROOT, { withFileTypes: true });
+  const slugs = fs.readdirSync(sessionsRoot(), { withFileTypes: true });
   const liveIds = readLiveSessionIds();
   for (const slug of slugs) {
     if (!slug.isDirectory()) continue;
-    const slugDir = path.posix.join(SESSIONS_ROOT, slug.name);
+    const slugDir = path.posix.join(sessionsRoot(), slug.name);
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(slugDir, { withFileTypes: true });

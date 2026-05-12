@@ -23,23 +23,11 @@
  * worst-severity label only, never full detail (that blows context).
  */
 import * as os from 'node:os';
-import * as path from 'node:path';
-import { listSessions } from '../dashboard/sessions.js';
 import { listPtys } from '../dashboard/pty-host.js';
 import { listBrainstorms, getStore } from './brainstorm-store.js';
 import { listReminders } from '../dashboard/reminders.js';
 import { decodeBridgeMarker } from '../dashboard/bridge-presence.js';
 import type { ProjectSessionRow } from '../store/index-db.js';
-
-function friendlyProject(slug: string): string {
-  /* Claude Code project slugs encode cwd as `<drive>--<seg>-<seg>...`
-   * (colons + path separators flattened to `-`). The last hyphen-
-   * separated token is the leaf folder, which is what humans call
-   * the project. Fall back to the raw slug if it's empty. */
-  const parts = slug.split('-').filter((s) => s.length > 0);
-  const leaf = parts[parts.length - 1];
-  return leaf && leaf.length > 0 ? leaf : slug;
-}
 
 function ageHuman(ms: number): string {
   const d = Date.now() - ms;
@@ -56,23 +44,15 @@ function ageHuman(ms: number): string {
  */
 export function buildVoiceSnapshot(): string {
   const ts = new Date().toISOString();
-  /* Project anchor surface from docs/spec/PROJECT-ANCHORS.md step 5.
-   * project_session WHERE status='live' is now the authoritative
-   * source for "what projects are open". Legacy listSessions() stays
-   * available as a soft fallback during the migration window; step 6
-   * removes the fallback. */
+  /* Project anchor surface from docs/spec/PROJECT-ANCHORS.md step 5
+   * / 6. project_session WHERE status='live' is the authoritative
+   * source for "what projects are open". Step 6 retired the legacy
+   * listSessions() identity-file path entirely. */
   const projectAnchors = (() => {
     try {
       return getStore().db.listProjectSessions({ status: 'live', limit: 200 });
     } catch {
       return [] as ProjectSessionRow[];
-    }
-  })();
-  const sessions = (() => {
-    try {
-      return listSessions().filter((s) => s.active);
-    } catch {
-      return [];
     }
   })();
   const brainstorms = (() => {
@@ -102,7 +82,7 @@ export function buildVoiceSnapshot(): string {
    *   - <slug> (anchor <id8>, session <cc8>, status=live, bridge=ok|N)
    * where bridge=ok for single-window connections and bridge=N when
    * multiple VS Code windows are bound to the same anchor. */
-  const anchorLines = projectAnchors.length
+  const sessionLines = projectAnchors.length
     ? projectAnchors
         .slice(0, 12)
         .map((a) => {
@@ -116,25 +96,7 @@ export function buildVoiceSnapshot(): string {
           return `  - ${a.project_slug} (anchor ${anchorShort}, session ${ccShort}, status=live, ${bridge})`;
         })
         .join('\n')
-    : null;
-
-  /* Legacy fallback. Used only when no anchors are live yet; rip-out
-   * in step 6 will remove this entire path. */
-  const legacySessionLines = sessions.length
-    ? sessions
-        .slice(0, 8)
-        .map((s) => {
-          const name = friendlyProject(s.project_slug);
-          const idShort = s.session_id.slice(0, 8);
-          const ctx = s.context
-            ? `, ${Math.round((s.context.tokens / s.context.max) * 100)}% ctx`
-            : '';
-          return `  - ${name} (session ${idShort}, ${s.phase}${ctx})`;
-        })
-        .join('\n')
-    : null;
-
-  const sessionLines = anchorLines ?? legacySessionLines ?? '  (none)';
+    : '  (none)';
 
   const brainstormLines = brainstorms.length
     ? brainstorms
