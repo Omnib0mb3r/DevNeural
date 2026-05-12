@@ -44,6 +44,8 @@ import {
 } from './dashboard/reminder-push.js';
 import { runDistillationBackfill, BACKFILL_DEFAULT_LIMIT } from './lex/sibling-distillation-backfill.js';
 import { createLlmDistillationGenerator } from './lex/distillation-generator.js';
+import { runSmartCompactTick } from './dashboard/smart-compact-scheduler.js';
+import { ptyInject } from './dashboard/pty-host.js';
 import { startBridgePresenceLoop } from './dashboard/bridge-presence.js';
 import { startWorkerEventListener } from './dashboard/worker-event-listener.js';
 import { emitAwarenessEvent } from './lex/awareness.js';
@@ -365,6 +367,41 @@ async function main(): Promise<void> {
   }, 60_000);
   if (typeof distillBackfillTimer.unref === 'function') {
     distillBackfillTimer.unref();
+  }
+
+  /* Smart-compact scheduler. Walks every live project_session anchor,
+   * runs evaluateSmartCompact, and fires the resulting fire/wrap
+   * through fireSmartCompact. Global toggle
+   * DEVNEURAL_SMART_COMPACT_ENABLED gates the live inject inside
+   * fireSmartCompact; off-state still produces shadow audit rows so
+   * the operator sees what would have fired. Cadence configurable
+   * via DEVNEURAL_SMART_COMPACT_TICK_MS (default 60s). */
+  const smartCompactTickMs = Number(
+    process.env.DEVNEURAL_SMART_COMPACT_TICK_MS ?? 60_000,
+  );
+  async function tickSmartCompact(): Promise<void> {
+    try {
+      const r = await runSmartCompactTick({
+        db: store.db,
+        injector: ptyInject,
+        log: (m) => logger(m),
+      });
+      if (r.fired.length || r.wrapped.length || r.errors.length) {
+        logger(
+          `[smart-compact] evaluated=${r.evaluated} fired=${r.fired.length} wrapped=${r.wrapped.length} waited=${r.waited.length} errors=${r.errors.length}`,
+        );
+      }
+    } catch (err) {
+      logger(`[smart-compact] tick failed: ${(err as Error).message}`);
+    }
+  }
+  const smartCompactTimer = setTimeout(() => {
+    void tickSmartCompact();
+    const repeat = setInterval(() => void tickSmartCompact(), smartCompactTickMs);
+    if (typeof repeat.unref === 'function') repeat.unref();
+  }, 90_000);
+  if (typeof smartCompactTimer.unref === 'function') {
+    smartCompactTimer.unref();
   }
 
   /* Memory janitor (Wave 3 Lane B step 37 / LX-14). Runs weekly at
