@@ -17,6 +17,7 @@ import {
 } from "@/lib/daemon-client";
 import { LexSessionList } from "@/components/LexSessionList";
 import { LexArtifactsPanel } from "@/components/LexArtifactsPanel";
+import { LexTranscriptHistoryPanel } from "@/components/LexTranscriptHistoryPanel";
 
 /**
  * Brainstorming with Lex.
@@ -276,6 +277,7 @@ export default function LexPage() {
              * still render the panel; the mirror starts streaming
              * once the session-id appears. */}
             <TerminalMirror sessionId={lexPty?.sessionId ?? ""} />
+            <LexTranscriptHistoryPanel />
             <LexArtifactsPanel
               brainstormId={activeAnchorId}
               active={Boolean(lexPty)}

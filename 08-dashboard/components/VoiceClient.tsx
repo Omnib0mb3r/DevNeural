@@ -32,6 +32,10 @@ interface VoiceCtxValue {
    * utterance. The TopBar pill swaps the mic icon to MicOff while
    * this is true. */
   micGated: boolean;
+  /* Rolling turn history. Capped in-memory; full transcript stays in
+   * the daemon's jsonl. The TranscriptHistory panel renders the
+   * trailing N turns + a thinking placeholder. */
+  turns: Array<{ id: string; role: "user" | "assistant"; text: string }>;
   hasLex: boolean;
   toggleEnabled: () => void;
   setMicMuted: (next: boolean) => void;
@@ -253,6 +257,14 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   }, [enabled, hasLex, ptysQ.isLoading]);
   const [lastTranscript, setLastTranscript] = useState<string>("");
   const [lastReply, setLastReply] = useState<string>("");
+  /* Rolling turn history surfaced through VoiceCtx. The TranscriptHistory
+   * component renders the trailing N turns (default 10) plus a placeholder
+   * while status='thinking'. We cap in-memory at 50 to keep React updates
+   * cheap; the daemon retains the canonical jsonl for full history. */
+  const [turns, setTurns] = useState<
+    Array<{ id: string; role: "user" | "assistant"; text: string }>
+  >([]);
+  const TURNS_BUFFER_CAP = 50;
   /* Wave 2 carry-over #1: per-turn thumbs vote on Lex's last reply.
    * The voice WS sends turn_id (claude-code assistant message uuid)
    * + prompt_version on every assistant-text. Both are required by
@@ -845,20 +857,51 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           case "transcript": {
             const text = String(msg.text ?? "").trim();
             setLastTranscript(text);
-            if (text) setStatus("thinking");
-            else setStatus("ready");
+            if (text) {
+              setStatus("thinking");
+              setTurns((prev) => {
+                const next = [
+                  ...prev,
+                  {
+                    id: `u-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                    role: "user" as const,
+                    text,
+                  },
+                ];
+                return next.length > TURNS_BUFFER_CAP
+                  ? next.slice(next.length - TURNS_BUFFER_CAP)
+                  : next;
+              });
+            } else setStatus("ready");
             break;
           }
           case "injected":
             setStatus("thinking");
             break;
           case "assistant-text": {
-            setLastReply(String(msg.text ?? ""));
+            const replyText = String(msg.text ?? "");
+            setLastReply(replyText);
             const tid = typeof msg.turn_id === "string" ? msg.turn_id : "";
             const pv = typeof msg.prompt_version === "string" ? msg.prompt_version : "";
             const bid = typeof msg.brainstorm_id === "string" ? msg.brainstorm_id : null;
             if (tid && pv) {
               setLastTurn({ turn_id: tid, prompt_version: pv, brainstorm_id: bid });
+            }
+            if (replyText) {
+              setTurns((prev) => {
+                const next = [
+                  ...prev,
+                  {
+                    id: tid ||
+                      `a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                    role: "assistant" as const,
+                    text: replyText,
+                  },
+                ];
+                return next.length > TURNS_BUFFER_CAP
+                  ? next.slice(next.length - TURNS_BUFFER_CAP)
+                  : next;
+              });
             }
             /* If the user pressed stop in notes mode and we are
              * waiting on the finalize summary, this is the turn we
@@ -1610,6 +1653,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     enabled,
     muted,
     micGated,
+    turns,
     hasLex,
     toggleEnabled,
     setMicMuted,
