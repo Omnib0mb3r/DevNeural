@@ -3,6 +3,7 @@ import { SystemPanel } from "@/components/SystemPanel";
 import { LintFindingsPanel } from "@/components/LintFindingsPanel";
 import { PauseModeToggle } from "@/components/PauseModeToggle";
 import { PanicAuditPanel } from "@/components/PanicAuditPanel";
+import { SmartCompactAuditPanel } from "@/components/SmartCompactAuditPanel";
 
 export default function SystemPage() {
   return (
@@ -12,6 +13,7 @@ export default function SystemPage() {
         <SystemPanel />
         <PauseModeToggle />
         <PanicAuditPanel />
+        <SmartCompactAuditPanel />
         <LintFindingsPanel />
       </div>
     </AppShell>

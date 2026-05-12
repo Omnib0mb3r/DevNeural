@@ -1475,6 +1475,25 @@ export const listProjectAnchorTiles = () =>
     "/projects/anchor-tiles",
   );
 
+// ── Smart-compact audit ─────────────────────────────────────────
+export interface SmartCompactLogRow {
+  id: string;
+  ts: string;
+  anchor_id: string | null;
+  cc_session_id: string | null;
+  caller: string;
+  reason: string;
+  action: "fire" | "wrap" | "shadow" | "noop";
+  pre_ctx_pct: number | null;
+  post_ctx_pct: number | null;
+  summary_preview: string | null;
+  payload_text: string | null;
+}
+export const recentSmartCompacts = (limit: number = 20) =>
+  request<{ ok: boolean; rows: SmartCompactLogRow[] }>(
+    `/lex/smart-compact/recent?limit=${limit}`,
+  );
+
 export const uploadReference = (file: File, opts: { project_id?: string; tags?: string[] } = {}) => {
   const fd = new FormData();
   fd.append("file", file);
