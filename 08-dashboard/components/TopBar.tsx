@@ -12,6 +12,7 @@ import {
 import { Icon } from "./Icon";
 import { StatusDot } from "./StatusDot";
 import { VoiceTopBarPill } from "./VoiceClient";
+import { PanicButton } from "./PanicButton";
 import { lexPickStable } from "@/lib/lex";
 
 const TABS = [
@@ -193,6 +194,10 @@ export function TopBar({ activeTab }: { activeTab: string }) {
            * at the root (app/providers.tsx); this pill consumes
            * the same VoiceCtx for inline control. */}
           <VoiceTopBarPill />
+
+          {/* Global panic button: red outline, fires double-ESC at the
+           * single resolved live anchor. Keybind: Ctrl+Alt+. */}
+          <PanicButton />
 
           {/* Notifications dropdown */}
           <div className="relative" ref={notifRef}>

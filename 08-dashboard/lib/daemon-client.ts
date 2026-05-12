@@ -1392,6 +1392,41 @@ export const referenceDocs = (project_id?: string) =>
     `/reference${project_id ? `?project_id=${encodeURIComponent(project_id)}` : ""}`,
   );
 
+// ── Panic button ────────────────────────────────────────────────
+export interface PanicResponse {
+  ok: boolean;
+  result: "accepted" | "pty_not_found" | "no_target";
+  target_anchor_id: string | null;
+  log_id: string;
+}
+export interface PanicLogRow {
+  id: string;
+  ts: string;
+  target_anchor_id: string | null;
+  target_pty_id: string | null;
+  target_session_id: string | null;
+  clicked_ms: number;
+  caller: string;
+  result: "accepted" | "pty_not_found" | "no_target";
+}
+export const firePanic = (caller: string = "dashboard") =>
+  request<PanicResponse>("/panic", {
+    method: "POST",
+    body: { caller, clicked_ms: Date.now() },
+  });
+export const fireProjectInterrupt = (
+  anchorId: string,
+  caller: string = "dashboard",
+) =>
+  request<PanicResponse>(
+    `/projects/${encodeURIComponent(anchorId)}/interrupt`,
+    { method: "POST", body: { caller, clicked_ms: Date.now() } },
+  );
+export const recentPanics = (limit: number = 20) =>
+  request<{ ok: boolean; panics: PanicLogRow[] }>(
+    `/panic/recent?limit=${limit}`,
+  );
+
 export const uploadReference = (file: File, opts: { project_id?: string; tags?: string[] } = {}) => {
   const fd = new FormData();
   fd.append("file", file);
