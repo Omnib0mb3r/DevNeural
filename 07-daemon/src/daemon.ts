@@ -38,6 +38,7 @@ import { runBackfillWiki, getBackfillStatus } from './wiki/backfill.js';
 import { generateWhatsNew } from './wiki/whats-new.js';
 import { registerDashboardRoutes } from './dashboard/routes.js';
 import { listReminders } from './dashboard/reminders.js';
+import { startBridgePresenceLoop } from './dashboard/bridge-presence.js';
 import { emitAwarenessEvent } from './lex/awareness.js';
 import fastifyCookie from '@fastify/cookie';
 import fastifyMultipart from '@fastify/multipart';
@@ -116,6 +117,28 @@ async function main(): Promise<void> {
     log: logger,
   });
   logger('gpu queue + vram monitor up');
+
+  /* Bridge presence resolver (PROJECT-ANCHORS.md step 2 of 6).
+   * Polls <bridgeDir>/.bridge-presence/ on a short interval, flips
+   * project_session anchors live or dormant based on whether their
+   * cwd has a fresh presence file. Tunable via env:
+   *   DEVNEURAL_BRIDGE_PRESENCE_INTERVAL_MS (default 1000)
+   *   DEVNEURAL_BRIDGE_TIMEOUT_MS         (default 30000) */
+  const bridgePresenceInterval = Number(
+    process.env.DEVNEURAL_BRIDGE_PRESENCE_INTERVAL_MS ?? 1_000,
+  );
+  const bridgePresenceFreshMs = Number(
+    process.env.DEVNEURAL_BRIDGE_TIMEOUT_MS ?? 30_000,
+  );
+  startBridgePresenceLoop(store.db, {
+    intervalMs: bridgePresenceInterval,
+    freshMs: bridgePresenceFreshMs,
+    onError: (err) =>
+      logger(`[bridge-presence] reconcile failed: ${err.message}`),
+  });
+  logger(
+    `bridge presence loop up (interval=${bridgePresenceInterval}ms fresh=${bridgePresenceFreshMs}ms)`,
+  );
 
   /* External heartbeat poster (Wave 2 day 1 step 5).
    * No-op when DEVNEURAL_HEARTBEAT_URL is unset; the poster logs

@@ -624,9 +624,102 @@ function writeHeartbeat(): void {
   }
 }
 
+/* Per-window presence registration for the project-anchor model. The
+ * daemon polls <bridgeDir>/.bridge-presence/<workspace-key>.json and
+ * flips matching project_session rows live, dedupes multi-window
+ * connections, and clears stale anchors. Workspace key matches the
+ * existing per-window offsets key so two windows on the same
+ * workspace use the same file (last writer wins, which is fine: the
+ * daemon counts files, not writers). bridge_id is per-window so the
+ * daemon can still count distinct connections via the dedup key in
+ * .bridge-presence-id. */
+let cachedBridgeId: string | undefined;
+function getBridgeId(context: vscode.ExtensionContext): string {
+  if (cachedBridgeId) return cachedBridgeId;
+  const key = 'devneural.bridgeId';
+  const existing = context.globalState.get<string>(key);
+  if (existing) {
+    cachedBridgeId = existing;
+    return existing;
+  }
+  /* Math.random + Date.now is sufficient — this id only has to be
+   * unique among concurrently-running bridges on one machine. */
+  const id = `${Date.now().toString(36)}-${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
+  void context.globalState.update(key, id);
+  cachedBridgeId = id;
+  return id;
+}
+
+function getPresenceDir(): string {
+  return path.posix.join(getBridgeDir(), '.bridge-presence');
+}
+
+function presenceFilename(workspace: string): string {
+  return workspace.replace(/[\\/:*?"<>|]/g, '_') || 'no-workspace';
+}
+
+let presenceContext: vscode.ExtensionContext | undefined;
+function writePresence(): void {
+  if (!presenceContext) return;
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  if (folders.length === 0) return;
+  const dir = getPresenceDir();
+  if (!fs.existsSync(dir)) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch {
+      return;
+    }
+  }
+  const bridgeId = getBridgeId(presenceContext);
+  /* One presence file per top-level workspace folder. Multi-root
+   * windows declare presence for every root; the daemon dedupes by
+   * cwd. */
+  for (const folder of folders) {
+    const cwd = folder.uri.fsPath.replace(/\\/g, '/');
+    const filename = `${presenceFilename(cwd)}.json`;
+    const file = path.posix.join(dir, filename);
+    const payload: Record<string, unknown> = {
+      workspace: cwd,
+      cwd,
+      bridge_id: bridgeId,
+      updated_at: new Date().toISOString(),
+    };
+    /* Best-effort CC session id from the daemon /sessions cache the
+     * mirror loop already maintains. */
+    const slug = cwd.replace(/[\\/:]/g, '-').toLowerCase();
+    const ccSession = daemonActiveSessions.get(slug);
+    if (ccSession) payload.cc_session_ids = [ccSession];
+    try {
+      fs.writeFileSync(file, JSON.stringify(payload), 'utf-8');
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function clearPresence(): void {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  if (folders.length === 0) return;
+  const dir = getPresenceDir();
+  if (!fs.existsSync(dir)) return;
+  for (const folder of folders) {
+    const cwd = folder.uri.fsPath.replace(/\\/g, '/');
+    const file = path.posix.join(dir, `${presenceFilename(cwd)}.json`);
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 function tick(): void {
   if (!enabled || !isEnabled()) return;
   writeHeartbeat();
+  writePresence();
   const dir = getBridgeDir();
   if (!fs.existsSync(dir)) return;
   let entries: fs.Dirent[];
@@ -1177,9 +1270,14 @@ function startTerminalMirror(context: vscode.ExtensionContext): void {
 
 export function activate(context: vscode.ExtensionContext): void {
   channel.appendLine(`[activate] DevNeural Bridge ${getDataRoot()}`);
+  presenceContext = context;
   if (isEnabled()) {
     startWatching();
   }
+
+  /* Drop our presence file on deactivate so the daemon doesn't wait
+   * out the freshness window to mark the anchor dormant. */
+  context.subscriptions.push({ dispose: () => clearPresence() });
 
   context.subscriptions.push(
     vscode.commands.registerCommand('devneural.bridge.status', () => {

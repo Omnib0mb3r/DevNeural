@@ -211,6 +211,37 @@ export interface LexTranscriptRefRow {
   ordering: number;
 }
 
+/* project_session row. Durable per-project anchor identity, daemon-
+ * owned, mirroring the lex_session pattern. cwd is the unique join
+ * key against bridge presence files; project_slug is the folder
+ * basename (with hash suffix on collision). Inserted dormant on
+ * boot/seed; flipped live by the bridge presence resolver. */
+export interface ProjectSessionRow {
+  id: string;
+  project_slug: string;
+  cwd: string;
+  title: string | null;
+  status: 'live' | 'dormant';
+  current_session_id: string | null;
+  current_bridge_id: string | null;
+  current_pty_id: string | null;
+  created_ms: number;
+  last_seen_ms: number;
+}
+
+/* project_transcript_ref row. Ordered list of CC jsonl pointers per
+ * project_session anchor. cc_session_id is UNIQUE across the table so
+ * the same jsonl never lands under two anchors. closed_ms is NULL
+ * while the underlying CC session is still live. */
+export interface ProjectTranscriptRefRow {
+  id: string;
+  anchor_id: string;
+  cc_session_id: string;
+  jsonl_path: string;
+  opened_ms: number;
+  closed_ms: number | null;
+}
+
 /* backfill_review_queue row. Populated by npm run backfill-brainstorms
  * with one (page, brainstorm) candidate pair per band; the dashboard
  * empties the queue at /brainstorms/backfill-review. */
@@ -1469,6 +1500,140 @@ export class IndexDb {
       )
       .get(lexSessionId) as { n: number } | undefined;
     return r?.n ?? 0;
+  }
+
+  /* ── project_session ────────────────────────────────────────────
+   * Durable project anchor model from docs/spec/PROJECT-ANCHORS.md.
+   * Mirrors the lex_session pattern. cwd is the unique join key. */
+  insertProjectSession(row: ProjectSessionRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO project_session
+           (id, project_slug, cwd, title, status,
+            current_session_id, current_bridge_id, current_pty_id,
+            created_ms, last_seen_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        row.id,
+        row.project_slug,
+        row.cwd,
+        row.title,
+        row.status,
+        row.current_session_id,
+        row.current_bridge_id,
+        row.current_pty_id,
+        row.created_ms,
+        row.last_seen_ms,
+      );
+  }
+
+  updateProjectSession(
+    id: string,
+    patch: Partial<Omit<ProjectSessionRow, 'id' | 'created_ms'>>,
+  ): ProjectSessionRow | null {
+    const sets: string[] = [];
+    const params: Array<string | number | null> = [];
+    for (const [k, v] of Object.entries(patch)) {
+      if (v === undefined) continue;
+      sets.push(`${k} = ?`);
+      params.push(v as string | number | null);
+    }
+    if (sets.length === 0) return this.getProjectSession(id);
+    params.push(id);
+    this.db
+      .prepare(`UPDATE project_session SET ${sets.join(', ')} WHERE id = ?`)
+      .run(...params);
+    return this.getProjectSession(id);
+  }
+
+  getProjectSession(id: string): ProjectSessionRow | null {
+    return (
+      (this.db
+        .prepare(`SELECT * FROM project_session WHERE id = ?`)
+        .get(id) as ProjectSessionRow | undefined) ?? null
+    );
+  }
+
+  getProjectSessionByCwd(cwd: string): ProjectSessionRow | null {
+    return (
+      (this.db
+        .prepare(`SELECT * FROM project_session WHERE cwd = ?`)
+        .get(cwd) as ProjectSessionRow | undefined) ?? null
+    );
+  }
+
+  listProjectSessions(opts: {
+    status?: 'live' | 'dormant';
+    limit?: number;
+  } = {}): ProjectSessionRow[] {
+    const limit = opts.limit ?? 200;
+    if (opts.status) {
+      return this.db
+        .prepare(
+          `SELECT * FROM project_session WHERE status = ?
+             ORDER BY last_seen_ms DESC LIMIT ?`,
+        )
+        .all(opts.status, limit) as ProjectSessionRow[];
+    }
+    return this.db
+      .prepare(
+        `SELECT * FROM project_session
+           ORDER BY status = 'live' DESC, last_seen_ms DESC LIMIT ?`,
+      )
+      .all(limit) as ProjectSessionRow[];
+  }
+
+  deleteProjectSession(id: string): void {
+    /* ON DELETE CASCADE on project_transcript_ref drops the children. */
+    this.db.prepare(`DELETE FROM project_session WHERE id = ?`).run(id);
+  }
+
+  /* ── project_transcript_ref ──────────────────────────────────── */
+  insertProjectTranscriptRef(row: ProjectTranscriptRefRow): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO project_transcript_ref
+           (id, anchor_id, cc_session_id, jsonl_path, opened_ms, closed_ms)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        row.id,
+        row.anchor_id,
+        row.cc_session_id,
+        row.jsonl_path,
+        row.opened_ms,
+        row.closed_ms,
+      );
+  }
+
+  closeProjectTranscriptRef(ccSessionId: string, closedMs: number): void {
+    this.db
+      .prepare(
+        `UPDATE project_transcript_ref
+           SET closed_ms = ?
+         WHERE cc_session_id = ? AND closed_ms IS NULL`,
+      )
+      .run(closedMs, ccSessionId);
+  }
+
+  listProjectTranscriptRefs(anchorId: string): ProjectTranscriptRefRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM project_transcript_ref WHERE anchor_id = ?
+           ORDER BY opened_ms ASC`,
+      )
+      .all(anchorId) as ProjectTranscriptRefRow[];
+  }
+
+  getProjectTranscriptRefByCc(
+    ccSessionId: string,
+  ): ProjectTranscriptRefRow | null {
+    return (
+      (this.db
+        .prepare(`SELECT * FROM project_transcript_ref WHERE cc_session_id = ?`)
+        .get(ccSessionId) as ProjectTranscriptRefRow | undefined) ?? null
+    );
   }
 
   upsertRawChunk(row: RawChunkRow): void {
