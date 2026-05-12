@@ -58,4 +58,65 @@ describe('archivePromptVersion', () => {
     expect(readPromptVersion(v.version)).toBe('readable body');
     expect(readPromptVersion('does-not-exist')).toBeNull();
   });
+
+  it('monotonic-version-ordering: filenames sort in write order', async () => {
+    const { archivePromptVersion, listPromptVersions } = await import(
+      '../src/lex/prompt-archive.js'
+    );
+    const v1 = archivePromptVersion('one');
+    await new Promise((r) => setTimeout(r, 5));
+    const v2 = archivePromptVersion('two');
+    await new Promise((r) => setTimeout(r, 5));
+    const v3 = archivePromptVersion('three');
+    const ordered = listPromptVersions().map((v) => v.version);
+    expect(ordered).toEqual([v1.version, v2.version, v3.version]);
+  });
+
+  it('backfill-on-empty-archive: first write lands a single file', async () => {
+    const { archivePromptVersion, listPromptVersions } = await import(
+      '../src/lex/prompt-archive.js'
+    );
+    expect(listPromptVersions()).toEqual([]);
+    const v = archivePromptVersion('cold-boot body');
+    const all = listPromptVersions();
+    expect(all).toHaveLength(1);
+    expect(all[0]!.version).toBe(v.version);
+    expect(all[0]!.hash).toMatch(/^[0-9a-f]{7}$/);
+  });
+
+  it('idempotent-on-unchanged-prompt: no new file written on identical body', async () => {
+    const { archivePromptVersion, listPromptVersions } = await import(
+      '../src/lex/prompt-archive.js'
+    );
+    archivePromptVersion('stable body');
+    await new Promise((r) => setTimeout(r, 5));
+    archivePromptVersion('stable body');
+    await new Promise((r) => setTimeout(r, 5));
+    archivePromptVersion('stable body');
+    expect(listPromptVersions()).toHaveLength(1);
+  });
+
+  it('hash-collision-on-different-content: different bodies get distinct hashes', async () => {
+    const { archivePromptVersion } = await import(
+      '../src/lex/prompt-archive.js'
+    );
+    const a = archivePromptVersion('alpha body');
+    const b = archivePromptVersion('beta body');
+    expect(a.hash).not.toBe(b.hash);
+    expect(a.version).not.toBe(b.version);
+    expect(a.hash).toMatch(/^[0-9a-f]{7}$/);
+    expect(b.hash).toMatch(/^[0-9a-f]{7}$/);
+  });
+
+  it('atomic-write: no .partial residue after a successful archive', async () => {
+    const { archivePromptVersion } = await import(
+      '../src/lex/prompt-archive.js'
+    );
+    const v = archivePromptVersion('atomic body');
+    const dir = path.posix.dirname(v.filePath);
+    const residue = fs
+      .readdirSync(dir)
+      .filter((f) => f.endsWith('.partial'));
+    expect(residue).toEqual([]);
+  });
 });
