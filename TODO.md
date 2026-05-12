@@ -16,6 +16,17 @@ Captured 2026-05-04. Living list. Tick when shipped.
 ## Validation
 
 - [ ] Trigger a real reinforcement event in conversation. Send Claude a prompt where the wiki should match, watch dashboard ReinforcementPanel for an `injected` row, then watch for `hit` / `raw-hit` after the reply lands. Confirms curator + reinforcement + panel chain end-to-end.
+- [ ] Live verify Lex session rewrite (commit `5af07d0`). Open past anchor on /lex, confirm spawn-or-bind works, check Brainstorms group renders in Stream Deck, hit end on a session.
+
+## Deferred Wave 2 Day 5 (Lex personality track)
+
+- [ ] Step 20 (LX-1) prompt versioning archive. Daemon writes `07-daemon/data/lex-prompts/<version>.md` on every prompt change. Version = monotonic ISO timestamp + short hash. Backfill existing prompts on first run. Foundation for step 21 A/B replay harness.
+
+## Next after project-anchors spec
+
+- [ ] Global panic button on the main dashboard, next to mute/stop. Single click sends double-ESC (`\x1b\x1b`) to the currently active session via the existing PTY inject path. New endpoint variant (or flag on inject) for raw key bytes, `commit=false`. Defer per-tile mini panic until usage shows it's needed. Reason: emergency stop for a runaway session, muscle memory next to existing stop.
+- [ ] Smart compact (queued after panic button). Spec at `docs/spec/SMART-COMPACT.md`. Default threshold 60% +/- 5, two-condition trigger (window + stop point), forced wrap-and-commit fallback, hard ceiling 90%, shadow mode first per anchor.
+- [ ] Lex dashboard controls (queued after smart compact). Add endpoints like `POST /voice/mute`, `POST /voice/unmute`, `POST /voice/stop` that push state changes over the existing voice WS to the dashboard client. Expose as Lex tools so Lex can mute/unmute itself or stop the voice session on voice command. Reason: hands-busy control without touching the UI.
 
 ## Stream deck (virtual deck in dashboard)
 
