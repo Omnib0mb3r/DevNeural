@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   lexAnchors,
@@ -11,8 +11,16 @@ import {
   type LexAnchor,
 } from "@/lib/daemon-client";
 import { relTime } from "@/lib/session-helpers";
+import { createCollapseStore } from "@/lib/transcript-collapse";
 import { Icon } from "./Icon";
 import { StatusDot } from "./StatusDot";
+
+/* Past Sessions collapse-toggle persistence. Mirrors the
+ * TranscriptHistory pattern so a refresh respects the user's choice
+ * of capped-height-list vs count-only strip. */
+export const PAST_SESSIONS_COLLAPSE_KEY =
+  "devneural.lex.past-sessions.collapsed";
+const collapseStore = createCollapseStore(PAST_SESSIONS_COLLAPSE_KEY);
 
 /**
  * Past Sessions panel for /lex (PLAN-lex-session-rewrite.md, step 4).
@@ -36,6 +44,8 @@ interface Props {
    * button kills the underlying PTY in addition to flipping the
    * anchor's status. */
   activePtyId?: string | null;
+  /* Test seam: override the initial collapsed-state read. */
+  initialCollapsed?: boolean;
 }
 
 function shortId(id: string): string {
@@ -50,9 +60,23 @@ function nameFor(anchor: LexAnchor): string {
   return anchor.title?.trim() || anchor.derived_title?.trim() || "";
 }
 
-export function LexSessionList({ activeAnchorId, activePtyId }: Props) {
+export function LexSessionList({
+  activeAnchorId,
+  activePtyId,
+  initialCollapsed,
+}: Props) {
   const qc = useQueryClient();
-  const [open, setOpen] = useState(true);
+  /* Collapsed = count-only strip; expanded = capped-height list with
+   * internal scroll. Default expanded on first load; persists every
+   * toggle through the shared transcript-collapse store under the
+   * past-sessions key. */
+  const [collapsed, setCollapsed] = useState<boolean>(
+    initialCollapsed ?? false,
+  );
+  useEffect(() => {
+    if (initialCollapsed !== undefined) return;
+    setCollapsed(collapseStore.read());
+  }, [initialCollapsed]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftLabel, setDraftLabel] = useState("");
   /* Per-row pending state. Without this every row's open button
@@ -128,34 +152,63 @@ export function LexSessionList({ activeAnchorId, activePtyId }: Props) {
     });
   }
 
+  const liveCount = rows.filter((r) => r.status === "live").length;
+
+  function toggleCollapsed() {
+    setCollapsed((prev) => {
+      const next = !prev;
+      collapseStore.write(next);
+      return next;
+    });
+  }
+
   return (
-    <div className="rounded-panel bg-surface1 hairline">
+    <div
+      className="rounded-panel bg-surface1 hairline"
+      data-testid="lex-past-sessions"
+      data-collapsed={collapsed ? "1" : "0"}
+    >
       <div className="px-5 py-3 border-b border-border1 flex items-center justify-between gap-3">
-        <button
-          type="button"
-          onClick={() => setOpen((v) => !v)}
-          className="flex items-center gap-2 hover:opacity-80"
-          aria-expanded={open}
-        >
+        <div className="flex items-center gap-2 min-w-0">
           <Icon name="History" className="text-brandSoft" size={16} />
           <h2 className="font-display text-sm font-emphasized">Past sessions</h2>
-          <span className="text-nano text-txt3 ml-1">({rows.length})</span>
-          <Icon name={open ? "ChevronUp" : "ChevronDown"} size={14} className="text-txt3 ml-1" />
-        </button>
-        <button
-          type="button"
-          onClick={() => newM.mutate()}
-          disabled={newM.isPending}
-          className="text-xs px-3 py-1.5 rounded-pill bg-brand/15 text-brandSoft hairline ring-1 ring-brand/30 hover:bg-brand/25 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
-          title="Spawn a fresh Lex anchor"
-        >
-          <Icon name="Plus" size={12} />
-          {newM.isPending ? "starting…" : "new brainstorm"}
-        </button>
+          <span className="text-nano text-txt3 ml-1">
+            ({rows.length}
+            {liveCount > 0 ? `, ${liveCount} live` : ""})
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => newM.mutate()}
+            disabled={newM.isPending}
+            className="text-xs px-3 py-1.5 rounded-pill bg-brand/15 text-brandSoft hairline ring-1 ring-brand/30 hover:bg-brand/25 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
+            title="Spawn a fresh Lex anchor"
+          >
+            <Icon name="Plus" size={12} />
+            {newM.isPending ? "starting…" : "new brainstorm"}
+          </button>
+          <button
+            type="button"
+            onClick={toggleCollapsed}
+            aria-expanded={!collapsed}
+            aria-controls="lex-past-sessions-body"
+            className="text-[11px] px-2 py-0.5 rounded-pill hairline font-emphasized bg-surface2 text-txt2 hover:bg-surface3"
+          >
+            {collapsed ? "expand" : "collapse"}
+          </button>
+        </div>
       </div>
 
-      {open && (
-        <div className="max-h-72 overflow-y-auto">
+      {!collapsed && (
+        <div
+          id="lex-past-sessions-body"
+          /* Cap to roughly 3.5 rows (~56px each at py-2.5 + content);
+           * anything past that gets the internal scroll instead of
+           * pushing the rest of the page down. */
+          className="max-h-56 overflow-y-auto"
+          data-testid="lex-past-sessions-body"
+        >
           {q.isLoading && (
             <div className="p-4 space-y-2">
               {[0, 1, 2].map((i) => (
@@ -274,6 +327,17 @@ export function LexSessionList({ activeAnchorId, activePtyId }: Props) {
               })}
             </ul>
           )}
+        </div>
+      )}
+      {collapsed && (
+        <div
+          data-testid="lex-past-sessions-strip"
+          className="px-5 py-2 text-nano text-txt3 flex items-center gap-2"
+        >
+          <span>
+            {rows.length} session{rows.length === 1 ? "" : "s"}
+            {liveCount > 0 ? `, ${liveCount} live` : ""}
+          </span>
         </div>
       )}
     </div>
