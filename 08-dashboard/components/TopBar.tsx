@@ -168,8 +168,8 @@ export function TopBar({ activeTab }: { activeTab: string }) {
             className="hidden md:flex group w-full items-center gap-2.5 h-9 px-3 rounded-card bg-surface1 hairline focus-within:ring-1 focus-within:ring-brand/60 transition text-left"
             aria-label="Open command palette"
           >
-            <Icon name="Search" className="text-txt3" size={16} />
-            <span className="flex-1 text-sm text-txt3">
+            <Icon name="Search" className="text-txt3 shrink-0" size={16} />
+            <span className="flex-1 min-w-0 truncate text-sm text-txt3">
               Search wiki, sessions, projects, reference docs…
             </span>
             <kbd className="hidden md:inline-flex items-center gap-1 px-1.5 h-5 rounded border border-border1 bg-surface2 text-[11px] font-mono text-txt2">
@@ -326,18 +326,21 @@ export function TopBar({ activeTab }: { activeTab: string }) {
       </div>
 
       <nav className="flex items-center h-11 px-3 sm:px-5 hairline-soft border-t border-border2 overflow-x-auto scrollbar-none">
-        <div className="flex gap-4 sm:gap-6 -mb-px whitespace-nowrap">
+        <div className="flex gap-3 sm:gap-6 -mb-px whitespace-nowrap">
           {TABS.map((t) => {
             const isActive = t.href === activeTab;
             return (
               <Link
                 key={t.href}
                 href={t.href}
+                aria-label={t.label}
+                title={t.label}
                 className={`relative py-3 text-sm font-medium flex items-center gap-2 ${
                   isActive ? "text-txt1 tab-active" : "text-txt2 hover:text-txt1"
                 }`}
               >
-                <Icon name={t.icon} size={16} /> {t.label}
+                <Icon name={t.icon} size={16} />
+                <span className="hidden sm:inline">{t.label}</span>
               </Link>
             );
           })}
