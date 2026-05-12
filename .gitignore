@@ -17,6 +17,7 @@ skill-connections/
 .playwright-mcp/
 /orb-*.png
 /home-*.png
+/step5-verify-*.png
 
 # Claude Code local-only state. .claude/commands/ stays tracked (shared
 # slash commands); these two files are per-machine and must not ship.
