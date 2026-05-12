@@ -30,6 +30,7 @@ let priors: {
   USERPROFILE?: string;
   HOME?: string;
   DEVNEURAL_SMART_COMPACT_SHADOW_N?: string;
+  DEVNEURAL_SMART_COMPACT_ENABLED?: string;
 };
 
 beforeEach(async () => {
@@ -46,14 +47,18 @@ beforeEach(async () => {
     HOME: process.env.HOME,
     DEVNEURAL_SMART_COMPACT_SHADOW_N:
       process.env.DEVNEURAL_SMART_COMPACT_SHADOW_N,
+    DEVNEURAL_SMART_COMPACT_ENABLED:
+      process.env.DEVNEURAL_SMART_COMPACT_ENABLED,
   };
   process.env.DEVNEURAL_DATA_ROOT = tmpDir;
   process.env.DEVNEURAL_PROJECTS_ROOT = path.join(tmpDir, 'Projects');
   process.env.USERPROFILE = path.join(tmpDir, 'home');
   process.env.HOME = path.join(tmpDir, 'home');
-  /* Set shadow gate to 0 so tests can drive live behavior without
-   * burning through fake rows. The shadow-specific test sets it back. */
+  /* Set shadow gate to 0 + global toggle ON so tests can drive live
+   * behavior. The shadow-specific test and the global-toggle test
+   * set these back as needed. */
   process.env.DEVNEURAL_SMART_COMPACT_SHADOW_N = '0';
+  process.env.DEVNEURAL_SMART_COMPACT_ENABLED = 'true';
 
   const idx = new IndexDb(dbFile);
   idx.close();
@@ -238,10 +243,12 @@ describe('fireSmartCompact', () => {
     expect(row.summary_preview?.length).toBeLessThanOrEqual(280);
   });
 
-  it('global toggle DEVNEURAL_SMART_COMPACT_ENABLED=false degrades fire to shadow (no inject)', () => {
+  it('global toggle DEVNEURAL_SMART_COMPACT_ENABLED unset/false degrades fire to shadow (no inject)', () => {
     seedAnchor({ id: 'a', pty: 'pty-A' });
     const prior = process.env.DEVNEURAL_SMART_COMPACT_ENABLED;
-    process.env.DEVNEURAL_SMART_COMPACT_ENABLED = 'false';
+    /* Default-off: explicitly unset to confirm the kill-switch is
+     * the default at launch (shadow-only until operator opts in). */
+    delete process.env.DEVNEURAL_SMART_COMPACT_ENABLED;
     try {
       const injector = vi.fn(() => ({ ok: true as const }));
       const r = fireSmartCompact(db, 'a', {

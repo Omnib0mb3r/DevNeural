@@ -35,6 +35,7 @@ beforeEach(async () => {
   process.env.USERPROFILE = path.join(tmpDir, 'home');
   process.env.HOME = path.join(tmpDir, 'home');
   process.env.DEVNEURAL_SMART_COMPACT_SHADOW_N = '0';
+  process.env.DEVNEURAL_SMART_COMPACT_ENABLED = 'true';
   const idx = new IndexDb(dbFile);
   idx.close();
   await runMigrations({ dbPath: dbFile, migrationsDir: MIGRATIONS_DIR });
@@ -47,6 +48,7 @@ beforeEach(async () => {
 afterEach(() => {
   db.close();
   delete process.env.DEVNEURAL_SMART_COMPACT_SHADOW_N;
+  delete process.env.DEVNEURAL_SMART_COMPACT_ENABLED;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 

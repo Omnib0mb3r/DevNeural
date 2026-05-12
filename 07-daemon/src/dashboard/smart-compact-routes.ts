@@ -347,14 +347,16 @@ export interface FireResult {
   anchor_id: string;
 }
 
-/* Global kill-switch. When DEVNEURAL_SMART_COMPACT_ENABLED=false the
- * fire path degrades to shadow regardless of the per-anchor counter:
- * the audit row still lands with action='shadow' and reason carries
- * the operator-provided cause, but no inject ever runs. */
+/* Global kill-switch. Default is FALSE: smart-compact ships shadow-
+ * only at launch so the operator can observe every intended fire in
+ * the audit log before opting the live inject in via
+ * DEVNEURAL_SMART_COMPACT_ENABLED=true (or 1). Any other value keeps
+ * the kill-switch on. When off, the fire path degrades to a shadow
+ * row even if force=true; no PTY inject ever runs. */
 export function smartCompactGloballyEnabled(): boolean {
   const raw = process.env.DEVNEURAL_SMART_COMPACT_ENABLED;
-  if (raw === undefined) return true;
-  return raw !== 'false' && raw !== '0';
+  if (raw === undefined) return false;
+  return raw === 'true' || raw === '1';
 }
 
 export function fireSmartCompact(
