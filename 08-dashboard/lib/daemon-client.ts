@@ -1427,6 +1427,32 @@ export const recentPanics = (limit: number = 20) =>
     `/panic/recent?limit=${limit}`,
   );
 
+// ── Project anchor PATCH (supervision_mode + title) ─────────────
+export type SupervisionMode = "polling" | "event" | "off";
+export interface ProjectAnchorView {
+  id: string;
+  project_slug: string;
+  cwd: string;
+  title: string | null;
+  status: "live" | "dormant";
+  current_session_id: string | null;
+  current_bridge_id: string | null;
+  bridge_connection_count: number;
+  current_pty_id: string | null;
+  created_ms: number;
+  last_seen_ms: number;
+  exists_on_disk: boolean;
+  supervision_mode: SupervisionMode;
+}
+export const patchProjectAnchor = (
+  anchorId: string,
+  patch: { title?: string | null; supervision_mode?: SupervisionMode },
+) =>
+  request<{ ok: boolean; anchor?: ProjectAnchorView; error?: string }>(
+    `/projects/${encodeURIComponent(anchorId)}`,
+    { method: "PATCH", body: patch },
+  );
+
 export const uploadReference = (file: File, opts: { project_id?: string; tags?: string[] } = {}) => {
   const fd = new FormData();
   fd.append("file", file);
