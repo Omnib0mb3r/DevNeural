@@ -43,6 +43,7 @@ import {
   loadPushedReminderIds,
 } from './dashboard/reminder-push.js';
 import { startBridgePresenceLoop } from './dashboard/bridge-presence.js';
+import { startWorkerEventListener } from './dashboard/worker-event-listener.js';
 import { emitAwarenessEvent } from './lex/awareness.js';
 import fastifyCookie from '@fastify/cookie';
 import fastifyMultipart from '@fastify/multipart';
@@ -143,6 +144,18 @@ async function main(): Promise<void> {
   logger(
     `bridge presence loop up (interval=${bridgePresenceInterval}ms fresh=${bridgePresenceFreshMs}ms)`,
   );
+
+  /* Event-driven Lex supervision (EVENT-DRIVEN-SUPERVISION.md).
+   * Subscribes to every Claude Code transcript jsonl, runs the
+   * detector pipeline, routes WorkerEvents to Lex's active
+   * brainstorm via the cross-session inject path. Only fires for
+   * anchors with supervision_mode='event'; polling stays the
+   * failsafe for the rest. */
+  const workerEventListener = startWorkerEventListener({
+    db: store.db,
+    log: (msg) => logger(msg),
+  });
+  void workerEventListener;
 
   /* External heartbeat poster (Wave 2 day 1 step 5).
    * No-op when DEVNEURAL_HEARTBEAT_URL is unset; the poster logs
