@@ -157,6 +157,13 @@ export async function registerDashboardRoutes(
   const { registerPanicRoutes } = await import('./panic-routes.js');
   registerPanicRoutes(app, store.db, ptyInject, log);
 
+  /* Smart-compact surface (SMART-COMPACT.md). Lex polls evaluate,
+   * decides to fire, daemon executes /clear + resume summary via the
+   * existing PTY transport. Shadow mode for the first N attempts per
+   * anchor; audit row on every decision. */
+  const { registerSmartCompactRoutes } = await import('./smart-compact-routes.js');
+  registerSmartCompactRoutes(app, store.db, ptyInject, log);
+
   /* Background poll that binds a daemon-owned PTY to its claude
    * session_id once the .jsonl file appears. Single global timer; no
    * cost when no PTYs are unbound. */

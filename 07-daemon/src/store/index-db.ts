@@ -154,6 +154,23 @@ export interface CrossSessionInjectionLogRow {
   brainstorm_id: string | null;
 }
 
+/* smart_compact_log row. SMART-COMPACT.md "Audit". One row per
+ * smart-compact decision (evaluate fire / wrap injection / hard
+ * ceiling / shadow). Dashboard panel reads this to surface a
+ * timeline. */
+export interface SmartCompactLogRow {
+  id: string;
+  ts: string;
+  anchor_id: string | null;
+  cc_session_id: string | null;
+  caller: string;
+  reason: string;
+  action: 'fire' | 'wrap' | 'shadow' | 'noop';
+  pre_ctx_pct: number | null;
+  post_ctx_pct: number | null;
+  summary_preview: string | null;
+}
+
 /* panic_log row. PANIC-BUTTON.md step 3. Audit row for every panic
  * button fire (dashboard click, Ctrl+Alt+. keybind, Lex tool call). */
 export interface PanicLogRow {
@@ -1919,6 +1936,67 @@ export class IndexDb {
         );
     } catch {
       /* table may not exist yet; not fatal */
+    }
+  }
+
+  /** Write one smart-compact audit record. Swallowed if migration 021
+   * has not been applied yet. */
+  insertSmartCompactLog(row: {
+    id: string;
+    anchor_id: string | null;
+    cc_session_id: string | null;
+    caller: string;
+    reason: string;
+    action: 'fire' | 'wrap' | 'shadow' | 'noop';
+    pre_ctx_pct: number | null;
+    post_ctx_pct?: number | null;
+    summary_preview?: string | null;
+  }): void {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO smart_compact_log
+             (id, anchor_id, cc_session_id, caller, reason, action,
+              pre_ctx_pct, post_ctx_pct, summary_preview)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          row.id,
+          row.anchor_id,
+          row.cc_session_id,
+          row.caller,
+          row.reason,
+          row.action,
+          row.pre_ctx_pct,
+          row.post_ctx_pct ?? null,
+          row.summary_preview ?? null,
+        );
+    } catch {
+      /* table may not exist yet; not fatal */
+    }
+  }
+
+  listRecentSmartCompacts(limit: number = 20): SmartCompactLogRow[] {
+    try {
+      const capped = Math.min(200, Math.max(1, limit));
+      return this.db
+        .prepare(`SELECT * FROM smart_compact_log ORDER BY ts DESC LIMIT ?`)
+        .all(capped) as SmartCompactLogRow[];
+    } catch {
+      return [];
+    }
+  }
+
+  countSmartCompactsForAnchor(anchorId: string): number {
+    try {
+      const row = this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM smart_compact_log WHERE anchor_id = ?`,
+        )
+        .get(anchorId) as { n: number } | undefined;
+      return row?.n ?? 0;
+    } catch {
+      return 0;
     }
   }
 
