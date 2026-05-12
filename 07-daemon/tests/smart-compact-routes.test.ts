@@ -220,4 +220,36 @@ describe('fireSmartCompact', () => {
     expect(r.action).toBe('fire');
     expect(injector).toHaveBeenCalledTimes(2);
   });
+
+  it('persists payload_text on the audit row (full summary, not just preview)', () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    const longSummary = 'You were working on demo. '.repeat(40);
+    const r = fireSmartCompact(db, 'a', {
+      caller: 'lex',
+      reason: 'window-open',
+      action: 'fire',
+      ctxPct: 60,
+      summary: longSummary,
+      injector: vi.fn(() => ({ ok: true as const })),
+    });
+    expect(r.action).toBe('fire');
+    const row = recentSmartCompacts(db)[0]!;
+    expect(row.payload_text).toBe(longSummary);
+    expect(row.summary_preview?.length).toBeLessThanOrEqual(280);
+  });
+
+  it('wrap action persists WRAP_AND_COMMIT_PROMPT as payload_text', () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    const r = fireSmartCompact(db, 'a', {
+      caller: 'lex',
+      reason: 'forced-no-stop',
+      action: 'wrap',
+      ctxPct: 75,
+      injector: vi.fn(() => ({ ok: true as const })),
+    });
+    expect(r.action).toBe('wrap');
+    expect(recentSmartCompacts(db)[0]!.payload_text).toMatch(
+      /Wrap your current work/,
+    );
+  });
 });

@@ -366,6 +366,10 @@ export function fireSmartCompact(
       action: 'shadow',
       pre_ctx_pct: opts.ctxPct,
       summary_preview: opts.summary?.slice(0, 280) ?? null,
+      payload_text:
+        opts.action === 'wrap'
+          ? WRAP_AND_COMMIT_PROMPT
+          : opts.summary ?? null,
     });
     return {
       ok: true,
@@ -402,6 +406,10 @@ export function fireSmartCompact(
     action: opts.action === 'wait' ? 'noop' : opts.action,
     pre_ctx_pct: opts.ctxPct,
     summary_preview: opts.summary?.slice(0, 280) ?? null,
+    payload_text:
+      opts.action === 'wrap'
+        ? WRAP_AND_COMMIT_PROMPT
+        : opts.summary ?? null,
   });
 
   return {

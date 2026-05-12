@@ -169,6 +169,10 @@ export interface SmartCompactLogRow {
   pre_ctx_pct: number | null;
   post_ctx_pct: number | null;
   summary_preview: string | null;
+  /* Full payload the audit panel expands to show. Migration 023 adds
+   * the column nullable; older rows have payload_text=null and the
+   * panel falls back to summary_preview. */
+  payload_text: string | null;
 }
 
 /* panic_log row. PANIC-BUTTON.md step 3. Audit row for every panic
@@ -1965,14 +1969,15 @@ export class IndexDb {
     pre_ctx_pct: number | null;
     post_ctx_pct?: number | null;
     summary_preview?: string | null;
+    payload_text?: string | null;
   }): void {
     try {
       this.db
         .prepare(
           `INSERT INTO smart_compact_log
              (id, anchor_id, cc_session_id, caller, reason, action,
-              pre_ctx_pct, post_ctx_pct, summary_preview)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              pre_ctx_pct, post_ctx_pct, summary_preview, payload_text)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           row.id,
@@ -1984,6 +1989,7 @@ export class IndexDb {
           row.pre_ctx_pct,
           row.post_ctx_pct ?? null,
           row.summary_preview ?? null,
+          row.payload_text ?? null,
         );
     } catch {
       /* table may not exist yet; not fatal */
