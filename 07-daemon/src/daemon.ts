@@ -38,6 +38,10 @@ import { runBackfillWiki, getBackfillStatus } from './wiki/backfill.js';
 import { generateWhatsNew } from './wiki/whats-new.js';
 import { registerDashboardRoutes } from './dashboard/routes.js';
 import { listReminders } from './dashboard/reminders.js';
+import {
+  firePushForReminder,
+  loadPushedReminderIds,
+} from './dashboard/reminder-push.js';
 import { startBridgePresenceLoop } from './dashboard/bridge-presence.js';
 import { emitAwarenessEvent } from './lex/awareness.js';
 import fastifyCookie from '@fastify/cookie';
@@ -260,26 +264,37 @@ async function main(): Promise<void> {
   const reminderSweepIntervalMs = Number(
     process.env.DEVNEURAL_REMINDER_SWEEP_INTERVAL_MS ?? 5 * 60 * 1000,
   );
+  /* In-memory dedupe set, seeded from the persisted push ledger so a
+   * daemon restart mid-sweep does not re-fire a reminder that already
+   * dispatched a web push. The awareness event uses its own
+   * idle_duplicate guard so we keep emitting it (cheap, no external
+   * side effect); the push ledger guards the network-side action. */
   const remindedIds = new Set<string>();
+  const pushedIds = loadPushedReminderIds();
   function sweepReminders(): void {
     try {
       const now = Date.now();
       for (const r of listReminders()) {
         if (!r.due_at) continue;
         if (r.completed_at) continue;
-        if (remindedIds.has(r.id)) continue;
         const dueMs = Date.parse(r.due_at);
         if (!Number.isFinite(dueMs) || dueMs > now) continue;
-        remindedIds.add(r.id);
-        emitAwarenessEvent({
-          kind: 'reminder-due',
-          label: r.title.slice(0, 80),
-          detail: {
-            id: r.id,
-            due_at: r.due_at,
-            ...(r.project_id ? { project_id: r.project_id } : {}),
-          },
-        });
+        if (!remindedIds.has(r.id)) {
+          remindedIds.add(r.id);
+          emitAwarenessEvent({
+            kind: 'reminder-due',
+            label: r.title.slice(0, 80),
+            detail: {
+              id: r.id,
+              due_at: r.due_at,
+              ...(r.project_id ? { project_id: r.project_id } : {}),
+            },
+          });
+        }
+        /* Web push dispatch. Dedupe handled inside firePushForReminder
+         * against the shared pushedIds Set + the persisted ledger so
+         * a daemon restart cannot re-buzz the user's phone. */
+        firePushForReminder(r, { pushedIds });
       }
     } catch (err) {
       logger(`[reminder sweep] failed: ${(err as Error).message}`);
