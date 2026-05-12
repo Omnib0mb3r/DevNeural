@@ -1453,6 +1453,28 @@ export const patchProjectAnchor = (
     { method: "PATCH", body: patch },
   );
 
+export interface ProjectAnchorTile {
+  anchor_id: string;
+  project_slug: string;
+  title: string | null;
+  cwd: string;
+  status: "live" | "dormant";
+  current_session_id: string | null;
+  current_bridge_id: string | null;
+  bridge_connection_count: number;
+  current_pty_id: string | null;
+  transcript_path: string | null;
+  phase: "thinking" | "tool" | "permission" | "idle" | "unknown";
+  pending_prompt: { text: string; ts: number } | null;
+  last_activity_ms: number;
+  transcript_count: number;
+  supervision_mode: SupervisionMode;
+}
+export const listProjectAnchorTiles = () =>
+  request<{ ok: boolean; tiles: ProjectAnchorTile[] }>(
+    "/projects/anchor-tiles",
+  );
+
 export const uploadReference = (file: File, opts: { project_id?: string; tags?: string[] } = {}) => {
   const fd = new FormData();
   fd.append("file", file);

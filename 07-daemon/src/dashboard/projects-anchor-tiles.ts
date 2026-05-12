@@ -36,6 +36,10 @@ export interface ProjectAnchorTile {
   pending_prompt: PendingPrompt | null;
   last_activity_ms: number;
   transcript_count: number;
+  /** EVENT-DRIVEN-SUPERVISION.md: per-anchor toggle. The dashboard
+   * ProjectsGrid mounts a three-state control bound to this column
+   * via PATCH /projects/:id. */
+  supervision_mode: 'polling' | 'event' | 'off';
 }
 
 function latestTranscriptRef(
@@ -109,6 +113,10 @@ export function buildProjectAnchorTile(
     pending_prompt: pending,
     last_activity_ms: lastActivityMs(row, refs),
     transcript_count: refs.length,
+    supervision_mode: (row.supervision_mode ?? 'polling') as
+      | 'polling'
+      | 'event'
+      | 'off',
   };
 }
 

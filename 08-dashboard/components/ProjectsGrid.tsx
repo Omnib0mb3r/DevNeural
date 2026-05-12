@@ -1,10 +1,16 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
-import { projects as projectsClient, sessions as sessionsClient } from "@/lib/daemon-client";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  projects as projectsClient,
+  sessions as sessionsClient,
+  listProjectAnchorTiles,
+  type ProjectAnchorTile,
+} from "@/lib/daemon-client";
 import { sessionsByProject } from "@/lib/session-helpers";
 import { Icon } from "./Icon";
 import { StatusDot } from "./StatusDot";
+import { SupervisionModeToggle } from "./SupervisionModeToggle";
 
 function relTimeIso(ts: string | undefined): string {
   if (!ts) return "—";
@@ -25,7 +31,12 @@ interface Props {
   limit?: number;
 }
 
+function normalizeCwd(cwd: string | undefined): string {
+  return (cwd ?? "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
 export function ProjectsGrid({ compact = false, limit }: Props = {}) {
+  const qc = useQueryClient();
   const projQ = useQuery({
     queryKey: ["projects"],
     queryFn: projectsClient,
@@ -36,6 +47,18 @@ export function ProjectsGrid({ compact = false, limit }: Props = {}) {
     queryFn: sessionsClient,
     refetchInterval: 5_000,
   });
+  /* Anchor feed carries supervision_mode + status + phase. Joined to
+   * the legacy project record by lowercased cwd so the toggle only
+   * renders on tiles that map to a known anchor. */
+  const anchorsQ = useQuery({
+    queryKey: ["project-anchor-tiles"],
+    queryFn: listProjectAnchorTiles,
+    refetchInterval: 10_000,
+  });
+  const anchorByCwd = new Map<string, ProjectAnchorTile>();
+  for (const t of anchorsQ.data?.tiles ?? []) {
+    anchorByCwd.set(normalizeCwd(t.cwd), t);
+  }
 
   const all = projQ.data?.projects ?? [];
   const sessByProject = sessionsByProject(sessQ.data?.sessions ?? []);
@@ -85,10 +108,17 @@ export function ProjectsGrid({ compact = false, limit }: Props = {}) {
       {list.map((p) => {
         // Match by both id and name since session slugs decode to varying forms.
         const liveSessions = sessByProject.get(p.name) ?? sessByProject.get(p.id) ?? 0;
+        const anchor = anchorByCwd.get(normalizeCwd(p.root));
+        const dim = anchor?.supervision_mode === "off";
         return (
           <div
             key={p.id}
-            className="rounded-card bg-surface1 hairline lift p-4 cursor-pointer"
+            data-testid="projects-grid-tile"
+            data-anchor-id={anchor?.anchor_id ?? ""}
+            data-supervision-mode={anchor?.supervision_mode ?? ""}
+            className={`rounded-card bg-surface1 hairline lift p-4 cursor-pointer transition ${
+              dim ? "opacity-60" : ""
+            }`}
           >
             <div className="flex items-center justify-between mb-2">
               <div className="font-display text-sm font-emphasized truncate">
@@ -109,6 +139,22 @@ export function ProjectsGrid({ compact = false, limit }: Props = {}) {
               </span>
               <span>{relTimeIso(p.last_seen)} ago</span>
             </div>
+            {anchor && (
+              <div className="mt-3 pt-2 border-t border-border2 flex items-center justify-between gap-2">
+                <span className="text-nano text-txt3 uppercase tracking-wider">
+                  supervision
+                </span>
+                <SupervisionModeToggle
+                  anchorId={anchor.anchor_id}
+                  initialMode={anchor.supervision_mode}
+                  onChange={() =>
+                    qc.invalidateQueries({
+                      queryKey: ["project-anchor-tiles"],
+                    })
+                  }
+                />
+              </div>
+            )}
           </div>
         );
       })}
