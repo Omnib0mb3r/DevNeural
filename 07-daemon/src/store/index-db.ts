@@ -154,6 +154,19 @@ export interface CrossSessionInjectionLogRow {
   brainstorm_id: string | null;
 }
 
+/* panic_log row. PANIC-BUTTON.md step 3. Audit row for every panic
+ * button fire (dashboard click, Ctrl+Alt+. keybind, Lex tool call). */
+export interface PanicLogRow {
+  id: string;
+  ts: string;
+  target_anchor_id: string | null;
+  target_pty_id: string | null;
+  target_session_id: string | null;
+  clicked_ms: number;
+  caller: string;
+  result: 'accepted' | 'pty_not_found' | 'no_target';
+}
+
 /* runtime_config row. Wave 2 day 4 step 19 (A15) pause-mode toggle
  * lives here so a daemon restart is not required to flip the gate.
  * Generic key/value JSON so future toggles (lint cadence override,
@@ -1906,6 +1919,50 @@ export class IndexDb {
         );
     } catch {
       /* table may not exist yet; not fatal */
+    }
+  }
+
+  /** Write one panic-button audit record. Swallowed if migration 020
+   * has not been applied yet. */
+  insertPanicLog(row: {
+    id: string;
+    target_anchor_id: string | null;
+    target_pty_id: string | null;
+    target_session_id: string | null;
+    clicked_ms: number;
+    caller: string;
+    result: 'accepted' | 'pty_not_found' | 'no_target';
+  }): void {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO panic_log
+             (id, target_anchor_id, target_pty_id, target_session_id,
+              clicked_ms, caller, result)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          row.id,
+          row.target_anchor_id,
+          row.target_pty_id,
+          row.target_session_id,
+          row.clicked_ms,
+          row.caller,
+          row.result,
+        );
+    } catch {
+      /* table may not exist yet; not fatal */
+    }
+  }
+
+  listRecentPanics(limit: number = 20): PanicLogRow[] {
+    try {
+      const capped = Math.min(200, Math.max(1, limit));
+      return this.db
+        .prepare(`SELECT * FROM panic_log ORDER BY ts DESC LIMIT ?`)
+        .all(capped) as PanicLogRow[];
+    } catch {
+      return [];
     }
   }
 

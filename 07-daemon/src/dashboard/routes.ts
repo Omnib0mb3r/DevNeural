@@ -151,6 +151,12 @@ export async function registerDashboardRoutes(
   const { registerProjectAnchorRoutes } = await import('./projects-routes.js');
   registerProjectAnchorRoutes(app, store.db, log);
 
+  /* Panic button surface (PANIC-BUTTON.md). POST /panic, POST
+   * /projects/:id/interrupt, GET /panic/recent. Bound to the real
+   * ptyInject so a button press lands as \x1b\x1b on the target PTY. */
+  const { registerPanicRoutes } = await import('./panic-routes.js');
+  registerPanicRoutes(app, store.db, ptyInject, log);
+
   /* Background poll that binds a daemon-owned PTY to its claude
    * session_id once the .jsonl file appears. Single global timer; no
    * cost when no PTYs are unbound. */

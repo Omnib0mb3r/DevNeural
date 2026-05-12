@@ -59,6 +59,9 @@ import {
 } from '../lex/brainstorm-store.js';
 import { processAssistantTurn } from '../lex/artifact-parser.js';
 import { buildVoiceSnapshot } from '../lex/snapshot-context.js';
+import { matchesPanicCommand } from './panic-voice.js';
+import { firePanic } from '../dashboard/panic-routes.js';
+import { getStore } from '../lex/brainstorm-store.js';
 import { checkToolGate, notifyLargeFsRead, LARGE_FS_READ_LINE_THRESHOLD } from '../lex/tool-gate.js';
 import { runSessionEndPipeline } from '../lex/session-end-pipeline.js';
 import { appendUtterance as appendSessionAudio } from './audio-bundle.js';
@@ -651,6 +654,27 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * the client to tear down. Notes-mode users who want the dictation
      * summary should press Stop instead — voice command is an
      * immediate close. */
+    /* Hands-free panic: spoken trigger ("panic", "emergency stop",
+     * "kill the worker") fires firePanic against the active project
+     * anchor and skips the normal Lex inject. Audit row written via
+     * firePanic; caller="lex-voice". */
+    if (matchesPanicCommand(result.text)) {
+      try {
+        const r = firePanic(getStore().db, {
+          caller: 'lex-voice',
+          clickedMs: Date.now(),
+          injector: ptyInject,
+        });
+        send({
+          t: 'panic-fired',
+          result: r.result,
+          target_anchor_id: r.target?.id ?? null,
+        });
+      } catch {
+        /* never block the voice loop on audit-row write */
+      }
+      return;
+    }
     if (matchesEndSession(result.text)) {
       send({ t: 'session-end', reason: 'voice-command' });
       /* Run ingest + summary + RAG embed before the WS close fires.
