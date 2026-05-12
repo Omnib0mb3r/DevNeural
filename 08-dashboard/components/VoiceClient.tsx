@@ -26,6 +26,12 @@ interface VoiceCtxValue {
     | "error";
   enabled: boolean;
   muted: boolean;
+  /* True while the daemon is streaming TTS to us. The mic capture
+   * path is hard-paused for the duration so the speaker's own
+   * playback does not loop back through whisper as the user's next
+   * utterance. The TopBar pill swaps the mic icon to MicOff while
+   * this is true. */
+  micGated: boolean;
   hasLex: boolean;
   toggleEnabled: () => void;
   setMicMuted: (next: boolean) => void;
@@ -357,6 +363,12 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   const playheadRef = useRef<number>(0);
   const speakingRef = useRef<boolean>(false);
   const mutedRef = useRef<boolean>(false);
+  /* Hard mic gate driven by the daemon's tts-start / tts-end events.
+   * Independent of the user-controlled mute toggle: the user can
+   * leave mute=off and still expect zero self-echo into whisper while
+   * Lex is speaking. */
+  const [micGated, setMicGated] = useState<boolean>(false);
+  const micGatedRef = useRef<boolean>(false);
   /* All currently-scheduled TTS sources for the in-flight reply.
    * AudioBufferSourceNode.start() commits the buffer to the audio
    * context's render queue; the only way to silence it is src.stop().
@@ -906,11 +918,41 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
              * configured cooldown window. */
             lastTtsStartAtRef.current = Date.now();
             setStatus("speaking");
+            /* Hard mic gate for the duration of TTS playback. The
+             * speaker's own audio bleeds into the mic (laptop
+             * speakers, AirPods leak, room echo) and used to come
+             * back through whisper as the user's "next utterance",
+             * making Lex talk over herself. Pause silero VAD,
+             * disarm the parallel capture rig, and surface a UI flag
+             * so the TopBar pill can show MicOff during playback.
+             * Resumed on tts-end below. */
+            micGatedRef.current = true;
+            setMicGated(true);
+            captureCapturingRef.current = false;
+            captureBufRef.current = [];
+            try {
+              const v = vadRef.current as { pause?: () => void } | null;
+              v?.pause?.();
+            } catch {
+              /* non-fatal: gate via the onSpeechStart early-return
+               * still applies even if pause() throws. */
+            }
             break;
           }
           case "tts-end":
             speakingRef.current = false;
             setStatus("ready");
+            /* Re-open the mic. Order matters: clear the gate flag
+             * BEFORE restarting VAD so a fast-firing onSpeechStart
+             * does not bounce off a still-true micGatedRef. */
+            micGatedRef.current = false;
+            setMicGated(false);
+            try {
+              const v = vadRef.current as { start?: () => void } | null;
+              v?.start?.();
+            } catch {
+              /* ignore */
+            }
             break;
           case "session-end":
             /* Server-side intent match on the transcript flagged a
@@ -956,6 +998,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           captureProcRef.current = proc;
           proc.onaudioprocess = (e: AudioProcessingEvent) => {
             if (!captureCapturingRef.current) return;
+            /* Drop frames while the TTS gate is active. tts-start
+             * already disarmed captureCapturingRef but a buffer
+             * that landed mid-flip would still push into
+             * captureBufRef without this check. */
+            if (micGatedRef.current) return;
             const f = e.inputBuffer.getChannelData(0);
             const gain = micGainRef.current;
             const i16 = new Int16Array(f.length);
@@ -1033,6 +1080,13 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             onnxWASMBasePath: "/vad/",
             onSpeechStart: () => {
               if (mutedRef.current) return;
+              /* Hard gate: while the daemon is streaming TTS, the
+               * mic must not produce any whisper-bound frames or
+               * fire barge-in. The tts-start / tts-end handlers
+               * pause+resume the VAD itself, but a stray
+               * onSpeechStart that races the pause still lands here
+               * and would otherwise call utterance-start. Drop it. */
+              if (micGatedRef.current) return;
               if (speakingRef.current) {
                 /* Self-echo guard: Lex's own audio bleeds into the mic
                  * (laptop speakers, AirPods leak, etc.) and trips VAD
@@ -1174,6 +1228,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           const proc = pttCtx.createScriptProcessor(4096, 1, 1);
           proc.onaudioprocess = (e) => {
             if (!pttCapturing) return;
+            /* TTS gate also applies to push-to-talk: holding the
+             * talk button while Lex is speaking should not capture
+             * her audio. The user can still barge in by releasing
+             * the button and pressing again after tts-end. */
+            if (micGatedRef.current) return;
             const f = e.inputBuffer.getChannelData(0);
             const gain = micGainRef.current;
             const i16 = new Int16Array(f.length);
@@ -1550,6 +1609,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     status,
     enabled,
     muted,
+    micGated,
     hasLex,
     toggleEnabled,
     setMicMuted,
@@ -1599,11 +1659,22 @@ export function VoiceTopBarPill(): React.ReactElement | null {
                   ? "speaking"
                   : "error";
 
+  /* Mic gated during TTS playback: swap to MicOff with a muted tone
+   * so the user can see at a glance that the speaker's audio is not
+   * being captured back into whisper. Tooltip explains. */
+  const iconName: "Mic" | "MicOff" = v.micGated ? "MicOff" : "Mic";
+  const iconTone = v.micGated ? "text-txt3" : "text-brandSoft";
+  const pillTitle = v.micGated
+    ? "Mic paused while Lex is speaking. Resumes automatically when TTS finishes."
+    : undefined;
   return (
-    <div className="flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline">
-      <Icon name="Mic" className="text-brandSoft" size={12} />
+    <div
+      className="flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline"
+      title={pillTitle}
+    >
+      <Icon name={iconName} className={iconTone} size={12} />
       <span className={`hidden sm:inline text-[11px] font-mono ${tone}`}>
-        {label}
+        {v.micGated ? "muted (tts)" : label}
       </span>
       {v.enabled && (
         <button
