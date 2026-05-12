@@ -347,13 +347,25 @@ export interface FireResult {
   anchor_id: string;
 }
 
+/* Global kill-switch. When DEVNEURAL_SMART_COMPACT_ENABLED=false the
+ * fire path degrades to shadow regardless of the per-anchor counter:
+ * the audit row still lands with action='shadow' and reason carries
+ * the operator-provided cause, but no inject ever runs. */
+export function smartCompactGloballyEnabled(): boolean {
+  const raw = process.env.DEVNEURAL_SMART_COMPACT_ENABLED;
+  if (raw === undefined) return true;
+  return raw !== 'false' && raw !== '0';
+}
+
 export function fireSmartCompact(
   db: IndexDb,
   anchorId: string,
   opts: FireOptions,
 ): FireResult {
   const anchor = db.getProjectSession(anchorId);
-  const shadow = !opts.force && isShadow(db, anchorId);
+  const globallyDisabled = !smartCompactGloballyEnabled();
+  const shadow =
+    globallyDisabled || (!opts.force && isShadow(db, anchorId));
 
   if (shadow) {
     const logId = randomUUID();

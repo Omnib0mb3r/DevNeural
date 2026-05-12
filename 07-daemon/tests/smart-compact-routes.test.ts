@@ -238,6 +238,36 @@ describe('fireSmartCompact', () => {
     expect(row.summary_preview?.length).toBeLessThanOrEqual(280);
   });
 
+  it('global toggle DEVNEURAL_SMART_COMPACT_ENABLED=false degrades fire to shadow (no inject)', () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    const prior = process.env.DEVNEURAL_SMART_COMPACT_ENABLED;
+    process.env.DEVNEURAL_SMART_COMPACT_ENABLED = 'false';
+    try {
+      const injector = vi.fn(() => ({ ok: true as const }));
+      const r = fireSmartCompact(db, 'a', {
+        caller: 'lex',
+        reason: 'window-open',
+        action: 'fire',
+        ctxPct: 60,
+        summary: 'queued payload',
+        injector,
+        /* force=true would normally bypass the per-anchor shadow
+         * counter; the global toggle must still win. */
+        force: true,
+      });
+      expect(r.action).toBe('shadow');
+      expect(r.shadow).toBe(true);
+      expect(injector).not.toHaveBeenCalled();
+      const row = recentSmartCompacts(db)[0]!;
+      expect(row.action).toBe('shadow');
+      expect(row.payload_text).toBe('queued payload');
+    } finally {
+      if (prior === undefined)
+        delete process.env.DEVNEURAL_SMART_COMPACT_ENABLED;
+      else process.env.DEVNEURAL_SMART_COMPACT_ENABLED = prior;
+    }
+  });
+
   it('wrap action persists WRAP_AND_COMMIT_PROMPT as payload_text', () => {
     seedAnchor({ id: 'a', pty: 'pty-A' });
     const r = fireSmartCompact(db, 'a', {
