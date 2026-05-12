@@ -207,7 +207,7 @@ export default function LexPage() {
           <div className="flex items-center gap-3">
             <Icon name="Sparkles" className="text-brandSoft" size={22} />
             <h1 className="font-display text-2xl font-emphasized">
-              Brainstorm with Lex
+              Lex
             </h1>
           </div>
           <div className="flex items-center gap-2">

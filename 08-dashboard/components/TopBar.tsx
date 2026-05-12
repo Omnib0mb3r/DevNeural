@@ -26,7 +26,7 @@ const TABS = [
   { href: "/reminders",   label: "Reminders",      icon: "BellRing" as const },
   { href: "/system",      label: "System",         icon: "Cpu" as const },
   { href: "/orb",         label: "Neural network", icon: "Brain" as const },
-  { href: "/lex",         label: "Lex chat",       icon: "Bot" as const },
+  { href: "/lex",         label: "Lex",            icon: "Bot" as const },
 ];
 
 /* TopBar previously had a non-functioning notifications icon, settings
