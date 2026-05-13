@@ -381,26 +381,44 @@ async function handleMessage(message: BridgeMessage): Promise<void> {
       }`,
     );
     terminal.show(true);
-    // VS Code's sendText(_, true) appends '\n', but the Claude Code TUI on
-    // Windows wants '\r' to commit input. Without an explicit '\r' the
-    // text lands in the prompt buffer and waits for the user to hit
-    // Enter manually. Send text with no auto-newline; only append the
-    // '\r' when the message wants to auto-commit.
-    //
-    // Small delay between the paste and the '\r' so VS Code's
-    // bracketed-paste-mode terminator (\e[201~) is fully delivered to
-    // the TUI before the carriage return arrives. Without this, the
-    // '\r' sometimes lands inside the paste envelope and CC treats it
-    // as part of the pasted text instead of as Enter — leaving the
-    // user staring at an unsubmitted prompt.
-    terminal.sendText(message.text, false);
+    /* Bracketed-paste wrap for any multi-line or long payload.
+     * VS Code's terminal.sendText writes raw to the PTY without the
+     * bracketed-paste envelope that the integrated paste action (Ctrl+V)
+     * supplies, so every literal '\n' in the payload was getting read
+     * by Claude Code's TUI as "submit this prompt now." Net effect:
+     * a multi-line cross-session inject landed as just its first line.
+     * CSI 2004 / xterm bracketed paste (\x1b[200~ ... \x1b[201~) marks
+     * the whole payload as one atomic paste; CC's input layer holds
+     * the buffer until the terminator arrives and only then commits.
+     *
+     * Wrap when the payload has at least one newline OR is longer than
+     * the safety threshold (200 chars). Single-line short payloads
+     * (Nav-style pointers, one-liner suggestions) skip the wrap so a
+     * shell that mishandles the escapes does not regress on the
+     * common path. */
+    const wrapped = needsBracketedPaste(message.text)
+      ? `${BRACKETED_PASTE_START}${message.text}${BRACKETED_PASTE_END}`
+      : message.text;
+    terminal.sendText(wrapped, false);
     if (commit) {
+      /* Small delay between the paste body and the carriage return so
+       * the bracketed-paste terminator (\x1b[201~) is fully delivered
+       * to the TUI before the '\r' arrives. Without this, the '\r'
+       * sometimes lands inside the paste envelope and CC treats it
+       * as part of the pasted text instead of as Enter. */
       await new Promise((resolve) => setTimeout(resolve, 80));
       terminal.sendText('\r', false);
     }
   } catch (err) {
     channel.appendLine(`[error] sendText failed: ${(err as Error).message}`);
   }
+}
+
+const BRACKETED_PASTE_START = '\x1b[200~';
+const BRACKETED_PASTE_END = '\x1b[201~';
+const BRACKETED_PASTE_THRESHOLD = 200;
+function needsBracketedPaste(text: string): boolean {
+  return text.includes('\n') || text.length > BRACKETED_PASTE_THRESHOLD;
 }
 
 /* Cache: session_id -> { cwd, resolvedAt }. Bounded TTL so a session
