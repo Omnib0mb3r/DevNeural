@@ -570,6 +570,10 @@ export interface LexAnchor {
   created_ms: number;
   last_activity_ms: number;
   transcript_count: number;
+  /* Phase C: project anchor this brainstorm supervises. NULL when
+   * unbound. Cross-session inject falls back to the bound project's
+   * current_session_id when target_session is omitted. */
+  supervises_project_anchor_id?: string | null;
 }
 export interface LexAnchorTranscriptRef {
   id: number;
@@ -622,7 +626,12 @@ export const openLexAnchor = (id: string) =>
   });
 export const patchLexAnchor = (
   id: string,
-  patch: { title?: string | null; derived_title?: string | null },
+  patch: {
+    title?: string | null;
+    derived_title?: string | null;
+    /* Phase C binding. Pass null to clear. */
+    supervises_project_anchor_id?: string | null;
+  },
 ) =>
   request<{ ok: boolean; anchor?: LexAnchor; error?: string }>(
     `/lex/anchors/${encodeURIComponent(id)}`,

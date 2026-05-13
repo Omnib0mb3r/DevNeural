@@ -234,6 +234,11 @@ export interface LexSessionRow {
   status: 'live' | 'dormant';
   current_pty_id: string | null;
   cwd: string;
+  /* Migration 025: persistent brainstorm-to-project binding. NULL =
+   * unbound (cross-session-inject falls back to explicit
+   * target_session as before). Non-null references project_session.id
+   * so the inject path can resolve a target without judgment. */
+  supervises_project_anchor_id?: string | null;
 }
 
 /* lex_transcript_ref row. Ordered list of CC jsonl pointers per
@@ -1440,8 +1445,8 @@ export class IndexDb {
     this.db
       .prepare(
         `INSERT INTO lex_session
-           (id, created_ms, title, derived_title, status, current_pty_id, cwd)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+           (id, created_ms, title, derived_title, status, current_pty_id, cwd, supervises_project_anchor_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         row.id,
@@ -1451,7 +1456,27 @@ export class IndexDb {
         row.status,
         row.current_pty_id,
         row.cwd,
+        row.supervises_project_anchor_id ?? null,
       );
+  }
+
+  /* Phase C: bind / unbind a brainstorm anchor to a project anchor.
+   * The cross-session-inject fallback resolver consults this column
+   * when Lex omits target_session, so the operator can pick the
+   * project up front and never re-state it inside Lex prompts. Pass
+   * null to clear an existing binding. */
+  setLexSessionSupervises(
+    lexAnchorId: string,
+    projectAnchorId: string | null,
+  ): LexSessionRow | null {
+    this.db
+      .prepare(
+        `UPDATE lex_session
+           SET supervises_project_anchor_id = ?
+         WHERE id = ?`,
+      )
+      .run(projectAnchorId, lexAnchorId);
+    return this.getLexSession(lexAnchorId);
   }
 
   updateLexSession(

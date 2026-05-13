@@ -992,22 +992,51 @@ export async function registerDashboardRoutes(
     }
   });
 
-  /* Rename / mark dormant. Body: { title?, derived_title? } */
+  /* Rename / mark dormant. Body: { title?, derived_title?,
+   *   supervises_project_anchor_id? } */
   app.patch('/lex/anchors/:id', async (req, reply) => {
     const id = (req.params as { id: string }).id;
     const body = (req.body ?? {}) as {
       title?: string | null;
       derived_title?: string | null;
+      supervises_project_anchor_id?: string | null;
     };
     const row = getLexSession(id);
     if (!row) {
       reply.code(404);
       return { ok: false, error: 'anchor not found' };
     }
-    const updated = setLexSessionTitle(id, {
-      title: body.title,
-      derivedTitle: body.derived_title,
-    });
+    /* Validate supervises target before touching anything. Null is
+     * allowed to clear an existing binding; non-null must reference
+     * a real project_session row. */
+    if (body.supervises_project_anchor_id !== undefined) {
+      const target = body.supervises_project_anchor_id;
+      if (target !== null) {
+        if (typeof target !== 'string' || !target) {
+          reply.code(422);
+          return {
+            ok: false,
+            error: 'supervises_project_anchor_id must be a non-empty string or null',
+          };
+        }
+        const exists = store.db.getProjectSession(target);
+        if (!exists) {
+          reply.code(422);
+          return {
+            ok: false,
+            error: `project_session ${target} not found`,
+          };
+        }
+      }
+      store.db.setLexSessionSupervises(id, target);
+    }
+    let updated = store.db.getLexSession(id);
+    if (body.title !== undefined || body.derived_title !== undefined) {
+      updated = setLexSessionTitle(id, {
+        title: body.title,
+        derivedTitle: body.derived_title,
+      });
+    }
     return { ok: true, anchor: updated };
   });
 
@@ -1856,12 +1885,44 @@ export async function registerDashboardRoutes(
         open_projects: openProjects.length,
       },
       open_projects: openProjects,
-      active_brainstorms: brainstorms.map((b) => ({
-        id: b.id,
-        label: b.user_label ?? b.derived_label,
-        mode: b.mode,
-        started_ms: b.started_ms,
-      })),
+      active_brainstorms: brainstorms.map((b) => {
+        /* Phase C: surface the supervised project so Lex's prompt
+         * block templates can render the bound target without
+         * judgment. Best-effort: stays null when no binding or when
+         * the lex_session row hasn't been created yet (legacy
+         * brainstorms predating migration 025). */
+        const lex = store.db.getLexSession(b.id);
+        let supervises:
+          | {
+              project_anchor_id: string;
+              project_slug: string;
+              cwd: string;
+              cc_session_id: string | null;
+              status: 'live' | 'dormant';
+            }
+          | null = null;
+        if (lex?.supervises_project_anchor_id) {
+          const proj = store.db.getProjectSession(
+            lex.supervises_project_anchor_id,
+          );
+          if (proj) {
+            supervises = {
+              project_anchor_id: proj.id,
+              project_slug: proj.project_slug,
+              cwd: proj.cwd,
+              cc_session_id: proj.current_session_id,
+              status: proj.status,
+            };
+          }
+        }
+        return {
+          id: b.id,
+          label: b.user_label ?? b.derived_label,
+          mode: b.mode,
+          started_ms: b.started_ms,
+          supervises,
+        };
+      }),
     };
   });
 
@@ -3591,11 +3652,32 @@ export async function registerDashboardRoutes(
       token?: string;
       text?: string;
       caller_label?: string;
+      caller_brainstorm_id?: string;
       commit?: boolean;
     };
-    if (!body.target_session || typeof body.target_session !== 'string') {
+    /* Phase C fallback: when Lex omits target_session and identifies
+     * itself with caller_brainstorm_id, resolve the bound project
+     * anchor's current_session_id. Explicit target_session always
+     * wins. */
+    let targetSession = body.target_session;
+    if (
+      (!targetSession || typeof targetSession !== 'string') &&
+      typeof body.caller_brainstorm_id === 'string' &&
+      body.caller_brainstorm_id
+    ) {
+      const resolved = resolveSupervisedTargetSession(
+        store.db,
+        body.caller_brainstorm_id,
+      );
+      if (resolved) targetSession = resolved;
+    }
+    if (!targetSession || typeof targetSession !== 'string') {
       reply.code(400);
-      return { ok: false, error: 'target_session required' };
+      return {
+        ok: false,
+        error:
+          'target_session required (or caller_brainstorm_id pointing at a bound + live project anchor)',
+      };
     }
     if (!body.token || typeof body.token !== 'string') {
       reply.code(400);
@@ -3612,7 +3694,7 @@ export async function registerDashboardRoutes(
     const { crossSessionInject } = await import('../lex/cross-session-inject.js');
     const result = crossSessionInject(
       {
-        target_session: body.target_session,
+        target_session: targetSession,
         token: body.token,
         text: body.text,
         caller_label: body.caller_label,
@@ -4210,6 +4292,23 @@ export async function registerDashboardRoutes(
 
   // Use the notification event bus to suppress unused-import lint
   void notificationEvents;
+}
+
+/* Phase C resolver: brainstorm-anchor -> bound project anchor ->
+ * current CC session id. Returns null when the brainstorm has no
+ * binding, the bound project is missing, or the project anchor is
+ * dormant (current_session_id null). Callers fall back to explicit
+ * target_session in that case so a stale binding never silently
+ * drops an inject. Exported so tests can drive it directly. */
+export function resolveSupervisedTargetSession(
+  db: import('../store/index-db.js').IndexDb,
+  brainstormAnchorId: string,
+): string | null {
+  const lex = db.getLexSession(brainstormAnchorId);
+  if (!lex || !lex.supervises_project_anchor_id) return null;
+  const project = db.getProjectSession(lex.supervises_project_anchor_id);
+  if (!project) return null;
+  return project.current_session_id ?? null;
 }
 
 /* Runtime mode selector for the cold-start preload feature.
