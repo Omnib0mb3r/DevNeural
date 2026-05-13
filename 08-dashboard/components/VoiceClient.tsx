@@ -1233,6 +1233,34 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           try {
             const ort: any = await import("onnxruntime-web");
             ort.env.wasm.wasmPaths = "/vad/";
+            /* Pin the lightest WASM variant up front (2026-05-13 OOM
+             * fix). Without this, ORT probes the threaded + JSEP
+             * builds first. On a tab that has no cross-origin
+             * isolation (no COOP/COEP headers) the threaded init
+             * fails because SharedArrayBuffer is unavailable, the
+             * JSEP init fails because WebGPU isn't wired, and ORT
+             * cascades into a degraded WASM build whose heap config
+             * is the smallest of the lot. The previous failure
+             * surfaced as `no available backend found. ERR: [wasm]
+             * RangeError: Out of memory, [cpu] Error: previous call
+             * to 'initWasm()' failed.` because every backend after
+             * the first OOM inherited the broken init state.
+             *
+             * Single-thread + SIMD + no proxy is the configuration
+             * silero-vad ships against; ORT picks ort-wasm-simd.mjs
+             * out of /vad/ and skips every other variant. The model
+             * is tiny enough that single-threaded inference keeps
+             * up with 16 kHz mic frames on every device that runs
+             * the dashboard today. */
+            try {
+              ort.env.wasm.numThreads = 1;
+              ort.env.wasm.simd = true;
+              ort.env.wasm.proxy = false;
+            } catch {
+              /* env shape varies across ORT minors; pinning is best
+               * effort and the default path still loads if it
+               * fails. */
+            }
           } catch {
             /* fallback: vad-web default cdn */
           }
@@ -1759,7 +1787,29 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       )}
       {(lastTurn || errMsg) && (
         <div className="px-5 py-3 flex items-center gap-3 text-xs">
-          {errMsg && <div className="text-err flex-1 min-w-0">{errMsg}</div>}
+          {errMsg && (
+            <div className="text-err flex-1 min-w-0 flex items-center gap-2">
+              <span className="min-w-0 truncate">{errMsg}</span>
+              {/* 2026-05-13 retry button. WASM OOMs inside ORT are
+               * almost always transient: the heap exhausted because
+               * the tab held a previous VAD module's pages. A full
+               * page reload drops every WASM Memory and lets the
+               * pinned single-thread build come up clean. We don't
+               * try a hot retry (re-importing ORT in the same tab)
+               * because ORT memoises the broken module across
+               * import cycles, so a second MicVAD.new in this tab
+               * lands on the same dead state. */}
+              <button
+                type="button"
+                data-testid="voice-error-retry"
+                onClick={() => window.location.reload()}
+                className="text-nano px-2 py-1 rounded-pill bg-surface2 hairline ring-1 ring-border1 text-txt2 hover:bg-surface3"
+                title="Reload the page to drop any leftover WASM memory and retry mic init."
+              >
+                retry
+              </button>
+            </div>
+          )}
           {lastTurn && (
             <div className="ml-auto flex items-center gap-2">
               <span className="text-nano text-txt3 font-mono">
