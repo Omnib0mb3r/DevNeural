@@ -24,6 +24,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { execFile } from 'node:child_process';
 import { writePresenceFiles, presenceFilename } from './presence.js';
+import { cwdToSlug } from './slug.js';
 
 const channel = vscode.window.createOutputChannel('DevNeural Bridge');
 
@@ -673,8 +674,12 @@ function writePresence(): void {
     now: new Date(),
     ccSessionLookup: (cwd) => {
       /* Best-effort CC session id from the daemon /sessions cache the
-       * mirror loop already maintains. */
-      const slug = cwd.replace(/[\\/:]/g, '-').toLowerCase();
+       * mirror loop already maintains. Route through the shared
+       * cwdToSlug helper rather than hand-rolling the regex here.
+       * A prior inline `cwd.replace(/[:]/g, '-')` lost the slash
+       * escapes on Windows and the lookup quietly missed every time,
+       * leaving cc_session_ids empty in the presence file. */
+      const slug = cwdToSlug(cwd).toLowerCase();
       return daemonActiveSessions.get(slug);
     },
   });
@@ -981,15 +986,6 @@ function writeMirrorStateDebounced(): void {
  * daemon serves /sessions in a few ms. */
 const daemonActiveSessions = new Map<string, string>();
 let daemonSessionsRefreshTimer: NodeJS.Timeout | undefined;
-
-function cwdToSlug(cwd: string): string {
-  /* Match the daemon's project_slug encoding exactly: every backslash,
-   * forward slash, and colon flattens to a hyphen. Case is preserved
-   * here because the slug we cache from /sessions is also lowercased
-   * at insert time, so both sides of the eventual comparison are
-   * lowercase. */
-  return cwd.replace(/[\\/:]/g, '-');
-}
 
 async function refreshDaemonSessions(): Promise<void> {
   try {
