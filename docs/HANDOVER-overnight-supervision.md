@@ -52,13 +52,14 @@ e8a807a feat(daemon): smart-compact orchestration surface
 - **Reminders -> iOS push**: code is in but the real-device end-to-end test isn't done. Push the dashboard, accept the PWA notification prompt on the phone, set a reminder for one minute out, watch for the buzz.
 - **Phase 1 sibling index**: confirm next brainstorm cold-start under "DevNeural Testing" actually shows the sibling index header in the system prompt. Source is the current anchor's prior `lex_transcript_refs`, not other brainstorm rows.
 - **Phase 2 preload**: same cold-start should also include the last-2 prior transcript distillations + last 5 user/assistant pairs from each ref's jsonl, appended after the index.
-- **Distillation backfill scheduler**: backfill module exists with injected generator and clock; an LLM-wiring follow-up has been queued (claude-haiku-4-5 via the daemon's Anthropic SDK client, env-guarded on `ANTHROPIC_API_KEY`). Once wired, confirm null-distillation refs get populated and surface in the next cold-start preload.
+- **Distillation backfill scheduler**: backfill module is bound to a daemon-side scheduler that ticks every 10 minutes (first fire after a 30s boot grace). Generator is `createLlmDistillationGenerator` which goes through `pickProvider()` and lands on the local ollama provider (BF-4 forbids Anthropic for brainstorm content). The provider's `distillation` role is wired on qwen3:8b alongside the existing ingest / lint / reconcile / selfQuery roles and is surfaced on `/system` under the LLM Provider panel. Prompt asks for 3-4 short lines under 80 words covering headline, last decision, open questions, and any blocker, so cold-start handoff is structured rather than a one-line tease.
+- **Brainstorm-to-project binding**: each brainstorm anchor (`lex_sessions` row) carries a nullable `supervises_project_anchor_id` foreign key into `project_session`. Set at create time via the new-brainstorm modal's project picker, editable later from the brainstorm tile. `voice-snapshot` surfaces the binding in `live_state` so Lex sees its supervised target without having to infer from `open_projects`. The cross-session inject path resolves a missing `target_session` against the bound project's `current_session_id`, so Lex inject calls can omit the target entirely when supervising a single project. Explicit `target_session` in the call still wins. Clearing the column drops Lex back to the legacy judgment-based behavior of choosing from `open_projects`.
 
 ## Open follow-ups worker captured
 
-- LLM provider wiring into the distillation backfill scheduler (above).
+- LLM provider wiring into the distillation backfill scheduler is now live on local ollama / qwen3:8b under the `distillation` role.
 - Per-tile mini-panic buttons deferred from panic-button spec; only add if global button targets wrong session often in practice.
-- Manual "attach session to thread X" affordance for brainstorm threading: deferred since user commits to always labeling sessions. Revisit if labeling discipline slips.
+- Manual "attach session to thread X" affordance is now the brainstorm-to-project binding picker on the new-brainstorm modal and the brainstorm tile edit affordance.
 
 ## Parked items still parked
 
