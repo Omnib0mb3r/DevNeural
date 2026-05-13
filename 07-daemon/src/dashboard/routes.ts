@@ -150,6 +150,7 @@ export async function registerDashboardRoutes(
    * of this file. */
   const { registerProjectAnchorRoutes } = await import('./projects-routes.js');
   registerProjectAnchorRoutes(app, store.db, log);
+  const { decodeBridgeMarker } = await import('./bridge-presence.js');
 
   /* Panic button surface (PANIC-BUTTON.md). POST /panic, POST
    * /projects/:id/interrupt, GET /panic/recent. Bound to the real
@@ -1818,6 +1819,28 @@ export async function registerDashboardRoutes(
     const brainstorms = listBrainstorms({ status: 'active', limit: 20 });
     const ptyInfo = listPtys();
     const env = process.env;
+    /* open_projects mirrors the JSON shape of the voice-snapshot text
+     * block built in lex/snapshot-context.ts. Sourced from project_session
+     * anchors with status='live', which the bridge presence resolver
+     * flips on every tick a fresh presence file lands for the anchor's
+     * cwd. bridge=ok for the single-window case, bridge=N when more than
+     * one VS Code window is reporting presence for the same cwd. */
+    const liveAnchors = store.db.listProjectSessions({
+      status: 'live',
+      limit: 200,
+    });
+    const openProjects = liveAnchors.map((a) => {
+      const decoded = decodeBridgeMarker(a.current_bridge_id);
+      return {
+        anchor_id: a.id,
+        project_slug: a.project_slug,
+        cwd: a.cwd,
+        cc_session_id: a.current_session_id,
+        bridge: decoded.count > 1 ? `bridge=${decoded.count}` : 'bridge=ok',
+        bridge_connections: decoded.count,
+        last_seen_ms: a.last_seen_ms,
+      };
+    });
     return {
       ok: true,
       now_ms: Date.now(),
@@ -1830,7 +1853,9 @@ export async function registerDashboardRoutes(
         active_sessions: sessions.length,
         active_brainstorms: brainstorms.length,
         live_ptys: ptyInfo.filter((p) => !p.exited).length,
+        open_projects: openProjects.length,
       },
+      open_projects: openProjects,
       active_brainstorms: brainstorms.map((b) => ({
         id: b.id,
         label: b.user_label ?? b.derived_label,

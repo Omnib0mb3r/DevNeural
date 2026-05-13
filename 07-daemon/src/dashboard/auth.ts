@@ -204,6 +204,29 @@ function isProtectedApi(url: string): boolean {
   );
 }
 
+/* Hosts that count as the local machine for the purposes of the
+ * /sessions loopback bypass below. IPv4 and IPv6 loopback only.
+ * Fastify reports IPv4-mapped IPv6 as `::ffff:127.0.0.1` so that
+ * shape needs to round-trip too. */
+const LOOPBACK_HOSTS = new Set([
+  '127.0.0.1',
+  '::1',
+  '::ffff:127.0.0.1',
+]);
+
+function isLoopbackRequest(req: FastifyRequest): boolean {
+  const ip = req.ip ?? '';
+  if (LOOPBACK_HOSTS.has(ip)) return true;
+  /* Fastify under Node 22+ occasionally surfaces the socket address
+   * as a hostname rather than the numeric ip; fall through to the
+   * socket itself when req.ip is empty or non-loopback. */
+  const socket = (req as FastifyRequest & {
+    socket?: { remoteAddress?: string | null };
+  }).socket;
+  const sockAddr = socket?.remoteAddress ?? '';
+  return LOOPBACK_HOSTS.has(sockAddr);
+}
+
 export function authMiddleware(
   req: FastifyRequest,
   reply: FastifyReply,
@@ -228,6 +251,27 @@ export function authMiddleware(
 
   // First-run: no PIN set, dashboard hasn't been initialized → allow.
   if (!isPinSet()) {
+    done();
+    return;
+  }
+
+  /* Loopback bypass for the read-only /sessions feed. The bridge
+   * extension polls /sessions on a short interval from the same host
+   * to drive its cwd -> cc_session_id lookup; without this exception
+   * the bridge can never populate cc_session_ids in the presence
+   * file and every project_session anchor stays dormant. Scope is
+   * narrow on purpose: GET /sessions and its subpaths only, and only
+   * when the request actually originated from 127.0.0.1 / ::1.
+   * Other protected APIs (notifications, projects, push, etc.) still
+   * require the dn_session cookie. See FUTURE-SECURITY-CONCERNS.md
+   * for the residual risk: any local process on the host can now
+   * enumerate active CC sessions without the dashboard PIN. */
+  const path = url.split('?')[0] ?? '/';
+  const isSessionsGet =
+    req.method === 'GET' &&
+    (path === '/sessions' || path.startsWith('/sessions/') ||
+      path.startsWith('/sessions?'));
+  if (isSessionsGet && isLoopbackRequest(req)) {
     done();
     return;
   }

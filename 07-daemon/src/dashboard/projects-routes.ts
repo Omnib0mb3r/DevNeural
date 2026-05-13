@@ -310,13 +310,13 @@ export function registerProjectAnchorRoutes(
     return { ok: true, tiles: listProjectAnchorTiles(db) };
   });
 
-  app.get('/projects', async (req) => {
-    const q = (req.query ?? {}) as { status?: string; limit?: string };
-    const status =
-      q.status === 'live' || q.status === 'dormant' ? q.status : undefined;
-    const limit = q.limit ? Math.min(500, Math.max(1, Number(q.limit))) : 200;
-    return { ok: true, projects: listProjectAnchors(db, { status, limit }) };
-  });
+  /* GET /projects (bare list) collides with the legacy registry-backed
+   * route in daemon.ts; fastify rejects duplicate route registrations and
+   * the daemon crashes on boot. The legacy shape is the one the dashboard
+   * already consumes via daemon-client.projects(); the anchor list here
+   * had no source-level callers as of 2026-05-13. Keep the per-anchor
+   * routes (/:id, /:id/open, etc.) which the dashboard does need. */
+  // app.get('/projects', async (req) => { ...listProjectAnchors... });
 
   app.get('/projects/:id', async (req, reply) => {
     const id = (req.params as { id: string }).id;
