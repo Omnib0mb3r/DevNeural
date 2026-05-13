@@ -3658,7 +3658,9 @@ export async function registerDashboardRoutes(
     /* Phase C fallback: when Lex omits target_session and identifies
      * itself with caller_brainstorm_id, resolve the bound project
      * anchor's current_session_id. Explicit target_session always
-     * wins. */
+     * wins. A bound-but-dormant project surfaces as 422 with a
+     * structured reason so Lex can queue and tell the user "parked,
+     * worker closed" rather than silently drop the inject. */
     let targetSession = body.target_session;
     if (
       (!targetSession || typeof targetSession !== 'string') &&
@@ -3669,7 +3671,29 @@ export async function registerDashboardRoutes(
         store.db,
         body.caller_brainstorm_id,
       );
-      if (resolved) targetSession = resolved;
+      if (resolved.reason === 'bound-live' && resolved.target_session) {
+        targetSession = resolved.target_session;
+      } else if (resolved.reason === 'bound-project-dormant') {
+        reply.code(422);
+        return {
+          ok: false,
+          error: 'bound project worker is closed; queue for next live session',
+          reason: resolved.reason,
+          project_anchor_id: resolved.project_anchor_id,
+        };
+      } else if (resolved.reason === 'bound-project-missing') {
+        reply.code(422);
+        return {
+          ok: false,
+          error: 'bound project anchor was deleted; rebind the brainstorm',
+          reason: resolved.reason,
+          project_anchor_id: resolved.project_anchor_id,
+        };
+      }
+      /* 'unbound' / 'no-such-brainstorm' fall through to the
+       * target_session-required 400 below so the legacy path
+       * (explicit target_session, no binding configured) stays
+       * intact. */
     }
     if (!targetSession || typeof targetSession !== 'string') {
       reply.code(400);
@@ -4295,20 +4319,70 @@ export async function registerDashboardRoutes(
 }
 
 /* Phase C resolver: brainstorm-anchor -> bound project anchor ->
- * current CC session id. Returns null when the brainstorm has no
- * binding, the bound project is missing, or the project anchor is
- * dormant (current_session_id null). Callers fall back to explicit
- * target_session in that case so a stale binding never silently
- * drops an inject. Exported so tests can drive it directly. */
+ * current CC session id. Structured result so the inject route can
+ * tell apart "unbound, fall through to explicit target_session" from
+ * "bound but the project's worker is closed, surface as 422 so Lex
+ * can queue + tell the user". Exported so tests can drive it
+ * directly. */
+export type ResolveSupervisedReason =
+  | 'unbound'
+  | 'bound-project-missing'
+  | 'bound-project-dormant'
+  | 'bound-live'
+  | 'no-such-brainstorm';
+
+export interface ResolveSupervisedResult {
+  ok: true;
+  target_session: string | null;
+  reason: ResolveSupervisedReason;
+  project_anchor_id: string | null;
+}
+
 export function resolveSupervisedTargetSession(
   db: import('../store/index-db.js').IndexDb,
   brainstormAnchorId: string,
-): string | null {
+): ResolveSupervisedResult {
   const lex = db.getLexSession(brainstormAnchorId);
-  if (!lex || !lex.supervises_project_anchor_id) return null;
-  const project = db.getProjectSession(lex.supervises_project_anchor_id);
-  if (!project) return null;
-  return project.current_session_id ?? null;
+  if (!lex) {
+    return {
+      ok: true,
+      target_session: null,
+      reason: 'no-such-brainstorm',
+      project_anchor_id: null,
+    };
+  }
+  const projectId = lex.supervises_project_anchor_id ?? null;
+  if (!projectId) {
+    return {
+      ok: true,
+      target_session: null,
+      reason: 'unbound',
+      project_anchor_id: null,
+    };
+  }
+  const project = db.getProjectSession(projectId);
+  if (!project) {
+    return {
+      ok: true,
+      target_session: null,
+      reason: 'bound-project-missing',
+      project_anchor_id: projectId,
+    };
+  }
+  if (!project.current_session_id) {
+    return {
+      ok: true,
+      target_session: null,
+      reason: 'bound-project-dormant',
+      project_anchor_id: projectId,
+    };
+  }
+  return {
+    ok: true,
+    target_session: project.current_session_id,
+    reason: 'bound-live',
+    project_anchor_id: projectId,
+  };
 }
 
 /* Runtime mode selector for the cold-start preload feature.

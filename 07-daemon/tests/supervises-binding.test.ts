@@ -101,21 +101,51 @@ describe('resolveSupervisedTargetSession', () => {
   it('returns the bound project current_session_id when both rows exist + live', () => {
     insertProject('proj-A', 'devneural', 'cc-A-live');
     insertLex('lex-bound', 'proj-A');
-    expect(resolveSupervisedTargetSession(db, 'lex-bound')).toBe('cc-A-live');
+    const r = resolveSupervisedTargetSession(db, 'lex-bound');
+    expect(r).toEqual({
+      ok: true,
+      target_session: 'cc-A-live',
+      reason: 'bound-live',
+      project_anchor_id: 'proj-A',
+    });
   });
 
-  it('returns null when the brainstorm anchor has no binding', () => {
+  it('reports reason=unbound when the brainstorm anchor has no binding', () => {
     insertLex('lex-unbound', null);
-    expect(resolveSupervisedTargetSession(db, 'lex-unbound')).toBeNull();
+    const r = resolveSupervisedTargetSession(db, 'lex-unbound');
+    expect(r.target_session).toBeNull();
+    expect(r.reason).toBe('unbound');
+    expect(r.project_anchor_id).toBeNull();
   });
 
-  it('returns null when the bound project anchor has no current session (dormant)', () => {
+  it('reports reason=bound-project-dormant when the bound project has null current_session_id', () => {
     insertProject('proj-dormant', 'devneural-2', null, 'dormant');
     insertLex('lex-stale', 'proj-dormant');
-    expect(resolveSupervisedTargetSession(db, 'lex-stale')).toBeNull();
+    const r = resolveSupervisedTargetSession(db, 'lex-stale');
+    expect(r.target_session).toBeNull();
+    expect(r.reason).toBe('bound-project-dormant');
+    expect(r.project_anchor_id).toBe('proj-dormant');
   });
 
-  it('returns null for a brainstorm anchor that does not exist', () => {
-    expect(resolveSupervisedTargetSession(db, 'ghost-id')).toBeNull();
+  it('reports reason=no-such-brainstorm for an unknown brainstorm id', () => {
+    const r = resolveSupervisedTargetSession(db, 'ghost-id');
+    expect(r.reason).toBe('no-such-brainstorm');
+    expect(r.target_session).toBeNull();
+  });
+
+  it('migration 025 ON DELETE SET NULL clears the binding on project delete', () => {
+    insertProject('proj-temp', 'devneural-3', 'cc-temp');
+    insertLex('lex-orphan', 'proj-temp');
+    expect(
+      db.getLexSession('lex-orphan')?.supervises_project_anchor_id,
+    ).toBe('proj-temp');
+    db.deleteProjectSession('proj-temp');
+    /* FK cascade nulled the column so the resolver lands on
+     * reason=unbound rather than leaving a stale pointer dangling. */
+    expect(
+      db.getLexSession('lex-orphan')?.supervises_project_anchor_id,
+    ).toBeFalsy();
+    const r = resolveSupervisedTargetSession(db, 'lex-orphan');
+    expect(r.reason).toBe('unbound');
   });
 });
