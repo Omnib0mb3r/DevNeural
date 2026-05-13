@@ -16,7 +16,10 @@ import { runMigrations } from '../src/db/migrate.js';
 import {
   evaluateSmartCompact,
   fireSmartCompact,
+  parseSmartCompactValue,
   recentSmartCompacts,
+  smartCompactMode,
+  SMART_COMPACT_CONFIG_KEY,
 } from '../src/dashboard/smart-compact-routes.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -288,5 +291,107 @@ describe('fireSmartCompact', () => {
     expect(recentSmartCompacts(db)[0]!.payload_text).toMatch(
       /Wrap your current work/,
     );
+  });
+});
+
+describe('smart-compact three-state runtime toggle', () => {
+  it('parseSmartCompactValue maps legacy + canonical spellings', () => {
+    expect(parseSmartCompactValue('off')).toBe('off');
+    expect(parseSmartCompactValue('false')).toBe('off');
+    expect(parseSmartCompactValue('0')).toBe('off');
+    expect(parseSmartCompactValue('shadow')).toBe('shadow');
+    expect(parseSmartCompactValue('live')).toBe('live');
+    expect(parseSmartCompactValue('on')).toBe('live');
+    expect(parseSmartCompactValue('true')).toBe('live');
+    expect(parseSmartCompactValue('1')).toBe('live');
+    expect(parseSmartCompactValue('')).toBeNull();
+    expect(parseSmartCompactValue('garbage')).toBeNull();
+    expect(parseSmartCompactValue(undefined)).toBeNull();
+    expect(parseSmartCompactValue(null)).toBeNull();
+  });
+
+  it('resolution order: runtime_config wins over env; env fills in when runtime is unset', () => {
+    /* Top of the file already sets env=true so smartCompactMode
+     * returns 'live' before any runtime_config write. */
+    expect(smartCompactMode(db)).toBe('live');
+    /* runtime override flips it. */
+    db.setRuntimeConfig(SMART_COMPACT_CONFIG_KEY, 'shadow', 'test');
+    expect(smartCompactMode(db)).toBe('shadow');
+    db.setRuntimeConfig(SMART_COMPACT_CONFIG_KEY, 'off', 'test');
+    expect(smartCompactMode(db)).toBe('off');
+    db.setRuntimeConfig(SMART_COMPACT_CONFIG_KEY, 'live', 'test');
+    expect(smartCompactMode(db)).toBe('live');
+  });
+
+  it('default falls through to shadow when both runtime and env are unset', () => {
+    const prior = process.env.DEVNEURAL_SMART_COMPACT_ENABLED;
+    delete process.env.DEVNEURAL_SMART_COMPACT_ENABLED;
+    try {
+      /* runtime_config is empty in this fresh DB. */
+      expect(smartCompactMode(db)).toBe('shadow');
+    } finally {
+      if (prior === undefined)
+        delete process.env.DEVNEURAL_SMART_COMPACT_ENABLED;
+      else process.env.DEVNEURAL_SMART_COMPACT_ENABLED = prior;
+    }
+  });
+
+  it("mode='off' short-circuits fire to noop without writing a log row", () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    db.setRuntimeConfig(SMART_COMPACT_CONFIG_KEY, 'off', 'test');
+    const injector = vi.fn(() => ({ ok: true as const }));
+    const r = fireSmartCompact(db, 'a', {
+      caller: 'lex',
+      reason: 'window-open',
+      action: 'fire',
+      ctxPct: 60,
+      summary: 'dropped silently',
+      injector,
+      /* force=true MUST NOT override off — off is supposed to be
+       * inert. */
+      force: true,
+    });
+    expect(r.action).toBe('shadow');
+    expect(r.log_id).toBe('');
+    expect(injector).not.toHaveBeenCalled();
+    /* No log row was inserted. */
+    expect(recentSmartCompacts(db).length).toBe(0);
+  });
+
+  it("mode='shadow' logs a shadow row + skips inject even with force", () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    db.setRuntimeConfig(SMART_COMPACT_CONFIG_KEY, 'shadow', 'test');
+    const injector = vi.fn(() => ({ ok: true as const }));
+    const r = fireSmartCompact(db, 'a', {
+      caller: 'lex',
+      reason: 'window-open',
+      action: 'fire',
+      ctxPct: 60,
+      summary: 'pending payload',
+      injector,
+      force: true,
+    });
+    expect(r.action).toBe('shadow');
+    expect(injector).not.toHaveBeenCalled();
+    const row = recentSmartCompacts(db)[0]!;
+    expect(row.action).toBe('shadow');
+    expect(row.payload_text).toBe('pending payload');
+  });
+
+  it("mode='live' injects and logs fire when the per-anchor shadow gate is cleared", () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    db.setRuntimeConfig(SMART_COMPACT_CONFIG_KEY, 'live', 'test');
+    const injector = vi.fn(() => ({ ok: true as const }));
+    const r = fireSmartCompact(db, 'a', {
+      caller: 'lex',
+      reason: 'window-open',
+      action: 'fire',
+      ctxPct: 60,
+      summary: 'real payload',
+      injector,
+    });
+    expect(r.action).toBe('fire');
+    /* /clear + summary injects on the resolved pty. */
+    expect(injector).toHaveBeenCalled();
   });
 });

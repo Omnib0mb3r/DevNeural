@@ -4,6 +4,7 @@ import { LintFindingsPanel } from "@/components/LintFindingsPanel";
 import { PauseModeToggle } from "@/components/PauseModeToggle";
 import { PanicAuditPanel } from "@/components/PanicAuditPanel";
 import { SmartCompactAuditPanel } from "@/components/SmartCompactAuditPanel";
+import { SmartCompactPanel } from "@/components/SmartCompactPanel";
 import { LexColdStartPreloadPanel } from "@/components/LexColdStartPreloadPanel";
 
 export default function SystemPage() {
@@ -15,6 +16,7 @@ export default function SystemPage() {
         <PauseModeToggle />
         <LexColdStartPreloadPanel />
         <PanicAuditPanel />
+        <SmartCompactPanel />
         <SmartCompactAuditPanel />
         <LintFindingsPanel />
       </div>

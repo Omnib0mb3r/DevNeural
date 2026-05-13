@@ -347,17 +347,69 @@ export interface FireResult {
   anchor_id: string;
 }
 
-/* Global kill-switch. Default is FALSE: smart-compact ships shadow-
- * only at launch so the operator can observe every intended fire in
- * the audit log before opting the live inject in via
- * DEVNEURAL_SMART_COMPACT_ENABLED=true (or 1). Any other value keeps
- * the kill-switch on. When off, the fire path degrades to a shadow
- * row even if force=true; no PTY inject ever runs. */
-export function smartCompactGloballyEnabled(): boolean {
-  const raw = process.env.DEVNEURAL_SMART_COMPACT_ENABLED;
-  if (raw === undefined) return false;
-  return raw === 'true' || raw === '1';
+/* Three-state global kill-switch.
+ *
+ * Resolution order:
+ *   1. runtime_config.smart_compact_mode   (dashboard toggle, hot)
+ *   2. DEVNEURAL_SMART_COMPACT_ENABLED env var (initial-default
+ *      fallback only; once runtime_config is set the env stops
+ *      mattering until it's cleared)
+ *   3. default = 'shadow'
+ *
+ * Modes:
+ *   off    — fireSmartCompact short-circuits to action='noop'. No
+ *            audit row, no PTY inject. Smart compact entirely inert
+ *            for the host. Useful when a misconfigured threshold or
+ *            a runaway evaluator is spamming /clear and the
+ *            operator needs to drop the system without bouncing the
+ *            daemon.
+ *   shadow — shadow audit rows always; PTY inject never runs. The
+ *            old default behaviour when smartCompactGloballyEnabled
+ *            returned false. Used to validate trigger conditions on
+ *            a new anchor before opting it in.
+ *   live   — per-anchor isShadow() decides. Anchor in shadow mode →
+ *            shadow row, no inject. Otherwise inject + fire/wrap
+ *            row.
+ *
+ * Back-compat: env truthy spellings ('true', '1', 'on', 'live') map
+ * to 'live'; falsey spellings ('false', '0', 'off') map to 'off';
+ * 'shadow' maps through. Unknown / unset env stays at default. */
+const SMART_COMPACT_CONFIG_KEY = 'smart_compact_mode';
+export type SmartCompactMode = 'off' | 'shadow' | 'live';
+
+export function parseSmartCompactValue(
+  raw: string | null | undefined,
+): SmartCompactMode | null {
+  if (raw === null || raw === undefined) return null;
+  const v = raw.trim().toLowerCase();
+  if (v === '') return null;
+  if (v === 'off' || v === 'false' || v === '0') return 'off';
+  if (v === 'shadow') return 'shadow';
+  if (v === 'live' || v === 'on' || v === 'true' || v === '1') return 'live';
+  return null;
 }
+
+export function smartCompactMode(db: IndexDb): SmartCompactMode {
+  const fromRuntime = parseSmartCompactValue(
+    db.getRuntimeConfig(SMART_COMPACT_CONFIG_KEY),
+  );
+  if (fromRuntime) return fromRuntime;
+  const fromEnv = parseSmartCompactValue(
+    process.env.DEVNEURAL_SMART_COMPACT_ENABLED,
+  );
+  if (fromEnv) return fromEnv;
+  return 'shadow';
+}
+
+/* Compat shim. Callers that historically checked the env-driven
+ * boolean kill-switch now read through the three-state resolver and
+ * treat 'live' as enabled. Kept as a function so future callers can
+ * still grep for the same name. */
+export function smartCompactGloballyEnabled(db: IndexDb): boolean {
+  return smartCompactMode(db) === 'live';
+}
+
+export { SMART_COMPACT_CONFIG_KEY };
 
 export function fireSmartCompact(
   db: IndexDb,
@@ -365,7 +417,23 @@ export function fireSmartCompact(
   opts: FireOptions,
 ): FireResult {
   const anchor = db.getProjectSession(anchorId);
-  const globallyDisabled = !smartCompactGloballyEnabled();
+  const mode = smartCompactMode(db);
+
+  /* 'off' short-circuits before we touch the audit log so the
+   * operator can drop the system cold without a row landing on every
+   * evaluate-driven fire request. force=true does NOT override this:
+   * the off state is supposed to be inert. */
+  if (mode === 'off') {
+    return {
+      ok: true,
+      action: 'shadow',
+      shadow: true,
+      log_id: '',
+      anchor_id: anchorId,
+    };
+  }
+
+  const globallyDisabled = mode !== 'live';
   const shadow =
     globallyDisabled || (!opts.force && isShadow(db, anchorId));
 
@@ -500,5 +568,51 @@ export function registerSmartCompactRoutes(
     const q = (req.query ?? {}) as { limit?: string };
     const limit = q.limit ? Math.min(200, Math.max(1, Number(q.limit))) : 20;
     return { ok: true, rows: recentSmartCompacts(db, limit) };
+  });
+
+  /* GET + POST /lex/smart-compact/toggle
+   *
+   * Three-state runtime kill-switch backing fireSmartCompact. Reads
+   * + writes runtime_config so the flip takes effect on the next
+   * fire request without a daemon restart. Mirrors the shape of
+   * /lex/cold-start-preload/toggle so the dashboard panel can be a
+   * near-clone.
+   *
+   * GET response:
+   *   { ok, mode, runtime_value, env_value, default_mode } */
+  app.get('/lex/smart-compact/toggle', async () => {
+    const runtimeValue = db.getRuntimeConfig(SMART_COMPACT_CONFIG_KEY);
+    const envValue = process.env.DEVNEURAL_SMART_COMPACT_ENABLED ?? null;
+    return {
+      ok: true,
+      mode: smartCompactMode(db),
+      runtime_value: runtimeValue,
+      env_value: envValue,
+      default_mode: 'shadow',
+    };
+  });
+
+  app.post('/lex/smart-compact/toggle', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      mode?: string;
+      updated_by?: string;
+    };
+    const next = parseSmartCompactValue(body.mode);
+    if (!next) {
+      reply.code(400);
+      return {
+        ok: false,
+        error: "mode must be 'off' | 'shadow' | 'live'",
+      };
+    }
+    db.setRuntimeConfig(SMART_COMPACT_CONFIG_KEY, next, body.updated_by);
+    log(`[smart-compact] mode -> ${next} by=${body.updated_by ?? 'unknown'}`);
+    return {
+      ok: true,
+      mode: smartCompactMode(db),
+      runtime_value: db.getRuntimeConfig(SMART_COMPACT_CONFIG_KEY),
+      env_value: process.env.DEVNEURAL_SMART_COMPACT_ENABLED ?? null,
+      default_mode: 'shadow',
+    };
   });
 }

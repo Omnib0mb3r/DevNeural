@@ -1524,6 +1524,25 @@ export const recentSmartCompacts = (limit: number = 20) =>
     `/lex/smart-compact/recent?limit=${limit}`,
   );
 
+// ── Smart-compact runtime toggle ────────────────────────────────
+export type SmartCompactMode = "off" | "shadow" | "live";
+
+export interface SmartCompactToggle {
+  ok: boolean;
+  mode: SmartCompactMode;
+  runtime_value: string | null;
+  env_value: string | null;
+  default_mode: SmartCompactMode;
+}
+export const smartCompactToggle = () =>
+  request<SmartCompactToggle>(`/lex/smart-compact/toggle`);
+export const setSmartCompactToggle = (mode: SmartCompactMode) =>
+  request<SmartCompactToggle>(`/lex/smart-compact/toggle`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+
 // ── Lex cold-start preload toggle ───────────────────────────────
 export type ColdStartPreloadMode = "off" | "shadow" | "live";
 

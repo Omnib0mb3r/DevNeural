@@ -155,6 +155,34 @@ rows write to `smart_compact_log` with `action='shadow'` and never
 touch the PTY. After N successful shadow rows, the next fire is live.
 `force=true` on the route bypasses the gate.
 
+### Runtime kill-switch (three-state)
+
+The host-wide kill-switch is a three-state runtime toggle backed
+by `runtime_config.smart_compact_mode`:
+
+- `off` — `fireSmartCompact` short-circuits to `action='noop'` with
+  no row inserted and no PTY inject. `force=true` does NOT override
+  off; off is supposed to be inert. Use this to drop the system
+  cold when a runaway evaluator is spamming `/clear`.
+- `shadow` (default) — every fire becomes a shadow row regardless
+  of per-anchor isShadow gate. Inject never runs. Equivalent to
+  the old `DEVNEURAL_SMART_COMPACT_ENABLED` unset/false behavior.
+- `live` — per-anchor `isShadow(db, anchorId)` decides; otherwise
+  inject + fire/wrap row. Equivalent to the old env=true behavior.
+
+Resolution order in `smartCompactMode(db)`:
+
+1. `runtime_config.smart_compact_mode`
+2. `DEVNEURAL_SMART_COMPACT_ENABLED` env (truthy → live, falsey →
+   off, `shadow` → shadow)
+3. default = `shadow`
+
+The dashboard exposes the toggle at `/system` via
+`SmartCompactPanel` (three-segment selector mirroring
+`LexColdStartPreloadPanel`). Reads + writes go through
+`GET/POST /lex/smart-compact/toggle`; the flip takes effect on the
+next fire request without a daemon restart.
+
 ### Audit columns
 
 `smart_compact_log` rows carry `caller`, `reason`, `action` (fire /
