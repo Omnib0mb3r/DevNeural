@@ -9,6 +9,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Icon } from "./Icon";
 import { LexThumbs } from "./LexThumbs";
 import { listPtys, type PtyEntry } from "@/lib/daemon-client";
+import { onVoiceSettingUpdate } from "@/lib/voice-settings-bus";
 import { emitTranscriptTurn } from "@/lib/transcript-bus";
 
 /* Voice control surface exposed to UI islands outside VoiceClient
@@ -256,8 +257,6 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     }, 2500);
     return () => clearTimeout(t);
   }, [enabled, hasLex, ptysQ.isLoading]);
-  const [lastTranscript, setLastTranscript] = useState<string>("");
-  const [lastReply, setLastReply] = useState<string>("");
   /* Rolling turn history surfaced through VoiceCtx. The TranscriptHistory
    * component renders the trailing N turns (default 10) plus a placeholder
    * while status='thinking'. We cap in-memory at 50 to keep React updates
@@ -724,6 +723,69 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       .catch(() => undefined);
   }, []);
 
+  /* Listen for slider updates from VoiceSettingsPanel (/settings route).
+   * The settings panel and the engine are separate components: the
+   * engine is mounted once at app/providers root and persists across
+   * navigation, so its piper-status seed at mount is the only value it
+   * had until this subscription was added. The settings panel emits
+   * after persisting to the daemon; the engine mirrors the value into
+   * its own React state, which the refs (micGainRef, vadSensitivityRef,
+   * etc.) pick up on the next render so the live capture path uses the
+   * fresh value. Gain applies immediately. VAD threshold / redemption
+   * only take effect on the next VAD start (silero ignores live
+   * threshold updates, documented elsewhere). */
+  useEffect(() => {
+    const unsubscribe = onVoiceSettingUpdate((u) => {
+      switch (u.key) {
+        case "mic_gain":
+          if (typeof u.value === "number" && Number.isFinite(u.value)) {
+            setMicGain(
+              Math.max(MIC_GAIN_MIN, Math.min(MIC_GAIN_MAX, u.value)),
+            );
+          }
+          break;
+        case "vad_sensitivity":
+          if (typeof u.value === "number" && Number.isFinite(u.value)) {
+            setVadSensitivity(
+              Math.max(
+                VAD_SENSITIVITY_MIN,
+                Math.min(VAD_SENSITIVITY_MAX, u.value),
+              ),
+            );
+          }
+          break;
+        case "barge_cooldown_ms":
+          if (typeof u.value === "number" && Number.isFinite(u.value)) {
+            setBargeCooldownMs(
+              Math.max(BARGE_MIN, Math.min(BARGE_MAX, u.value)),
+            );
+          }
+          break;
+        case "vad_redemption_ms":
+          if (typeof u.value === "number" && Number.isFinite(u.value)) {
+            setVadRedemptionMs(
+              Math.max(
+                VAD_REDEMPTION_MIN,
+                Math.min(VAD_REDEMPTION_MAX, u.value),
+              ),
+            );
+          }
+          break;
+        case "speed":
+          if (typeof u.value === "number" && Number.isFinite(u.value)) {
+            setSpeed(Math.max(SPEED_MIN, Math.min(SPEED_MAX, u.value)));
+          }
+          break;
+        case "active_voice":
+          if (typeof u.value === "string") {
+            setActiveVoiceState(u.value);
+          }
+          break;
+      }
+    });
+    return unsubscribe;
+  }, []);
+
   /* Persist speed on every change. Debounce server writes so dragging
    * the slider doesn't fire 20 POSTs; localStorage updates immediately
    * because it's free. */
@@ -788,8 +850,15 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   }
 
   useEffect(() => {
-    if (!enabled) {
-      /* Tear-down path. */
+    /* Tear down every resource the effect owns. Idempotent: safe to
+     * call from the !enabled branch, from React's cleanup phase on
+     * deps change (e.g. mode flip from conversation to push-to-talk),
+     * or twice in a row. Centralised so the mode-swap path can't leak
+     * the prior VAD / MediaStream / WS. A previous shape only torn
+     * down on the !enabled flip, which meant switching to PTT mid-
+     * session left the conversation-mode VAD live and firing
+     * transcripts without the talk key held. */
+    function teardown(): void {
       try {
         wsRef.current?.close();
       } catch {
@@ -803,7 +872,6 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         /* ignore */
       }
       vadRef.current = null;
-      /* Tear down the parallel capture rig if it was up. */
       try {
         captureProcRef.current?.disconnect();
       } catch {
@@ -832,6 +900,14 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         finalizeTimeoutRef.current = null;
       }
       awaitingFinalizeRef.current = false;
+      if (utteranceTimerRef.current) {
+        clearInterval(utteranceTimerRef.current);
+        utteranceTimerRef.current = null;
+      }
+      if (utteranceCapRef.current) {
+        clearTimeout(utteranceCapRef.current);
+        utteranceCapRef.current = null;
+      }
       const ctx = audioCtxRef.current;
       if (ctx && ctx.state !== "closed") {
         try {
@@ -841,6 +917,10 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         }
       }
       audioCtxRef.current = null;
+    }
+
+    if (!enabled) {
+      teardown();
       setStatus("idle");
       return;
     }
@@ -908,7 +988,6 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           }
           case "transcript": {
             const text = String(msg.text ?? "").trim();
-            setLastTranscript(text);
             if (text) {
               setStatus("thinking");
               const turnId = `u-${Date.now()}-${Math.random()
@@ -940,7 +1019,6 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             break;
           case "assistant-text": {
             const replyText = String(msg.text ?? "");
-            setLastReply(replyText);
             const tid = typeof msg.turn_id === "string" ? msg.turn_id : "";
             const pv = typeof msg.prompt_version === "string" ? msg.prompt_version : "";
             const bid = typeof msg.brainstorm_id === "string" ? msg.brainstorm_id : null;
@@ -1455,6 +1533,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
 
     return () => {
       cancelled = true;
+      teardown();
     };
   }, [enabled, sessionId, mode]);
 
@@ -1678,28 +1757,21 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           </button>
         </div>
       )}
-      {(lastTranscript || lastReply || errMsg) && (
-        <div className="px-5 py-3 space-y-2 text-xs">
-          {lastTranscript && (
-            <div>
-              <span className="text-nano text-txt3 font-mono mr-2">you:</span>
-              <span className="text-txt2">{lastTranscript}</span>
+      {(lastTurn || errMsg) && (
+        <div className="px-5 py-3 flex items-center gap-3 text-xs">
+          {errMsg && <div className="text-err flex-1 min-w-0">{errMsg}</div>}
+          {lastTurn && (
+            <div className="ml-auto flex items-center gap-2">
+              <span className="text-nano text-txt3 font-mono">
+                rate last reply
+              </span>
+              <LexThumbs
+                turn_id={lastTurn.turn_id}
+                prompt_version={lastTurn.prompt_version}
+                brainstorm_id={lastTurn.brainstorm_id}
+              />
             </div>
           )}
-          {lastReply && (
-            <div className="flex items-start gap-2">
-              <span className="text-nano text-brandSoft font-mono mr-2 pt-0.5">lex:</span>
-              <span className="text-txt1 flex-1 min-w-0">{lastReply}</span>
-              {lastTurn && (
-                <LexThumbs
-                  turn_id={lastTurn.turn_id}
-                  prompt_version={lastTurn.prompt_version}
-                  brainstorm_id={lastTurn.brainstorm_id}
-                />
-              )}
-            </div>
-          )}
-          {errMsg && <div className="text-err">{errMsg}</div>}
         </div>
       )}
       {!enabled && (

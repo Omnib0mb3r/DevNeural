@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { emitVoiceSettingUpdate } from "@/lib/voice-settings-bus";
 
 const BARGE_STORAGE_KEY = "lex-barge-cooldown-ms";
 const BARGE_MIN = 0;
@@ -125,6 +126,7 @@ export function VoiceSettingsPanel() {
     if (typeof window !== "undefined") {
       window.localStorage.setItem(VAD_STORAGE_KEY, String(clamped));
     }
+    emitVoiceSettingUpdate({ key: "vad_sensitivity", value: clamped });
     setSaveStatus("saving");
     if (vadSaveTimerRef.current) clearTimeout(vadSaveTimerRef.current);
     vadSaveTimerRef.current = setTimeout(() => {
@@ -152,6 +154,7 @@ export function VoiceSettingsPanel() {
     if (typeof window !== "undefined") {
       window.localStorage.setItem(MIC_GAIN_STORAGE_KEY, String(clamped));
     }
+    emitVoiceSettingUpdate({ key: "mic_gain", value: clamped });
     setSaveStatus("saving");
     if (micGainSaveTimerRef.current) clearTimeout(micGainSaveTimerRef.current);
     micGainSaveTimerRef.current = setTimeout(() => {
@@ -182,6 +185,7 @@ export function VoiceSettingsPanel() {
     if (typeof window !== "undefined") {
       window.localStorage.setItem(BARGE_STORAGE_KEY, String(clamped));
     }
+    emitVoiceSettingUpdate({ key: "barge_cooldown_ms", value: clamped });
     setSaveStatus("saving");
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
