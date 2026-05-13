@@ -294,6 +294,34 @@ export function TerminalMirror({ sessionId }: Props) {
 
       termRef.current = term;
 
+      /* Sticky auto-scroll: follow the live tail unless the user has
+       * scrolled up to read older output. xterm's built-in pin-to-
+       * bottom heuristic was flaky enough that pasted ANSI bursts
+       * occasionally left the viewport stuck a few lines above the
+       * cursor, so we own the decision explicitly.
+       *
+       * "At bottom" means viewportY is within 1 line of baseY (the
+       * row where the scrollback ends and the live screen begins).
+       * That's the xterm-buffer equivalent of the DOM `scrollTop vs
+       * scrollHeight - clientHeight < 20px` check most chat / dev-
+       * tools surfaces use. */
+      const isAtBottom = (): boolean => {
+        const buf = term.buffer.active;
+        return buf.viewportY >= buf.baseY - 1;
+      };
+      const writeFollowing = (data: string): void => {
+        const wasFollowing = isAtBottom();
+        term.write(data, () => {
+          if (wasFollowing) {
+            try {
+              term.scrollToBottom();
+            } catch {
+              /* ignore */
+            }
+          }
+        });
+      };
+
       /* Match the source terminal's grid by scaling fontSize until
        * xterm's natural cols/rows for the container >= the source's
        * cols/rows, then locking the grid to source dims. This is the
@@ -355,10 +383,15 @@ export function TerminalMirror({ sessionId }: Props) {
           setTimeout(() => correct(depth + 1), 60);
         };
         setTimeout(() => correct(0), 60);
-        try {
-          term.scrollToBottom();
-        } catch {
-          /* ignore */
+        /* Resize pulls the viewport down only if the user was already
+         * tailing the output; otherwise a window resize would yank them
+         * back to the bottom of a session they were reviewing. */
+        if (isAtBottom()) {
+          try {
+            term.scrollToBottom();
+          } catch {
+            /* ignore */
+          }
         }
       };
       void measureCharWidth; // retained for future use; suppress unused
@@ -497,11 +530,11 @@ export function TerminalMirror({ sessionId }: Props) {
               | { t: "s"; c: number; r: number }
               | { t: "d"; d: string };
             if (msg.t === "s") applyDims(msg.c, msg.r);
-            else if (msg.t === "d") term.write(msg.d);
+            else if (msg.t === "d") writeFollowing(msg.d);
           } catch {
             /* tolerate the old plain-text wire format during rolling
              * upgrades: write the chunk verbatim. */
-            term.write(text);
+            writeFollowing(text);
           }
         };
         ws.onclose = () => {

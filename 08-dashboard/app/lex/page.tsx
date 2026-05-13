@@ -271,13 +271,18 @@ export default function LexPage() {
              * full panel UI into this div, and on every other
              * route a floating mini-badge takes over. */}
             <div id="voice-panel-mount" />
-            {/* Reuse the existing TerminalMirror — it expects a session
+            {/* Transcript panel sits above the terminal mirror so the
+             * conversational view is the primary surface; the raw
+             * terminal stream is still reachable underneath for the
+             * cases where the user wants to read the tool calls
+             * directly. */}
+            <LexTranscriptHistoryPanel />
+            {/* Reuse the existing TerminalMirror. It expects a session
              * id and pulls from the same terminal-stream ring the
              * daemon-PTY pumps into post-binding. Before binding we
              * still render the panel; the mirror starts streaming
              * once the session-id appears. */}
             <TerminalMirror sessionId={lexPty?.sessionId ?? ""} />
-            <LexTranscriptHistoryPanel />
             <LexArtifactsPanel
               brainstormId={activeAnchorId}
               active={Boolean(lexPty)}

@@ -136,8 +136,15 @@ export function TopBar({ activeTab }: { activeTab: string }) {
     .filter((n) => !(n.dismissed_scopes ?? []).includes("bell"))
     .slice(0, 8);
 
+  /* Persistently visible across every authenticated route. The
+   * surrounding AppShell pins the bar to the top of a 100dvh
+   * flex-col so it never scrolls with the page; the explicit
+   * `relative z-40` here guarantees the bar stays above any future
+   * full-bleed overlay or terminal mirror that ships with its own
+   * stacking context. Do not gate the <header> on a pathname or a
+   * media query: this is a primary nav surface. */
   return (
-    <header className="flex flex-col">
+    <header className="relative z-40 flex flex-col shrink-0 bg-base">
       <div className="flex items-center h-14 px-3 sm:px-5 hairline-soft gap-2 min-w-0">
         <button
           type="button"

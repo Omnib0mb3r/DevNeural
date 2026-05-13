@@ -9,6 +9,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Icon } from "./Icon";
 import { LexThumbs } from "./LexThumbs";
 import { listPtys, type PtyEntry } from "@/lib/daemon-client";
+import { emitTranscriptTurn } from "@/lib/transcript-bus";
 
 /* Voice control surface exposed to UI islands outside VoiceClient
  * (TopBar mic pill, future status badges). VoiceClient wraps the
@@ -381,6 +382,17 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * Lex is speaking. */
   const [micGated, setMicGated] = useState<boolean>(false);
   const micGatedRef = useRef<boolean>(false);
+  /* True once the server has signalled tts-end for the in-flight reply
+   * but the AudioContext still has scheduled buffers playing. The
+   * server's tts-end fires as soon as piper finishes streaming PCM,
+   * which is typically several seconds before the last buffered chunk
+   * actually leaves the speaker, because the client schedules audio
+   * back-to-back ahead of the playhead. Clearing the mic gate on
+   * tts-end therefore flashed the indicator off mid-sentence. We now
+   * defer the gate-clear until the last AudioBufferSourceNode's
+   * onended fires, gated by this flag so a late chunk that arrives
+   * AFTER tts-end still keeps the indicator lit until it plays out. */
+  const streamFinishedRef = useRef<boolean>(false);
   /* All currently-scheduled TTS sources for the in-flight reply.
    * AudioBufferSourceNode.start() commits the buffer to the audio
    * context's render queue; the only way to silence it is src.stop().
@@ -443,6 +455,38 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       playheadRef.current = audioCtxRef.current.currentTime;
     }
     speakingRef.current = false;
+    /* Barge-in: drop the TTS gate immediately so the new utterance's
+     * onSpeechStart doesn't early-return against a stale micGatedRef.
+     * Do NOT route through finalizePlaybackEnd here: VAD is already
+     * mid-utterance and must not be restarted under it. */
+    micGatedRef.current = false;
+    setMicGated(false);
+    streamFinishedRef.current = false;
+  }
+
+  /* Called when both halves of the playback contract are complete:
+   * the server has signalled tts-end (no more chunks coming) AND every
+   * scheduled AudioBufferSourceNode has fired its onended (no audio
+   * left in the AudioContext queue). Drops the mic gate, restarts the
+   * VAD, and reverts status to "ready" (but only if status is still
+   * "speaking", so a late onended after the user has already started a
+   * new utterance doesn't downgrade a fresh "listening" state. */
+  function finalizePlaybackEnd(): void {
+    if (!streamFinishedRef.current) return;
+    streamFinishedRef.current = false;
+    speakingRef.current = false;
+    setStatus((cur) => (cur === "speaking" ? "ready" : cur));
+    /* Order matters: clear the gate flag BEFORE restarting VAD so a
+     * fast-firing onSpeechStart does not bounce off a still-true
+     * micGatedRef. */
+    micGatedRef.current = false;
+    setMicGated(false);
+    try {
+      const v = vadRef.current as { start?: () => void } | null;
+      v?.start?.();
+    } catch {
+      /* ignore */
+    }
   }
 
   /* Flush the parallel capture buffer to the server as a single
@@ -574,6 +618,14 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     src.onended = () => {
       const idx = activeSourcesRef.current.indexOf(src);
       if (idx >= 0) activeSourcesRef.current.splice(idx, 1);
+      /* Last scheduled buffer just left the speaker AND the server is
+       * done streaming: only now is the mic gate safe to drop. */
+      if (
+        streamFinishedRef.current &&
+        activeSourcesRef.current.length === 0
+      ) {
+        finalizePlaybackEnd();
+      }
     };
   }
 
@@ -859,11 +911,14 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             setLastTranscript(text);
             if (text) {
               setStatus("thinking");
+              const turnId = `u-${Date.now()}-${Math.random()
+                .toString(36)
+                .slice(2, 8)}`;
               setTurns((prev) => {
                 const next = [
                   ...prev,
                   {
-                    id: `u-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                    id: turnId,
                     role: "user" as const,
                     text,
                   },
@@ -872,6 +927,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                   ? next.slice(next.length - TURNS_BUFFER_CAP)
                   : next;
               });
+              /* Push to the transcript bus so the dedicated panel
+               * surfaces the line without waiting on the VoiceCtx
+               * re-render chain. The panel maintains its own list
+               * fed by these events. */
+              emitTranscriptTurn({ id: turnId, role: "user", text });
             } else setStatus("ready");
             break;
           }
@@ -888,12 +948,14 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
               setLastTurn({ turn_id: tid, prompt_version: pv, brainstorm_id: bid });
             }
             if (replyText) {
+              const turnId =
+                tid ||
+                `a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
               setTurns((prev) => {
                 const next = [
                   ...prev,
                   {
-                    id: tid ||
-                      `a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                    id: turnId,
                     role: "assistant" as const,
                     text: replyText,
                   },
@@ -901,6 +963,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                 return next.length > TURNS_BUFFER_CAP
                   ? next.slice(next.length - TURNS_BUFFER_CAP)
                   : next;
+              });
+              emitTranscriptTurn({
+                id: turnId,
+                role: "assistant",
+                text: replyText,
               });
             }
             /* If the user pressed stop in notes mode and we are
@@ -956,6 +1023,10 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             }
             playheadRef.current = ctx?.currentTime ?? 0;
             speakingRef.current = true;
+            /* Fresh reply: reset the server-finished flag so an
+             * onended for THIS reply only finalises after this reply's
+             * own tts-end has landed. */
+            streamFinishedRef.current = false;
             /* Stamp the moment audio actually started flowing so the
              * VAD barge-in handler can swallow self-echo within the
              * configured cooldown window. */
@@ -982,21 +1053,19 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             }
             break;
           }
-          case "tts-end":
-            speakingRef.current = false;
-            setStatus("ready");
-            /* Re-open the mic. Order matters: clear the gate flag
-             * BEFORE restarting VAD so a fast-firing onSpeechStart
-             * does not bounce off a still-true micGatedRef. */
-            micGatedRef.current = false;
-            setMicGated(false);
-            try {
-              const v = vadRef.current as { start?: () => void } | null;
-              v?.start?.();
-            } catch {
-              /* ignore */
+          case "tts-end": {
+            /* Server has flushed the last PCM chunk for this reply.
+             * That can land seconds before the AudioContext has played
+             * the buffered tail (the client schedules audio ahead of
+             * the playhead). Mark the stream finished; the actual gate
+             * drop happens in finalizePlaybackEnd, called either now
+             * (if no buffers remain) or by the last src.onended. */
+            streamFinishedRef.current = true;
+            if (activeSourcesRef.current.length === 0) {
+              finalizePlaybackEnd();
             }
             break;
+          }
           case "session-end":
             /* Server-side intent match on the transcript flagged a
              * spoken end-session command ("end session", "stop voice",
