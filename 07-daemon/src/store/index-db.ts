@@ -149,7 +149,12 @@ export interface CrossSessionInjectionLogRow {
   caller_label: string | null;
   text_preview: string;
   text_length: number;
-  decision: 'accepted' | 'rejected_auth' | 'rejected_allowlist' | 'rejected_pty';
+  decision:
+    | 'accepted'
+    | 'rejected_auth'
+    | 'rejected_allowlist'
+    | 'rejected_pty'
+    | 'shadow';
   reject_reason: string | null;
   brainstorm_id: string | null;
 }
@@ -1945,7 +1950,12 @@ export class IndexDb {
     caller_label?: string | null;
     text_preview: string;
     text_length: number;
-    decision: 'accepted' | 'rejected_auth' | 'rejected_allowlist' | 'rejected_pty';
+    decision:
+      | 'accepted'
+      | 'rejected_auth'
+      | 'rejected_allowlist'
+      | 'rejected_pty'
+      | 'shadow';
     reject_reason?: string | null;
     brainstorm_id?: string | null;
   }): void {
@@ -2080,36 +2090,39 @@ export class IndexDb {
 
   listCrossSessionLogs(opts: {
     target_session?: string;
-    decision?: 'accepted' | 'rejected_auth' | 'rejected_allowlist' | 'rejected_pty';
+    decision?:
+      | 'accepted'
+      | 'rejected_auth'
+      | 'rejected_allowlist'
+      | 'rejected_pty'
+      | 'shadow';
+    caller_label?: string;
     limit?: number;
   } = {}): CrossSessionInjectionLogRow[] {
     try {
       const limit = Math.min(200, Math.max(1, opts.limit ?? 50));
+      const wheres: string[] = [];
+      const params: unknown[] = [];
       if (opts.target_session) {
-        const rows = this.db
-          .prepare(
-            `SELECT * FROM cross_session_injection_log
-             WHERE target_session = ?
-             ORDER BY ts DESC LIMIT ?`,
-          )
-          .all(opts.target_session, limit);
-        return rows as CrossSessionInjectionLogRow[];
+        wheres.push('target_session = ?');
+        params.push(opts.target_session);
       }
       if (opts.decision) {
-        const rows = this.db
-          .prepare(
-            `SELECT * FROM cross_session_injection_log
-             WHERE decision = ?
-             ORDER BY ts DESC LIMIT ?`,
-          )
-          .all(opts.decision, limit);
-        return rows as CrossSessionInjectionLogRow[];
+        wheres.push('decision = ?');
+        params.push(opts.decision);
       }
+      if (opts.caller_label) {
+        wheres.push('caller_label = ?');
+        params.push(opts.caller_label);
+      }
+      const clause = wheres.length > 0 ? `WHERE ${wheres.join(' AND ')}` : '';
+      params.push(limit);
       const rows = this.db
         .prepare(
-          `SELECT * FROM cross_session_injection_log ORDER BY ts DESC LIMIT ?`,
+          `SELECT * FROM cross_session_injection_log ${clause}
+           ORDER BY ts DESC LIMIT ?`,
         )
-        .all(limit);
+        .all(...params);
       return rows as CrossSessionInjectionLogRow[];
     } catch {
       return [];

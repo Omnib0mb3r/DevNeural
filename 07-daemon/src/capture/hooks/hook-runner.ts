@@ -143,15 +143,22 @@ function parsePhase(arg: string | undefined): HookPhase {
  * first turn. Letting Lex reference a prior decision without firing
  * a Read.
  *
- * Feature-flag-gated: DEVNEURAL_LEX_COLD_START_PRELOAD_ENABLED
- *   default: OFF (matches the smart-compact precedent: auto-firing
- *   risky features ship shadow-only until the operator opts in)
- *   ON only when env is explicitly '1' / 'true' / 'on'
+ * Three-state gating mirrors the smart-compact precedent:
+ *   - 'off'    : skip everything; the daemon route is not even hit.
+ *   - 'shadow' : call the route; it computes the block and writes an
+ *                audit row but returns block:'' so this hook prints
+ *                nothing to stdout (no inject).
+ *   - 'live'   : call the route; it returns the real block; hook
+ *                prints to stdout so CC picks it up as
+ *                additionalContext on the first turn.
  *
- * Runtime toggle: the daemon side also consults runtime_config
- * (key 'lex_cold_start_preload_enabled', value 'on'|'off'), edited
- * via the dashboard /system panel. Either gate off = the preload
- * route returns an empty block and this hook stays silent.
+ * The daemon side reads runtime_config first, then this env var,
+ * then defaults to 'shadow'. The hook only needs to decide whether
+ * to hit the route at all; mode mapping for the response shape
+ * happens daemon-side. Explicit env='off' / 'false' / '0' short-
+ * circuits the call entirely; any other value (including unset)
+ * forwards to the daemon so the shadow default still records what
+ * would have happened.
  *
  * Bounded timeout; daemon-down or empty-block paths are silent
  * no-ops so a missing daemon never blocks the session start. */
@@ -165,10 +172,7 @@ async function postColdStartPreload(
   )
     .trim()
     .toLowerCase();
-  /* Default OFF: only explicit truthy values flip the gate on. Any
-   * other value (unset, '', 'false', '0', typos) keeps the hook
-   * silent so an accidental env spill cannot start auto-injecting. */
-  if (flag !== '1' && flag !== 'true' && flag !== 'on') return;
+  if (flag === 'off' || flag === 'false' || flag === '0') return;
   const url = `http://127.0.0.1:${DAEMON_PORT}/lex/cold-start-preload`;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 2000);

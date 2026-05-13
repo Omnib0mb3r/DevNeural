@@ -3671,13 +3671,14 @@ export async function registerDashboardRoutes(
       reply.code(400);
       return { ok: false, error: 'session_id required' };
     }
-    /* Runtime kill-switch consulted before any work. Default OFF
-     * (matches the smart-compact precedent). The dashboard /system
-     * toggle writes runtime_config; the hook also gates on
-     * DEVNEURAL_LEX_COLD_START_PRELOAD_ENABLED, so either off here
-     * is a silent no-op for the SessionStart caller. */
-    if (!coldStartPreloadEnabled(store.db)) {
-      return { ok: true, block: '', reason: 'disabled' };
+    /* Three-state runtime mode: off / shadow / live. Off short-
+     * circuits before any work. Shadow + live still compute the
+     * block so the operator can audit what would have shipped; the
+     * difference is whether the block is returned to the caller and
+     * whether the audit row is decision='shadow' or 'accepted'. */
+    const mode = coldStartPreloadMode(store.db);
+    if (mode === 'off') {
+      return { ok: true, block: '', reason: 'disabled', mode };
     }
     const sessionId = body.session_id;
     const { getBrainstormByClaudeSessionId } = await import(
@@ -3686,11 +3687,22 @@ export async function registerDashboardRoutes(
     const { buildSiblingIndex } = await import('../lex/sibling-index.js');
     const bs = getBrainstormByClaudeSessionId(sessionId);
     if (!bs) {
-      return { ok: true, block: '', reason: 'no-brainstorm-bound' };
+      return {
+        ok: true,
+        block: '',
+        reason: 'no-brainstorm-bound',
+        mode,
+      };
     }
     const label = bs.user_label ?? bs.derived_label ?? null;
     if (!label) {
-      return { ok: true, block: '', reason: 'no-label', brainstorm_id: bs.id };
+      return {
+        ok: true,
+        block: '',
+        reason: 'no-label',
+        brainstorm_id: bs.id,
+        mode,
+      };
     }
     const block = buildSiblingIndex({
       db: store.db,
@@ -3706,13 +3718,13 @@ export async function registerDashboardRoutes(
         reason: 'no-siblings',
         brainstorm_id: bs.id,
         label,
+        mode,
       };
     }
-    /* Best-effort audit row in cross_session_injection_log so the
-     * dashboard's /lex/injection-log surface (and any reviewer
-     * scrolling back through who-said-what) can see when a cold-start
-     * preload fired. Reuses the existing table because adding a
-     * dedicated one for a single audit field would be over-engineering. */
+    /* Audit row: decision tracks the mode so reviewers can filter
+     * /lex/injection-log for 'shadow' to see what the feature WOULD
+     * have done versus 'accepted' for real fires. caller_label
+     * remains 'cold-start-preload' in both states. */
     try {
       const { randomUUID } = await import('node:crypto');
       store.db.insertCrossSessionLog({
@@ -3721,19 +3733,33 @@ export async function registerDashboardRoutes(
         caller_label: 'cold-start-preload',
         text_preview: block.slice(0, 240),
         text_length: block.length,
-        decision: 'accepted',
+        decision: mode === 'live' ? 'accepted' : 'shadow',
         brainstorm_id: bs.id,
       });
     } catch {
       /* audit row is observational; never block the preload response */
     }
     const siblingCount = (block.match(/^- /gm) ?? []).length;
+    if (mode === 'shadow') {
+      return {
+        ok: true,
+        block: '',
+        reason: 'shadow',
+        preview_len: block.length,
+        sibling_count: siblingCount,
+        brainstorm_id: bs.id,
+        label,
+        mode,
+      };
+    }
     return {
       ok: true,
       block,
+      reason: 'live',
       sibling_count: siblingCount,
       brainstorm_id: bs.id,
       label,
+      mode,
     };
   });
 
@@ -3753,36 +3779,42 @@ export async function registerDashboardRoutes(
     const runtimeValue = store.db.getRuntimeConfig(
       COLD_START_PRELOAD_CONFIG_KEY,
     );
-    const envValue = process.env.DEVNEURAL_LEX_COLD_START_PRELOAD_ENABLED ?? null;
+    const envValue =
+      process.env.DEVNEURAL_LEX_COLD_START_PRELOAD_ENABLED ?? null;
     return {
       ok: true,
-      enabled: coldStartPreloadEnabled(store.db),
+      mode: coldStartPreloadMode(store.db),
       runtime_value: runtimeValue,
       env_value: envValue,
-      env_default_off: true,
+      default_mode: 'shadow',
     };
   });
 
   app.post('/lex/cold-start-preload/toggle', async (req, reply) => {
     const body = (req.body ?? {}) as {
-      enabled?: boolean;
+      mode?: string;
       updated_by?: string;
     };
-    if (typeof body.enabled !== 'boolean') {
+    const next = parseColdStartPreloadValue(body.mode);
+    if (!next) {
       reply.code(400);
-      return { ok: false, error: 'enabled (boolean) required' };
+      return {
+        ok: false,
+        error: "mode must be 'off' | 'shadow' | 'live'",
+      };
     }
     store.db.setRuntimeConfig(
       COLD_START_PRELOAD_CONFIG_KEY,
-      body.enabled ? 'on' : 'off',
+      next,
       body.updated_by,
     );
     return {
       ok: true,
-      enabled: coldStartPreloadEnabled(store.db),
+      mode: coldStartPreloadMode(store.db),
       runtime_value: store.db.getRuntimeConfig(COLD_START_PRELOAD_CONFIG_KEY),
-      env_value: process.env.DEVNEURAL_LEX_COLD_START_PRELOAD_ENABLED ?? null,
-      env_default_off: true,
+      env_value:
+        process.env.DEVNEURAL_LEX_COLD_START_PRELOAD_ENABLED ?? null,
+      default_mode: 'shadow',
     };
   });
 
@@ -3790,13 +3822,20 @@ export async function registerDashboardRoutes(
     const q = (req.query ?? {}) as {
       target_session?: string;
       decision?: string;
+      caller_label?: string;
       limit?: string;
     };
     const opts: Parameters<typeof store.db.listCrossSessionLogs>[0] = {};
     if (q.target_session) opts.target_session = q.target_session;
     if (q.decision) {
-      opts.decision = q.decision as 'accepted' | 'rejected_auth' | 'rejected_allowlist' | 'rejected_pty';
+      opts.decision = q.decision as
+        | 'accepted'
+        | 'rejected_auth'
+        | 'rejected_allowlist'
+        | 'rejected_pty'
+        | 'shadow';
     }
+    if (q.caller_label) opts.caller_label = q.caller_label;
     if (q.limit) opts.limit = Number(q.limit);
     return { ok: true, logs: store.db.listCrossSessionLogs(opts) };
   });
@@ -4171,22 +4210,54 @@ export async function registerDashboardRoutes(
   void notificationEvents;
 }
 
-/* Runtime kill-switch for the cold-start preload feature.
+/* Runtime mode selector for the cold-start preload feature.
  *
- * Mirrors the smart-compact precedent: default OFF so an auto-firing
- * inject ships shadow-until-opted-in. The dashboard /system page
- * writes runtime_config.lex_cold_start_preload_enabled to 'on' or
- * 'off'. We accept the legacy 'true' / '1' values as ON for parity
- * with the env-flag spelling; anything else (unset, 'off', 'false',
- * '0', typos) keeps the switch off. */
+ * Mirrors the smart-compact precedent in three states:
+ *   - 'off'    : skip everything; no audit row.
+ *   - 'shadow' : compute the block and write an audit row with
+ *                decision='shadow', but return block:'' so the
+ *                SessionStart hook injects nothing. Lets the
+ *                operator observe what the feature would do before
+ *                flipping it live.
+ *   - 'live'   : compute the block, audit with decision='accepted',
+ *                return block to the caller for stdout injection.
+ *
+ * Source order:
+ *   1. runtime_config.lex_cold_start_preload_enabled   (dashboard toggle)
+ *   2. DEVNEURAL_LEX_COLD_START_PRELOAD_ENABLED env var
+ *   3. default = 'shadow'
+ *
+ * Back-compat: legacy truthy spellings 'on' / 'true' / '1' (from
+ * commit b997f2a) map to 'live'. Legacy falsey spellings 'off' /
+ * 'false' / '0' map to 'off'. Anything unrecognised falls through
+ * to the next source so a typo never silently re-enables live. */
 const COLD_START_PRELOAD_CONFIG_KEY = 'lex_cold_start_preload_enabled';
-function coldStartPreloadEnabled(
-  db: import('../store/index-db.js').IndexDb,
-): boolean {
-  const raw = db.getRuntimeConfig(COLD_START_PRELOAD_CONFIG_KEY);
-  if (raw === null) return false;
+type ColdStartPreloadMode = 'off' | 'shadow' | 'live';
+
+function parseColdStartPreloadValue(
+  raw: string | null | undefined,
+): ColdStartPreloadMode | null {
+  if (raw === null || raw === undefined) return null;
   const v = raw.trim().toLowerCase();
-  return v === 'on' || v === 'true' || v === '1';
+  if (v === '') return null;
+  if (v === 'off' || v === 'false' || v === '0') return 'off';
+  if (v === 'shadow') return 'shadow';
+  if (v === 'live' || v === 'on' || v === 'true' || v === '1') return 'live';
+  return null;
+}
+
+function coldStartPreloadMode(
+  db: import('../store/index-db.js').IndexDb,
+): ColdStartPreloadMode {
+  const fromRuntime = parseColdStartPreloadValue(
+    db.getRuntimeConfig(COLD_START_PRELOAD_CONFIG_KEY),
+  );
+  if (fromRuntime) return fromRuntime;
+  const fromEnv = parseColdStartPreloadValue(
+    process.env.DEVNEURAL_LEX_COLD_START_PRELOAD_ENABLED,
+  );
+  if (fromEnv) return fromEnv;
+  return 'shadow';
 }
 
 /* Decorate a brainstorm row with the audio + cues URLs the dashboard

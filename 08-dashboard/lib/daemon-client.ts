@@ -1495,21 +1495,54 @@ export const recentSmartCompacts = (limit: number = 20) =>
   );
 
 // ── Lex cold-start preload toggle ───────────────────────────────
+export type ColdStartPreloadMode = "off" | "shadow" | "live";
+
 export interface ColdStartPreloadToggle {
   ok: boolean;
-  enabled: boolean;
+  mode: ColdStartPreloadMode;
   runtime_value: string | null;
   env_value: string | null;
-  env_default_off: boolean;
+  default_mode: ColdStartPreloadMode;
 }
 export const coldStartPreloadToggle = () =>
   request<ColdStartPreloadToggle>(`/lex/cold-start-preload/toggle`);
-export const setColdStartPreloadToggle = (enabled: boolean) =>
+export const setColdStartPreloadToggle = (mode: ColdStartPreloadMode) =>
   request<ColdStartPreloadToggle>(`/lex/cold-start-preload/toggle`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ enabled }),
+    body: JSON.stringify({ mode }),
   });
+
+export interface InjectionLogRow {
+  id: string;
+  ts: string;
+  target_session: string;
+  caller_label: string | null;
+  text_preview: string;
+  text_length: number;
+  decision:
+    | "accepted"
+    | "rejected_auth"
+    | "rejected_allowlist"
+    | "rejected_pty"
+    | "shadow";
+  reject_reason: string | null;
+  brainstorm_id: string | null;
+}
+export const injectionLog = (opts: {
+  caller_label?: string;
+  decision?: InjectionLogRow["decision"];
+  limit?: number;
+} = {}) => {
+  const params = new URLSearchParams();
+  if (opts.caller_label) params.set("caller_label", opts.caller_label);
+  if (opts.decision) params.set("decision", opts.decision);
+  if (opts.limit) params.set("limit", String(opts.limit));
+  const qs = params.toString();
+  return request<{ ok: boolean; logs: InjectionLogRow[] }>(
+    `/lex/injection-log${qs ? `?${qs}` : ""}`,
+  );
+};
 
 export const uploadReference = (file: File, opts: { project_id?: string; tags?: string[] } = {}) => {
   const fd = new FormData();
