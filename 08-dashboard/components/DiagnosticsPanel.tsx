@@ -146,6 +146,7 @@ export function DiagnosticsPanel() {
                   <div>lint: {d.llm.models.lint}</div>
                   <div>reconcile: {d.llm.models.reconcile}</div>
                   <div>selfQuery: {d.llm.models.selfQuery}</div>
+                  <div>distillation: {d.llm.models.distillation}</div>
                 </div>
                 {!d.llm.configured && (
                   <div className="text-[11px] font-mono text-warn">

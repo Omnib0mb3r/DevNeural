@@ -33,7 +33,13 @@ export function providerStatus(): {
   name: string;
   configured: boolean;
   hint: string;
-  models: { ingest: string; lint: string; reconcile: string; selfQuery: string };
+  models: {
+    ingest: string;
+    lint: string;
+    reconcile: string;
+    selfQuery: string;
+    distillation: string;
+  };
 } | null {
   const p = pickProvider();
   if (!p) return null;

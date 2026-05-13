@@ -220,7 +220,13 @@ export interface DiagnosticsResponse {
     name: string;
     configured: boolean;
     hint: string;
-    models: { ingest: string; lint: string; reconcile: string; selfQuery: string };
+    models: {
+      ingest: string;
+      lint: string;
+      reconcile: string;
+      selfQuery: string;
+      distillation: string;
+    };
   } | null;
   embedder: {
     model: string;
@@ -436,7 +442,13 @@ export interface KpiStats {
     name: string;
     configured: boolean;
     hint: string;
-    models: { ingest: string; lint: string; reconcile: string; selfQuery: string };
+    models: {
+      ingest: string;
+      lint: string;
+      reconcile: string;
+      selfQuery: string;
+      distillation: string;
+    };
   } | null;
   embedder: {
     warmed_at: string | null;

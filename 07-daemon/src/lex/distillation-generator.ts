@@ -31,7 +31,8 @@ export interface CreateGeneratorOptions {
   /** Cap the bytes of transcript shipped to the provider. Default
    * 3000 to keep prompts cheap on ollama. */
   maxTranscriptBytes?: number;
-  /** Cap the provider's reply tokens. Default 100 ~ 1 sentence. */
+  /** Cap the provider's reply tokens. Default 180 to fit the 3-4 line
+   * cold-start handoff format below. */
   maxTokens?: number;
   /** Cap the chunks pulled per session. Default 50. */
   chunkLimit?: number;
@@ -41,9 +42,13 @@ export interface CreateGeneratorOptions {
 
 const SYSTEM_BLOCK = {
   text:
-    'Summarize the following brainstorm transcript in ONE plain-prose ' +
-    'sentence of at most 20 words. No fences, no JSON, no markdown. ' +
-    'Capture the most concrete thing discussed; skip the rest.',
+    'Summarize the brainstorm transcript for the next Lex session to ' +
+    'pick up where this one left off. Output 3-4 short lines, plain ' +
+    'prose, no fences or markdown. Cover: line 1 the headline topic, ' +
+    'line 2 the most recent concrete decision or commit landed, line ' +
+    '3 the open questions or unresolved items, line 4 (optional) any ' +
+    'blockers or next-action queued. Keep the whole thing under 80 ' +
+    'words. Be specific. Skip pleasantries.',
   cache: true,
 };
 
@@ -68,7 +73,7 @@ export function createLlmDistillationGenerator(
 ): DistillationGenerator {
   const log = opts.log ?? (() => undefined);
   const maxTranscriptBytes = opts.maxTranscriptBytes ?? 3000;
-  const maxTokens = opts.maxTokens ?? 100;
+  const maxTokens = opts.maxTokens ?? 180;
   const chunkLimit = opts.chunkLimit ?? 50;
   return async (row: BrainstormSessionRow): Promise<string | null> => {
     const provider = opts.provider ?? pickProvider();
@@ -100,7 +105,7 @@ export function createLlmDistillationGenerator(
       return null;
     }
     try {
-      const result = await provider.call('ingest', {
+      const result = await provider.call('distillation', {
         systemBlocks: [SYSTEM_BLOCK],
         user: transcript,
         maxTokens,

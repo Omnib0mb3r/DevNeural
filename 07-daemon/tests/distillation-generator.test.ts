@@ -83,6 +83,7 @@ function stubProvider(opts: {
       lint: 'stub',
       reconcile: 'stub',
       selfQuery: 'stub',
+      distillation: 'stub',
     }),
     call: vi.fn(
       async (_role, callOpts): Promise<CallResult> => ({
@@ -135,6 +136,35 @@ describe('createLlmDistillationGenerator', () => {
     const row = db.listBrainstorms({ limit: 5 })[0]!;
     const out = await generator(row);
     expect(out).toBe('neat summary');
+  });
+
+  it('ships the 3-4 line cold-start handoff prompt + role=distillation', async () => {
+    insertBs({ id: 'bs-prompt', started_ms: 1_000 });
+    insertChunk({
+      id: 'c-pp',
+      brainstormId: 'bs-prompt',
+      turn: 0,
+      role: 'user',
+      text: 'transcript content',
+    });
+    const provider = stubProvider({});
+    const generator = createLlmDistillationGenerator({ db, provider });
+    const row = db.listBrainstorms({ limit: 5 })[0]!;
+    await generator(row);
+    const callMock = provider.call as ReturnType<typeof vi.fn>;
+    expect(callMock).toHaveBeenCalledTimes(1);
+    const [role, callOpts] = callMock.mock.calls[0]!;
+    expect(role).toBe('distillation');
+    const systemText = (callOpts as { systemBlocks: { text: string }[] })
+      .systemBlocks[0]!.text;
+    expect(systemText).toMatch(/pick up where this one left off/);
+    expect(systemText).toMatch(/line 1 the headline topic/);
+    expect(systemText).toMatch(/line 2 the most recent concrete decision/);
+    expect(systemText).toMatch(/line 3 the open questions/);
+    expect(systemText).toMatch(/under 80 words/);
+    expect((callOpts as { maxTokens: number }).maxTokens).toBeGreaterThanOrEqual(
+      160,
+    );
   });
 
   it('returns null when the provider is not configured', async () => {

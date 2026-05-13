@@ -23,6 +23,12 @@ const MODEL_RECONCILE =
   process.env.DEVNEURAL_MODEL_RECONCILE ?? 'claude-sonnet-4-6';
 const MODEL_SELF_QUERY =
   process.env.DEVNEURAL_MODEL_SELF_QUERY ?? 'claude-haiku-4-5';
+/* Defined for type completeness; the BF-4 guard in
+ * distillation-generator short-circuits before this role ever reaches
+ * the Anthropic provider, so this model never receives brainstorm
+ * content. */
+const MODEL_DISTILLATION =
+  process.env.DEVNEURAL_MODEL_DISTILLATION ?? 'claude-haiku-4-5';
 
 let client: Anthropic | null = null;
 
@@ -52,6 +58,8 @@ function modelForRole(role: LlmRole): string {
       return MODEL_RECONCILE;
     case 'self_query':
       return MODEL_SELF_QUERY;
+    case 'distillation':
+      return MODEL_DISTILLATION;
   }
 }
 
@@ -73,6 +81,7 @@ export class AnthropicProvider implements LlmProvider {
       lint: MODEL_LINT,
       reconcile: MODEL_RECONCILE,
       selfQuery: MODEL_SELF_QUERY,
+      distillation: MODEL_DISTILLATION,
     };
   }
 

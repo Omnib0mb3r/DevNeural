@@ -47,6 +47,7 @@ import { createLlmDistillationGenerator } from './lex/distillation-generator.js'
 import { runSmartCompactTick } from './dashboard/smart-compact-scheduler.js';
 import { ptyInject } from './dashboard/pty-host.js';
 import { startBridgePresenceLoop } from './dashboard/bridge-presence.js';
+import { startDistillationBackfillScheduler } from './lex/distillation-scheduler.js';
 import { startWorkerEventListener } from './dashboard/worker-event-listener.js';
 import { emitAwarenessEvent } from './lex/awareness.js';
 import fastifyCookie from '@fastify/cookie';
@@ -148,6 +149,23 @@ async function main(): Promise<void> {
   logger(
     `bridge presence loop up (interval=${bridgePresenceInterval}ms fresh=${bridgePresenceFreshMs}ms)`,
   );
+
+  /* Bind the local-only distillation generator to the
+   * sibling-distillation backfill module. Generator is gated on
+   * ollama isConfigured() + name !== 'anthropic' (BF-4); when either
+   * gate fails the scheduler logs once and no-ops. Tunable via env:
+   *   DEVNEURAL_DISTILL_SCHEDULER_INTERVAL_MS  (default 600000 / 10m)
+   *   DEVNEURAL_DISTILL_SCHEDULER_FIRST_FIRE_MS (default 30000 / 30s) */
+  startDistillationBackfillScheduler({
+    db: store.db,
+    log: logger,
+    intervalMs: Number(
+      process.env.DEVNEURAL_DISTILL_SCHEDULER_INTERVAL_MS ?? 10 * 60_000,
+    ),
+    firstFireDelayMs: Number(
+      process.env.DEVNEURAL_DISTILL_SCHEDULER_FIRST_FIRE_MS ?? 30_000,
+    ),
+  });
 
   /* Event-driven Lex supervision (EVENT-DRIVEN-SUPERVISION.md).
    * Subscribes to every Claude Code transcript jsonl, runs the

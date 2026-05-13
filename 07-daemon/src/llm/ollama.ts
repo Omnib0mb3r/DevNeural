@@ -33,6 +33,8 @@ const MODEL_RECONCILE =
   process.env.DEVNEURAL_OLLAMA_MODEL_RECONCILE ?? DEFAULT_MODEL;
 const MODEL_SELF_QUERY =
   process.env.DEVNEURAL_OLLAMA_MODEL_SELF_QUERY ?? DEFAULT_MODEL;
+const MODEL_DISTILLATION =
+  process.env.DEVNEURAL_OLLAMA_MODEL_DISTILLATION ?? DEFAULT_MODEL;
 
 interface OllamaChatRequest {
   model: string;
@@ -118,6 +120,7 @@ export class OllamaProvider implements LlmProvider {
       lint: MODEL_LINT,
       reconcile: MODEL_RECONCILE,
       selfQuery: MODEL_SELF_QUERY,
+      distillation: MODEL_DISTILLATION,
     };
   }
 
@@ -146,8 +149,11 @@ export class OllamaProvider implements LlmProvider {
 
   async call(role: LlmRole, opts: CallOptions): Promise<CallResult> {
     const ids = this.modelIds();
-    const model =
-      ids[role === 'self_query' ? 'selfQuery' : (role as 'ingest' | 'lint' | 'reconcile')];
+    const roleKey: keyof ModelIds =
+      role === 'self_query'
+        ? 'selfQuery'
+        : (role as 'ingest' | 'lint' | 'reconcile' | 'distillation');
+    const model = ids[roleKey];
 
     // Validate model presence on first attempt; log clear error if missing.
     const available = await listAvailableModels();

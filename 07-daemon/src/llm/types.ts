@@ -8,7 +8,12 @@
  * through a provider role rather than a hard-coded model id, so the
  * provider's modelIds() controls which actual model handles each role.
  */
-export type LlmRole = 'ingest' | 'lint' | 'reconcile' | 'self_query';
+export type LlmRole =
+  | 'ingest'
+  | 'lint'
+  | 'reconcile'
+  | 'self_query'
+  | 'distillation';
 
 export interface SystemBlock {
   text: string;
@@ -46,6 +51,7 @@ export interface ModelIds {
   lint: string;
   reconcile: string;
   selfQuery: string;
+  distillation: string;
 }
 
 export class LlmNotConfiguredError extends Error {

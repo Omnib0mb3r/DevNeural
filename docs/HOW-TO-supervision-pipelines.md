@@ -337,9 +337,18 @@ excludeRefId?, now?})`:
 - `hit_cap` in the result tells the caller whether to schedule
   another tick.
 - The job itself is pure; the LLM provider is supplied via the
-  injected generator (claude-haiku-4-5 once wired) and gated on
-  `ANTHROPIC_API_KEY`. The scheduler that periodically calls it is
-  registered at daemon startup; manual / HTTP triggers also work.
+  injected generator. `createLlmDistillationGenerator` routes through
+  the local-only ollama provider via the new `distillation` LlmRole
+  (BF-4: anthropic is hard-blocked for brainstorm content).
+- **Scheduler is now bound at daemon startup**
+  (`startDistillationBackfillScheduler` in
+  `07-daemon/src/lex/distillation-scheduler.ts`). First fire after a
+  30s grace period (avoids blocking startup on the ollama warm-up),
+  then every 10 minutes via `setInterval`. Tunable via env:
+  `DEVNEURAL_DISTILL_SCHEDULER_INTERVAL_MS`,
+  `DEVNEURAL_DISTILL_SCHEDULER_FIRST_FIRE_MS`. If the provider is
+  unconfigured or set to anthropic the scheduler logs once on boot
+  and returns a no-op handle so the logs stay quiet.
 
 ### Why two phases
 
