@@ -283,10 +283,6 @@ export default function LexPage() {
              * still render the panel; the mirror starts streaming
              * once the session-id appears. */}
             <TerminalMirror sessionId={lexPty?.sessionId ?? ""} />
-            <LexArtifactsPanel
-              brainstormId={activeAnchorId}
-              active={Boolean(lexPty)}
-            />
             <div className="rounded-panel bg-surface1 hairline">
               <div className="px-5 py-3 border-b border-border1 flex items-center gap-2">
                 <Icon name="MessageSquare" className="text-brandSoft" size={16} />
@@ -384,6 +380,10 @@ export default function LexPage() {
                 )}
               </form>
             </div>
+            <LexArtifactsPanel
+              brainstormId={activeAnchorId}
+              active={Boolean(lexPty)}
+            />
           </>
         )}
 
