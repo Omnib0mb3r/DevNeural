@@ -711,6 +711,20 @@ export class IndexDb {
     return r.n;
   }
 
+  /* Next monotonically-increasing turn_index for a brainstorm. Used by
+   * the live voice WS path to land each user / assistant turn the
+   * moment it arrives instead of waiting on the session-end pipeline.
+   * COALESCE so the first turn lands at index 0. */
+  nextTurnIndex(brainstormId: string): number {
+    const r = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(turn_index), -1) + 1 AS n
+           FROM brainstorm_chunks WHERE brainstorm_id = ?`,
+      )
+      .get(brainstormId) as { n: number };
+    return r.n;
+  }
+
   listBrainstormChunks(brainstormId: string, limit = 1000): BrainstormChunkRow[] {
     return this.db
       .prepare(

@@ -42,6 +42,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { randomUUID } from 'node:crypto';
 import type { WebSocket as FastifyWS } from '@fastify/websocket';
 import { transcribeWav, pcm16ToWav } from './whisper.js';
 import { synthesize, piperStatus } from './piper.js';
@@ -459,13 +460,14 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * same handle resolution the artifact-extraction block below does;
      * order matters because that block also wants brainstormId. */
     let brainstormForFeedback: { id: string; prompt_version: string | null } | null = null;
+    let brainstormModeForChunk: 'conversation' | 'notes' | 'push-to-talk' = 'conversation';
     try {
       const handle = state.bindKey
         ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
         : undefined;
       let bs = null as
         | null
-        | { id: string; prompt_version?: string | null };
+        | { id: string; prompt_version?: string | null; mode?: string };
       if (handle?.sessionId) {
         bs = getBrainstormByClaudeSessionId(handle.sessionId);
       }
@@ -477,6 +479,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           id: bs.id,
           prompt_version: bs.prompt_version ?? null,
         };
+        const bsMode = bs.mode;
+        brainstormModeForChunk =
+          bsMode === 'notes' || bsMode === 'push-to-talk' ? bsMode : 'conversation';
       }
     } catch {
       /* observability only */
@@ -490,6 +495,28 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         ? { prompt_version: brainstormForFeedback.prompt_version }
         : {}),
     });
+    /* Land an assistant turn into brainstorm_chunks the moment it
+     * arrives so brainstorm_sessions.turn_count + the /lex/recall
+     * retrieval surface track live conversation, not just the
+     * session-end backfill. Wrapped so a chunk insert failure cannot
+     * block the speak path. The pattern mirrors the user-side insert
+     * landed alongside this commit in handleUtteranceEnd. */
+    if (brainstormForFeedback?.id) {
+      try {
+        getStore().db.insertBrainstormChunk({
+          id: uuid || randomUUID(),
+          brainstorm_id: brainstormForFeedback.id,
+          turn_index: getStore().db.nextTurnIndex(brainstormForFeedback.id),
+          role: 'lex',
+          mode: brainstormModeForChunk,
+          text,
+          model_id: process.env.DEVNEURAL_LEX_MODEL_ID ?? 'claude',
+          no_decay: 1,
+        });
+      } catch {
+        /* observational; never block speak() */
+      }
+    }
     /* Slice C: scan the assistant turn for fenced artifact blocks
      * (research-note / wiki-draft / project-intent / notes-summary),
      * persist them, and link the artifact ids into the brainstorm
@@ -643,6 +670,35 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         const consentOk = kind !== 'meeting' || consent === 1;
         if (consentOk) {
           appendSessionAudio(bs.id, pcm, 16000);
+        }
+        /* Land the user turn into brainstorm_chunks immediately so the
+         * session's turn_count + /lex/recall surface track live
+         * conversation rather than waiting on the session-end pipeline.
+         * Empty transcripts are skipped further below; we mirror that
+         * here so we don't store noise rows. */
+        if (result.text.trim()) {
+          try {
+            const bsMode = (bs as { mode?: string }).mode;
+            const stateMode = state.mode;
+            const mode: 'conversation' | 'notes' | 'push-to-talk' =
+              bsMode === 'notes' || bsMode === 'push-to-talk'
+                ? bsMode
+                : stateMode === 'notes' || stateMode === 'push-to-talk'
+                  ? stateMode
+                  : 'conversation';
+            getStore().db.insertBrainstormChunk({
+              id: randomUUID(),
+              brainstorm_id: bs.id,
+              turn_index: getStore().db.nextTurnIndex(bs.id),
+              role: 'user',
+              mode,
+              text: result.text,
+              model_id: '',
+              no_decay: 1,
+            });
+          } catch {
+            /* chunk insert is observational; never block the turn */
+          }
         }
       }
     } catch {
