@@ -273,23 +273,36 @@ Lex restart against the same brainstorm row. Label-grouped lookup
 across other `brainstorm_sessions` rows is retained as a fallback
 only when the anchor has zero prior refs.
 
-`buildSiblingIndex({db, anchorId, excludeRefId?, limit?,
-distillationWords?})`:
+`buildSiblingIndex({db, label, anchorId, currentCcSessionId,
+excludeId?, refLimit?, limit?, distillationWords?, turnSnippetChars?,
+pairsPerRef?, readTranscript?, now?})`:
 
-- Pulls prior refs via `listTranscriptRefs(anchorId)`.
-- Excludes `excludeRefId` (the just-bound ref) so a fresh ref
-  never lists itself.
-- Result is a markdown block:
+- When `anchorId` is supplied, primary path pulls prior refs via
+  `listLexTranscriptRefs(anchorId)`, sorts by `ordering` DESC,
+  drops the current `currentCcSessionId`, and takes the top
+  `refLimit` (default 2).
+- For each prior ref the helper reads `transcript_path` via the
+  injected `readTranscript` (filesystem by default), extracts the
+  last `pairsPerRef * 2` user/assistant messages with
+  `extractLastTurnPairs` (skips tool_use / tool_result / compact
+  summaries), and renders:
   ```
-  # Prior sessions for this anchor
+  # Prior Lex sessions on this anchor
 
-  Prior CC bindings under the same Lex anchor. Reference if context
-  demands; do not re-read the jsonls unless asked.
+  Earlier CC sessions bound to this same Lex brainstorm. Reference
+  if context demands; do not re-read the transcripts unless asked.
 
-  - <cc_session_id8> started <ISO> [— <distillation up to N words>]
+  ## Prior session N (ago: 4h ago)
+  Summary: <brainstorm.last_summary or "(no distillation yet)">
+  Last 5 turns:
+  - user: ...
+  - assistant: ...
   ```
-- Distillation tail is pulled per ref; missing distillations omit
-  the tail and the line still renders (id + started).
+- When `anchorId` is absent OR the anchor has 0 prior refs, the
+  helper falls back to the legacy label-match block (id8 + label +
+  ISO + truncated distillation) so a brand-new anchor still gets
+  some context surfaced.
+- `now` injection keeps "ago" rendering deterministic in tests.
 
 ### Phase 2 part 1: preloader
 

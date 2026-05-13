@@ -3707,6 +3707,8 @@ export async function registerDashboardRoutes(
     const block = buildSiblingIndex({
       db: store.db,
       label,
+      anchorId: bs.id,
+      currentCcSessionId: sessionId,
       excludeId: bs.id,
       limit: 5,
       distillationWords: 20,

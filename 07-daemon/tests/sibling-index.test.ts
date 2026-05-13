@@ -227,3 +227,183 @@ describe('buildSiblingIndex - header block', () => {
     expect(out).toMatch(/Prior brainstorms the user named the same way/);
   });
 });
+
+describe('buildSiblingIndex - anchor transcript_refs path (TODO bug 2026-05-13)', () => {
+  function insertLexSession(id: string): void {
+    /* lex_session is the durable anchor; brainstorm.id == lex_session.id
+     * per the spec, but the foreign-key constraint on
+     * lex_transcript_ref requires the row to actually exist before
+     * inserts are accepted. */
+    db.insertLexSession({
+      id,
+      created_ms: 1_000,
+      title: null,
+      derived_title: null,
+      status: 'dormant',
+      current_pty_id: null,
+      cwd: 'C:/p/lex',
+    });
+  }
+
+  function insertRef(opts: {
+    anchorId: string;
+    cc: string;
+    transcriptPath: string;
+    ordering: number;
+    startedMs: number;
+    endedMs?: number | null;
+  }): void {
+    db.insertLexTranscriptRef({
+      lex_session_id: opts.anchorId,
+      cc_session_id: opts.cc,
+      transcript_path: opts.transcriptPath,
+      started_ms: opts.startedMs,
+      ended_ms: opts.endedMs ?? null,
+      ordering: opts.ordering,
+    });
+  }
+
+  it('renders prior session blocks from listLexTranscriptRefs (no label match required)', () => {
+    insertLexSession('anchor-1');
+    insertBs({
+      id: 'anchor-1',
+      user_label: 'DevNeural Testing',
+      started_ms: 1_000,
+      last_summary: 'first thing we decided / second open item',
+    });
+    insertRef({
+      anchorId: 'anchor-1',
+      cc: 'cc-old',
+      transcriptPath: '/fake/old.jsonl',
+      ordering: 0,
+      startedMs: Date.now() - 7_200_000,
+      endedMs: Date.now() - 7_200_000,
+    });
+    insertRef({
+      anchorId: 'anchor-1',
+      cc: 'cc-current',
+      transcriptPath: '/fake/current.jsonl',
+      ordering: 1,
+      startedMs: Date.now() - 60_000,
+    });
+    const out = buildSiblingIndex({
+      db,
+      label: 'DevNeural Testing',
+      anchorId: 'anchor-1',
+      currentCcSessionId: 'cc-current',
+      readTranscript: (p) => {
+        if (p === '/fake/old.jsonl') {
+          return [
+            JSON.stringify({
+              type: 'user',
+              message: { role: 'user', content: 'do the bracketed paste fix' },
+            }),
+            JSON.stringify({
+              type: 'assistant',
+              message: {
+                role: 'assistant',
+                content: [
+                  { type: 'text', text: 'landed in commit b943f10' },
+                ],
+              },
+            }),
+          ].join('\n');
+        }
+        return null;
+      },
+    });
+    expect(out).toMatch(/^# Prior Lex sessions on this anchor/);
+    expect(out).toMatch(/## Prior session 1/);
+    expect(out).toMatch(/Summary: first thing we decided/);
+    expect(out).toMatch(/- user: do the bracketed paste fix/);
+    expect(out).toMatch(/- assistant: landed in commit b943f10/);
+    /* Current session must not appear */
+    expect(out).not.toMatch(/cc-current/);
+  });
+
+  it('returns nothing from anchor-path when the anchor has only the current ref (1 ref total)', () => {
+    insertLexSession('anchor-solo');
+    insertBs({
+      id: 'anchor-solo',
+      user_label: null,
+      started_ms: 1_000,
+    });
+    insertRef({
+      anchorId: 'anchor-solo',
+      cc: 'cc-only',
+      transcriptPath: '/fake/only.jsonl',
+      ordering: 0,
+      startedMs: Date.now(),
+    });
+    const out = buildSiblingIndex({
+      db,
+      label: null,
+      anchorId: 'anchor-solo',
+      currentCcSessionId: 'cc-only',
+      readTranscript: () => 'irrelevant',
+    });
+    expect(out).toBe('');
+  });
+
+  it('skips refs whose transcript file is missing without crashing', () => {
+    insertLexSession('anchor-missing');
+    insertBs({
+      id: 'anchor-missing',
+      user_label: null,
+      started_ms: 1_000,
+    });
+    insertRef({
+      anchorId: 'anchor-missing',
+      cc: 'cc-missing',
+      transcriptPath: '/fake/does-not-exist.jsonl',
+      ordering: 0,
+      startedMs: Date.now() - 3_600_000,
+    });
+    insertRef({
+      anchorId: 'anchor-missing',
+      cc: 'cc-now',
+      transcriptPath: '/fake/current.jsonl',
+      ordering: 1,
+      startedMs: Date.now(),
+    });
+    /* readTranscript returns null for the missing file and there is
+     * no distillation in last_summary, so renderPriorRefSection skips
+     * the entry entirely. With no other prior refs, the anchor-path
+     * yields nothing and the helper falls back to label-match (which
+     * also yields nothing without a label). */
+    const out = buildSiblingIndex({
+      db,
+      label: null,
+      anchorId: 'anchor-missing',
+      currentCcSessionId: 'cc-now',
+      readTranscript: () => null,
+    });
+    expect(out).toBe('');
+  });
+
+  it('falls back to legacy label-match when the anchor has zero prior refs', () => {
+    insertLexSession('anchor-new');
+    insertBs({
+      id: 'anchor-new',
+      user_label: 'Shared Topic',
+      started_ms: 5_000,
+    });
+    insertBs({
+      id: 'anchor-other',
+      user_label: 'Shared Topic',
+      started_ms: 1_000,
+      last_summary: 'earlier brainstorm notes',
+    });
+    /* No transcript refs registered for anchor-new → buildAnchorTranscriptBlock
+     * returns ''. The label-match fallback should still pick up
+     * anchor-other. */
+    const out = buildSiblingIndex({
+      db,
+      label: 'Shared Topic',
+      anchorId: 'anchor-new',
+      excludeId: 'anchor-new',
+    });
+    expect(out).toMatch(/^# Sibling sessions \(same label "Shared Topic"\)/);
+    expect(out).toMatch(/- anchor-o/);
+  });
+});
