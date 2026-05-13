@@ -266,57 +266,67 @@ Daemon-side files:
 
 ### Phase 1: index injection at spawn / reopen
 
-`buildSiblingIndex({db, label, excludeId?, limit?,
+Sibling source is the current anchor's prior `lex_transcript_refs`
+(every prior CC binding under the same anchor), ordered by
+`ordering` DESC, excluding the current ref. Each ref is a distinct
+Lex restart against the same brainstorm row. Label-grouped lookup
+across other `brainstorm_sessions` rows is retained as a fallback
+only when the anchor has zero prior refs.
+
+`buildSiblingIndex({db, anchorId, excludeRefId?, limit?,
 distillationWords?})`:
 
-- Match key: lowercase, whitespace-trimmed `user_label`.
-- Excludes `excludeId` (the just-created session) so a fresh anchor
+- Pulls prior refs via `listTranscriptRefs(anchorId)`.
+- Excludes `excludeRefId` (the just-bound ref) so a fresh ref
   never lists itself.
 - Result is a markdown block:
   ```
-  # Sibling sessions (same label "<label>")
+  # Prior sessions for this anchor
 
-  Prior brainstorms the user named the same way. Reference if context
-  demands; do not re-read the transcripts unless asked.
+  Prior CC bindings under the same Lex anchor. Reference if context
+  demands; do not re-read the jsonls unless asked.
 
-  - <id8> "<label>" started <ISO> [— <distillation up to N words>]
+  - <cc_session_id8> started <ISO> [— <distillation up to N words>]
   ```
-- Empty / null label returns the empty string — singletons skip
-  the block entirely; the caller can concat unconditionally.
-- Distillation tail is pulled from `brainstorm_sessions.last_summary`
-  (truncated at `distillationWords`, default 10).
+- Distillation tail is pulled per ref; missing distillations omit
+  the tail and the line still renders (id + started).
 
 ### Phase 2 part 1: preloader
 
-`preloadSiblingDistillations({db, label, excludeId?, generator,
-limit?, now?})`:
+`preloadSiblingDistillations({db, anchorId, excludeRefId?,
+generator, limit?, now?})`:
 
 - Generator is an injected
-  `(row: BrainstormSessionRow) => Promise<string | null>` so the LLM
-  provider stays a swap-in.
-- Picks the top **N=2** most-recent same-label siblings missing
-  `last_summary`, calls the generator, persists via
-  `updateBrainstorm` with `last_summary_ms` stamped at `now()`.
+  `(ref: LexTranscriptRef) => Promise<string | null>` so the LLM
+  provider stays a swap-in (claude-haiku-4-5 by default once wired).
+- Picks the top **N=2** most-recent prior refs under the anchor
+  missing a distillation, reads the ref's jsonl tail (cap input at
+  12000 chars), calls the generator, persists the distillation
+  against the ref row with `last_summary_ms` stamped at `now()`.
 - Null generator output or thrown error is treated as a clean skip;
-  the row's `last_summary` stays null and the sibling-index line
+  the ref's distillation stays null and the sibling-index line
   simply omits the tail.
+- Each preload payload also carries the last 5 user/assistant
+  message pairs from the ref's jsonl so the next Lex spawn sees
+  fresh verbatim context, not just a summary.
 - Returns `{preloaded, skipped, already_present}` for logging.
 
 ### Phase 2 part 2: backfill job
 
-`runDistillationBackfill({db, generator, limit?, label?, excludeId?,
-now?})`:
+`runDistillationBackfill({db, generator, limit?, anchorId?,
+excludeRefId?, now?})`:
 
-- Default cap: **N=5** rows per run so a cold start cannot melt the
+- Default cap: **N=5** refs per run so a cold start cannot melt the
   LLM provider. `BACKFILL_DEFAULT_LIMIT = 5` exported.
-- Selection: every brainstorm_session with null/empty
-  `last_summary`, most-recent first, optionally filtered by label,
-  optionally excluding a specific id.
+- Selection: every prior `lex_transcript_refs` row with null/empty
+  distillation, most-recent first, optionally filtered to a single
+  anchor, optionally excluding a specific ref.
 - `hit_cap` in the result tells the caller whether to schedule
   another tick.
-- The job itself is pure; the scheduler that periodically calls it
-  is still pending (no LLM provider wired into the daemon-side
-  scheduler yet; manual / HTTP triggers possible).
+- The job itself is pure; the LLM provider is supplied via the
+  injected generator (claude-haiku-4-5 once wired) and gated on
+  `ANTHROPIC_API_KEY`. The scheduler that periodically calls it is
+  registered at daemon startup; manual / HTTP triggers also work.
 
 ### Why two phases
 
@@ -337,8 +347,8 @@ brainstorm" without queuing 50 LLM calls.
 | Lex never sees worker events | `supervision_mode='event'` on the anchor + chokidar `[worker-event]` log lines |
 | Event mode silent on a known stall | `WorkerEventGate` per-type gap, or kill-switch trip in `notifications.jsonl` source=`supervision` |
 | Smart compact never fires | `smart_compact_log` action column: all `shadow` rows = still in shadow N |
-| Sibling block missing on spawn | the new session has no `user_label` set (singleton path) or no other same-label rows yet |
-| Sibling line missing distillation | `brainstorm_sessions.last_summary IS NULL` → run backfill |
+| Sibling block missing on spawn | the anchor has zero prior `lex_transcript_refs` (genuine first session) — fallback label-match path also empty |
+| Sibling line missing distillation | the prior ref has null distillation → run backfill (LLM wiring + ANTHROPIC_API_KEY required) |
 
 `cross_session_injection_log` grouped by `caller_label` is the
 single highest-signal table for "who injected what when" across
