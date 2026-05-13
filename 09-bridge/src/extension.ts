@@ -708,17 +708,23 @@ function writePresence(): void {
     bridgeId,
     now: new Date(),
     ccSessionLookup: (cwd) => {
-      /* Two-pass lookup. Daemon /sessions cache first (covers the
-       * common case where the mirror loop has already mapped the
-       * project_slug to a UUID). Sticky latch second so an idle
-       * worker terminal does not drop out of cc_session_ids on
-       * the very next tick after a 30s quiet stretch: the latch
-       * keeps the newest jsonl uuid for this cwd until either
-       * deactivate clears the map or a newer jsonl supersedes. */
+      /* Task E (2026-05-13): latch-first lookup.
+       *
+       * The prior order consulted daemonActiveSessions first, which
+       * created a self-reinforcing loop after /clear: the daemon
+       * cache reflected whatever cc_session_id the bridge had last
+       * reported, the bridge re-reported it without re-asking the
+       * latch, and the daemon kept reading the stale id from its
+       * own /sessions response. The latch is the authoritative
+       * source for the live jsonl on this host (it scans the slug
+       * dir directly with the 60s anti-flap window in
+       * CcSessionLatch), so it must run first. The daemon cache
+       * stays as a fallback for transient filesystem hiccups when
+       * the latch returns undefined. */
+      const latched = ccSessionLatch.resolve(cwd);
+      if (latched) return latched;
       const slug = cwdToSlug(cwd).toLowerCase();
-      const cached = daemonActiveSessions.get(slug);
-      if (cached) return cached;
-      return ccSessionLatch.resolve(cwd);
+      return daemonActiveSessions.get(slug);
     },
   });
 }

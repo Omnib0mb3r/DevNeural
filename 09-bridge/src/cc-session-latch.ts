@@ -18,12 +18,20 @@
  *     fresh; presence going stale (worker terminal closed) is what
  *     dormant-flips the anchor, not jsonl mtime drift.
  *
- * Supersession rule: newest jsonl by mtime in the slug dir wins.
- * A fresh session creates a new <uuid>.jsonl that immediately has
- * the largest mtime; the latch picks it up on the next call. An
- * idle worker's jsonl stays the freshest among its own dir contents
- * (no other jsonl in the same slug is being written), so the latch
- * keeps it.
+ * Supersession rule (Task E, 2026-05-13):
+ *
+ *   - Same UUID newest by mtime → refresh the latch's stored mtime
+ *     so a long-running session that occasionally writes a turn
+ *     keeps its firstLatched timestamp but tracks the latest stamp.
+ *   - Different UUID newest by mtime → only supersede when the
+ *     mtime delta vs the latched entry exceeds SUPERSEDE_WINDOW_MS
+ *     (60s). This anti-flap window prevents a transient stat race
+ *     or a one-shot tool-driven mtime touch on an unrelated jsonl
+ *     from flipping the latch off the still-active session. After
+ *     a real /clear inside an active CC session the new jsonl gets
+ *     turn writes for at least one tick while the prior jsonl
+ *     stays quiet, so the delta crosses the window inside a
+ *     minute and the new UUID wins.
  *
  * Pure module: filesystem + clock are injected so tests can drive
  * the resolver without touching ~/.claude/projects/.
@@ -43,16 +51,33 @@ export interface CcSessionLatchDeps {
   claudeProjectsRoot: string;
   /** Clock injection point; defaults to Date.now. */
   now?: () => number;
+  /** Anti-flap window (ms) for cross-UUID supersession.
+   * Defaults to SUPERSEDE_WINDOW_MS (60s). A different jsonl UUID
+   * must have mtime delta > this value vs the latched entry before
+   * the latch flips onto it. Exposed for tests so they don't have
+   * to back-date files by a full minute. */
+  supersedeWindowMs?: number;
 }
+
+/* Task E (2026-05-13): minimum mtime divergence between the latched
+ * jsonl and a different-UUID candidate before the latch supersedes.
+ * The prior code used `newest.uuid !== prior.uuid` as a sufficient
+ * condition, which let a transient mtime touch on an unrelated
+ * jsonl flip the latch onto a stale session. The 60s gate keeps the
+ * latch pinned through quick races but still flips inside a minute
+ * for a real /clear-spawned session writing fresh turns. */
+export const SUPERSEDE_WINDOW_MS = 60_000;
 
 export class CcSessionLatch {
   private readonly latch = new Map<string, CcSessionLatchEntry>();
   private readonly root: string;
   private readonly now: () => number;
+  private readonly supersedeWindowMs: number;
 
   constructor(deps: CcSessionLatchDeps) {
     this.root = deps.claudeProjectsRoot;
     this.now = deps.now ?? Date.now;
+    this.supersedeWindowMs = deps.supersedeWindowMs ?? SUPERSEDE_WINDOW_MS;
   }
 
   /** Lookup the latched UUID for a workspace cwd. */
@@ -111,19 +136,61 @@ export class CcSessionLatch {
     if (!newest) return this.latch.get(slugKey)?.uuid;
 
     const prior = this.latch.get(slugKey);
-    if (
-      !prior ||
-      newest.uuid !== prior.uuid ||
-      newest.mtimeMs > prior.mtimeMs
-    ) {
-      /* First sight OR a different / newer jsonl: supersede. The
-       * mtime-newer check covers the case where the worker writes
-       * another turn to the same UUID (refresh stamp) so the latch
-       * tracks the live one even across long quiet stretches. */
+
+    /* First sight: latch onto whatever the slug dir shows. */
+    if (!prior) {
       this.latch.set(slugKey, {
         uuid: newest.uuid,
         mtimeMs: newest.mtimeMs,
-        firstLatchedMs: prior?.uuid === newest.uuid ? prior.firstLatchedMs : this.now(),
+        firstLatchedMs: this.now(),
+      });
+      return newest.uuid;
+    }
+
+    /* Same UUID: track the freshest mtime stamp so the
+     * cross-UUID delta check below has the most accurate baseline
+     * if a different jsonl appears later. firstLatchedMs is
+     * preserved so callers that read it can still see when this
+     * session first attached. */
+    if (newest.uuid === prior.uuid) {
+      if (newest.mtimeMs > prior.mtimeMs) {
+        this.latch.set(slugKey, {
+          uuid: prior.uuid,
+          mtimeMs: newest.mtimeMs,
+          firstLatchedMs: prior.firstLatchedMs,
+        });
+      }
+      return prior.uuid;
+    }
+
+    /* Task E (2026-05-13): cross-UUID supersession gate.
+     *
+     * The prior code flipped onto any different-UUID newest by
+     * mtime, which let a one-shot stat touch on an unrelated
+     * jsonl (e.g. a CC tool reading a sibling transcript) hijack
+     * the latch from a still-active worker. The gate requires
+     * the new jsonl to be at least supersedeWindowMs (60s by
+     * default) fresher than the latched entry before flipping.
+     *
+     * Real /clear flow: new jsonl receives turn writes
+     * continuously while the prior jsonl stays quiet; the delta
+     * crosses 60s well inside a minute of operator typing, and
+     * the latch flips. Transient races: the unrelated jsonl's
+     * mtime touch usually clears within the window, so the
+     * latched session keeps owning the slug.
+     *
+     * Tested in 09-bridge/tests/cc-session-latch.test.ts:
+     *   - "re-latches when a different jsonl exceeds the
+     *      60s mtime divergence window"
+     *   - "ignores a different jsonl whose mtime divergence is
+     *      under the window (anti-flap)"
+     */
+    const delta = newest.mtimeMs - prior.mtimeMs;
+    if (delta > this.supersedeWindowMs) {
+      this.latch.set(slugKey, {
+        uuid: newest.uuid,
+        mtimeMs: newest.mtimeMs,
+        firstLatchedMs: this.now(),
       });
       return newest.uuid;
     }
