@@ -95,6 +95,19 @@ describe('migration 025 + setLexSessionSupervises', () => {
     const cleared = db.setLexSessionSupervises('lex-1', null);
     expect(cleared?.supervises_project_anchor_id).toBeNull();
   });
+
+  /* C-3 follow-up: POST /lex/anchors stamps the binding via the
+   * same setter immediately after the row is created. Pin the
+   * setter's persistence semantics here so the route handler does
+   * not need a fastify boot for the same one-line assertion. */
+  it('setLexSessionSupervises persists a binding stamped at create time', () => {
+    insertProject('proj-create', 'devneural-create', 'cc-create');
+    insertLex('lex-create', null);
+    const after = db.setLexSessionSupervises('lex-create', 'proj-create');
+    expect(after?.supervises_project_anchor_id).toBe('proj-create');
+    const reread = db.getLexSession('lex-create');
+    expect(reread?.supervises_project_anchor_id).toBe('proj-create');
+  });
 });
 
 describe('resolveSupervisedTargetSession', () => {

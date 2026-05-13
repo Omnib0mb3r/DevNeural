@@ -14,7 +14,13 @@
  * test so caches do not leak between specs.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import {
   QueryClient,
   QueryClientProvider,
@@ -26,13 +32,39 @@ vi.mock("@/lib/daemon-client", () => ({
   createLexAnchor: vi.fn().mockResolvedValue({ ok: true }),
   openLexAnchor: vi.fn().mockResolvedValue({ ok: true }),
   endLexAnchor: vi.fn().mockResolvedValue({ ok: true }),
+  /* Phase C-3: SupervisesPicker fetches project anchor tiles via
+   * this helper. The picker also accepts an `options` prop to bypass
+   * the call entirely, but LexSessionList does not thread that
+   * through, so the mock returns a small fixture. */
+  listProjectAnchorTiles: vi.fn().mockResolvedValue({
+    ok: true,
+    tiles: [
+      {
+        anchor_id: "proj-A",
+        project_slug: "devneural",
+        title: "DevNeural",
+        cwd: "C:/dev/Projects/DevNeural",
+        status: "live",
+        current_session_id: "cc-live",
+        current_bridge_id: null,
+        bridge_connection_count: 0,
+        current_pty_id: null,
+        transcript_path: null,
+        phase: "idle",
+        pending_prompt: null,
+        last_activity_ms: 0,
+        transcript_count: 0,
+        supervision_mode: "polling",
+      },
+    ],
+  }),
 }));
 
 import {
   LexSessionList,
   PAST_SESSIONS_COLLAPSE_KEY,
 } from "../components/LexSessionList";
-import { lexAnchors } from "@/lib/daemon-client";
+import { lexAnchors, createLexAnchor } from "@/lib/daemon-client";
 
 function renderWithQuery(ui: React.ReactElement) {
   const qc = new QueryClient({
@@ -121,5 +153,76 @@ describe("LexSessionList - collapse toggle persistence", () => {
     expect(PAST_SESSIONS_COLLAPSE_KEY).not.toBe(
       "devneural.lex.transcript.collapsed",
     );
+  });
+});
+
+describe("LexSessionList - C-3 supervises picker", () => {
+  it("hides the new-brainstorm form until + button is clicked", () => {
+    renderWithQuery(<LexSessionList initialCollapsed={false} />);
+    expect(
+      screen.queryByTestId("lex-new-brainstorm-form"),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /new brainstorm/i }));
+    expect(
+      screen.getByTestId("lex-new-brainstorm-form"),
+    ).toBeInTheDocument();
+  });
+
+  it("posts createLexAnchor with the selected supervises_project_anchor_id", async () => {
+    renderWithQuery(<LexSessionList initialCollapsed={false} />);
+    fireEvent.click(screen.getByRole("button", { name: /new brainstorm/i }));
+    const form = await screen.findByTestId("lex-new-brainstorm-form");
+    const picker = form.querySelector(
+      "select[data-testid='supervises-picker']",
+    ) as HTMLSelectElement;
+    expect(picker).toBeTruthy();
+    /* Wait for the listProjectAnchorTiles mock to resolve so the
+     * picker has the project-A option mounted before we select it. */
+    await waitFor(() => {
+      expect(picker.querySelector("option[value='proj-A']")).toBeTruthy();
+    });
+    fireEvent.change(picker, { target: { value: "proj-A" } });
+    fireEvent.click(
+      screen.getByRole("button", { name: /create brainstorm/i }),
+    );
+    await waitFor(() => {
+      expect(createLexAnchor).toHaveBeenCalledWith({
+        supervises_project_anchor_id: "proj-A",
+      });
+    });
+  });
+
+  it("renders the per-row supervises chip with current binding", async () => {
+    (lexAnchors as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      anchors: [
+        {
+          id: "lex-1",
+          title: "Brainstorm 1",
+          derived_title: null,
+          status: "dormant",
+          current_pty_id: null,
+          cwd: "C:/p",
+          created_ms: 1,
+          last_activity_ms: 1,
+          transcript_count: 0,
+          supervises_project_anchor_id: "proj-A",
+        },
+      ],
+    });
+    renderWithQuery(<LexSessionList initialCollapsed={false} />);
+    const chip = await screen.findByTestId("lex-row-supervises-lex-1");
+    expect(chip).toBeInTheDocument();
+    /* The compact picker inside the chip reflects the current binding
+     * once the listProjectAnchorTiles mock has resolved and the
+     * proj-A option exists. */
+    const select = chip.querySelector(
+      "select[data-testid='supervises-picker']",
+    ) as HTMLSelectElement;
+    expect(select).toBeTruthy();
+    await waitFor(() => {
+      expect(select.querySelector("option[value='proj-A']")).toBeTruthy();
+    });
+    expect(select.value).toBe("proj-A");
   });
 });

@@ -9,11 +9,13 @@ import {
   openLexAnchor,
   endLexAnchor,
   type LexAnchor,
+  type ProjectAnchorTile,
 } from "@/lib/daemon-client";
 import { relTime } from "@/lib/session-helpers";
 import { createCollapseStore } from "@/lib/transcript-collapse";
 import { Icon } from "./Icon";
 import { StatusDot } from "./StatusDot";
+import { SupervisesPicker } from "./SupervisesPicker";
 
 /* Past Sessions collapse-toggle persistence. Mirrors the
  * TranscriptHistory pattern so a refresh respects the user's choice
@@ -83,6 +85,12 @@ export function LexSessionList({
    * shared the mutation's isPending, so clicking one made all of
    * them flash "opening…" and disabled together. */
   const [pendingRowId, setPendingRowId] = useState<string | null>(null);
+  /* Phase C-3: inline "new brainstorm" form is hidden by default;
+   * clicking the + button opens it so the user can pick a project
+   * to bind before spawning. Submitting it fires createLexAnchor
+   * with the supervises field; cancelling collapses it back. */
+  const [newOpen, setNewOpen] = useState(false);
+  const [newSupervises, setNewSupervises] = useState<string | null>(null);
 
   const q = useQuery({
     queryKey: ["lex-anchors"],
@@ -129,10 +137,16 @@ export function LexSessionList({
   });
 
   const newM = useMutation({
-    mutationFn: () => createLexAnchor({}),
+    mutationFn: (opts: { supervises_project_anchor_id: string | null }) =>
+      createLexAnchor({
+        supervises_project_anchor_id: opts.supervises_project_anchor_id,
+      }),
     onSettled: async () => {
       await qc.refetchQueries({ queryKey: ["pty-list"] });
       qc.invalidateQueries({ queryKey: ["lex-anchors"] });
+      qc.invalidateQueries({ queryKey: ["project-anchor-tiles"] });
+      setNewOpen(false);
+      setNewSupervises(null);
     },
   });
 
@@ -180,13 +194,19 @@ export function LexSessionList({
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={() => newM.mutate()}
+            onClick={() => setNewOpen((v) => !v)}
             disabled={newM.isPending}
+            aria-expanded={newOpen}
+            aria-controls="lex-new-brainstorm-form"
             className="text-xs px-3 py-1.5 rounded-pill bg-brand/15 text-brandSoft hairline ring-1 ring-brand/30 hover:bg-brand/25 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
             title="Spawn a fresh Lex anchor"
           >
             <Icon name="Plus" size={12} />
-            {newM.isPending ? "starting…" : "new brainstorm"}
+            {newM.isPending
+              ? "starting…"
+              : newOpen
+                ? "cancel"
+                : "new brainstorm"}
           </button>
           <button
             type="button"
@@ -199,6 +219,40 @@ export function LexSessionList({
           </button>
         </div>
       </div>
+
+      {newOpen && !collapsed && (
+        <div
+          id="lex-new-brainstorm-form"
+          data-testid="lex-new-brainstorm-form"
+          className="px-5 py-3 border-b border-border1 bg-surface2/40 flex flex-col gap-2"
+        >
+          <label className="text-nano text-txt3 flex flex-col gap-1">
+            <span>Supervises project (optional)</span>
+            <SupervisesPicker
+              value={newSupervises}
+              onChange={setNewSupervises}
+              disabled={newM.isPending}
+            />
+          </label>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() =>
+                newM.mutate({ supervises_project_anchor_id: newSupervises })
+              }
+              disabled={newM.isPending}
+              className="text-xs px-3 py-1.5 rounded-pill bg-brand/20 text-brandSoft hairline ring-1 ring-brand/40 hover:bg-brand/30 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {newM.isPending ? "starting…" : "create brainstorm"}
+            </button>
+            <span className="text-nano text-txt3">
+              {newSupervises
+                ? "Lex inject-cross-session will land here unless target_session is explicit."
+                : "Brainstorm starts unbound — set target_session per call or bind later."}
+            </span>
+          </div>
+        </div>
+      )}
 
       {!collapsed && (
         <div
@@ -283,6 +337,30 @@ export function LexSessionList({
                             {row.transcript_count === 1 ? "" : "s"}
                           </span>
                         )}
+                      </div>
+                      {/* Phase C-3: per-row supervises binding chip.
+                       *
+                       * Inline `<select>` PATCHes /lex/anchors/:id
+                       * with the new project_session id (or null to
+                       * clear). Disabled while the PATCH is in-flight
+                       * so a fast double-click does not race the
+                       * mutation. */}
+                      <div
+                        data-testid={`lex-row-supervises-${row.id}`}
+                        className="text-nano text-txt3 flex items-center gap-1 mt-0.5"
+                      >
+                        <span>supervises</span>
+                        <SupervisesPicker
+                          compact
+                          value={row.supervises_project_anchor_id ?? null}
+                          disabled={patchM.isPending}
+                          onChange={(next) =>
+                            patchM.mutate({
+                              id: row.id,
+                              patch: { supervises_project_anchor_id: next },
+                            })
+                          }
+                        />
                       </div>
                     </div>
                     <div className="flex items-center gap-1 flex-shrink-0">

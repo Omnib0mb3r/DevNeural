@@ -873,7 +873,11 @@ export async function registerDashboardRoutes(
    * cwd defaults to <DATA_ROOT>/brainstorm. Returns the new anchor +
    * spawned PTY id so the dashboard can immediately route to it. */
   app.post('/lex/anchors', async (req, reply) => {
-    const body = (req.body ?? {}) as { cwd?: string; title?: string };
+    const body = (req.body ?? {}) as {
+      cwd?: string;
+      title?: string;
+      supervises_project_anchor_id?: string | null;
+    };
     const cwd =
       body.cwd ?? path.posix.join(DATA_ROOT.replace(/\\/g, '/'), 'brainstorm');
     if (!fs.existsSync(cwd)) {
@@ -884,6 +888,27 @@ export async function registerDashboardRoutes(
         return {
           ok: false,
           error: `cannot create cwd: ${(err as Error).message}`,
+        };
+      }
+    }
+    /* Validate the supervises target up front so a bad id never
+     * leaves a half-bound anchor behind. Mirrors the PATCH
+     * validation; null is accepted (no binding). */
+    if (body.supervises_project_anchor_id !== undefined && body.supervises_project_anchor_id !== null) {
+      const target = body.supervises_project_anchor_id;
+      if (typeof target !== 'string' || !target) {
+        reply.code(422);
+        return {
+          ok: false,
+          error: 'supervises_project_anchor_id must be a non-empty string or null',
+        };
+      }
+      const exists = store.db.getProjectSession(target);
+      if (!exists) {
+        reply.code(422);
+        return {
+          ok: false,
+          error: `project_session ${target} not found`,
         };
       }
     }
@@ -908,6 +933,19 @@ export async function registerDashboardRoutes(
       log(
         `[lex-anchor] new anchor=${r.lexSessionId} cc=${r.ccSessionId} pty=${r.ptyId} cwd=${cwd}`,
       );
+      /* Stamp the binding immediately after the row is created so
+       * the first call to /lex/voice-snapshot or
+       * /lex/inject-cross-session sees the supervises target without
+       * needing a follow-up PATCH from the client. */
+      if (
+        body.supervises_project_anchor_id !== undefined &&
+        body.supervises_project_anchor_id !== null
+      ) {
+        store.db.setLexSessionSupervises(
+          r.lexSessionId,
+          body.supervises_project_anchor_id,
+        );
+      }
       return {
         ok: true,
         anchor_id: r.lexSessionId,
@@ -915,6 +953,7 @@ export async function registerDashboardRoutes(
         pty_id: r.ptyId,
         transcript_path: r.transcriptPath,
         prompt_version: built.version,
+        supervises_project_anchor_id: body.supervises_project_anchor_id ?? null,
       };
     } catch (err) {
       log(`[lex-anchor] new failed: ${(err as Error).message}`);

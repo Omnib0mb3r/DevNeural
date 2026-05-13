@@ -7,17 +7,20 @@
  * when audio was retained. Cues are loaded lazily from the cues_url
  * so a session without audio doesn't pay the second fetch.
  */
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { AudioPlayer } from "./AudioPlayer";
 import {
   getBrainstormApi,
   getBrainstormCuesApi,
   getBrainstormChunksApi,
+  lexAnchor,
   lexSessionArtifacts,
+  patchLexAnchor,
   type AudioCue,
   type BrainstormChunkRow,
 } from "@/lib/daemon-client";
+import { SupervisesPicker } from "./SupervisesPicker";
 
 export function BrainstormDetail({ id }: { id: string }) {
   const detail = useQuery({
@@ -86,6 +89,7 @@ export function BrainstormDetail({ id }: { id: string }) {
       ) : (
         <p className="text-xs text-txt3">no audio retained for this session.</p>
       )}
+      <SupervisesSection brainstormId={id} />
       {bs.last_summary ? (
         <section>
           <h2 className="text-sm font-semibold">Summary</h2>
@@ -101,6 +105,54 @@ export function BrainstormDetail({ id }: { id: string }) {
         loading={artifacts.isLoading}
       />
     </div>
+  );
+}
+
+/* Phase C-3: binding section.
+ *
+ * The legacy /brainstorms/:id endpoint feeds off brainstorm_sessions
+ * (the write-through mirror table), which does not carry the
+ * supervises field. lex_session is the source of truth, so this
+ * subsection fetches the matching lex_anchor row by the same id and
+ * exposes the SupervisesPicker for inline rebind / clear. PATCHes
+ * /lex/anchors/:id; invalidates the anchor query + the past-sessions
+ * row so other surfaces refresh without a reload. */
+function SupervisesSection({ brainstormId }: { brainstormId: string }) {
+  const qc = useQueryClient();
+  const q = useQuery({
+    queryKey: ["lex-anchor", brainstormId],
+    queryFn: () => lexAnchor(brainstormId),
+    refetchInterval: 30_000,
+  });
+  const patchM = useMutation({
+    mutationFn: (next: string | null) =>
+      patchLexAnchor(brainstormId, {
+        supervises_project_anchor_id: next,
+      }),
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ["lex-anchor", brainstormId] });
+      qc.invalidateQueries({ queryKey: ["lex-anchors"] });
+    },
+  });
+  /* The anchor row may not exist for brainstorms that pre-date
+   * migration 018 (lex_session backfill). Render nothing in that
+   * case rather than a confusing empty picker. */
+  if (q.isLoading) return null;
+  if (!q.data?.ok || !q.data.anchor) return null;
+  const value = q.data.anchor.supervises_project_anchor_id ?? null;
+  return (
+    <section data-testid="brainstorm-detail-supervises">
+      <h2 className="text-sm font-semibold">Supervises project</h2>
+      <p className="text-nano text-txt3 mb-1">
+        When set, /lex/inject-cross-session lands here if the caller
+        omits target_session. Clear to require an explicit target.
+      </p>
+      <SupervisesPicker
+        value={value}
+        onChange={(next) => patchM.mutate(next)}
+        disabled={patchM.isPending}
+      />
+    </section>
   );
 }
 

@@ -599,7 +599,15 @@ export const lexAnchor = (id: string) =>
     anchor: LexAnchor & { transcripts: LexAnchorTranscriptRef[] };
     error?: string;
   }>(`/lex/anchors/${encodeURIComponent(id)}`);
-export const createLexAnchor = (opts: { cwd?: string; title?: string } = {}) =>
+export const createLexAnchor = (
+  opts: {
+    cwd?: string;
+    title?: string;
+    /* Phase C binding. Pass a project_session id to bind the new
+     * anchor on create; null/omitted leaves the brainstorm unbound. */
+    supervises_project_anchor_id?: string | null;
+  } = {},
+) =>
   request<{
     ok: boolean;
     anchor_id?: string;
@@ -607,6 +615,7 @@ export const createLexAnchor = (opts: { cwd?: string; title?: string } = {}) =>
     pty_id?: string;
     transcript_path?: string;
     prompt_version?: string;
+    supervises_project_anchor_id?: string | null;
     error?: string;
   }>(`/lex/anchors`, { method: "POST", body: opts });
 export const openLexAnchor = (id: string) =>
