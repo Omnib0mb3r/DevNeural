@@ -53,7 +53,26 @@ e8a807a feat(daemon): smart-compact orchestration surface
 - **Phase 1 sibling index**: confirm next brainstorm cold-start under "DevNeural Testing" actually shows the sibling index header in the system prompt. Source is the current anchor's prior `lex_transcript_refs`, not other brainstorm rows.
 - **Phase 2 preload**: same cold-start should also include the last-2 prior transcript distillations + last 5 user/assistant pairs from each ref's jsonl, appended after the index.
 - **Distillation backfill scheduler**: backfill module is bound to a daemon-side scheduler that ticks every 10 minutes (first fire after a 30s boot grace). Generator is `createLlmDistillationGenerator` which goes through `pickProvider()` and lands on the local ollama provider (BF-4 forbids Anthropic for brainstorm content). The provider's `distillation` role is wired on qwen3:8b alongside the existing ingest / lint / reconcile / selfQuery roles and is surfaced on `/system` under the LLM Provider panel. Prompt asks for 3-4 short lines under 80 words covering headline, last decision, open questions, and any blocker, so cold-start handoff is structured rather than a one-line tease.
-- **Brainstorm-to-project binding**: each brainstorm anchor (`lex_sessions` row) carries a nullable `supervises_project_anchor_id` foreign key into `project_session`. Set at create time via the new-brainstorm modal's project picker, editable later from the brainstorm tile. `voice-snapshot` surfaces the binding in `live_state` so Lex sees its supervised target without having to infer from `open_projects`. The cross-session inject path resolves a missing `target_session` against the bound project's `current_session_id`, so Lex inject calls can omit the target entirely when supervising a single project. Explicit `target_session` in the call still wins. Clearing the column drops Lex back to the legacy judgment-based behavior of choosing from `open_projects`.
+- **Brainstorm-to-project binding**: each brainstorm anchor (`lex_sessions` row) carries a nullable `supervises_project_anchor_id` foreign key into `project_session` (ON DELETE SET NULL so a project removal blanks the pointer without taking the brainstorm with it). Set at create time via the new-brainstorm modal's project picker, editable later from the brainstorm tile. `voice-snapshot` surfaces the binding in `live_state` so Lex sees its supervised target without having to infer from `open_projects`. The cross-session inject path resolves a missing `target_session` against the bound project's `current_session_id`, so Lex inject calls can omit the target entirely when supervising a single project. When the bound project is dormant the resolver returns `{target_session: null, reason: 'bound-project-dormant'}` and the inject route 422s with a clear message instead of silently dropping. Explicit `target_session` in the call still wins. Clearing the column drops Lex back to the legacy judgment-based behavior of choosing from `open_projects`.
+
+### Hierarchy at a glance
+
+```
+Brainstorm anchor (lex_sessions)              grandparent / boss
+  user_label = "DevNeural Testing"            persistent across resets
+  supervises_project_anchor_id ──────────┐
+                                         │
+                                         ▼
+Project anchor (project_session)              parent / child of the brainstorm
+  id = "DevNeural"                            persistent across worker restarts
+  current_session_id ────────────────────┐
+                                         │
+                                         ▼
+Worker CC session                             grandchild / rotates
+  id = "0d25363c..."                          new id on every VS Code restart
+```
+
+The brainstorm anchor owns the relationship. The project anchor is its child and lives independently. The actual Claude Code worker process is the grandchild and is the only layer that rotates on every restart; the daemon walks brainstorm → project → live worker on every inject, so the binding never has to be re-pointed when only the worker session id changes.
 
 ## Open follow-ups worker captured
 
