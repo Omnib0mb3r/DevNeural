@@ -3671,6 +3671,14 @@ export async function registerDashboardRoutes(
       reply.code(400);
       return { ok: false, error: 'session_id required' };
     }
+    /* Runtime kill-switch consulted before any work. Default OFF
+     * (matches the smart-compact precedent). The dashboard /system
+     * toggle writes runtime_config; the hook also gates on
+     * DEVNEURAL_LEX_COLD_START_PRELOAD_ENABLED, so either off here
+     * is a silent no-op for the SessionStart caller. */
+    if (!coldStartPreloadEnabled(store.db)) {
+      return { ok: true, block: '', reason: 'disabled' };
+    }
     const sessionId = body.session_id;
     const { getBrainstormByClaudeSessionId } = await import(
       '../lex/brainstorm-store.js'
@@ -3726,6 +3734,55 @@ export async function registerDashboardRoutes(
       sibling_count: siblingCount,
       brainstorm_id: bs.id,
       label,
+    };
+  });
+
+  /* GET + POST /lex/cold-start-preload/toggle
+   *
+   * Dashboard /system surface for the runtime kill-switch backing
+   * /lex/cold-start-preload. Reads + writes runtime_config so the
+   * flip takes effect immediately without a daemon restart.
+   *
+   * GET response shape:
+   *   { ok, enabled, runtime_value, env_value, env_default_off }
+   *
+   * POST body: { enabled: boolean, updated_by?: string }
+   *   Persists 'on' / 'off' into runtime_config; returns the same
+   *   shape as GET so the dashboard can reconcile optimistically. */
+  app.get('/lex/cold-start-preload/toggle', async () => {
+    const runtimeValue = store.db.getRuntimeConfig(
+      COLD_START_PRELOAD_CONFIG_KEY,
+    );
+    const envValue = process.env.DEVNEURAL_LEX_COLD_START_PRELOAD_ENABLED ?? null;
+    return {
+      ok: true,
+      enabled: coldStartPreloadEnabled(store.db),
+      runtime_value: runtimeValue,
+      env_value: envValue,
+      env_default_off: true,
+    };
+  });
+
+  app.post('/lex/cold-start-preload/toggle', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      enabled?: boolean;
+      updated_by?: string;
+    };
+    if (typeof body.enabled !== 'boolean') {
+      reply.code(400);
+      return { ok: false, error: 'enabled (boolean) required' };
+    }
+    store.db.setRuntimeConfig(
+      COLD_START_PRELOAD_CONFIG_KEY,
+      body.enabled ? 'on' : 'off',
+      body.updated_by,
+    );
+    return {
+      ok: true,
+      enabled: coldStartPreloadEnabled(store.db),
+      runtime_value: store.db.getRuntimeConfig(COLD_START_PRELOAD_CONFIG_KEY),
+      env_value: process.env.DEVNEURAL_LEX_COLD_START_PRELOAD_ENABLED ?? null,
+      env_default_off: true,
     };
   });
 
@@ -4112,6 +4169,24 @@ export async function registerDashboardRoutes(
 
   // Use the notification event bus to suppress unused-import lint
   void notificationEvents;
+}
+
+/* Runtime kill-switch for the cold-start preload feature.
+ *
+ * Mirrors the smart-compact precedent: default OFF so an auto-firing
+ * inject ships shadow-until-opted-in. The dashboard /system page
+ * writes runtime_config.lex_cold_start_preload_enabled to 'on' or
+ * 'off'. We accept the legacy 'true' / '1' values as ON for parity
+ * with the env-flag spelling; anything else (unset, 'off', 'false',
+ * '0', typos) keeps the switch off. */
+const COLD_START_PRELOAD_CONFIG_KEY = 'lex_cold_start_preload_enabled';
+function coldStartPreloadEnabled(
+  db: import('../store/index-db.js').IndexDb,
+): boolean {
+  const raw = db.getRuntimeConfig(COLD_START_PRELOAD_CONFIG_KEY);
+  if (raw === null) return false;
+  const v = raw.trim().toLowerCase();
+  return v === 'on' || v === 'true' || v === '1';
 }
 
 /* Decorate a brainstorm row with the audio + cues URLs the dashboard

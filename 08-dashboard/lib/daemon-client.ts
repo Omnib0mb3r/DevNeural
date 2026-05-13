@@ -1494,6 +1494,23 @@ export const recentSmartCompacts = (limit: number = 20) =>
     `/lex/smart-compact/recent?limit=${limit}`,
   );
 
+// ── Lex cold-start preload toggle ───────────────────────────────
+export interface ColdStartPreloadToggle {
+  ok: boolean;
+  enabled: boolean;
+  runtime_value: string | null;
+  env_value: string | null;
+  env_default_off: boolean;
+}
+export const coldStartPreloadToggle = () =>
+  request<ColdStartPreloadToggle>(`/lex/cold-start-preload/toggle`);
+export const setColdStartPreloadToggle = (enabled: boolean) =>
+  request<ColdStartPreloadToggle>(`/lex/cold-start-preload/toggle`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  });
+
 export const uploadReference = (file: File, opts: { project_id?: string; tags?: string[] } = {}) => {
   const fd = new FormData();
   fd.append("file", file);

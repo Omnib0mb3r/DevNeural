@@ -144,8 +144,14 @@ function parsePhase(arg: string | undefined): HookPhase {
  * a Read.
  *
  * Feature-flag-gated: DEVNEURAL_LEX_COLD_START_PRELOAD_ENABLED
- *   default: ON
- *   off only when explicit 'false' / '0' / 'off' (case-insensitive)
+ *   default: OFF (matches the smart-compact precedent: auto-firing
+ *   risky features ship shadow-only until the operator opts in)
+ *   ON only when env is explicitly '1' / 'true' / 'on'
+ *
+ * Runtime toggle: the daemon side also consults runtime_config
+ * (key 'lex_cold_start_preload_enabled', value 'on'|'off'), edited
+ * via the dashboard /system panel. Either gate off = the preload
+ * route returns an empty block and this hook stays silent.
  *
  * Bounded timeout; daemon-down or empty-block paths are silent
  * no-ops so a missing daemon never blocks the session start. */
@@ -159,7 +165,10 @@ async function postColdStartPreload(
   )
     .trim()
     .toLowerCase();
-  if (flag === 'false' || flag === '0' || flag === 'off') return;
+  /* Default OFF: only explicit truthy values flip the gate on. Any
+   * other value (unset, '', 'false', '0', typos) keeps the hook
+   * silent so an accidental env spill cannot start auto-injecting. */
+  if (flag !== '1' && flag !== 'true' && flag !== 'on') return;
   const url = `http://127.0.0.1:${DAEMON_PORT}/lex/cold-start-preload`;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 2000);
