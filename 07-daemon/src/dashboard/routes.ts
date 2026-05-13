@@ -836,6 +836,13 @@ export async function registerDashboardRoutes(
         created_ms: row.created_ms,
         last_activity_ms: last,
         transcript_count: refs.length,
+        /* Phase C: surface the brainstorm-to-project binding so
+         * the dashboard's SupervisesPicker can read its current
+         * value from the same row it just PATCH'd. Without this
+         * column the controlled <select> bounced back to
+         * '(no project)' on every refetch tick because
+         * row.supervises_project_anchor_id was undefined. */
+        supervises_project_anchor_id: row.supervises_project_anchor_id ?? null,
       };
     });
     return { ok: true, anchors: out };
@@ -864,6 +871,12 @@ export async function registerDashboardRoutes(
         cwd: row.cwd,
         created_ms: row.created_ms,
         transcripts: refs,
+        /* Phase C: see the matching note in GET /lex/anchors. The
+         * BrainstormDetail SupervisesSection reads
+         * q.data?.anchor?.supervises_project_anchor_id to seed
+         * its picker; omitting the field here broke the same
+         * round-trip the list endpoint did. */
+        supervises_project_anchor_id: row.supervises_project_anchor_id ?? null,
       },
     };
   });
