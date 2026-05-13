@@ -3647,6 +3647,88 @@ export async function registerDashboardRoutes(
     };
   });
 
+  /* POST /lex/cold-start-preload
+   *
+   * Called by Claude Code's SessionStart hook the moment a fresh Lex
+   * brainstorm session boots. Resolves the new brainstorm row by its
+   * just-bound CC session id, looks up sibling brainstorms that share
+   * the same user_label, and returns a tiny markdown block listing
+   * each sibling's last_summary distillation. The hook prints the
+   * block to stdout so CC injects it as additionalContext on the
+   * first turn, letting Lex reference prior decisions without
+   * firing a Read.
+   *
+   * Side-effect-free apart from one audit row written via
+   * insertCrossSessionLog with caller_label='cold-start-preload'.
+   * Returns { ok: true, block: '', reason } when there is nothing
+   * to preload so the hook can no-op cleanly.
+   *
+   * Body: { session_id: string; cwd?: string }
+   */
+  app.post('/lex/cold-start-preload', async (req, reply) => {
+    const body = (req.body ?? {}) as { session_id?: string; cwd?: string };
+    if (!body.session_id || typeof body.session_id !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'session_id required' };
+    }
+    const sessionId = body.session_id;
+    const { getBrainstormByClaudeSessionId } = await import(
+      '../lex/brainstorm-store.js'
+    );
+    const { buildSiblingIndex } = await import('../lex/sibling-index.js');
+    const bs = getBrainstormByClaudeSessionId(sessionId);
+    if (!bs) {
+      return { ok: true, block: '', reason: 'no-brainstorm-bound' };
+    }
+    const label = bs.user_label ?? bs.derived_label ?? null;
+    if (!label) {
+      return { ok: true, block: '', reason: 'no-label', brainstorm_id: bs.id };
+    }
+    const block = buildSiblingIndex({
+      db: store.db,
+      label,
+      excludeId: bs.id,
+      limit: 5,
+      distillationWords: 20,
+    });
+    if (!block) {
+      return {
+        ok: true,
+        block: '',
+        reason: 'no-siblings',
+        brainstorm_id: bs.id,
+        label,
+      };
+    }
+    /* Best-effort audit row in cross_session_injection_log so the
+     * dashboard's /lex/injection-log surface (and any reviewer
+     * scrolling back through who-said-what) can see when a cold-start
+     * preload fired. Reuses the existing table because adding a
+     * dedicated one for a single audit field would be over-engineering. */
+    try {
+      const { randomUUID } = await import('node:crypto');
+      store.db.insertCrossSessionLog({
+        id: randomUUID(),
+        target_session: sessionId,
+        caller_label: 'cold-start-preload',
+        text_preview: block.slice(0, 240),
+        text_length: block.length,
+        decision: 'accepted',
+        brainstorm_id: bs.id,
+      });
+    } catch {
+      /* audit row is observational; never block the preload response */
+    }
+    const siblingCount = (block.match(/^- /gm) ?? []).length;
+    return {
+      ok: true,
+      block,
+      sibling_count: siblingCount,
+      brainstorm_id: bs.id,
+      label,
+    };
+  });
+
   app.get('/lex/injection-log', async (req) => {
     const q = (req.query ?? {}) as {
       target_session?: string;

@@ -137,6 +137,57 @@ function parsePhase(arg: string | undefined): HookPhase {
   }
 }
 
+/* Ask the daemon for prior-sibling-session decisions on a fresh Lex
+ * spawn (SessionStart source=startup) and print the returned block to
+ * stdout so Claude Code injects it as additionalContext on the very
+ * first turn. Letting Lex reference a prior decision without firing
+ * a Read.
+ *
+ * Feature-flag-gated: DEVNEURAL_LEX_COLD_START_PRELOAD_ENABLED
+ *   default: ON
+ *   off only when explicit 'false' / '0' / 'off' (case-insensitive)
+ *
+ * Bounded timeout; daemon-down or empty-block paths are silent
+ * no-ops so a missing daemon never blocks the session start. */
+async function postColdStartPreload(
+  sessionId: string,
+  cwd: string,
+): Promise<void> {
+  if (!sessionId) return;
+  const flag = String(
+    process.env.DEVNEURAL_LEX_COLD_START_PRELOAD_ENABLED ?? '',
+  )
+    .trim()
+    .toLowerCase();
+  if (flag === 'false' || flag === '0' || flag === 'off') return;
+  const url = `http://127.0.0.1:${DAEMON_PORT}/lex/cold-start-preload`;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 2000);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, cwd }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return;
+    const json = (await res.json()) as {
+      ok?: boolean;
+      block?: string;
+    };
+    if (!json.ok || !json.block || json.block.trim().length === 0) return;
+    /* Claude Code's SessionStart hook reads stdout and injects the
+     * payload as additional context on the first user turn. The
+     * trailing newline keeps the markdown block detached from any
+     * harness boilerplate that follows. */
+    process.stdout.write(json.block + '\n');
+  } catch {
+    /* daemon down / network error / timeout: silent no-op */
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 /* Tell the daemon a SessionStart fired from /clear so it can mark the
  * previous session in this workspace as superseded. Without this the
  * Stream Deck rail keeps the old tile around for ACTIVE_THRESHOLD_MS. */
@@ -417,6 +468,12 @@ async function main(): Promise<void> {
     const sessionId = String(payload.session_id ?? '');
     if ((source === 'clear' || source === 'compact') && sessionId) {
       await postClearSupersede(sessionId, cwd);
+    } else if (source === 'startup' && sessionId) {
+      /* Fresh spawn: ask the daemon to compose a sibling-decision
+       * block and print it to stdout for CC to inject as
+       * additionalContext on the first turn. Flag-gated and
+       * timeout-bounded; on any failure the session starts normally. */
+      await postColdStartPreload(sessionId, cwd);
     }
     // Lazy-spawn daemon so the supersede arrives even on cold start.
     const pid = readPid();
