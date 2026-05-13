@@ -658,6 +658,71 @@ function getPresenceDir(): string {
   return path.posix.join(getBridgeDir(), '.bridge-presence');
 }
 
+/* Freshness window for a CC session jsonl to count as "the live
+ * session for this cwd". 30s matches the daemon's bridge-presence
+ * timeout so a stale jsonl from a closed VS Code window doesn't
+ * keep its old anchor pinned live. */
+const CC_JSONL_FRESH_MS = 30_000;
+
+/* Filesystem fallback: scan ~/.claude/projects/<slug>/*.jsonl for the
+ * most recently modified file whose mtime is inside the freshness
+ * window. Used when the daemon-side /sessions cache hasn't surfaced
+ * the live session yet (it's chicken-and-egg: daemon's listSessions
+ * filters by readLiveSessionIds, which only contains UUIDs already
+ * bound to live anchors, so the very first binding has to come from
+ * the bridge). Returns the session uuid or undefined if no fresh
+ * jsonl exists. */
+function ccSessionIdFromJsonlScan(cwd: string): string | undefined {
+  const slug = cwdToSlug(cwd);
+  const claudeRoot = path.posix.join(
+    os.homedir().replace(/\\/g, '/'),
+    '.claude',
+    'projects',
+  );
+  if (!fs.existsSync(claudeRoot)) return undefined;
+  /* Slug encoding preserves case (DevNeural stays DevNeural). On
+   * Windows the filesystem is case-insensitive so a direct path
+   * lookup works regardless of the on-disk casing; on case-sensitive
+   * filesystems we fall back to a name match. */
+  let slugDir = path.posix.join(claudeRoot, slug);
+  if (!fs.existsSync(slugDir)) {
+    try {
+      const candidates = fs.readdirSync(claudeRoot, { withFileTypes: true });
+      const slugLower = slug.toLowerCase();
+      const match = candidates.find(
+        (e) => e.isDirectory() && e.name.toLowerCase() === slugLower,
+      );
+      if (!match) return undefined;
+      slugDir = path.posix.join(claudeRoot, match.name);
+    } catch {
+      return undefined;
+    }
+  }
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(slugDir, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  const now = Date.now();
+  let best: { id: string; mtimeMs: number } | undefined;
+  for (const e of entries) {
+    if (!e.isFile() || !e.name.endsWith('.jsonl')) continue;
+    const full = path.posix.join(slugDir, e.name);
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(full);
+    } catch {
+      continue;
+    }
+    if (now - stat.mtimeMs > CC_JSONL_FRESH_MS) continue;
+    if (!best || stat.mtimeMs > best.mtimeMs) {
+      best = { id: e.name.replace(/\.jsonl$/, ''), mtimeMs: stat.mtimeMs };
+    }
+  }
+  return best?.id;
+}
+
 let presenceContext: vscode.ExtensionContext | undefined;
 function writePresence(): void {
   if (!presenceContext) return;
@@ -673,14 +738,17 @@ function writePresence(): void {
     bridgeId,
     now: new Date(),
     ccSessionLookup: (cwd) => {
-      /* Best-effort CC session id from the daemon /sessions cache the
-       * mirror loop already maintains. Route through the shared
-       * cwdToSlug helper rather than hand-rolling the regex here.
-       * A prior inline `cwd.replace(/[:]/g, '-')` lost the slash
-       * escapes on Windows and the lookup quietly missed every time,
-       * leaving cc_session_ids empty in the presence file. */
+      /* Two-pass lookup. Daemon /sessions cache first (covers the
+       * common case where the mirror loop has already mapped the
+       * project_slug to a UUID). Filesystem scan second so the very
+       * first binding for a fresh session lands without the daemon
+       * having to publish it: the bridge owns the cwd plus a one-line
+       * readdir of ~/.claude/projects/<slug>/, which is enough to
+       * populate cc_session_ids on the next presence tick. */
       const slug = cwdToSlug(cwd).toLowerCase();
-      return daemonActiveSessions.get(slug);
+      const cached = daemonActiveSessions.get(slug);
+      if (cached) return cached;
+      return ccSessionIdFromJsonlScan(cwd);
     },
   });
 }
