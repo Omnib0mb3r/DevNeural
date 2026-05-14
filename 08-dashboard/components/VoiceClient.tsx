@@ -2243,123 +2243,207 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   );
 }
 
+/* Presentational pill body, split out from VoiceTopBarPill so tests
+ * can drive it with synthetic state without standing up the WS + VAD
+ * machinery the engine owns. Two reactive icons sit side-by-side
+ * (mic on the left for user-input mute, speaker on the right for
+ * Lex-TTS mute) followed by a status label and the hard stop
+ * button. Symmetric input/output controls so tap targets are
+ * predictable on touch. */
+export interface VoicePillViewProps {
+  status: VoiceCtxValue["status"];
+  enabled: boolean;
+  muted: boolean;
+  micGated: boolean;
+  softMuted: boolean;
+  silentMessageCount: number;
+  toggleEnabled: () => void;
+  setMicMuted: (next: boolean) => void;
+  setSoftMuted: (next: boolean) => void;
+}
+
+export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
+  const {
+    status,
+    enabled,
+    muted,
+    micGated,
+    softMuted,
+    silentMessageCount,
+    toggleEnabled,
+    setMicMuted,
+    setSoftMuted,
+  } = props;
+  const statusTone =
+    status === "error"
+      ? "text-err"
+      : status === "listening" || status === "ready"
+        ? "text-ok"
+        : status === "transcribing" || status === "thinking"
+          ? "text-attn"
+          : status === "speaking"
+            ? "text-brandSoft"
+            : "text-txt3";
+  const baseLabel =
+    status === "idle"
+      ? "off"
+      : status === "connecting"
+        ? "connecting"
+        : status === "ready"
+          ? "ready"
+          : status === "listening"
+            ? "listening"
+            : status === "transcribing"
+              ? "transcribing"
+              : status === "thinking"
+                ? "thinking"
+                : status === "speaking"
+                  ? "speaking"
+                  : "error";
+  /* Soft mute communicates the strongest signal: TTS is silenced
+   * until the user explicitly unmutes. Override the transient
+   * status label so the pill never reads "speaking" while Lex's
+   * audio is being dropped on the floor. */
+  const statusLabel = softMuted
+    ? "muted (voice)"
+    : micGated
+      ? "muted (tts)"
+      : baseLabel;
+  const finalStatusTone = softMuted ? "text-attn" : statusTone;
+  const pillTitle = softMuted
+    ? `Lex is muted. ${silentMessageCount} silent message${
+        silentMessageCount === 1 ? "" : "s"
+      } received. Tap the speaker icon or say "Lex unmute" to resume TTS.`
+    : micGated
+      ? "Mic paused while Lex is speaking. Resumes automatically when TTS finishes."
+      : undefined;
+
+  /* Mic icon reflects the user-input mute state. micGated rolls into
+   * the same visual because either condition means "your voice will
+   * NOT reach Lex right now"; the tooltip distinguishes them. */
+  const micIconName: "Mic" | "MicOff" = muted || micGated ? "MicOff" : "Mic";
+  const micTone = muted
+    ? "text-attn"
+    : micGated
+      ? "text-txt3"
+      : "text-brandSoft";
+  /* Reactive pulse on the mic icon while silero is actively
+   * listening so the user has a confident "your speech is being
+   * captured right now" signal that does not depend on reading the
+   * tiny status label. Suppressed while muted / gated. */
+  const micPulse = enabled && !muted && !micGated && status === "listening";
+
+  /* Speaker icon mirrors the mic on the output side: tap to mute or
+   * unmute Lex's outbound TTS. VolumeX is the universal "speaker
+   * silenced" glyph; Volume2 carries an animated set of arcs when
+   * Lex is actively speaking so the pulse reads as a waveform. */
+  const speakerIconName: "Volume2" | "VolumeX" = softMuted ? "VolumeX" : "Volume2";
+  const speakerTone = softMuted
+    ? "text-attn"
+    : status === "speaking"
+      ? "text-brandSoft"
+      : "text-txt2";
+  const speakerPulse = enabled && !softMuted && status === "speaking";
+
+  return (
+    <div
+      className="flex items-center gap-0.5 sm:gap-1 h-9 px-1 sm:px-2 rounded-pill hairline"
+      title={pillTitle}
+    >
+      <button
+        type="button"
+        aria-label={muted ? "Unmute microphone" : "Mute microphone"}
+        aria-pressed={muted}
+        onClick={() => setMicMuted(!muted)}
+        disabled={!enabled}
+        className="w-9 h-9 grid place-items-center rounded-pill text-txt2 hover:bg-surface2 disabled:opacity-40 disabled:cursor-not-allowed"
+        title={
+          micGated
+            ? "Mic paused while Lex speaks. Tap to also user-mute."
+            : muted
+              ? "Microphone muted. Tap to unmute."
+              : "Mute your microphone."
+        }
+      >
+        <Icon
+          name={micIconName}
+          size={16}
+          className={`${micTone} ${micPulse ? "pulse-live" : ""}`}
+        />
+      </button>
+      <button
+        type="button"
+        aria-label={softMuted ? "Unmute Lex voice" : "Mute Lex voice"}
+        aria-pressed={softMuted}
+        onClick={() => setSoftMuted(!softMuted)}
+        disabled={!enabled}
+        className="relative w-9 h-9 grid place-items-center rounded-pill text-txt2 hover:bg-surface2 disabled:opacity-40 disabled:cursor-not-allowed"
+        title={
+          softMuted
+            ? `Lex is muted. ${silentMessageCount} silent message${
+                silentMessageCount === 1 ? "" : "s"
+              }. Tap to resume TTS.`
+            : "Mute Lex's voice. Transcript keeps rendering; tap again to unmute."
+        }
+      >
+        <Icon
+          name={speakerIconName}
+          size={16}
+          className={`${speakerTone} ${speakerPulse ? "pulse-live" : ""}`}
+        />
+        {softMuted && silentMessageCount > 0 && (
+          <span
+            className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 grid place-items-center rounded-pill bg-attn text-base text-[10px] font-mono ring-1 ring-attn/40"
+            aria-label={`${silentMessageCount} silent message${
+              silentMessageCount === 1 ? "" : "s"
+            }`}
+          >
+            {silentMessageCount > 99 ? "99+" : silentMessageCount}
+          </span>
+        )}
+      </button>
+      <span
+        className={`hidden sm:inline text-[11px] font-mono px-1 ${finalStatusTone}`}
+      >
+        {statusLabel}
+      </span>
+      <button
+        type="button"
+        onClick={toggleEnabled}
+        aria-label={enabled ? "Stop voice" : "Start voice"}
+        className={`text-[11px] px-2 py-0.5 rounded-pill hairline font-emphasized ${
+          enabled
+            ? "bg-err/15 text-err ring-1 ring-err/30 hover:bg-err/25"
+            : "bg-brand/15 text-brandSoft ring-1 ring-brand/30 hover:bg-brand/25"
+        }`}
+        title={enabled ? "Stop voice." : "Start voice."}
+      >
+        {enabled ? "stop" : "start"}
+      </button>
+    </div>
+  );
+}
+
 /* Compact mic pill rendered in the TopBar's right cluster. Lives in
  * this file so it shares the constants + context type with the
  * engine. Renders nothing when there's no live Lex PTY so the bar
  * stays clean on first launch; once Lex is alive the pill surfaces
- * status + a start/stop toggle + a mute toggle. */
+ * status, the mic + speaker mute icons, and a start/stop toggle. */
 export function VoiceTopBarPill(): React.ReactElement | null {
   const v = useVoice();
   if (!v) return null;
   if (!v.hasLex && !v.enabled) return null;
-
-  const tone =
-    v.status === "error"
-      ? "text-err"
-      : v.status === "listening" || v.status === "ready"
-        ? "text-ok"
-        : v.status === "transcribing" || v.status === "thinking"
-          ? "text-attn"
-          : v.status === "speaking"
-            ? "text-brandSoft"
-            : "text-txt3";
-  const label =
-    v.status === "idle"
-      ? "off"
-      : v.status === "connecting"
-        ? "connecting"
-        : v.status === "ready"
-          ? "ready"
-          : v.status === "listening"
-            ? "listening"
-            : v.status === "transcribing"
-              ? "transcribing"
-              : v.status === "thinking"
-                ? "thinking"
-                : v.status === "speaking"
-                  ? "speaking"
-                  : "error";
-
-  /* Mic gated during TTS playback: swap to MicOff with a muted tone
-   * so the user can see at a glance that the speaker's audio is not
-   * being captured back into whisper. Tooltip explains. */
-  const iconName: "Mic" | "MicOff" =
-    v.micGated || v.softMuted ? "MicOff" : "Mic";
-  const iconTone =
-    v.micGated || v.softMuted ? "text-txt3" : "text-brandSoft";
-  /* Soft-mute pill copy takes precedence over the transient tts gate
-   * because soft mute is a persistent state and the user needs the
-   * stronger signal. */
-  const pillTitle = v.softMuted
-    ? `Lex is muted. ${v.silentMessageCount} silent message${
-        v.silentMessageCount === 1 ? "" : "s"
-      } received. Say "Lex unmute" or click the muted button to resume TTS.`
-    : v.micGated
-      ? "Mic paused while Lex is speaking. Resumes automatically when TTS finishes."
-      : undefined;
-  const statusLabel = v.softMuted
-    ? "muted (voice)"
-    : v.micGated
-      ? "muted (tts)"
-      : label;
-  const statusTone = v.softMuted ? "text-attn" : tone;
   return (
-    <div
-      className="flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline"
-      title={pillTitle}
-    >
-      <Icon name={iconName} className={iconTone} size={12} />
-      <span
-        className={`hidden sm:inline text-[11px] font-mono ${statusTone}`}
-      >
-        {statusLabel}
-      </span>
-      {v.softMuted && v.silentMessageCount > 0 && (
-        <span
-          className="text-[10px] font-mono px-1.5 py-0.5 rounded-pill bg-attn/20 text-attn ring-1 ring-attn/40"
-          title={`${v.silentMessageCount} unread silent message${
-            v.silentMessageCount === 1 ? "" : "s"
-          } in the transcript. Badge clears on unmute.`}
-        >
-          {v.silentMessageCount > 99 ? "99+" : v.silentMessageCount}
-        </span>
-      )}
-      {v.enabled && v.softMuted && (
-        <button
-          type="button"
-          onClick={() => v.setSoftMuted(false)}
-          className="text-[11px] px-2 py-0.5 rounded-pill hairline font-emphasized bg-attn/15 text-attn ring-1 ring-attn/30 hover:bg-attn/25"
-          title='Lex is muted. Click to unmute or say "Lex unmute".'
-        >
-          unmute
-        </button>
-      )}
-      {v.enabled && (
-        <button
-          type="button"
-          onClick={() => v.setMicMuted(!v.muted)}
-          className={`text-[11px] px-2 py-0.5 rounded-pill hairline font-emphasized ${
-            v.muted
-              ? "bg-attn/15 text-attn ring-1 ring-attn/30 hover:bg-attn/25"
-              : "bg-surface2 text-txt2 hover:bg-surface3"
-          }`}
-          title="Mute mic without ending the session."
-        >
-          {v.muted ? "muted" : "mute"}
-        </button>
-      )}
-      <button
-        type="button"
-        onClick={v.toggleEnabled}
-        className={`text-[11px] px-2 py-0.5 rounded-pill hairline font-emphasized ${
-          v.enabled
-            ? "bg-err/15 text-err ring-1 ring-err/30 hover:bg-err/25"
-            : "bg-brand/15 text-brandSoft ring-1 ring-brand/30 hover:bg-brand/25"
-        }`}
-        title={v.enabled ? "Stop voice." : "Start voice."}
-      >
-        {v.enabled ? "stop" : "start"}
-      </button>
-    </div>
+    <VoicePillView
+      status={v.status}
+      enabled={v.enabled}
+      muted={v.muted}
+      micGated={v.micGated}
+      softMuted={v.softMuted}
+      silentMessageCount={v.silentMessageCount}
+      toggleEnabled={v.toggleEnabled}
+      setMicMuted={v.setMicMuted}
+      setSoftMuted={v.setSoftMuted}
+    />
   );
 }

@@ -179,7 +179,14 @@ export function TopBar({ activeTab }: { activeTab: string }) {
             <span className="flex-1 min-w-0 truncate text-sm text-txt3">
               Search wiki, sessions, projects, reference docs…
             </span>
-            <kbd className="hidden md:inline-flex items-center gap-1 px-1.5 h-5 rounded border border-border1 bg-surface2 text-[11px] font-mono text-txt2">
+            {/* ⌘K hint is gated behind xl so it never overlaps the
+             * voice pill on the medium-tablet viewport where the
+             * search button is still rendered as a full pill but the
+             * right cluster has grown to include the symmetric voice
+             * mic+speaker icons. Mid-2026-05-14 screenshot bug:
+             * uploads/screenshots/1853b239-…-036e009c0f9c.jpeg
+             * showed ⌘K bleeding into the mic icon. */}
+            <kbd className="hidden xl:inline-flex items-center gap-1 px-1.5 h-5 rounded border border-border1 bg-surface2 text-[11px] font-mono text-txt2">
               ⌘ K
             </kbd>
           </button>
