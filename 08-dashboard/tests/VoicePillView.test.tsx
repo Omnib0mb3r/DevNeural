@@ -29,6 +29,7 @@ function defaultProps() {
     micGated: true,
     softMuted: false,
     silentMessageCount: 0,
+    wakeWordActive: false,
     toggleEnabled: vi.fn(),
     setMicMuted: vi.fn(),
     setSoftMuted: vi.fn(),
@@ -164,6 +165,36 @@ describe("VoicePillView", () => {
     expect(
       (screen.getByLabelText("Mute Lex voice") as HTMLButtonElement).disabled,
     ).toBe(true);
+  });
+
+  it("keeps the Mic glyph (not MicOff) when only micGated is true so the wake-word path reads as live", () => {
+    /* Bug 2026-05-14-voice-pill-inconsistent-and-wake-word-muted:
+     * the old pill flipped to MicOff whenever micGated was true,
+     * which read as "wake-word also muted" even though the always-
+     * on listener was still alive. The pill must only show MicOff
+     * on an explicit user mute. */
+    render(
+      <VoicePillView
+        {...defaultProps()}
+        muted={false}
+        micGated={true}
+        wakeWordActive={true}
+      />,
+    );
+    const micBtn = screen.getByLabelText("Mute microphone");
+    /* No MicOff glyph in the tree; the active glyph is Mic. */
+    expect(micBtn.querySelector("svg")).not.toBeNull();
+    expect(micBtn.getAttribute("aria-pressed")).toBe("false");
+    expect(
+      screen.getByTestId("voice-pill-wake-indicator"),
+    ).toBeTruthy();
+  });
+
+  it("does not render the wake-word indicator when wakeWordActive is false", () => {
+    render(
+      <VoicePillView {...defaultProps()} wakeWordActive={false} />,
+    );
+    expect(screen.queryByTestId("voice-pill-wake-indicator")).toBeNull();
   });
 
   it("toggle stop button fires toggleEnabled and reads start/stop depending on enabled", () => {

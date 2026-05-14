@@ -2,17 +2,17 @@
 
 ## Open bugs
 
-_None._ Wave 3 fixup sprint (2026-05-11) closed every entry that had been
-open at the start of the sprint. See "Recently closed" for the audit
-trail; new bugs go here when reported.
-
 | Date | Bug | Status | Severity |
 |------|-----|--------|----------|
+| 2026-05-14 | [iOS PWA reminders not pushing](./2026-05-14-pwa-reminders-not-pushing.md) | open | medium |
 
 ## Recently closed
 
 | Date | Bug | Status | Severity |
 |------|-----|--------|----------|
+| 2026-05-14 | [Voice pill inconsistent + wake-word muted](./2026-05-14-voice-pill-inconsistent-and-wake-word-muted.md) | fixed (pending soak) | medium |
+| 2026-05-14 | [Enable-audio double permission prompt](./2026-05-14-enable-audio-double-permission-prompt.md) | fixed (pending soak) | medium |
+| 2026-05-14 | [No TTS on first prompt after restart](./2026-05-14-no-tts-on-first-prompt-after-restart.md) | fixed (pending soak) | medium |
 | 2026-05-05 | [Leftover session tiles](./2026-05-05-leftover-session-tiles.md) | closed | low |
 | 2026-05-10 | [Brainstorm picker and transcripts](./2026-05-10-brainstorm-picker-and-transcripts.md) | fixed (pending soak) | medium |
 | 2026-05-10 | [CC feedback prompt unanswerable](./2026-05-10-cc-feedback-prompt-unanswerable.md) | fixed (pending soak) | medium |

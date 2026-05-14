@@ -62,6 +62,11 @@ interface VoiceCtxValue {
    * surface a persistent "unread silent messages" badge next to the
    * pill. Cleared on unmute; never auto-stales. */
   silentMessageCount: number;
+  /* True while the always-on wake-word recognizer is live. Rendered
+   * as a small "wake" indicator on the pill so the user can confirm
+   * Lex command capture is still on even when the foreground mic is
+   * micGated during TTS playback. */
+  wakeWordActive: boolean;
   toggleEnabled: () => void;
   setMicMuted: (next: boolean) => void;
   setSoftMuted: (next: boolean) => void;
@@ -318,6 +323,34 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   const [softMuted, setSoftMutedState] = useState<boolean>(false);
   const softMutedRef = useRef<boolean>(false);
   softMutedRef.current = softMuted;
+  /* Mic permission gate. Flips true the first time the parallel-
+   * capture rig's getUserMedia resolves; the wake-word recognizer
+   * waits for this flag before calling SpeechRecognition.start() so
+   * Chromium doesn't pop a second permission prompt in parallel
+   * with the VAD's getStream(). Reset on every enabled->disabled
+   * cycle so a fresh start re-confirms the permission instead of
+   * trusting a stale grant from a prior session. */
+  const [micPermissionGranted, setMicPermissionGranted] = useState<boolean>(false);
+  /* Wake-word listener live state. Independent of mic-mute /
+   * micGated / softMuted: the Web Speech recognizer runs whenever
+   * voice is enabled and the permission gate is open, regardless of
+   * whether the foreground capture path is muted or TTS-gated. The
+   * pill renders this as a small "wake" indicator so the user can
+   * tell the Lex command suite is still listening during TTS
+   * playback (bug 2026-05-14-voice-pill-inconsistent-and-wake-word-
+   * muted: the prior pill had no separate wake-word indicator, so
+   * the foreground mic icon flipping to MicOff during micGated
+   * read as "wake-word also muted" even though it never was). */
+  const [wakeWordActive, setWakeWordActive] = useState<boolean>(false);
+  /* Start/stop click idempotency guard. The enable effect kicks off
+   * async getUserMedia + MicVAD.new + WS connect; a rapid second
+   * click can land before any of that resolves and either no-ops
+   * silently (looks like the first click was lost) or stacks a
+   * second teardown on top of an unfinished init. busyUntil holds a
+   * monotonic deadline (ms) inside which toggleEnabled refuses to
+   * flip the state; the deadline clears when the engine reaches a
+   * stable status. */
+  const enableBusyUntilRef = useRef<number>(0);
   /* Unread-silent-message badge. Counts assistant turns that arrived
    * while soft-muted. Cleared only on unmute (never auto-stales) so
    * the pill keeps signalling "go read the transcript" through long
@@ -435,6 +468,15 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       softMutedRef.current = false;
       setSoftMutedState(false);
       setSilentMessageCount(0);
+      /* Force a fresh permission grant on the next start so the
+       * wake-word recognizer waits for getUserMedia again instead of
+       * relying on a stale flag from the prior session. The browser
+       * itself remembers the grant per-origin so the user does not
+       * see a second permission UI; the state reset is purely so the
+       * wake-word useEffect's gate works deterministically across
+       * enable cycles. */
+      setMicPermissionGranted(false);
+      setWakeWordActive(false);
     }
   }, [enabled]);
 
@@ -445,9 +487,21 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * STT backend fall back to the keyboard hotkey listener below. The
    * recognizer auto-restarts on `onend` because Chromium pauses the
    * session every ~30s of silence; we keep it running for as long as
-   * voice is enabled. */
+   * voice is enabled.
+   *
+   * Gated on micPermissionGranted (the parallel-capture rig's
+   * getUserMedia having resolved at least once) so Chromium's
+   * SpeechRecognition.start() doesn't race the VAD's getStream() for
+   * the mic permission prompt. Without this gate the user saw two
+   * permission prompts on first Enable Audio (bug
+   * 2026-05-14-enable-audio-double-permission-prompt): one for plain
+   * getUserMedia, one for Web Speech, fired in parallel before the
+   * user had a chance to grant the first. Sequencing makes Chromium
+   * reuse the grant for the second request so only one prompt
+   * surfaces. */
   useEffect(() => {
     if (!enabled) return;
+    if (!micPermissionGranted) return;
     if (typeof window === "undefined") return;
     const Ctor = getSpeechRecognitionCtor();
     if (!Ctor) return;
@@ -490,6 +544,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         };
         recognizer = r;
         r.start();
+        if (!cancelled) setWakeWordActive(true);
       } catch {
         /* SpeechRecognition can throw on rapid start/stop cycles or
          * when another tab is holding the speech session. Backoff +
@@ -513,8 +568,9 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           /* ignore */
         }
       }
+      setWakeWordActive(false);
     };
-  }, [enabled]);
+  }, [enabled, micPermissionGranted]);
 
   /* Keyboard hotkey fallback for the always-on wake-word path. Web
    * Speech is unavailable on Firefox and on offline / air-gapped
@@ -1480,6 +1536,13 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             return;
           }
           captureStreamRef.current = stream;
+          /* First-grant gate for the wake-word recognizer. The
+           * getUserMedia returned a stream which means the user
+           * granted (or auto-allowed) microphone access; flag this
+           * synchronously so the wake-word useEffect can start the
+           * Web Speech recognizer without racing a parallel
+           * permission prompt. */
+          setMicPermissionGranted(true);
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const Cls: any =
             (window as unknown as { AudioContext?: typeof AudioContext })
@@ -1979,6 +2042,16 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * guards against a stuck Lex so the user always gets out of
    * the panel. */
   function toggleEnabled(): void {
+    /* Idempotency guard against rapid double-clicks. The enable
+     * effect kicks off async getUserMedia + MicVAD.new + WS connect;
+     * a second click landing before any of that resolves used to
+     * stack a teardown on top of an unfinished init which read to
+     * the user as "first click was lost, mash the button again". A
+     * 400ms cooldown after every flip keeps the state machine clean
+     * without throttling intentional single clicks. */
+    const now = Date.now();
+    if (now < enableBusyUntilRef.current) return;
+    enableBusyUntilRef.current = now + 400;
     if (!enabled) {
       setEnabled(true);
       return;
@@ -2231,6 +2304,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     hasLex,
     softMuted,
     silentMessageCount,
+    wakeWordActive,
     toggleEnabled,
     setMicMuted,
     setSoftMuted,
@@ -2257,6 +2331,10 @@ export interface VoicePillViewProps {
   micGated: boolean;
   softMuted: boolean;
   silentMessageCount: number;
+  /** True while the always-on wake-word recognizer is live. Drives a
+   * small "wake" indicator so the user can confirm Lex commands
+   * still listen even when the foreground mic is micGated. */
+  wakeWordActive?: boolean;
   toggleEnabled: () => void;
   setMicMuted: (next: boolean) => void;
   setSoftMuted: (next: boolean) => void;
@@ -2270,6 +2348,7 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
     micGated,
     softMuted,
     silentMessageCount,
+    wakeWordActive,
     toggleEnabled,
     setMicMuted,
     setSoftMuted,
@@ -2318,10 +2397,15 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
       ? "Mic paused while Lex is speaking. Resumes automatically when TTS finishes."
       : undefined;
 
-  /* Mic icon reflects the user-input mute state. micGated rolls into
-   * the same visual because either condition means "your voice will
-   * NOT reach Lex right now"; the tooltip distinguishes them. */
-  const micIconName: "Mic" | "MicOff" = muted || micGated ? "MicOff" : "Mic";
+  /* Mic icon now reflects the foreground (full-STT) state only.
+   * micGated keeps the Mic glyph (NOT MicOff) because the always-
+   * on wake-word recognizer is still listening for "Lex shut up"
+   * etc.; rendering MicOff during TTS playback misled the user
+   * into thinking voice commands were dead. Only an explicit user
+   * mute flips to MicOff (bug 2026-05-14-voice-pill-inconsistent-
+   * and-wake-word-muted: pill conflated foreground STT with the
+   * wake-word path). */
+  const micIconName: "Mic" | "MicOff" = muted ? "MicOff" : "Mic";
   const micTone = muted
     ? "text-attn"
     : micGated
@@ -2356,7 +2440,7 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
         aria-pressed={muted}
         onClick={() => setMicMuted(!muted)}
         disabled={!enabled}
-        className="w-9 h-9 grid place-items-center rounded-pill text-txt2 hover:bg-surface2 disabled:opacity-40 disabled:cursor-not-allowed"
+        className="relative w-9 h-9 grid place-items-center rounded-pill text-txt2 hover:bg-surface2 disabled:opacity-40 disabled:cursor-not-allowed"
         title={
           micGated
             ? "Mic paused while Lex speaks. Tap to also user-mute."
@@ -2370,6 +2454,16 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
           size={16}
           className={`${micTone} ${micPulse ? "pulse-live" : ""}`}
         />
+        {wakeWordActive && (
+          <span
+            data-testid="voice-pill-wake-indicator"
+            aria-label="Lex commands listening"
+            title="Always-on wake-word path is listening for Lex commands, even during TTS."
+            className={`absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-pill ring-1 ring-base ${
+              status === "speaking" ? "bg-brandSoft animate-pulse" : "bg-ok"
+            }`}
+          />
+        )}
       </button>
       <button
         type="button"
@@ -2441,6 +2535,7 @@ export function VoiceTopBarPill(): React.ReactElement | null {
       micGated={v.micGated}
       softMuted={v.softMuted}
       silentMessageCount={v.silentMessageCount}
+      wakeWordActive={v.wakeWordActive}
       toggleEnabled={v.toggleEnabled}
       setMicMuted={v.setMicMuted}
       setSoftMuted={v.setSoftMuted}
