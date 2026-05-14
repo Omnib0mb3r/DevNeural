@@ -644,16 +644,64 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
                 extraArgs: ['--dangerously-skip-permissions'],
                 systemPrompt: built.prompt,
               });
-              /* Kill the prior PTY only AFTER spawn returns so the
-               * brainstorm anchor never spends a tick without a live
-               * binding. pty-host's onExit still fires the session-
-               * end pipeline a second time, but runSessionEndPipeline
-               * is guarded by sessionEndLock + sessionEndFired so the
-               * second invocation no-ops. */
+              /* Internal rebind BEFORE killing the old PTY. Without
+               * this the WS keeps watching the old jsonl + injecting
+               * into the dying PTY, so the first reply on the fresh
+               * session lands in the new jsonl while the WS is still
+               * pointed at the old one and never reaches the speak
+               * path. Bug 2026-05-14-no-tts-on-first-prompt-after-
+               * restart fixed by repointing every per-session field
+               * here:
+               *
+               *   - state.watchSessionId / state.jsonlPath /
+               *     state.jsonlOffset move to the new transcript so
+               *     the existing pollJsonl watcher (250ms tick reads
+               *     state.jsonlPath dynamically) picks up the new
+               *     file on its next tick.
+               *   - state.bindKey moves to the new PTY id so
+               *     handleUtteranceEnd's ptyInject targets the live
+               *     session instead of the dying one.
+               *   - state.awaitingResponseSince is stamped NOW so the
+               *     handleJsonlLine gate ("only speak when this WS
+               *     drove the inject OR we're read-only") admits the
+               *     first end_turn that lands on the new session even
+               *     if the user types the prompt into the brainstorm
+               *     UI instead of speaking it.
+               *   - state.sessionEndFired / state.compaction
+               *     .compactedAt reset so the new session's own end-
+               *     of-life pipeline can fire later and so the new
+               *     session can also compact when it crosses the
+               *     threshold.
+               *   - lastSpokenUuid clears so the speak dedupe doesn't
+               *     accidentally suppress a reply whose uuid happens
+               *     to match the prior session's last spoken record.
+               *   - activeByBindKey re-keyed on the new bindKey so a
+               *     second tab's hello against the new session
+               *     correctly evicts this socket if needed. */
+              const priorBindKey = state.bindKey;
+              if (priorBindKey && activeByBindKey.get(priorBindKey) === state) {
+                activeByBindKey.delete(priorBindKey);
+              }
+              state.watchSessionId = fresh.ccSessionId;
+              state.jsonlPath = fresh.transcriptPath;
+              state.jsonlOffset = 0;
+              state.bindKey = fresh.ptyId;
+              state.awaitingResponseSince = Date.now();
+              state.sessionEndFired = false;
+              state.compaction.compactedAt = 0;
+              lastSpokenUuid = null;
+              activeByBindKey.set(state.bindKey, state);
+              startJsonlWatch();
+              /* Kill the prior PTY AFTER the internal rebind so the
+               * pollJsonl watcher already points at the new file by
+               * the time onExit's session-end pipeline runs (its
+               * lock + sessionEndFired guard turn the duplicate
+               * invocation into a no-op anyway, but the timing keeps
+               * the brainstorm anchor live-bound throughout). */
               try {
-                if (state.bindKey) {
+                if (priorBindKey) {
                   const handle =
-                    getPty(state.bindKey) || getPtyBySession(state.bindKey);
+                    getPty(priorBindKey) || getPtyBySession(priorBindKey);
                   if (handle && !handle.exited) {
                     handle.pty.kill();
                   }
