@@ -101,52 +101,60 @@ export function DailyBrief() {
   const summary = q.data?.summary;
   const md = q.data?.whats_new_markdown ?? "";
 
+  const dateLabel = new Date().toLocaleDateString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
   return (
     <section className="rounded-panel bg-surface1 hairline relative overflow-hidden">
       <div className="absolute inset-0 grid-bg pointer-events-none" />
-      <div className="relative px-7 py-6 flex items-start gap-5">
-        <div className="flex-1 min-w-0">
-          <div className="text-nano text-txt3 mb-1">
-            Daily brief ·{" "}
-            {new Date().toLocaleDateString(undefined, {
-              weekday: "short",
-              month: "short",
-              day: "numeric",
-            })}
-          </div>
-          <h1 className="font-display text-3xl font-bold leading-snug text-txt1 mb-2">
-            {greeting()} <span className="text-brandSoft">Michael</span>.
-          </h1>
-          {q.isLoading ? (
-            <div className="space-y-1.5">
-              <div className="h-3 w-3/4 rounded bg-surface2 animate-pulse" />
-              <div className="h-3 w-1/2 rounded bg-surface2 animate-pulse" />
-            </div>
-          ) : summary ? (
-            <p className="text-txt2 text-md max-w-2xl">
-              {summary.projects_total} projects, {summary.active_sessions} active session
-              {summary.active_sessions === 1 ? "" : "s"}, {summary.unread_notifications}{" "}
-              unread{" "}
-              {summary.unread_notifications === 1 ? "notification" : "notifications"}.{" "}
-              {summary.whats_new_present
-                ? `Wiki digest from ${
-                    summary.whats_new_age_hours != null
-                      ? Math.round(summary.whats_new_age_hours) + "h ago"
-                      : "—"
-                  }.`
-                : "No wiki digest yet."}
-            </p>
-          ) : (
-            <p className="text-txt3 text-sm">Daemon not reachable.</p>
-          )}
+      {/* Header strip matches the canonical Projects / Neural network
+       * / Reinforcement-events widgets: icon + title on the left,
+       * refresh affordance on the right, hairline divider below. */}
+      <div className="relative px-5 py-3 border-b border-border1 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Icon name="Calendar" className="text-brandSoft" size={16} />
+          <h2 className="font-display text-sm font-emphasized">
+            Daily brief
+            <span className="text-txt3 font-normal"> · {dateLabel}</span>
+          </h2>
         </div>
         <button
-          className="shrink-0 h-9 px-3.5 rounded-card bg-brand/10 hairline ring-1 ring-brand/30 text-brandSoft text-xs font-emphasized hover:bg-brand/15 flex items-center gap-2"
+          type="button"
           aria-label="Refresh brief"
           onClick={() => q.refetch()}
+          className="flex items-center gap-1.5 text-nano text-txt3 hover:text-txt1"
         >
-          <Icon name="RefreshCw" size={14} /> refresh
+          <Icon name="RefreshCw" size={12} /> refresh
         </button>
+      </div>
+      <div className="relative px-7 py-6">
+        <h1 className="font-display text-3xl font-bold leading-snug text-txt1 mb-2">
+          {greeting()} <span className="text-brandSoft">Michael</span>.
+        </h1>
+        {q.isLoading ? (
+          <div className="space-y-1.5">
+            <div className="h-3 w-3/4 rounded bg-surface2 animate-pulse" />
+            <div className="h-3 w-1/2 rounded bg-surface2 animate-pulse" />
+          </div>
+        ) : summary ? (
+          <p className="text-txt2 text-md max-w-2xl">
+            {summary.projects_total} projects, {summary.active_sessions} active session
+            {summary.active_sessions === 1 ? "" : "s"}, {summary.unread_notifications}{" "}
+            unread{" "}
+            {summary.unread_notifications === 1 ? "notification" : "notifications"}.{" "}
+            {summary.whats_new_present
+              ? `Wiki digest from ${
+                  summary.whats_new_age_hours != null
+                    ? Math.round(summary.whats_new_age_hours) + "h ago"
+                    : "—"
+                }.`
+              : "No wiki digest yet."}
+          </p>
+        ) : (
+          <p className="text-txt3 text-sm">Daemon not reachable.</p>
+        )}
       </div>
 
       {md && (
