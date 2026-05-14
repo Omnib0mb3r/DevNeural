@@ -1593,6 +1593,38 @@ export const injectionLog = (opts: {
   );
 };
 
+export interface ColdStartPreloadEvent {
+  ts: string;
+  brainstorm_id: string;
+  cc_session_id: string | null;
+  sibling_count: number;
+  last_distilled_ms: number | null;
+  recent_turns_appended: number;
+  preloaded_ids: string[];
+  already_present_ids: string[];
+  failure_reason: string | null;
+  preamble: string;
+}
+
+export interface ColdStartPreloadEventGroup {
+  brainstorm_id: string;
+  cc_session_id: string | null;
+  rows: ColdStartPreloadEvent[];
+}
+
+export const coldStartPreloadEvents = (
+  opts: { brainstorm_id?: string; limit?: number } = {},
+) => {
+  const params = new URLSearchParams();
+  if (opts.brainstorm_id) params.set("brainstorm_id", opts.brainstorm_id);
+  if (opts.limit) params.set("limit", String(opts.limit));
+  const qs = params.toString();
+  return request<
+    | { ok: boolean; rows: ColdStartPreloadEvent[] }
+    | { ok: boolean; groups: ColdStartPreloadEventGroup[] }
+  >(`/lex/cold-start-preload/events${qs ? `?${qs}` : ""}`);
+};
+
 export const uploadReference = (file: File, opts: { project_id?: string; tags?: string[] } = {}) => {
   const fd = new FormData();
   fd.append("file", file);

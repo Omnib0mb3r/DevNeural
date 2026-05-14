@@ -3862,6 +3862,60 @@ export async function registerDashboardRoutes(
         mode,
       };
     }
+    /* Force-distill the top-N siblings synchronously before
+     * buildSiblingIndex reads them. Closes the race where the
+     * steady-state cron has not yet caught up to a just-ended
+     * sibling; preloadColdStartSiblings invokes the LLM generator
+     * for any missing last_summary row + returns the metadata the
+     * three visibility layers consume. Generator wiring is null
+     * when no LLM provider is configured (or the env points at
+     * anthropic, which BF-4 blocks for brainstorm content) - in
+     * that case the preloader skips the force pass and the
+     * sibling-index falls back to whatever last_summary rows the
+     * cron has already produced. */
+    let preloadSummary:
+      | Awaited<
+          ReturnType<
+            typeof import('../lex/lex-cold-start-preamble.js').preloadColdStartSiblings
+          >
+        >
+      | null = null;
+    let preamble = '';
+    try {
+      const { preloadColdStartSiblings, formatColdStartPreamble, buildPreloadEventLogRow, recordPreloadEvent } =
+        await import('../lex/lex-cold-start-preamble.js');
+      const { pickProvider } = await import('../llm/index.js');
+      const { createLlmDistillationGenerator } = await import(
+        '../lex/distillation-generator.js'
+      );
+      const provider = pickProvider();
+      const generator =
+        provider && provider.isConfigured() && provider.name !== 'anthropic'
+          ? createLlmDistillationGenerator({ db: store.db, provider })
+          : null;
+      preloadSummary = await preloadColdStartSiblings({
+        db: store.db,
+        generator,
+        label,
+        excludeId: bs.id,
+        forceForTopN: 2,
+      });
+      preamble = formatColdStartPreamble(preloadSummary);
+      recordPreloadEvent(
+        buildPreloadEventLogRow({
+          brainstormId: bs.id,
+          ccSessionId: sessionId,
+          summary: preloadSummary,
+          preamble,
+        }),
+      );
+    } catch (err) {
+      /* Force-distill failure cannot block the cold-start path.
+       * Fall through to the existing buildSiblingIndex behaviour
+       * and surface the failure reason in the preamble so the
+       * brainstorm header pill can render red. */
+      preamble = `Cold start: preload failed (${(err as Error).message}).`;
+    }
     const block = buildSiblingIndex({
       db: store.db,
       label,
@@ -3900,6 +3954,22 @@ export async function registerDashboardRoutes(
       /* audit row is observational; never block the preload response */
     }
     const siblingCount = (block.match(/^- /gm) ?? []).length;
+    /* preamble + header_status surface the three visibility layers:
+     *   - preamble: one-liner the SessionStart hook prepends to the
+     *     injected block so Lex prints it verbatim on her first
+     *     reply ("Loaded 4 sibling sessions, last distilled ...").
+     *   - header_status: tone + text the brainstorm UI renders as a
+     *     small pill in the session header row (green when healthy,
+     *     red on preload failure).
+     *   - preload_summary: the raw counts so the dashboard panel +
+     *     anyone who wants to drive their own UI off these fields
+     *     can read them without re-deriving from the preamble. */
+    const { formatHeaderStatus } = await import(
+      '../lex/lex-cold-start-preamble.js'
+    );
+    const headerStatus = preloadSummary
+      ? formatHeaderStatus(preloadSummary)
+      : { tone: 'err' as const, text: 'context: preload failed' };
     if (mode === 'shadow') {
       return {
         ok: true,
@@ -3910,16 +3980,22 @@ export async function registerDashboardRoutes(
         brainstorm_id: bs.id,
         label,
         mode,
+        preamble,
+        header_status: headerStatus,
+        preload_summary: preloadSummary,
       };
     }
     return {
       ok: true,
-      block,
+      block: preamble ? `${preamble}\n\n${block}` : block,
       reason: 'live',
       sibling_count: siblingCount,
       brainstorm_id: bs.id,
       label,
       mode,
+      preamble,
+      header_status: headerStatus,
+      preload_summary: preloadSummary,
     };
   });
 
@@ -3975,6 +4051,39 @@ export async function registerDashboardRoutes(
       env_value:
         process.env.DEVNEURAL_LEX_COLD_START_PRELOAD_ENABLED ?? null,
       default_mode: 'shadow',
+    };
+  });
+
+  /* GET /lex/cold-start-preload/events
+   *
+   * Multi-session preload event log. Returns one card per brainstorm
+   * (latest cc_session_id, most-recent N rows under that brainstorm)
+   * so the LexColdStartPreloadPanel can show what context primed
+   * each concurrently running session without mashing the feeds
+   * together. recordPreloadEvent appends to the in-memory log; the
+   * route exposes it for the dashboard. */
+  app.get('/lex/cold-start-preload/events', async (req) => {
+    const { groupPreloadEventsBySession, listPreloadEvents } = await import(
+      '../lex/lex-cold-start-preamble.js'
+    );
+    const q = (req.query ?? {}) as {
+      brainstorm_id?: string;
+      limit?: string;
+    };
+    if (q.brainstorm_id) {
+      const limit = q.limit ? Number(q.limit) : 50;
+      return {
+        ok: true,
+        rows: listPreloadEvents({
+          brainstormId: q.brainstorm_id,
+          limit,
+        }),
+      };
+    }
+    const perSessionLimit = q.limit ? Number(q.limit) : 20;
+    return {
+      ok: true,
+      groups: groupPreloadEventsBySession({ perSessionLimit }),
     };
   });
 
