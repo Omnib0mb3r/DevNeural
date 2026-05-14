@@ -67,6 +67,14 @@ interface VoiceCtxValue {
    * Lex command capture is still on even when the foreground mic is
    * micGated during TTS playback. */
   wakeWordActive: boolean;
+  /* Lex speech rate, persisted globally. Exposed on the context so
+   * the TopBar pill can render an inline speed slider without re-
+   * deriving from voice-preferences. */
+  speed: number;
+  speedMin: number;
+  speedMax: number;
+  speedStep: number;
+  setSpeed: (next: number) => void;
   toggleEnabled: () => void;
   setMicMuted: (next: boolean) => void;
   setSoftMuted: (next: boolean) => void;
@@ -2305,6 +2313,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     softMuted,
     silentMessageCount,
     wakeWordActive,
+    speed,
+    speedMin: SPEED_MIN,
+    speedMax: SPEED_MAX,
+    speedStep: SPEED_STEP,
+    setSpeed: changeSpeed,
     toggleEnabled,
     setMicMuted,
     setSoftMuted,
@@ -2319,11 +2332,15 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
 
 /* Presentational pill body, split out from VoiceTopBarPill so tests
  * can drive it with synthetic state without standing up the WS + VAD
- * machinery the engine owns. Two reactive icons sit side-by-side
- * (mic on the left for user-input mute, speaker on the right for
- * Lex-TTS mute) followed by a status label and the hard stop
- * button. Symmetric input/output controls so tap targets are
- * predictable on touch. */
+ * machinery the engine owns. Two-row layout:
+ *   ROW 1: "Voice" label, speed slider with N.NNx readout, mic mute,
+ *          speaker mute, stop button.
+ *   ROW 2: status text on its own line, left-aligned, dim.
+ * The stop button anchors row 1 and the status moved to row 2 so a
+ * long status string ("LEX THINKING") can never push the stop
+ * affordance off-screen on narrow viewports (verified down to the
+ * ~390px iPhone width). Row 2 wraps inside its own container; the
+ * pill height grows with content rather than overflowing row 1. */
 export interface VoicePillViewProps {
   status: VoiceCtxValue["status"];
   enabled: boolean;
@@ -2335,6 +2352,13 @@ export interface VoicePillViewProps {
    * small "wake" indicator so the user can confirm Lex commands
    * still listen even when the foreground mic is micGated. */
   wakeWordActive?: boolean;
+  /** Current Lex speech-rate multiplier; rendered as the slider
+   * thumb position and the inline N.NNx readout. */
+  speed?: number;
+  speedMin?: number;
+  speedMax?: number;
+  speedStep?: number;
+  setSpeed?: (next: number) => void;
   toggleEnabled: () => void;
   setMicMuted: (next: boolean) => void;
   setSoftMuted: (next: boolean) => void;
@@ -2349,10 +2373,23 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
     softMuted,
     silentMessageCount,
     wakeWordActive,
+    speed,
+    speedMin,
+    speedMax,
+    speedStep,
+    setSpeed,
     toggleEnabled,
     setMicMuted,
     setSoftMuted,
   } = props;
+  /* Speed slider defaults so test renders that omit the speed wiring
+   * still get a sensible thumb position. Production always threads
+   * the full set through VoiceTopBarPill / VoiceCtx. */
+  const sliderEnabled = typeof setSpeed === "function";
+  const sliderValue = typeof speed === "number" ? speed : 1;
+  const sliderMin = typeof speedMin === "number" ? speedMin : 0.5;
+  const sliderMax = typeof speedMax === "number" ? speedMax : 1.5;
+  const sliderStep = typeof speedStep === "number" ? speedStep : 0.05;
   const statusTone =
     status === "error"
       ? "text-err"
@@ -2431,89 +2468,136 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
 
   return (
     <div
-      className="flex items-center gap-0.5 sm:gap-1 h-9 px-1 sm:px-2 rounded-pill hairline"
+      data-testid="voice-pill-root"
+      className="flex flex-col gap-0.5 py-1 px-1 sm:px-2 rounded-card hairline min-w-0"
       title={pillTitle}
     >
-      <button
-        type="button"
-        aria-label={muted ? "Unmute microphone" : "Mute microphone"}
-        aria-pressed={muted}
-        onClick={() => setMicMuted(!muted)}
-        disabled={!enabled}
-        className="relative w-9 h-9 grid place-items-center rounded-pill text-txt2 hover:bg-surface2 disabled:opacity-40 disabled:cursor-not-allowed"
-        title={
-          micGated
-            ? "Mic paused while Lex speaks. Tap to also user-mute."
-            : muted
-              ? "Microphone muted. Tap to unmute."
-              : "Mute your microphone."
-        }
+      {/* ROW 1: controls. The stop button anchors the row's right
+       * edge and never moves; the speed slider in the middle is the
+       * only flex-1 child, so growing controls budget shrinks the
+       * slider rather than ejecting the stop button on narrow
+       * viewports. */}
+      <div
+        data-testid="voice-pill-row-controls"
+        className="flex items-center gap-1 h-9 min-w-0"
       >
-        <Icon
-          name={micIconName}
-          size={16}
-          className={`${micTone} ${micPulse ? "pulse-live" : ""}`}
-        />
-        {wakeWordActive && (
-          <span
-            data-testid="voice-pill-wake-indicator"
-            aria-label="Lex commands listening"
-            title="Always-on wake-word path is listening for Lex commands, even during TTS."
-            className={`absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-pill ring-1 ring-base ${
-              status === "speaking" ? "bg-brandSoft animate-pulse" : "bg-ok"
-            }`}
+        <span className="text-[11px] font-emphasized text-txt2 px-1 shrink-0">
+          Voice
+        </span>
+        <label
+          className="flex items-center gap-1.5 min-w-0 flex-1 text-nano font-mono text-txt3"
+          title="Lex speech rate. Persisted globally; applies to every voice consumer until you change it again."
+        >
+          <input
+            type="range"
+            aria-label="Lex speech rate"
+            min={sliderMin}
+            max={sliderMax}
+            step={sliderStep}
+            value={sliderValue}
+            disabled={!enabled || !sliderEnabled}
+            onChange={(e) => setSpeed?.(Number(e.target.value))}
+            className="flex-1 min-w-0 accent-brandSoft disabled:opacity-40"
           />
-        )}
-      </button>
-      <button
-        type="button"
-        aria-label={softMuted ? "Unmute Lex voice" : "Mute Lex voice"}
-        aria-pressed={softMuted}
-        onClick={() => setSoftMuted(!softMuted)}
-        disabled={!enabled}
-        className="relative w-9 h-9 grid place-items-center rounded-pill text-txt2 hover:bg-surface2 disabled:opacity-40 disabled:cursor-not-allowed"
-        title={
-          softMuted
-            ? `Lex is muted. ${silentMessageCount} silent message${
-                silentMessageCount === 1 ? "" : "s"
-              }. Tap to resume TTS.`
-            : "Mute Lex's voice. Transcript keeps rendering; tap again to unmute."
-        }
-      >
-        <Icon
-          name={speakerIconName}
-          size={16}
-          className={`${speakerTone} ${speakerPulse ? "pulse-live" : ""}`}
-        />
-        {softMuted && silentMessageCount > 0 && (
           <span
-            className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 grid place-items-center rounded-pill bg-attn text-base text-[10px] font-mono ring-1 ring-attn/40"
-            aria-label={`${silentMessageCount} silent message${
-              silentMessageCount === 1 ? "" : "s"
-            }`}
+            data-testid="voice-pill-speed-readout"
+            className="text-txt2 tabular-nums w-10 text-right shrink-0"
           >
-            {silentMessageCount > 99 ? "99+" : silentMessageCount}
+            {sliderValue.toFixed(2)}x
           </span>
-        )}
-      </button>
-      <span
-        className={`hidden sm:inline text-[11px] font-mono px-1 ${finalStatusTone}`}
+        </label>
+        <button
+          type="button"
+          aria-label={muted ? "Unmute microphone" : "Mute microphone"}
+          aria-pressed={muted}
+          onClick={() => setMicMuted(!muted)}
+          disabled={!enabled}
+          className="relative w-9 h-9 grid place-items-center rounded-pill text-txt2 hover:bg-surface2 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+          title={
+            micGated
+              ? "Mic paused while Lex speaks. Tap to also user-mute."
+              : muted
+                ? "Microphone muted. Tap to unmute."
+                : "Mute your microphone."
+          }
+        >
+          <Icon
+            name={micIconName}
+            size={16}
+            className={`${micTone} ${micPulse ? "pulse-live" : ""}`}
+          />
+          {wakeWordActive && (
+            <span
+              data-testid="voice-pill-wake-indicator"
+              aria-label="Lex commands listening"
+              title="Always-on wake-word path is listening for Lex commands, even during TTS."
+              className={`absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-pill ring-1 ring-base ${
+                status === "speaking" ? "bg-brandSoft animate-pulse" : "bg-ok"
+              }`}
+            />
+          )}
+        </button>
+        <button
+          type="button"
+          aria-label={softMuted ? "Unmute Lex voice" : "Mute Lex voice"}
+          aria-pressed={softMuted}
+          onClick={() => setSoftMuted(!softMuted)}
+          disabled={!enabled}
+          className="relative w-9 h-9 grid place-items-center rounded-pill text-txt2 hover:bg-surface2 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+          title={
+            softMuted
+              ? `Lex is muted. ${silentMessageCount} silent message${
+                  silentMessageCount === 1 ? "" : "s"
+                }. Tap to resume TTS.`
+              : "Mute Lex's voice. Transcript keeps rendering; tap again to unmute."
+          }
+        >
+          <Icon
+            name={speakerIconName}
+            size={16}
+            className={`${speakerTone} ${speakerPulse ? "pulse-live" : ""}`}
+          />
+          {softMuted && silentMessageCount > 0 && (
+            <span
+              className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 grid place-items-center rounded-pill bg-attn text-base text-[10px] font-mono ring-1 ring-attn/40"
+              aria-label={`${silentMessageCount} silent message${
+                silentMessageCount === 1 ? "" : "s"
+              }`}
+            >
+              {silentMessageCount > 99 ? "99+" : silentMessageCount}
+            </span>
+          )}
+        </button>
+        <button
+          type="button"
+          onClick={toggleEnabled}
+          aria-label={enabled ? "Stop voice" : "Start voice"}
+          className={`text-[11px] px-2 py-0.5 rounded-pill hairline font-emphasized shrink-0 ${
+            enabled
+              ? "bg-err/15 text-err ring-1 ring-err/30 hover:bg-err/25"
+              : "bg-brand/15 text-brandSoft ring-1 ring-brand/30 hover:bg-brand/25"
+          }`}
+          title={enabled ? "Stop voice." : "Start voice."}
+        >
+          {enabled ? "stop" : "start"}
+        </button>
+      </div>
+      {/* ROW 2: status. On its own line so a long status string can
+       * never push the stop button off-screen. Left-aligned + dim
+       * per spec; tone reflects the same severity tints the inline
+       * status used to carry. The label uppercases at render so
+       * "thinking" reads as the screenshot's "LEX THINKING" copy. */}
+      <div
+        data-testid="voice-pill-row-status"
+        className="flex items-center gap-1 px-1 min-w-0"
       >
-        {statusLabel}
-      </span>
-      <button
-        type="button"
-        onClick={toggleEnabled}
-        aria-label={enabled ? "Stop voice" : "Start voice"}
-        className={`text-[11px] px-2 py-0.5 rounded-pill hairline font-emphasized ${
-          enabled
-            ? "bg-err/15 text-err ring-1 ring-err/30 hover:bg-err/25"
-            : "bg-brand/15 text-brandSoft ring-1 ring-brand/30 hover:bg-brand/25"
-        }`}
-        title={enabled ? "Stop voice." : "Start voice."}
-      >
-        {enabled ? "stop" : "start"}
-      </button>
+        <span
+          data-testid="voice-pill-status"
+          className={`text-nano font-mono uppercase tracking-wider truncate ${finalStatusTone}`}
+        >
+          {statusLabel}
+        </span>
+      </div>
     </div>
   );
 }
@@ -2536,6 +2620,11 @@ export function VoiceTopBarPill(): React.ReactElement | null {
       softMuted={v.softMuted}
       silentMessageCount={v.silentMessageCount}
       wakeWordActive={v.wakeWordActive}
+      speed={v.speed}
+      speedMin={v.speedMin}
+      speedMax={v.speedMax}
+      speedStep={v.speedStep}
+      setSpeed={v.setSpeed}
       toggleEnabled={v.toggleEnabled}
       setMicMuted={v.setMicMuted}
       setSoftMuted={v.setSoftMuted}

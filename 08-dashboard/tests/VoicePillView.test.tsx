@@ -197,6 +197,51 @@ describe("VoicePillView", () => {
     expect(screen.queryByTestId("voice-pill-wake-indicator")).toBeNull();
   });
 
+  it("renders the two-row layout: controls on row 1, status on row 2, with the stop button anchored to row 1", () => {
+    /* Row 1 carries Voice label + speed slider + mute icons + stop;
+     * row 2 carries the status text. The stop button MUST live
+     * inside row 1 so a long status string ('LEX THINKING') in row
+     * 2 can never push it off-screen on narrow viewports. */
+    render(
+      <VoicePillView
+        {...defaultProps()}
+        status="thinking"
+        micGated={false}
+        speed={0.65}
+      />,
+    );
+    const controlsRow = screen.getByTestId("voice-pill-row-controls");
+    const statusRow = screen.getByTestId("voice-pill-row-status");
+    const stop = screen.getByLabelText("Stop voice");
+    expect(controlsRow.contains(stop)).toBe(true);
+    expect(statusRow.contains(stop)).toBe(false);
+    /* status text reads as the uppercased label per spec. */
+    expect(
+      screen.getByTestId("voice-pill-status").textContent?.trim().toUpperCase(),
+    ).toBe("THINKING");
+    /* speed readout reflects the prop, two-decimal x format. */
+    expect(
+      screen.getByTestId("voice-pill-speed-readout").textContent,
+    ).toBe("0.65x");
+  });
+
+  it("speed slider fires setSpeed on input change", () => {
+    const setSpeed = vi.fn();
+    render(
+      <VoicePillView
+        {...defaultProps()}
+        speed={1}
+        speedMin={0.5}
+        speedMax={1.5}
+        speedStep={0.05}
+        setSpeed={setSpeed}
+      />,
+    );
+    const slider = screen.getByLabelText("Lex speech rate") as HTMLInputElement;
+    fireEvent.change(slider, { target: { value: "0.85" } });
+    expect(setSpeed).toHaveBeenCalledWith(0.85);
+  });
+
   it("toggle stop button fires toggleEnabled and reads start/stop depending on enabled", () => {
     const toggleEnabled = vi.fn();
     const { rerender } = render(
