@@ -14,6 +14,7 @@ import { StatusDot } from "./StatusDot";
 import { VoiceTopBarPill } from "./VoiceClient";
 import { PanicButton } from "./PanicButton";
 import { lexPickStable } from "@/lib/lex";
+import { resolveModKey, type ModKey } from "@/lib/platform-mod-key";
 
 const TABS = [
   { href: "/",            label: "Home",           icon: "Home" as const },
@@ -107,6 +108,14 @@ export function TopBar({ activeTab }: { activeTab: string }) {
 
   const [notifOpen, setNotifOpen] = useState(false);
   const notifRef = useRef<HTMLDivElement>(null);
+  /* Keyboard chord glyph for the search button hint. Defaults to
+   * "Ctrl" so the server render is deterministic; the effect below
+   * upgrades to ⌘ on macOS once navigator is available, which
+   * avoids a hydration mismatch between SSR + first paint. */
+  const [modKey, setModKey] = useState<ModKey>("Ctrl");
+  useEffect(() => {
+    setModKey(resolveModKey());
+  }, []);
 
   useEffect(() => {
     if (!notifOpen) return;
@@ -179,15 +188,18 @@ export function TopBar({ activeTab }: { activeTab: string }) {
             <span className="flex-1 min-w-0 truncate text-sm text-txt3">
               Search wiki, sessions, projects, reference docs…
             </span>
-            {/* ⌘K hint is gated behind xl so it never overlaps the
-             * voice pill on the medium-tablet viewport where the
-             * search button is still rendered as a full pill but the
-             * right cluster has grown to include the symmetric voice
-             * mic+speaker icons. Mid-2026-05-14 screenshot bug:
-             * uploads/screenshots/1853b239-…-036e009c0f9c.jpeg
-             * showed ⌘K bleeding into the mic icon. */}
-            <kbd className="hidden xl:inline-flex items-center gap-1 px-1.5 h-5 rounded border border-border1 bg-surface2 text-[11px] font-mono text-txt2">
-              ⌘ K
+            {/* Keyboard hint. Hidden below the dashboard's mobile
+             * breakpoint (sm) so phone viewports never paint it
+             * outside the collapsed search affordance; gated up to
+             * xl on the search button itself stays unchanged
+             * because the parent button is already hidden md: and
+             * the hint is the last child of the button. Glyph
+             * adapts per platform: ⌘ on macOS, Ctrl on
+             * Windows/Linux/ChromeOS, resolved client-side from
+             * navigator.userAgentData.platform with the legacy
+             * navigator.platform as fallback. */}
+            <kbd className="hidden sm:inline-flex items-center gap-1 px-1.5 h-5 rounded border border-border1 bg-surface2 text-[11px] font-mono text-txt2">
+              {modKey} K
             </kbd>
           </button>
           <button
