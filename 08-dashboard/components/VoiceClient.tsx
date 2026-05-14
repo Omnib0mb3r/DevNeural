@@ -36,11 +36,28 @@ interface VoiceCtxValue {
   micGated: boolean;
   /* Rolling turn history. Capped in-memory; full transcript stays in
    * the daemon's jsonl. The TranscriptHistory panel renders the
-   * trailing N turns + a thinking placeholder. */
-  turns: Array<{ id: string; role: "user" | "assistant"; text: string }>;
+   * trailing N turns + a thinking placeholder. Assistant turns that
+   * arrived while soft-muted are tagged silent=true so the renderer
+   * can flag them as "never played aloud". */
+  turns: Array<{
+    id: string;
+    role: "user" | "assistant";
+    text: string;
+    silent?: boolean;
+  }>;
   hasLex: boolean;
+  /* Soft mute set by the "Lex mute / shut up / be quiet / stop talking"
+   * voice command. TTS is halted; Lex's thinking and worker actions
+   * continue. Cleared only by "Lex unmute" or by clicking the mute
+   * pill in the panel. */
+  softMuted: boolean;
+  /* Count of assistant turns that arrived while soft-muted. Used to
+   * surface a persistent "unread silent messages" badge next to the
+   * pill. Cleared on unmute; never auto-stales. */
+  silentMessageCount: number;
   toggleEnabled: () => void;
   setMicMuted: (next: boolean) => void;
+  setSoftMuted: (next: boolean) => void;
 }
 const VoiceCtx = createContext<VoiceCtxValue | null>(null);
 export function useVoice(): VoiceCtxValue | null {
@@ -275,9 +292,30 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * while status='thinking'. We cap in-memory at 50 to keep React updates
    * cheap; the daemon retains the canonical jsonl for full history. */
   const [turns, setTurns] = useState<
-    Array<{ id: string; role: "user" | "assistant"; text: string }>
+    Array<{
+      id: string;
+      role: "user" | "assistant";
+      text: string;
+      silent?: boolean;
+    }>
   >([]);
   const TURNS_BUFFER_CAP = 50;
+  /* Soft mute driven by the "lex mute" voice-command family. While
+   * true the audio path is suppressed: tts-start does not initialize
+   * the AudioContext, incoming PCM chunks are dropped on the floor,
+   * and any in-flight playback is cancelled the moment mute fires.
+   * Assistant transcript turns still arrive and render so the user
+   * can keep reading along; they are tagged silent=true. The "lex
+   * unmute" command (or the mute pill) clears the flag. There is NO
+   * auto-replay of messages received during the mute window. */
+  const [softMuted, setSoftMutedState] = useState<boolean>(false);
+  const softMutedRef = useRef<boolean>(false);
+  softMutedRef.current = softMuted;
+  /* Unread-silent-message badge. Counts assistant turns that arrived
+   * while soft-muted. Cleared only on unmute (never auto-stales) so
+   * the pill keeps signalling "go read the transcript" through long
+   * meeting windows. */
+  const [silentMessageCount, setSilentMessageCount] = useState<number>(0);
   /* Wave 2 carry-over #1: per-turn thumbs vote on Lex's last reply.
    * The voice WS sends turn_id (claude-code assistant message uuid)
    * + prompt_version on every assistant-text. Both are required by
@@ -380,6 +418,18 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   useEffect(() => {
     statusRef.current = status;
   }, [status]);
+
+  /* Reset soft-mute + silent-message badge whenever the user fully
+   * disables voice. A fresh "start voice" cycle always begins
+   * unmuted; carrying soft-mute across a teardown would otherwise
+   * leave the next session silently dropping TTS. */
+  useEffect(() => {
+    if (!enabled) {
+      softMutedRef.current = false;
+      setSoftMutedState(false);
+      setSilentMessageCount(0);
+    }
+  }, [enabled]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const vadRef = useRef<unknown>(null);
@@ -577,6 +627,38 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       if (statusRef.current === "listening") {
         setStatus("ready");
       }
+    }
+  }
+
+  /* Soft mute: halt outbound TTS, keep transcript turns flowing.
+   * Triggered by the "lex mute / shut up / be quiet / stop talking"
+   * voice command or directly by clicking the muted-pill toggle.
+   * Cancels any in-flight playback the same way barge-in does
+   * (resetTtsPlayback walks every scheduled AudioBufferSourceNode
+   * and stops it, drops the playhead, and clears speakingRef so
+   * subsequent PCM chunks land in the binary handler's softMuted
+   * gate instead of scheduling). The status pill drops back to
+   * 'ready' so a stale "speaking" state doesn't linger after the
+   * audio is gone. On unmute the silent-message badge clears; we
+   * never auto-replay messages that arrived during the mute window
+   * (spec). */
+  function setSoftMuted(next: boolean): void {
+    softMutedRef.current = next;
+    setSoftMutedState(next);
+    if (next) {
+      try {
+        resetTtsPlayback();
+      } catch {
+        /* never block the mute path on playback teardown */
+      }
+      if (
+        statusRef.current === "speaking" ||
+        statusRef.current === "thinking"
+      ) {
+        setStatus("ready");
+      }
+    } else {
+      setSilentMessageCount(0);
     }
   }
 
@@ -1048,6 +1130,10 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
               const turnId =
                 tid ||
                 `a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+              /* Soft mute tag: capture the flag at the moment the
+               * turn lands so a later unmute doesn't retroactively
+               * un-flag a turn the user never heard. */
+              const silentNow = softMutedRef.current;
               setTurns((prev) => {
                 const next = [
                   ...prev,
@@ -1055,12 +1141,16 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                     id: turnId,
                     role: "assistant" as const,
                     text: replyText,
+                    silent: silentNow ? true : undefined,
                   },
                 ];
                 return next.length > TURNS_BUFFER_CAP
                   ? next.slice(next.length - TURNS_BUFFER_CAP)
                   : next;
               });
+              if (silentNow) {
+                setSilentMessageCount((c) => c + 1);
+              }
               emitTranscriptTurn({
                 id: turnId,
                 role: "assistant",
@@ -1094,6 +1184,15 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
              * can show a chip per artifact. */
             break;
           case "tts-start": {
+            /* Soft mute: drop the entire audio path on the floor.
+             * The PCM chunks that follow are gated by speakingRef in
+             * the binary handler, so leaving speakingRef false here
+             * silently discards them. The chat scroll keeps updating
+             * via assistant-text frames so the user can still read
+             * along. */
+            if (softMutedRef.current) {
+              break;
+            }
             const rate = Number(msg.rate) || 22050;
             ttsRateRef.current = rate;
             if (!audioCtxRef.current) {
@@ -1164,13 +1263,38 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             break;
           }
           case "session-end":
-            /* Server-side intent match on the transcript flagged a
-             * spoken end-session command ("end session", "stop voice",
-             * "goodbye Lex", etc.). Tear down the same way the Stop
-             * button does in conversation mode: flip enabled off and
-             * the [enabled] effect closes the WS, mic, audio context,
-             * and clears localStorage so the next mount stays idle. */
+            /* Server-side intent match on the transcript flagged the
+             * spoken "lex end session" command. Tear down the same
+             * way the Stop button does in conversation mode: flip
+             * enabled off and the [enabled] effect closes the WS,
+             * mic, audio context, and clears localStorage so the
+             * next mount stays idle. */
             setEnabled(false);
+            break;
+          case "voice-disable":
+            /* "lex disable" voice command. Equivalent to clicking
+             * the dashboard stop button: stop voice entirely. The
+             * [enabled] effect cancels in-flight TTS, clears any
+             * queued audio, and shuts the WS + mic + AudioContext
+             * down. Lex's thinking + worker actions both keep
+             * running on the daemon side; there is no voice resume
+             * path other than the user clicking start again. */
+            setEnabled(false);
+            break;
+          case "voice-mute":
+            /* "lex mute" family. Soft mute: cancel current TTS
+             * playback, drop queued chunks (handled inside
+             * setSoftMuted via resetTtsPlayback), keep the WS open
+             * so transcript turns continue rendering with a silent
+             * marker. */
+            setSoftMuted(true);
+            break;
+          case "voice-unmute":
+            /* "lex unmute" voice command. Lift the soft mute and
+             * clear the unread-silent badge. Future TTS plays
+             * normally; messages received during the mute window
+             * are NOT auto-replayed. */
+            setSoftMuted(false);
             break;
           case "error":
             setStatus("error");
@@ -1939,8 +2063,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     micGated,
     turns,
     hasLex,
+    softMuted,
+    silentMessageCount,
     toggleEnabled,
     setMicMuted,
+    setSoftMuted,
   };
   return (
     <VoiceCtx.Provider value={ctxValue}>
@@ -1990,20 +2117,57 @@ export function VoiceTopBarPill(): React.ReactElement | null {
   /* Mic gated during TTS playback: swap to MicOff with a muted tone
    * so the user can see at a glance that the speaker's audio is not
    * being captured back into whisper. Tooltip explains. */
-  const iconName: "Mic" | "MicOff" = v.micGated ? "MicOff" : "Mic";
-  const iconTone = v.micGated ? "text-txt3" : "text-brandSoft";
-  const pillTitle = v.micGated
-    ? "Mic paused while Lex is speaking. Resumes automatically when TTS finishes."
-    : undefined;
+  const iconName: "Mic" | "MicOff" =
+    v.micGated || v.softMuted ? "MicOff" : "Mic";
+  const iconTone =
+    v.micGated || v.softMuted ? "text-txt3" : "text-brandSoft";
+  /* Soft-mute pill copy takes precedence over the transient tts gate
+   * because soft mute is a persistent state and the user needs the
+   * stronger signal. */
+  const pillTitle = v.softMuted
+    ? `Lex is muted. ${v.silentMessageCount} silent message${
+        v.silentMessageCount === 1 ? "" : "s"
+      } received. Say "Lex unmute" or click the muted button to resume TTS.`
+    : v.micGated
+      ? "Mic paused while Lex is speaking. Resumes automatically when TTS finishes."
+      : undefined;
+  const statusLabel = v.softMuted
+    ? "muted (voice)"
+    : v.micGated
+      ? "muted (tts)"
+      : label;
+  const statusTone = v.softMuted ? "text-attn" : tone;
   return (
     <div
       className="flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline"
       title={pillTitle}
     >
       <Icon name={iconName} className={iconTone} size={12} />
-      <span className={`hidden sm:inline text-[11px] font-mono ${tone}`}>
-        {v.micGated ? "muted (tts)" : label}
+      <span
+        className={`hidden sm:inline text-[11px] font-mono ${statusTone}`}
+      >
+        {statusLabel}
       </span>
+      {v.softMuted && v.silentMessageCount > 0 && (
+        <span
+          className="text-[10px] font-mono px-1.5 py-0.5 rounded-pill bg-attn/20 text-attn ring-1 ring-attn/40"
+          title={`${v.silentMessageCount} unread silent message${
+            v.silentMessageCount === 1 ? "" : "s"
+          } in the transcript. Badge clears on unmute.`}
+        >
+          {v.silentMessageCount > 99 ? "99+" : v.silentMessageCount}
+        </span>
+      )}
+      {v.enabled && v.softMuted && (
+        <button
+          type="button"
+          onClick={() => v.setSoftMuted(false)}
+          className="text-[11px] px-2 py-0.5 rounded-pill hairline font-emphasized bg-attn/15 text-attn ring-1 ring-attn/30 hover:bg-attn/25"
+          title='Lex is muted. Click to unmute or say "Lex unmute".'
+        >
+          unmute
+        </button>
+      )}
       {v.enabled && (
         <button
           type="button"

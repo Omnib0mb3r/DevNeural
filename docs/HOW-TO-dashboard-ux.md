@@ -63,9 +63,34 @@ keybind presses from button presses.
 Every fire writes one row to `panic_log` regardless of outcome
 (`accepted | pty_not_found | no_target`). The dashboard surfaces
 the last 20 rows on `/system` via `PanicAuditPanel`, refresh every
-10s. Lex voice triggers ("panic", "emergency stop", "kill the
-worker") fire through the same `firePanic` path with
-`caller='lex-voice'`.
+10s. The Lex voice command `Lex emergency stop` fires through the
+same `firePanic` path with `caller='lex-voice'`. The bare phrase
+"emergency stop" no longer matches (2026-05-14); every Lex voice
+command requires the explicit `Lex` prefix so meeting chatter
+cannot false-fire the panic path.
+
+### Lex voice-command suite
+
+The full set of Lex-prefixed voice commands, dispatched from
+`07-daemon/src/voice/lex-voice-commands.ts` and consumed by the
+dashboard via `08-dashboard/components/VoiceClient.tsx`:
+
+- `Lex disable` — equivalent to clicking the dashboard stop button.
+  Cancels in-flight TTS, clears the queue, tears down the WS / mic /
+  AudioContext. Lex's thinking and worker actions continue; there is
+  no voice resume path. The user must click `start voice` again.
+- `Lex mute` / `Lex shut up` / `Lex be quiet` / `Lex stop talking` —
+  soft mute. Halts outbound TTS only. Transcript turns keep arriving
+  and render with a silent marker; an unread-silent badge surfaces
+  on the pill. Badge clears only on unmute (no auto-stale).
+- `Lex unmute` — resume soft mute. Future TTS plays normally;
+  messages received during the mute window are NOT auto-replayed.
+  The phrase `Lex resume` is reserved for a future broader command
+  and explicitly does NOT match unmute.
+- `Lex emergency stop` — panic (above).
+- `Lex end session` — distillation + end. Routes through the
+  existing `fireSessionEndPipeline` to ingest + summarize + RAG-embed
+  before the WS close.
 
 ### Per-project interrupt
 

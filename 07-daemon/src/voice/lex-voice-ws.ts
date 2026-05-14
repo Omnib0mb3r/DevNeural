@@ -60,7 +60,7 @@ import {
 } from '../lex/brainstorm-store.js';
 import { processAssistantTurn } from '../lex/artifact-parser.js';
 import { buildVoiceSnapshot } from '../lex/snapshot-context.js';
-import { matchesPanicCommand } from './panic-voice.js';
+import { matchVoiceCommand } from './lex-voice-commands.js';
 import { firePanic } from '../dashboard/panic-routes.js';
 import { getStore } from '../lex/brainstorm-store.js';
 import { checkToolGate, notifyLargeFsRead, LARGE_FS_READ_LINE_THRESHOLD } from '../lex/tool-gate.js';
@@ -111,29 +111,11 @@ const MIC_BUF_MAX = 4 * 1024 * 1024; // 4 MB ~= 2 minutes of 16k mono pcm
 const SESSION_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/* Spoken end-session command. Matched against the transcript before we
- * inject into Lex so the user can stop the voice loop hands-free —
- * "end session", "stop voice", "goodbye Lex" all close the panel
- * without Lex generating a normal text reply that the user would then
- * have to interrupt. Conversation mode tears down immediately; notes
- * mode routes through the existing finalize-notes path so the
- * dictation summary still ships.
- *
- * Whisper transcripts come back lower-cased after our normalize pass
- * (punctuation stripped, whitespace collapsed). Patterns are matched
- * with word boundaries so "extend session" doesn't false-fire. */
-const END_SESSION_RE =
-  /\b(?:end|stop|finish|close)\s+(?:the\s+|this\s+|our\s+)?(?:session|chat|conversation|voice|listening)\b|\b(?:goodbye|bye)\s+lex\b|\bstop\s+listening\b/;
-
-function matchesEndSession(text: string): boolean {
-  const norm = text
-    .toLowerCase()
-    .replace(/[^a-z\s]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!norm) return false;
-  return END_SESSION_RE.test(norm);
-}
+/* Spoken end-session command. Recognition moved into the unified Lex
+ * voice-command dispatcher (lex-voice-commands.ts) on 2026-05-14;
+ * end-session now requires the explicit "lex end session" phrase like
+ * every other voice command so meeting chatter that mentions "end
+ * session" mid-conversation cannot tear down the panel. */
 
 /* Find a Claude Code session jsonl by sessionId, scanning every project
  * slug under ~/.claude/projects. Decouples the TTS watcher from pty-host
@@ -736,34 +718,65 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * the client to tear down. Notes-mode users who want the dictation
      * summary should press Stop instead — voice command is an
      * immediate close. */
-    /* Hands-free panic: spoken trigger ("panic", "emergency stop",
-     * "kill the worker") fires firePanic against the active project
-     * anchor and skips the normal Lex inject. Audit row written via
-     * firePanic; caller="lex-voice". */
-    if (matchesPanicCommand(result.text)) {
-      try {
-        const r = firePanic(getStore().db, {
-          caller: 'lex-voice',
-          clickedMs: Date.now(),
-          injector: ptyInject,
-        });
-        send({
-          t: 'panic-fired',
-          result: r.result,
-          target_anchor_id: r.target?.id ?? null,
-        });
-      } catch {
-        /* never block the voice loop on audit-row write */
+    /* Unified Lex voice-command dispatch. Every command requires the
+     * literal "lex" prefix so meeting chatter cannot false-fire any
+     * branch. The dispatcher resolves the longest-match-wins
+     * precedence (panic > end_session > mute > unmute > disable) in
+     * one place so the wire frames below stay deterministic.
+     *
+     *   panic       -> firePanic + 'panic-fired' frame (no inject)
+     *   end_session -> 'session-end' frame + run end-session pipeline
+     *   mute        -> 'voice-mute' frame; client halts TTS, keeps
+     *                  rendering transcript turns with a silent flag
+     *   unmute      -> 'voice-unmute' frame; client resumes TTS, no
+     *                  auto-replay of messages received during mute
+     *   disable     -> 'voice-disable' frame; client teardown
+     *                  equivalent to clicking the stop button (in-
+     *                  flight Lex thinking + worker actions both
+     *                  continue; the user must re-engage via the UI
+     *                  to get TTS back) */
+    const cmd = matchVoiceCommand(result.text);
+    if (cmd) {
+      switch (cmd.kind) {
+        case 'panic': {
+          try {
+            const r = firePanic(getStore().db, {
+              caller: 'lex-voice',
+              clickedMs: Date.now(),
+              injector: ptyInject,
+            });
+            send({
+              t: 'panic-fired',
+              result: r.result,
+              target_anchor_id: r.target?.id ?? null,
+            });
+          } catch {
+            /* never block the voice loop on audit-row write */
+          }
+          return;
+        }
+        case 'end_session': {
+          send({ t: 'session-end', reason: 'voice-command' });
+          /* Run ingest + summary + RAG embed before the WS close
+           * fires. Fire-and-forget: client teardown happens
+           * immediately on the session-end message, pipeline runs in
+           * the background. */
+          void fireSessionEndPipeline('voice-command');
+          return;
+        }
+        case 'mute': {
+          send({ t: 'voice-mute', reason: 'voice-command' });
+          return;
+        }
+        case 'unmute': {
+          send({ t: 'voice-unmute', reason: 'voice-command' });
+          return;
+        }
+        case 'disable': {
+          send({ t: 'voice-disable', reason: 'voice-command' });
+          return;
+        }
       }
-      return;
-    }
-    if (matchesEndSession(result.text)) {
-      send({ t: 'session-end', reason: 'voice-command' });
-      /* Run ingest + summary + RAG embed before the WS close fires.
-       * Fire-and-forget: client teardown happens immediately on the
-       * session-end message, pipeline runs in the background. */
-      void fireSessionEndPipeline('voice-command');
-      return;
     }
     if (!state.bindKey) {
       send({ t: 'error', code: 'no-bind', message: 'not bound to a Lex PTY' });
