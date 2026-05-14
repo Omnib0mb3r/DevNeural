@@ -60,6 +60,14 @@ import {
 } from '../lex/brainstorm-store.js';
 import { processAssistantTurn } from '../lex/artifact-parser.js';
 import { fireForLexTurn as fireAttentionForLexTurn } from '../dashboard/lex-attention.js';
+import {
+  contextTokensFromUsage,
+  maybeCompactOnTurnEnd,
+  type CompactionSupervisorState,
+  type UsageLike,
+} from '../lex/compaction-supervisor.js';
+import { spawnLexSession } from '../lex/spawn-lex-session.js';
+import { buildLexSpawnPrompt } from '../lex/spawn-prompt.js';
 import { buildVoiceSnapshot } from '../lex/snapshot-context.js';
 import {
   matchVoiceCommand,
@@ -118,6 +126,11 @@ interface ConnState {
    * the gap between the wake-word fire and the trailing transcript
    * landing through utterance-end. */
   lastVoiceCmdMs: Partial<Record<VoiceCommandKind, number>>;
+  /* Mid-session compaction trigger state. Flips compactedAt the
+   * moment shouldTriggerCompaction crosses 75% so a trailing
+   * end_turn record in the same jsonl tail cannot re-fire the
+   * restart while distillation is still running. */
+  compaction: CompactionSupervisorState;
 }
 
 const MIC_BUF_MAX = 4 * 1024 * 1024; // 4 MB ~= 2 minutes of 16k mono pcm
@@ -184,6 +197,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     mode: 'conversation',
     sessionEndFired: false,
     lastVoiceCmdMs: {},
+    compaction: { compactedAt: 0 },
   };
 
   function send(msg: Record<string, unknown>): void {
@@ -430,6 +444,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       | {
           content?: Array<{ type?: string; text?: string }>;
           stop_reason?: string;
+          usage?: UsageLike;
         }
       | undefined;
     if (!message) return;
@@ -590,9 +605,80 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       /* Surface a short ack so the panel can show "captured" — but
        * no audio. */
       send({ t: 'tts-skipped', reason: 'notes-mode' });
-      return;
+    } else {
+      speak(text);
     }
-    speak(text);
+    /* Mid-session compaction check. End-of-turn is the ONLY boundary
+     * at which a restart is safe (the spec is strict: never cut
+     * mid-sentence). When shouldTriggerCompaction crosses 75% of the
+     * model's max context, run the synchronous session-end pipeline
+     * (distill + summary + RAG embed) and then spawn-restart the
+     * same anchor so the brainstorm UI keeps the same anchor id and
+     * the cold-start preload force-distills the just-ended sibling
+     * before the new session reads it. Compaction state lives on
+     * ConnState so a trailing end_turn from the same jsonl tail
+     * cannot re-fire while the first restart is still distilling. */
+    const usage = message?.usage;
+    const tokens = contextTokensFromUsage(usage);
+    if (tokens > 0) {
+      const brainstormAnchorId = brainstormForFeedback?.id ?? null;
+      void maybeCompactOnTurnEnd(
+        { contextTokens: tokens },
+        {
+          state: state.compaction,
+          log: (msg) => console.log(msg),
+          runSessionEnd: async () => {
+            await fireSessionEndPipeline('compaction-restart');
+          },
+          spawnRestart: async () => {
+            if (!brainstormAnchorId) {
+              return { ok: false, error: 'no anchor handle' };
+            }
+            try {
+              const built = buildLexSpawnPrompt({
+                lexSessionId: brainstormAnchorId,
+                transcriptPaths: [],
+              });
+              const fresh = spawnLexSession({
+                lexSessionId: brainstormAnchorId,
+                extraArgs: ['--dangerously-skip-permissions'],
+                systemPrompt: built.prompt,
+              });
+              /* Kill the prior PTY only AFTER spawn returns so the
+               * brainstorm anchor never spends a tick without a live
+               * binding. pty-host's onExit still fires the session-
+               * end pipeline a second time, but runSessionEndPipeline
+               * is guarded by sessionEndLock + sessionEndFired so the
+               * second invocation no-ops. */
+              try {
+                if (state.bindKey) {
+                  const handle =
+                    getPty(state.bindKey) || getPtyBySession(state.bindKey);
+                  if (handle && !handle.exited) {
+                    handle.pty.kill();
+                  }
+                }
+              } catch {
+                /* observational; restart already succeeded */
+              }
+              send({
+                t: 'session-restart',
+                reason: 'compaction',
+                new_session_id: fresh.ccSessionId,
+                new_pty_id: fresh.ptyId,
+              });
+              return { ok: true, new_session_id: fresh.ccSessionId };
+            } catch (err) {
+              return { ok: false, error: (err as Error).message };
+            }
+          },
+        },
+      ).catch((err) => {
+        console.log(
+          `[lex-compaction] supervisor threw: ${(err as Error).message}`,
+        );
+      });
+    }
   }
 
   async function speak(text: string): Promise<void> {
