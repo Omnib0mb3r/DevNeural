@@ -4,12 +4,12 @@
 
 | Date | Bug | Status | Severity |
 |------|-----|--------|----------|
-| 2026-05-14 | [iOS PWA reminders not pushing](./2026-05-14-pwa-reminders-not-pushing.md) | open | medium |
 
 ## Recently closed
 
 | Date | Bug | Status | Severity |
 |------|-----|--------|----------|
+| 2026-05-14 | [iOS PWA reminders not pushing](./2026-05-14-pwa-reminders-not-pushing.md) | fixed (pending soak) | medium |
 | 2026-05-14 | [Voice pill inconsistent + wake-word muted](./2026-05-14-voice-pill-inconsistent-and-wake-word-muted.md) | fixed (pending soak) | medium |
 | 2026-05-14 | [Enable-audio double permission prompt](./2026-05-14-enable-audio-double-permission-prompt.md) | fixed (pending soak) | medium |
 | 2026-05-14 | [No TTS on first prompt after restart](./2026-05-14-no-tts-on-first-prompt-after-restart.md) | fixed (pending soak) | medium |

@@ -41,6 +41,71 @@ interface SubscriptionOp {
 
 let cached: VapidKeys | null = null;
 
+/* Legacy default that pre-dates 2026-05-14. Apple's APNs JWT
+ * validator rejects mailto subjects whose domain part is a non-
+ * routable TLD (`.local`, `.invalid`, `.localhost`, `.example`)
+ * with `403 BadJwtToken`, which means every push to an iPhone PWA
+ * fails silently while desktop FCM continues to deliver. The
+ * migration block in loadOrCreateVapid upgrades any persisted file
+ * carrying this exact value to DEFAULT_VAPID_SUBJECT below. Keep
+ * the constant for reference + future diagnostics; do NOT use it
+ * for any new write. */
+export const LEGACY_BAD_VAPID_SUBJECT = 'mailto:noreply@devneural.local';
+
+/* Public-TLD mailto Apple accepts. The .app TLD is real, so the
+ * subject parses as a deliverable email per RFC 6068 and Apple's
+ * stricter VAPID JWT audit passes. The address itself does not
+ * need to be reachable; APNs only checks the form. Override via
+ * the DEVNEURAL_VAPID_SUBJECT env if operators want a contact
+ * address they actually monitor. */
+export const DEFAULT_VAPID_SUBJECT = 'mailto:noreply@devneural.app';
+
+/* Validate a subject the way Apple does so the migration block +
+ * fresh-key path agree on what's safe. Rules pulled from the
+ * empirical 2026-05-14 isolation probe (C:/tmp/probe-ios-push*.mjs
+ * captured Apple returning BadJwtToken for .local but 201 Created
+ * for .app / .com / https). */
+const NON_ROUTABLE_TLDS = new Set([
+  'local',
+  'localhost',
+  'invalid',
+  'example',
+  'test',
+]);
+export function isSafeVapidSubject(subject: string | undefined | null): boolean {
+  if (!subject || typeof subject !== 'string') return false;
+  const trimmed = subject.trim();
+  if (trimmed.startsWith('mailto:')) {
+    const addr = trimmed.slice('mailto:'.length);
+    const at = addr.indexOf('@');
+    if (at < 1 || at === addr.length - 1) return false;
+    const domain = addr.slice(at + 1).toLowerCase();
+    if (!domain.includes('.')) return false;
+    const tld = domain.split('.').pop() ?? '';
+    if (NON_ROUTABLE_TLDS.has(tld)) return false;
+    return true;
+  }
+  if (trimmed.startsWith('https://') || trimmed.startsWith('http://')) {
+    try {
+      const u = new URL(trimmed);
+      if (NON_ROUTABLE_TLDS.has(u.hostname.split('.').pop() ?? '')) {
+        return false;
+      }
+      return Boolean(u.hostname);
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+function resolveSafeSubject(persisted: string | undefined): string {
+  const fromEnv = process.env.DEVNEURAL_VAPID_SUBJECT;
+  if (isSafeVapidSubject(fromEnv)) return fromEnv!;
+  if (isSafeVapidSubject(persisted)) return persisted!;
+  return DEFAULT_VAPID_SUBJECT;
+}
+
 function loadOrCreateVapid(): VapidKeys {
   if (cached) return cached;
   ensureDir(DASHBOARD_DIR);
@@ -48,6 +113,23 @@ function loadOrCreateVapid(): VapidKeys {
     try {
       const parsed = JSON.parse(fs.readFileSync(VAPID_FILE, 'utf-8')) as VapidKeys;
       if (parsed.publicKey && parsed.privateKey) {
+        const safe = resolveSafeSubject(parsed.subject);
+        if (safe !== parsed.subject) {
+          /* Migrate the file in place: keep the keys (rotating
+           * would invalidate every active subscription), only
+           * swap the bad subject. Apple-side iOS PWAs that have
+           * been silently failing on the legacy .local subject
+           * start delivering on the very next push attempt. */
+          console.log(
+            `[push] migrating vapid subject ${JSON.stringify(parsed.subject)} -> ${JSON.stringify(safe)} (Apple rejects non-routable TLDs)`,
+          );
+          parsed.subject = safe;
+          fs.writeFileSync(
+            VAPID_FILE,
+            JSON.stringify(parsed, null, 2),
+            'utf-8',
+          );
+        }
         cached = parsed;
         webpush.setVapidDetails(parsed.subject, parsed.publicKey, parsed.privateKey);
         return parsed;
@@ -57,8 +139,7 @@ function loadOrCreateVapid(): VapidKeys {
     }
   }
   const generated = webpush.generateVAPIDKeys();
-  const subject =
-    process.env.DEVNEURAL_VAPID_SUBJECT ?? 'mailto:noreply@devneural.local';
+  const subject = resolveSafeSubject(undefined);
   const fresh: VapidKeys = {
     publicKey: generated.publicKey,
     privateKey: generated.privateKey,
@@ -128,6 +209,37 @@ export function removeSubscription(id: string): void {
   );
 }
 
+/* Per-push audit row. One log line per subscription per attempt
+ * (req_id, endpoint host, payload bytes, push-service status,
+ * outcome) so future iOS-style silent failures are diagnosable
+ * from daemon.log without rebuilding an isolation probe. The full
+ * endpoint includes a long opaque device token; we log host +
+ * outcome only so the line is greppable but not log-spam. */
+function logPushAttempt(input: {
+  reqId: string;
+  endpoint: string;
+  bytes: number;
+  status: number | null;
+  outcome: string;
+  ms: number;
+  bodyPreview?: string;
+}): void {
+  let host = '?';
+  try {
+    host = new URL(input.endpoint).host;
+  } catch {
+    /* malformed endpoint; keep host=? */
+  }
+  const bodyTail = input.bodyPreview
+    ? ` body=${JSON.stringify(input.bodyPreview.slice(0, 160))}`
+    : '';
+  console.log(
+    `[push] req=${input.reqId} host=${host} bytes=${input.bytes} status=${
+      input.status ?? '?'
+    } outcome=${input.outcome} ms=${input.ms}${bodyTail}`,
+  );
+}
+
 export async function sendPushToAll(
   payload: {
     title: string;
@@ -150,23 +262,63 @@ export async function sendPushToAll(
   if (subs.length === 0) return { delivered: 0, pruned: 0 };
   let delivered = 0;
   let pruned = 0;
+  /* Shared correlation id across every fanout call for this
+   * notification. Subscriptions log under the same req= prefix so
+   * a single push event can be traced across all subscribers. */
+  const reqId = randomReqId();
+  const body = JSON.stringify(payload);
+  const bytes = Buffer.byteLength(body, 'utf-8');
   await Promise.all(
     subs.map(async (s) => {
       const ws: WebPushSubscription = { endpoint: s.endpoint, keys: s.keys };
+      const start = Date.now();
       try {
-        await webpush.sendNotification(ws, JSON.stringify(payload));
+        const result = await webpush.sendNotification(ws, body);
         delivered++;
+        logPushAttempt({
+          reqId,
+          endpoint: s.endpoint,
+          bytes,
+          status: result?.statusCode ?? 201,
+          outcome: 'delivered',
+          ms: Date.now() - start,
+        });
       } catch (err) {
-        const status = (err as { statusCode?: number }).statusCode;
+        const status = (err as { statusCode?: number }).statusCode ?? null;
+        const errBody = String((err as { body?: unknown }).body ?? '');
+        let outcome: string;
         if (status === 404 || status === 410) {
-          // gone — drop the subscription
           removeSubscription(s.id);
           pruned++;
+          outcome = 'pruned-gone';
+        } else if (status === 403) {
+          /* 403 from a push service almost always means VAPID auth
+           * was rejected (BadJwtToken on Apple, AuthenticationError
+           * on FCM). Surface it loudly so the next operator sees
+           * the cause without re-running the isolation probe. */
+          outcome = 'rejected-vapid';
+        } else {
+          outcome = 'error';
         }
+        logPushAttempt({
+          reqId,
+          endpoint: s.endpoint,
+          bytes,
+          status,
+          outcome,
+          ms: Date.now() - start,
+          bodyPreview: errBody,
+        });
       }
     }),
   );
   return { delivered, pruned };
+}
+
+function randomReqId(): string {
+  /* Short opaque id so the audit log lines correlate without
+   * pulling crypto.randomUUID into the hot path. */
+  return Math.random().toString(36).slice(2, 10);
 }
 
 /** Hook into emitNotification - default mode is 'auto' (warn + alert
