@@ -23,12 +23,27 @@
  * future broader resume command.
  */
 
+export type VoiceCommandKind =
+  | 'disable'
+  | 'mute'
+  | 'unmute'
+  | 'panic'
+  | 'end_session';
+
 export type VoiceCommand =
   | { kind: 'disable' }
   | { kind: 'mute' }
   | { kind: 'unmute' }
   | { kind: 'panic' }
   | { kind: 'end_session' };
+
+export const ALL_VOICE_COMMAND_KINDS: ReadonlyArray<VoiceCommandKind> = [
+  'disable',
+  'mute',
+  'unmute',
+  'panic',
+  'end_session',
+];
 
 const LEX_PREFIX = String.raw`\blex\s+`;
 

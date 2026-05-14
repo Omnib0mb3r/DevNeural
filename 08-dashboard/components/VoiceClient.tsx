@@ -11,6 +11,13 @@ import { LexThumbs } from "./LexThumbs";
 import { listPtys, type PtyEntry } from "@/lib/daemon-client";
 import { onVoiceSettingUpdate } from "@/lib/voice-settings-bus";
 import { emitTranscriptTurn } from "@/lib/transcript-bus";
+import {
+  matchWakeWord,
+  createDedupe,
+  getSpeechRecognitionCtor,
+  type VoiceCommandKind,
+  type SpeechRecognitionLike,
+} from "@/lib/voice-wake-word";
 
 /* Voice control surface exposed to UI islands outside VoiceClient
  * (TopBar mic pill, future status badges). VoiceClient wraps the
@@ -431,6 +438,122 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     }
   }, [enabled]);
 
+  /* Always-on wake-word listener via the Web Speech API. Runs in
+   * parallel with the silero VAD path so the Lex command suite still
+   * fires while TTS playback has gated the main mic capture. Feature-
+   * detected: Firefox and offline Chromium builds without the cloud
+   * STT backend fall back to the keyboard hotkey listener below. The
+   * recognizer auto-restarts on `onend` because Chromium pauses the
+   * session every ~30s of silence; we keep it running for as long as
+   * voice is enabled. */
+  useEffect(() => {
+    if (!enabled) return;
+    if (typeof window === "undefined") return;
+    const Ctor = getSpeechRecognitionCtor();
+    if (!Ctor) return;
+    let cancelled = false;
+    let recognizer: SpeechRecognitionLike | null = null;
+    let restartTimer: ReturnType<typeof setTimeout> | null = null;
+    const start = (): void => {
+      if (cancelled) return;
+      try {
+        const r = new Ctor();
+        r.continuous = true;
+        r.interimResults = true;
+        r.lang = "en-US";
+        r.onresult = (event) => {
+          if (cancelled) return;
+          /* Walk every result fragment in this event (Web Speech
+           * accumulates interim + final). Match each transcript
+           * candidate against the wake-word patterns; first match
+           * wins per fragment, and the dedupe on dispatchWakeCommand
+           * keeps a tight burst of interim results from firing the
+           * same kind repeatedly. */
+          for (let i = 0; i < event.results.length; i++) {
+            const alts = event.results[i]!;
+            for (let j = 0; j < alts.length; j++) {
+              const candidate = alts[j]?.transcript ?? "";
+              const kind = matchWakeWord(candidate);
+              if (kind) {
+                dispatchWakeCommandRef.current(kind);
+                break;
+              }
+            }
+          }
+        };
+        r.onerror = () => {
+          /* swallow; onend will retry */
+        };
+        r.onend = () => {
+          if (cancelled) return;
+          restartTimer = setTimeout(start, 250);
+        };
+        recognizer = r;
+        r.start();
+      } catch {
+        /* SpeechRecognition can throw on rapid start/stop cycles or
+         * when another tab is holding the speech session. Backoff +
+         * retry. */
+        if (!cancelled) {
+          restartTimer = setTimeout(start, 1000);
+        }
+      }
+    };
+    start();
+    return () => {
+      cancelled = true;
+      if (restartTimer) clearTimeout(restartTimer);
+      if (recognizer) {
+        try {
+          recognizer.onresult = null;
+          recognizer.onend = null;
+          recognizer.onerror = null;
+          recognizer.abort();
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+  }, [enabled]);
+
+  /* Keyboard hotkey fallback for the always-on wake-word path. Web
+   * Speech is unavailable on Firefox and on offline / air-gapped
+   * Chromium builds (the cloud STT backend cannot reach Google);
+   * keyboard chords give the user a way to mute / disable / unmute
+   * Lex mid-TTS without voice. Bindings:
+   *   Ctrl+Alt+M -> mute
+   *   Ctrl+Alt+U -> unmute
+   *   Ctrl+Alt+D -> disable
+   * Targets typing inputs are exempt so the chord does not fire
+   * while the user is typing into a textarea / contentEditable. */
+  useEffect(() => {
+    if (!enabled) return;
+    if (typeof window === "undefined") return;
+    const handler = (ev: KeyboardEvent): void => {
+      if (!ev.ctrlKey || !ev.altKey) return;
+      const target = ev.target as HTMLElement | null;
+      const tag = target?.tagName ?? "";
+      if (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+      const key = ev.key.toLowerCase();
+      let kind: VoiceCommandKind | null = null;
+      if (key === "m") kind = "mute";
+      else if (key === "u") kind = "unmute";
+      else if (key === "d") kind = "disable";
+      if (!kind) return;
+      ev.preventDefault();
+      dispatchWakeCommandRef.current(kind);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [enabled]);
+
   const wsRef = useRef<WebSocket | null>(null);
   const vadRef = useRef<unknown>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -672,6 +795,41 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       /* ignore */
     }
   }
+
+  /* Always-on wake-word dispatch. Driven by the Web Speech API
+   * listener and the keyboard-hotkey listener below. Local kinds
+   * (disable, mute, unmute) update client state directly so the UI
+   * responds instantly even mid-TTS. Server kinds (panic, end_session)
+   * route through the daemon's `wake-command` WS message so the same
+   * audit log + end-session pipeline that the transcript path runs
+   * still fires. The daemon dedupes wake-command vs. the trailing
+   * whisper transcript within a 1.5s window per kind; the client
+   * keeps its own dedupe so the keyboard hotkey + Web Speech don't
+   * double-dispatch the same intent in the same instant. */
+  const wakeDedupeRef = useRef(createDedupe(1500));
+  function dispatchWakeCommand(kind: VoiceCommandKind): void {
+    if (!wakeDedupeRef.current.shouldFire(kind)) return;
+    switch (kind) {
+      case "disable":
+        setEnabled(false);
+        return;
+      case "mute":
+        setSoftMuted(true);
+        return;
+      case "unmute":
+        setSoftMuted(false);
+        return;
+      case "panic":
+      case "end_session":
+        sendJson({ t: "wake-command", kind });
+        return;
+    }
+  }
+  /* Ref so the Web Speech / hotkey effects can read the latest
+   * dispatcher without having to be in the dependency list (which
+   * would tear them down on every render). */
+  const dispatchWakeCommandRef = useRef(dispatchWakeCommand);
+  dispatchWakeCommandRef.current = dispatchWakeCommand;
 
   function sendBinary(buf: ArrayBufferLike): void {
     const ws = wsRef.current;
@@ -1311,7 +1469,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
          * streams is fine on every browser we care about. */
         try {
           const stream = await navigator.mediaDevices.getUserMedia({
-            audio: { echoCancellation: true, noiseSuppression: true },
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
           });
           if (cancelled) {
             stream.getTracks().forEach((t) => t.stop());
@@ -1636,7 +1798,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       async function initPushToTalk(): Promise<void> {
         try {
           pttStream = await navigator.mediaDevices.getUserMedia({
-            audio: { echoCancellation: true, noiseSuppression: true },
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
           });
           /* Hold the mic in a disabled state until the user actually
            * presses talk. getUserMedia activates the OS mic indicator

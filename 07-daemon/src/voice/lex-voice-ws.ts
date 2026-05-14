@@ -60,7 +60,11 @@ import {
 } from '../lex/brainstorm-store.js';
 import { processAssistantTurn } from '../lex/artifact-parser.js';
 import { buildVoiceSnapshot } from '../lex/snapshot-context.js';
-import { matchVoiceCommand } from './lex-voice-commands.js';
+import {
+  matchVoiceCommand,
+  ALL_VOICE_COMMAND_KINDS,
+  type VoiceCommandKind,
+} from './lex-voice-commands.js';
 import { firePanic } from '../dashboard/panic-routes.js';
 import { getStore } from '../lex/brainstorm-store.js';
 import { checkToolGate, notifyLargeFsRead, LARGE_FS_READ_LINE_THRESHOLD } from '../lex/tool-gate.js';
@@ -104,6 +108,15 @@ interface ConnState {
    * no-op instead of running a duplicate force-ingest + summarize +
    * embed sequence. */
   sessionEndFired: boolean;
+  /* Per-kind dedupe window for voice commands. The client now has
+   * a Web Speech / hotkey "wake-word" path that fires while micGated
+   * is true (TTS playback) AND the daemon's normal transcript path
+   * still fires when the same utterance finishes through whisper.
+   * Without this, "Lex shut up" mid-TTS would emit voice-mute twice
+   * and panic / end-session would log two audit rows. 1500ms covers
+   * the gap between the wake-word fire and the trailing transcript
+   * landing through utterance-end. */
+  lastVoiceCmdMs: Partial<Record<VoiceCommandKind, number>>;
 }
 
 const MIC_BUF_MAX = 4 * 1024 * 1024; // 4 MB ~= 2 minutes of 16k mono pcm
@@ -169,6 +182,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     closed: false,
     mode: 'conversation',
     sessionEndFired: false,
+    lastVoiceCmdMs: {},
   };
 
   function send(msg: Record<string, unknown>): void {
@@ -606,6 +620,73 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     });
   }
 
+  /* Voice-command dispatch shared by the whisper-transcript path
+   * (inside handleUtteranceEnd) and the new wake-command WS frame
+   * fired by the client's always-on Web Speech / hotkey listener.
+   * The wake path fires while TTS is playing and micGated has paused
+   * the VAD, so without dedupe both paths would emit the same frame
+   * for one utterance (or log two panic rows). lastVoiceCmdMs holds
+   * the most recent fire timestamp per kind and the source tag is
+   * surfaced in the log so audit can tell which path won the race. */
+  const VOICE_CMD_DEDUPE_MS = 1500;
+  function dispatchVoiceCommand(
+    kind: VoiceCommandKind,
+    source: 'transcript' | 'wake',
+  ): boolean {
+    const now = Date.now();
+    const prev = state.lastVoiceCmdMs[kind] ?? 0;
+    if (now - prev < VOICE_CMD_DEDUPE_MS) {
+      console.log(
+        `[voice-ws] voice-command dedupe kind=${kind} source=${source} prev_ms_ago=${now - prev}`,
+      );
+      return false;
+    }
+    state.lastVoiceCmdMs[kind] = now;
+    switch (kind) {
+      case 'panic': {
+        try {
+          const r = firePanic(getStore().db, {
+            caller: source === 'wake' ? 'lex-voice-wake' : 'lex-voice',
+            clickedMs: now,
+            injector: ptyInject,
+          });
+          send({
+            t: 'panic-fired',
+            result: r.result,
+            target_anchor_id: r.target?.id ?? null,
+          });
+        } catch {
+          /* never block the voice loop on audit-row write */
+        }
+        return true;
+      }
+      case 'end_session': {
+        send({ t: 'session-end', reason: 'voice-command' });
+        void fireSessionEndPipeline('voice-command');
+        return true;
+      }
+      case 'mute': {
+        send({ t: 'voice-mute', reason: 'voice-command' });
+        return true;
+      }
+      case 'unmute': {
+        send({ t: 'voice-unmute', reason: 'voice-command' });
+        return true;
+      }
+      case 'disable': {
+        send({ t: 'voice-disable', reason: 'voice-command' });
+        return true;
+      }
+    }
+  }
+
+  function isVoiceCommandKind(v: unknown): v is VoiceCommandKind {
+    return (
+      typeof v === 'string' &&
+      (ALL_VOICE_COMMAND_KINDS as ReadonlyArray<string>).includes(v)
+    );
+  }
+
   async function handleUtteranceEnd(): Promise<void> {
     if (state.micBuf.length === 0) {
       send({ t: 'error', code: 'empty-utterance', message: 'no audio' });
@@ -737,46 +818,8 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      *                  to get TTS back) */
     const cmd = matchVoiceCommand(result.text);
     if (cmd) {
-      switch (cmd.kind) {
-        case 'panic': {
-          try {
-            const r = firePanic(getStore().db, {
-              caller: 'lex-voice',
-              clickedMs: Date.now(),
-              injector: ptyInject,
-            });
-            send({
-              t: 'panic-fired',
-              result: r.result,
-              target_anchor_id: r.target?.id ?? null,
-            });
-          } catch {
-            /* never block the voice loop on audit-row write */
-          }
-          return;
-        }
-        case 'end_session': {
-          send({ t: 'session-end', reason: 'voice-command' });
-          /* Run ingest + summary + RAG embed before the WS close
-           * fires. Fire-and-forget: client teardown happens
-           * immediately on the session-end message, pipeline runs in
-           * the background. */
-          void fireSessionEndPipeline('voice-command');
-          return;
-        }
-        case 'mute': {
-          send({ t: 'voice-mute', reason: 'voice-command' });
-          return;
-        }
-        case 'unmute': {
-          send({ t: 'voice-unmute', reason: 'voice-command' });
-          return;
-        }
-        case 'disable': {
-          send({ t: 'voice-disable', reason: 'voice-command' });
-          return;
-        }
-      }
+      dispatchVoiceCommand(cmd.kind, 'transcript');
+      return;
     }
     if (!state.bindKey) {
       send({ t: 'error', code: 'no-bind', message: 'not bound to a Lex PTY' });
@@ -909,6 +952,27 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       case 'utterance-end':
         void handleUtteranceEnd();
         break;
+      case 'wake-command': {
+        /* Client-side always-on listener (Web Speech API or
+         * keyboard hotkey) matched a Lex voice command while the
+         * normal VAD/STT path was gated (micGated during TTS). The
+         * client posts the matched kind here so we run the same
+         * dispatch the transcript path would have. dispatchVoice
+         * Command dedupes per-kind in a 1.5s window so the trailing
+         * whisper transcript carrying the same phrase no longer
+         * fires twice. */
+        const kind = (msg as { kind?: unknown }).kind;
+        if (!isVoiceCommandKind(kind)) {
+          send({
+            t: 'error',
+            code: 'bad-wake-kind',
+            message: 'wake-command requires a valid kind',
+          });
+          break;
+        }
+        dispatchVoiceCommand(kind, 'wake');
+        break;
+      }
       case 'barge-in':
         if (state.ttsActive) {
           state.ttsActive.cancel();
