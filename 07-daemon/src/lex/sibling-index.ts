@@ -61,7 +61,7 @@ export interface BuildSiblingIndexOptions {
   now?: () => number;
 }
 
-const DEFAULT_REF_LIMIT = 2;
+const DEFAULT_REF_LIMIT = 5;
 const DEFAULT_LIMIT = 8;
 const DEFAULT_DISTILLATION_WORDS = 10;
 const DEFAULT_TURN_SNIPPET_CHARS = 400;

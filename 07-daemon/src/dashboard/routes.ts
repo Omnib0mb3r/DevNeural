@@ -3899,6 +3899,8 @@ export async function registerDashboardRoutes(
         label,
         excludeId: bs.id,
         forceForTopN: 2,
+        anchorId: bs.id,
+        currentCcSessionId: sessionId,
       });
       preamble = formatColdStartPreamble(preloadSummary);
       recordPreloadEvent(

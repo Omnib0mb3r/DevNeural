@@ -32,6 +32,8 @@ import {
   type DistillationGenerator,
   type PreloadResult,
 } from './sibling-distillation-preload.js';
+import { extractLastTurnPairs } from './sibling-index.js';
+import * as fs from 'node:fs';
 
 export interface ColdStartPreloadInput {
   db: IndexDb;
@@ -52,6 +54,23 @@ export interface ColdStartPreloadInput {
   forceForTopN?: number;
   /** Clock for the last_summary_ms stamp on force-distilled rows. */
   now?: () => number;
+  /** Anchor (lex_session) id. When set, the prior-CC-transcripts under
+   * this anchor become the sibling source instead of label-matched
+   * brainstorm rows. Mirrors buildSiblingIndex's anchor-refs primary
+   * path so the preamble counts match the block actually injected. */
+  anchorId?: string | null;
+  /** Newly-bound CC session UUID. Excluded from the prior-refs list
+   * so the active session never counts itself. */
+  currentCcSessionId?: string | null;
+  /** Cap on prior refs to surface for the anchor-refs path. Mirrors
+   * buildSiblingIndex's refLimit default of 2. */
+  anchorRefLimit?: number;
+  /** Max user/assistant pairs to extract per prior ref for the
+   * recent_turns_appended count. Mirrors buildSiblingIndex's
+   * pairsPerRef default of 5. */
+  anchorPairsPerRef?: number;
+  /** Test seam: filesystem read for transcript_path jsonls. */
+  readTranscript?: (p: string) => string | null;
 }
 
 export interface ColdStartPreloadSummary {
@@ -75,6 +94,52 @@ export interface ColdStartPreloadSummary {
 }
 
 const TOP_N_DEFAULT = 2;
+const ANCHOR_REF_LIMIT_DEFAULT = 5;
+const ANCHOR_PAIRS_PER_REF_DEFAULT = 5;
+
+function readJsonl(p: string): string | null {
+  try {
+    return fs.readFileSync(p, 'utf-8');
+  } catch {
+    return null;
+  }
+}
+
+/* Anchor-refs path: returns sibling_count + recent_turns_appended for
+ * the prior CC transcripts bound to this anchor. Mirrors
+ * buildSiblingIndex's primary path so the preamble's "Loaded N sibling
+ * sessions, M turns" reflects the block actually injected into the
+ * system prompt. Returns null when the anchor has no prior refs so the
+ * caller falls through to the label-match path. */
+function summarizeFromAnchor(
+  input: ColdStartPreloadInput,
+): { sibling_count: number; recent_turns_appended: number; last_distilled_ms: number | null } | null {
+  const anchorId = input.anchorId;
+  if (!anchorId) return null;
+  const refs = input.db.listLexTranscriptRefs(anchorId);
+  if (refs.length === 0) return null;
+  const currentCc = input.currentCcSessionId ?? null;
+  const refLimit = input.anchorRefLimit ?? ANCHOR_REF_LIMIT_DEFAULT;
+  const pairs = input.anchorPairsPerRef ?? ANCHOR_PAIRS_PER_REF_DEFAULT;
+  const prior = refs
+    .filter((r) => !currentCc || r.cc_session_id !== currentCc)
+    .sort((a, b) => b.ordering - a.ordering)
+    .slice(0, refLimit);
+  if (prior.length === 0) return null;
+  const read = input.readTranscript ?? readJsonl;
+  let turns = 0;
+  for (const ref of prior) {
+    const text = read(ref.transcript_path);
+    if (!text) continue;
+    turns += extractLastTurnPairs(text, pairs).length;
+  }
+  const anchorBs = input.db.getBrainstorm(anchorId);
+  return {
+    sibling_count: prior.length,
+    recent_turns_appended: turns,
+    last_distilled_ms: anchorBs?.last_summary_ms ?? null,
+  };
+}
 
 export async function preloadColdStartSiblings(
   input: ColdStartPreloadInput,
@@ -86,6 +151,18 @@ export async function preloadColdStartSiblings(
     recent_turns_appended: 0,
     failure_reason: null,
   };
+  /* Anchor-refs primary path: when the new session re-binds an
+   * existing brainstorm anchor, the prior CC transcripts ARE the
+   * siblings. Skip the label-match force-distill (no other brainstorm
+   * rows to fire against) and surface the anchor's last_summary_ms +
+   * extracted turn count straight away. */
+  const fromAnchor = summarizeFromAnchor(input);
+  if (fromAnchor) {
+    out.sibling_count = fromAnchor.sibling_count;
+    out.recent_turns_appended = fromAnchor.recent_turns_appended;
+    out.last_distilled_ms = fromAnchor.last_distilled_ms;
+    return out;
+  }
   const label = (input.label ?? '').trim();
   if (!label) {
     out.failure_reason = 'no-label';
