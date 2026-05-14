@@ -84,6 +84,7 @@ export function startDistillationBackfillScheduler(
         db: opts.db,
         generator,
         limit,
+        log,
       });
       log(
         `[distill-scheduler] processed=${result.processed.length} errors=${result.errors.length} skipped=${result.skipped.length} hit_cap=${result.hit_cap}`,

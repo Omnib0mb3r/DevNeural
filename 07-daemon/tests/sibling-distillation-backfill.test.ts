@@ -27,6 +27,9 @@ function insertBs(opts: {
   label: string | null;
   started_ms: number;
   last_summary?: string | null;
+  /** Insert one canned chunk so the pre-filter sees content. Defaults
+   * to true; pass false to exercise the chunkless-skip path. */
+  withChunk?: boolean;
 }): void {
   db.insertBrainstorm({
     id: opts.id,
@@ -45,6 +48,18 @@ function insertBs(opts: {
     last_summary: opts.last_summary ?? null,
     last_summary_ms: opts.last_summary ? 1 : null,
   });
+  if (opts.withChunk !== false) {
+    db.insertBrainstormChunk({
+      id: `c-${opts.id}`,
+      brainstorm_id: opts.id,
+      turn_index: 0,
+      role: 'user',
+      mode: 'conversation',
+      text: 'thinking out loud about the design',
+      model_id: 'stub',
+      no_decay: 1,
+    });
+  }
 }
 
 beforeEach(async () => {
@@ -149,12 +164,88 @@ describe('runDistillationBackfill', () => {
   });
 
   it('generator failures land in errors[] without bumping the row', async () => {
+    /* Row HAS chunks so the pre-filter passes and the generator is
+     * actually invoked. The null return from the generator is the
+     * "real failure" branch and must bucket as error. */
     insertBs({ id: 'a', label: 'T', started_ms: 1 });
     const generator = vi.fn().mockResolvedValue(null);
     const r = await runDistillationBackfill({ db, generator, limit: 5 });
+    expect(generator).toHaveBeenCalledTimes(1);
     expect(r.processed).toEqual([]);
     expect(r.errors).toEqual(['a']);
+    expect(r.skipped).toEqual([]);
     const reread = db.listBrainstorms({ limit: 5 }).find((b) => b.id === 'a');
     expect(reread?.last_summary).toBeNull();
+  });
+
+  it('generator throws land in errors[] (transcript existed, run failed)', async () => {
+    insertBs({ id: 'boom', label: 'T', started_ms: 1 });
+    const generator = vi.fn().mockRejectedValue(new Error('llm down'));
+    const r = await runDistillationBackfill({ db, generator, limit: 5 });
+    expect(generator).toHaveBeenCalledTimes(1);
+    expect(r.errors).toEqual(['boom']);
+    expect(r.skipped).toEqual([]);
+    expect(r.processed).toEqual([]);
+  });
+
+  it('chunkless brainstorms land in skipped[], not errors, and the generator is never called', async () => {
+    /* Two chunkless rows + one chunked row. Only the chunked row
+     * should reach the generator; the chunkless ones bucket as
+     * skipped because there is no transcript to distill. The
+     * scheduler's log surface should also see a one-line summary
+     * of the chunkless skip so daemon.log stops printing one
+     * "[distill-gen] no chunks" per row per tick. */
+    insertBs({ id: 'empty-1', label: 'T', started_ms: 1, withChunk: false });
+    insertBs({ id: 'empty-2', label: 'T', started_ms: 2, withChunk: false });
+    insertBs({ id: 'full', label: 'T', started_ms: 3 });
+    const generator = vi.fn().mockResolvedValue('one line summary');
+    const logs: string[] = [];
+    const r = await runDistillationBackfill({
+      db,
+      generator,
+      limit: 5,
+      log: (m) => logs.push(m),
+    });
+    expect(generator).toHaveBeenCalledTimes(1);
+    expect(generator.mock.calls[0]![0]!.id).toBe('full');
+    expect(r.processed).toEqual(['full']);
+    expect(r.errors).toEqual([]);
+    expect(r.skipped.sort()).toEqual(['empty-1', 'empty-2']);
+    expect(r.hit_cap).toBe(false);
+    expect(
+      logs.find((l) =>
+        /skipped 2 chunkless brainstorms/.test(l),
+      ),
+    ).toBeTruthy();
+  });
+
+  it('chunkless rows do not consume the per-run cap', async () => {
+    /* 3 chunkless + 5 chunked + cap=5. Cap should bite on the
+     * chunked rows only; chunkless rows fill the skipped bucket
+     * alongside any chunked rows the cap pushed past. */
+    for (let i = 0; i < 3; i++) {
+      insertBs({
+        id: `empty-${i}`,
+        label: 'T',
+        started_ms: i + 1,
+        withChunk: false,
+      });
+    }
+    for (let i = 0; i < 5; i++) {
+      insertBs({
+        id: `full-${i}`,
+        label: 'T',
+        started_ms: 100 + i,
+      });
+    }
+    const generator = vi.fn().mockResolvedValue('summary');
+    const r = await runDistillationBackfill({ db, generator, limit: 5 });
+    expect(generator).toHaveBeenCalledTimes(5);
+    expect(r.processed.length).toBe(5);
+    expect(r.errors).toEqual([]);
+    /* All 3 chunkless land in skipped; cap did NOT bite on chunked
+     * rows so hit_cap stays false. */
+    expect(r.skipped.length).toBe(3);
+    expect(r.hit_cap).toBe(false);
   });
 });

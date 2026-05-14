@@ -33,12 +33,23 @@ export interface BackfillOptions {
   excludeId?: string | null;
   /** Clock for the last_summary_ms stamp. */
   now?: () => number;
+  /** Optional logger so the chunkless-skip summary lands in the same
+   * stream the scheduler uses for its tick summary. */
+  log?: (msg: string) => void;
 }
 
 export interface BackfillResult {
   processed: string[];
+  /** Rows that cannot or will not be distilled this tick: chunkless
+   * brainstorms (older than the brainstorm_chunks table) AND
+   * candidates the per-run cap pushed past. The two are merged into
+   * one bucket because both are "not failures, try later" from the
+   * caller's perspective. */
   skipped: string[];
-  /** Rows the generator failed or returned empty on. */
+  /** Rows the generator threw on or returned empty for AFTER reaching
+   * a transcript. Chunkless rows are NOT counted as errors; without
+   * chunks there is no transcript to distill in the first place, so
+   * bucketing them as failures was misclassifying daemon log noise. */
   errors: string[];
   /** True when the cap stopped the run before all candidates were
    * exhausted, so the caller can schedule another tick. */
@@ -88,17 +99,44 @@ export async function runDistillationBackfill(
     return true;
   });
 
+  /* Pre-filter chunkless brainstorms. Sessions older than the
+   * brainstorm_chunks table have no transcript rows; the generator
+   * would skip them ("[distill-gen] no chunks for <id>") and return
+   * null, which the old bucketing classified as a failure. Treat
+   * them as skipped so the scheduler summary distinguishes "no
+   * content" from a real LLM / DB / generation error. Pre-filtering
+   * also avoids burning a provider call per chunkless candidate. */
+  const chunked: BrainstormSessionRow[] = [];
+  let chunklessSkipCount = 0;
   for (const row of candidates) {
+    if (opts.db.countBrainstormChunks(row.id) === 0) {
+      out.skipped.push(row.id);
+      chunklessSkipCount += 1;
+      continue;
+    }
+    chunked.push(row);
+  }
+  if (chunklessSkipCount > 0 && opts.log) {
+    opts.log(
+      `[distill-backfill] skipped ${chunklessSkipCount} chunkless brainstorm${
+        chunklessSkipCount === 1 ? '' : 's'
+      }`,
+    );
+  }
+
+  for (const row of chunked) {
     if (out.processed.length >= limit) {
-      out.hit_cap = candidates.length > out.processed.length;
+      out.hit_cap = chunked.length > out.processed.length;
       out.skipped.push(row.id);
       continue;
     }
     let distillation: string | null = null;
+    let threw = false;
     try {
       distillation = await opts.generator(row);
     } catch {
       distillation = null;
+      threw = true;
     }
     if (distillation && distillation.trim().length > 0) {
       opts.db.updateBrainstorm(row.id, {
@@ -107,6 +145,10 @@ export async function runDistillationBackfill(
       });
       out.processed.push(row.id);
     } else {
+      /* Real failure: the row had a transcript but the generator
+       * threw or returned empty. Bucket as error so the summary
+       * still surfaces genuine provider / generation problems. */
+      void threw;
       out.errors.push(row.id);
     }
   }
