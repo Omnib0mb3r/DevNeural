@@ -737,7 +737,9 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * user explicitly mutes while the status is "listening". */
   const captureStreamRef = useRef<MediaStream | null>(null);
   const captureCtxRef = useRef<AudioContext | null>(null);
-  const captureProcRef = useRef<ScriptProcessorNode | null>(null);
+  const captureProcRef = useRef<AudioWorkletNode | ScriptProcessorNode | null>(
+    null,
+  );
   const captureBufRef = useRef<Int16Array[]>([]);
   const captureCapturingRef = useRef<boolean>(false);
   /* Stuck-open VAD recovery state. vadListenerOpenRef is true between
@@ -1635,16 +1637,33 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           const ctx = new Cls({ sampleRate: 16000 });
           captureCtxRef.current = ctx;
           const src = ctx.createMediaStreamSource(stream);
-          const proc = ctx.createScriptProcessor(4096, 1, 1);
+          /* AudioWorklet replaces the deprecated ScriptProcessorNode
+           * (bug 2026-05-14-vad-scriptprocessornode-deprecation). The
+           * worklet module posts Float32 mono frames over its port;
+           * gain + Int16 conversion stays on the main thread so the
+           * downstream consumer (captureBufRef) is byte-for-byte
+           * equivalent to the prior onaudioprocess callback. */
+          await ctx.audioWorklet.addModule("/vad-tap.worklet.js");
+          if (cancelled) {
+            stream.getTracks().forEach((t) => t.stop());
+            try {
+              await ctx.close();
+            } catch {
+              /* ignore */
+            }
+            return;
+          }
+          const proc = new AudioWorkletNode(ctx, "vad-tap");
           captureProcRef.current = proc;
-          proc.onaudioprocess = (e: AudioProcessingEvent) => {
+          proc.port.onmessage = (ev: MessageEvent<Float32Array>) => {
             if (!captureCapturingRef.current) return;
             /* Drop frames while the TTS gate is active. tts-start
              * already disarmed captureCapturingRef but a buffer
              * that landed mid-flip would still push into
              * captureBufRef without this check. */
             if (micGatedRef.current) return;
-            const f = e.inputBuffer.getChannelData(0);
+            const f = ev.data;
+            if (!f || f.length === 0) return;
             const gain = micGainRef.current;
             const i16 = new Int16Array(f.length);
             for (let i = 0; i < f.length; i++) {
