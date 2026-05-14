@@ -646,6 +646,33 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       send({ t: 'error', code: 'stt', message: (err as Error).message });
       return;
     }
+    /* Post-Whisper sanity drop. Whisper happily transcribes silence
+     * and room noise as either an empty string, the literal sentinel
+     * `[BLANK_AUDIO]`, or a single throwaway word ("you", "thanks",
+     * "okay"). Forwarding any of those to Lex pollutes the brainstorm
+     * with phantom turns and burns a Claude Code response on noise.
+     * Drop here before anything reaches the chat / brainstorm
+     * pipeline; still send a transcript frame with empty text so the
+     * client flips back to ready instead of sitting on "transcribing".
+     * Panic + end-session triggers are both 2+ words so this floor
+     * does not cut them off. */
+    const trimmed = result.text.trim();
+    const wordCount = trimmed
+      ? trimmed.split(/\s+/).filter((w) => w.length > 0).length
+      : 0;
+    const isBlankMarker = trimmed === '[BLANK_AUDIO]';
+    if (!trimmed || isBlankMarker || wordCount < 2) {
+      const reason = !trimmed
+        ? 'empty'
+        : isBlankMarker
+          ? 'blank-audio-marker'
+          : 'too-few-words';
+      console.log(
+        `[voice-ws] dropped whisper utterance: reason=${reason} words=${wordCount} text=${JSON.stringify(trimmed)}`,
+      );
+      send({ t: 'transcript', text: '', ms: result.ms });
+      return;
+    }
     send({ t: 'transcript', text: result.text, ms: result.ms });
     /* Wave 2 day 2 step 11: persist this utterance into the per-session
      * audio bundle so /brainstorms/:id/audio can serve it back later.
@@ -704,7 +731,6 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     } catch {
       /* audio bundle is observational; never block the turn */
     }
-    if (!result.text.trim()) return;
     /* Hands-free stop: if the transcript matches a spoken end-session
      * command, skip the inject path so Lex doesn't reply, and notify
      * the client to tear down. Notes-mode users who want the dictation

@@ -154,6 +154,19 @@ const VAD_REDEMPTION_MAX = 3000;
 const VAD_REDEMPTION_DEFAULT = 768;
 const SILERO_FRAME_MS = 32;
 
+/* Rolling probability floor for stuck-open VAD recovery. While the
+ * listener is open we average silero's per-frame isSpeech probability
+ * over the last VAD_PROB_WINDOW_MS; if the average drops below
+ * VAD_PROB_FLOOR we force end-of-utterance and recycle the VAD.
+ * Catches the case where silero opens on a transient (cough, room
+ * noise burst) but no real speech follows and the redemption window
+ * never elapses because background frames keep nudging probability
+ * just above the negative threshold. Intentionally no hard duration
+ * cap: legitimate long utterances stay alive as long as the user
+ * keeps speaking above the floor. */
+const VAD_PROB_FLOOR = 0.4;
+const VAD_PROB_WINDOW_MS = 1500;
+
 /* Map a 0-1 sensitivity knob to silero positive/negative speech
  * thresholds. Higher knob = more sensitive = lower threshold. The
  * 0.1 delta between positive and negative matches the legacy tuning
@@ -422,6 +435,12 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   const captureProcRef = useRef<ScriptProcessorNode | null>(null);
   const captureBufRef = useRef<Int16Array[]>([]);
   const captureCapturingRef = useRef<boolean>(false);
+  /* Stuck-open VAD recovery state. vadListenerOpenRef is true between
+   * onSpeechStart and onSpeechEnd (or any forced close); the rolling
+   * probability window only accumulates while it's true so silence
+   * between utterances doesn't poison the next utterance's floor. */
+  const vadListenerOpenRef = useRef<boolean>(false);
+  const probWindowRef = useRef<Array<{ t: number; p: number }>>([]);
   /* Notes-mode finalize awaits the next assistant-text before
    * closing the WS so the user sees the generated summary. */
   const awaitingFinalizeRef = useRef<boolean>(false);
@@ -1329,6 +1348,12 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
               utteranceStartRef.current = Date.now();
               utteranceSamplesRef.current = 0;
               setUtteranceMs(0);
+              /* Arm rolling probability window for stuck-open
+               * recovery. Cleared on every open so the previous
+               * utterance's frames can't trip an early close on
+               * this one. */
+              vadListenerOpenRef.current = true;
+              probWindowRef.current = [];
               if (utteranceTimerRef.current) {
                 clearInterval(utteranceTimerRef.current);
               }
@@ -1345,6 +1370,8 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
               utteranceCapRef.current = setTimeout(() => {
                 if (vadInstance && typeof vadInstance.pause === "function") {
                   vadInstance.pause();
+                  vadListenerOpenRef.current = false;
+                  probWindowRef.current = [];
                   /* Pulling buffered audio from the VAD: package
                    * doesn't expose mid-utterance audio, so we drop
                    * the cap-fired utterance and let the user try
@@ -1368,8 +1395,74 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                * of truth on the normal end-of-utterance path. */
               captureCapturingRef.current = false;
               captureBufRef.current = [];
+              vadListenerOpenRef.current = false;
+              probWindowRef.current = [];
               if (mutedRef.current) return;
               finalizeUtterance(audio);
+            },
+            /* Stuck-open recovery. Silero invokes this on every
+             * 32ms frame whether or not speech is currently open;
+             * we only accumulate while the listener is open. If
+             * the rolling average isSpeech probability stays below
+             * VAD_PROB_FLOOR across the full VAD_PROB_WINDOW_MS,
+             * force the listener closed locally and recycle VAD so
+             * the next real utterance starts clean. We deliberately
+             * do NOT ship audio or send utterance-end here: the
+             * daemon's micBuf hasn't received any binary frames yet
+             * (those only flow on the real end-of-utterance path),
+             * so simply dropping the in-progress utterance leaves
+             * the daemon in a consistent state for the next
+             * utterance-start. */
+            onFrameProcessed: (probs: {
+              isSpeech: number;
+              notSpeech: number;
+            }) => {
+              if (!vadListenerOpenRef.current) return;
+              const now = Date.now();
+              const w = probWindowRef.current;
+              w.push({ t: now, p: probs.isSpeech });
+              while (w.length > 0 && now - w[0]!.t > VAD_PROB_WINDOW_MS) {
+                w.shift();
+              }
+              /* Require a full window before evaluating so the first
+               * 1.5s of an utterance can't trip the floor before
+               * we've actually heard the speaker. */
+              if (w.length === 0) return;
+              if (now - w[0]!.t < VAD_PROB_WINDOW_MS - SILERO_FRAME_MS) {
+                return;
+              }
+              let sum = 0;
+              for (const x of w) sum += x.p;
+              const avg = sum / w.length;
+              if (avg >= VAD_PROB_FLOOR) return;
+              vadListenerOpenRef.current = false;
+              probWindowRef.current = [];
+              captureCapturingRef.current = false;
+              captureBufRef.current = [];
+              if (utteranceTimerRef.current) {
+                clearInterval(utteranceTimerRef.current);
+                utteranceTimerRef.current = null;
+              }
+              if (utteranceCapRef.current) {
+                clearTimeout(utteranceCapRef.current);
+                utteranceCapRef.current = null;
+              }
+              setUtteranceMs(0);
+              try {
+                vadInstance?.pause?.();
+              } catch {
+                /* ignore */
+              }
+              setStatus((cur) =>
+                cur === "listening" || cur === "transcribing" ? "ready" : cur,
+              );
+              setTimeout(() => {
+                try {
+                  vadInstance?.start?.();
+                } catch {
+                  /* ignore */
+                }
+              }, 250);
             },
             /* VAD thresholds derived from the user-tunable mic
              * sensitivity (0=ignore noise, 1=fire easily; 0.5 matches
