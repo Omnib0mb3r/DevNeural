@@ -131,17 +131,58 @@ describe('firePanic', () => {
     expect(log[0]!.target_session_id).toBe('cc-1');
   });
 
-  it('logs pty_not_found when the resolved anchor has no current_pty_id', () => {
+  it('falls back to current_session_id when current_pty_id is null and the cc session has a live daemon pty', () => {
+    /* Bridge-presence reconcile binds current_session_id on every
+     * live tick but never populates current_pty_id; before the fix
+     * the panic resolver short-circuited to pty_not_found here even
+     * when the daemon owned a PTY for that CC session. The injector
+     * stub stands in for ptyInject's session-id fallback path
+     * (getPtyBySession lookup). */
     seedLive({ id: 'only', pty: null, cc: 'cc-1' });
-    const injector = vi.fn();
+    const injector = vi.fn(() => ({ ok: true as const }));
     const r = firePanic(db, {
       caller: 'dashboard',
       clickedMs: 9003,
       injector,
     });
+    expect(r.ok).toBe(true);
+    expect(r.result).toBe('accepted');
+    expect(injector).toHaveBeenCalledWith('cc-1', '\x1b\x1b', false);
+    const log = recentPanics(db)[0]!;
+    expect(log.result).toBe('accepted');
+    expect(log.target_anchor_id).toBe('only');
+    expect(log.target_session_id).toBe('cc-1');
+    expect(log.target_pty_id).toBe('cc-1');
+  });
+
+  it('logs pty_not_found when both current_pty_id and current_session_id are null', () => {
+    seedLive({ id: 'only', pty: null, cc: null });
+    const injector = vi.fn();
+    const r = firePanic(db, {
+      caller: 'dashboard',
+      clickedMs: 9013,
+      injector,
+    });
     expect(r.ok).toBe(false);
     expect(r.result).toBe('pty_not_found');
     expect(injector).not.toHaveBeenCalled();
+    expect(recentPanics(db)[0]!.result).toBe('pty_not_found');
+  });
+
+  it('logs pty_not_found when the session-id fallback injector cannot resolve a live pty', () => {
+    seedLive({ id: 'only', pty: null, cc: 'cc-1' });
+    const injector = vi.fn(() => ({
+      ok: false as const,
+      error: 'pty not found',
+    }));
+    const r = firePanic(db, {
+      caller: 'dashboard',
+      clickedMs: 9023,
+      injector,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.result).toBe('pty_not_found');
+    expect(injector).toHaveBeenCalledWith('cc-1', '\x1b\x1b', false);
     expect(recentPanics(db)[0]!.result).toBe('pty_not_found');
   });
 

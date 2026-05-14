@@ -87,8 +87,21 @@ function fireOn(
     });
     return { ok: false, result: 'no_target', target: null, log_id: logId };
   }
-  const ptyId = target.current_pty_id;
-  if (!ptyId) {
+  /* Pick the injector key. Prefer the daemon-owned pty id snapshot on
+   * the anchor; fall back to the bound CC session id when pty id is
+   * null. Bridge-presence reconcile sets current_session_id on every
+   * live tick but never populates current_pty_id, so the previous
+   * "pty_id required" gate dropped every panic against a bridge-
+   * attached anchor at the daemon door even when a daemon-owned PTY
+   * was alive for that CC session. The production injector
+   * (`ptyInject`) accepts either form: it tries `ptys.get(key)` first
+   * and falls back to `getPtyBySession(key)` so an anchor whose
+   * current_session_id maps to a live daemon PTY still receives the
+   * \x1b\x1b interrupt. target_pty_id on the audit row stores the
+   * exact key we tried so the dashboard can show whichever identifier
+   * actually drove the inject. */
+  const injectKey = target.current_pty_id ?? target.current_session_id ?? null;
+  if (!injectKey) {
     const logId = writeLog(db, {
       target,
       clickedMs: opts.clickedMs,
@@ -98,14 +111,14 @@ function fireOn(
     });
     return { ok: false, result: 'pty_not_found', target, log_id: logId };
   }
-  const inj = opts.injector(ptyId, PANIC_PAYLOAD, false);
+  const inj = opts.injector(injectKey, PANIC_PAYLOAD, false);
   const result: PanicResult = inj.ok ? 'accepted' : 'pty_not_found';
   const logId = writeLog(db, {
     target,
     clickedMs: opts.clickedMs,
     caller: opts.caller,
     result,
-    ptyId,
+    ptyId: injectKey,
   });
   return { ok: inj.ok, result, target, log_id: logId };
 }
