@@ -24,11 +24,27 @@ export type Severity = 'info' | 'warn' | 'alert';
 export type NotificationScope = 'bell' | 'activity';
 export const ALL_SCOPES: NotificationScope[] = ['bell', 'activity'];
 
+/** Push payload event-type taxonomy. 'reminder' is the legacy default
+ * (scheduled reminder went due); 'attention' is the new real-time
+ * Lex attention-needed signal (a question that requires a yes/no or
+ * pick-one decision, or a supervision stall escalation). The service
+ * worker uses this to render different icons / sounds / urgencies. */
+export type PushEventType = 'reminder' | 'attention';
+
+/** Per-call push override. 'auto' keeps the legacy severity-driven
+ * gate (info skipped, warn+alert pushed). 'force' pushes regardless
+ * of severity (used by attention notifications even at info-level
+ * for quiet-hours follow-ups that DID escape suppression). 'suppress'
+ * blocks push entirely - the notification still lands in the log so
+ * the in-app surfaces see it, but no system push fires. Quiet-hours
+ * gating routes through 'suppress'. */
+export type PushMode = 'auto' | 'force' | 'suppress';
+
 export interface Notification {
   id: string;
   ts: string;
   severity: Severity;
-  source: string; // e.g. "ingest", "lint", "ollama", "system", "curator", "reinforcement"
+  source: string; // e.g. "ingest", "lint", "ollama", "system", "curator", "reinforcement", "lex-attention"
   title: string;
   body?: string;
   link?: string;
@@ -37,6 +53,16 @@ export interface Notification {
   dismissed: boolean;
   /** Per-surface dismiss tracking. Empty = visible everywhere. */
   dismissed_scopes: NotificationScope[];
+  /** Push taxonomy, persisted on the notification row so the
+   * dashboard log can render attention rows with a distinct affordance
+   * (icon, click target) even after a SW restart drops the in-memory
+   * push payload. Defaults to 'reminder' when missing for backward
+   * compat with older rows. */
+  event_type?: PushEventType;
+  /** Free-form metadata forwarded into the web-push payload so the
+   * service worker can deep-link or render specialised UIs. Kept
+   * narrow on purpose: brainstorm_id, turn_id, snippet. */
+  push_data?: Record<string, string | number | boolean | null>;
 }
 
 export const events = new EventEmitter();
@@ -52,6 +78,15 @@ export function emitNotification(input: {
   title: string;
   body?: string;
   link?: string;
+  /** Push taxonomy. Defaults to 'reminder' for back-compat with every
+   * existing caller; the lex-attention pipeline passes 'attention' so
+   * the SW can render a distinct urgency. */
+  event_type?: PushEventType;
+  /** Free-form metadata forwarded into the push payload. */
+  push_data?: Record<string, string | number | boolean | null>;
+  /** Push override. Defaults to 'auto' (severity-driven gate). The
+   * lex-attention pipeline uses 'suppress' inside quiet hours. */
+  push?: PushMode;
 }): Notification {
   const n: Notification = {
     id: randomUUID(),
@@ -63,19 +98,25 @@ export function emitNotification(input: {
     ...(input.link ? { link: input.link } : {}),
     dismissed: false,
     dismissed_scopes: [],
+    ...(input.event_type ? { event_type: input.event_type } : {}),
+    ...(input.push_data ? { push_data: input.push_data } : {}),
   };
   append(n);
   events.emit('notification', n);
-  // Web push delivery (warn + alert only). Imported lazily to avoid a circular
-  // load and to keep the persistence layer functional even if push setup fails.
-  void (async () => {
-    try {
-      const { maybePushNotification } = await import('./push.js');
-      await maybePushNotification(n);
-    } catch {
-      /* push delivery is best-effort */
-    }
-  })();
+  // Web push delivery (warn + alert only by default; 'force' / 'suppress'
+  // overrides honoured). Imported lazily to avoid a circular load and to
+  // keep the persistence layer functional even if push setup fails.
+  const pushMode: PushMode = input.push ?? 'auto';
+  if (pushMode !== 'suppress') {
+    void (async () => {
+      try {
+        const { maybePushNotification } = await import('./push.js');
+        await maybePushNotification(n, { mode: pushMode });
+      } catch {
+        /* push delivery is best-effort */
+      }
+    })();
+  }
   return n;
 }
 

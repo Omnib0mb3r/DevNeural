@@ -129,7 +129,21 @@ export function removeSubscription(id: string): void {
 }
 
 export async function sendPushToAll(
-  payload: { title: string; body?: string; url?: string; id?: string; tag?: string },
+  payload: {
+    title: string;
+    body?: string;
+    url?: string;
+    id?: string;
+    tag?: string;
+    /** Service worker reads this to pick icon / sound / urgency.
+     * Defaults to 'reminder' for back-compat with the existing
+     * scheduled-reminder push path. */
+    event_type?: 'reminder' | 'attention';
+    /** Free-form metadata: brainstorm_id, turn_id, snippet. The SW
+     * forwards these in notification.data so the click handler can
+     * deep-link into the dashboard. */
+    data?: Record<string, string | number | boolean | null>;
+  },
 ): Promise<{ delivered: number; pruned: number }> {
   loadOrCreateVapid();
   const subs = listSubscriptions();
@@ -155,21 +169,32 @@ export async function sendPushToAll(
   return { delivered, pruned };
 }
 
-/** Hook into emitNotification — only warn + alert push by default.
+/** Hook into emitNotification - default mode is 'auto' (warn + alert
+ * push, info skipped). 'force' overrides the severity gate so the
+ * lex-attention pipeline can fire at info-level when it makes sense.
+ * 'suppress' is short-circuited by the caller in notifications.ts so
+ * this function never sees it.
+ *
  * OP-2 native toast fallback: when web push delivers zero pushes
  * (no subscriptions, all stale, push server unreachable), spawn a
  * Windows toast via BurntToast. The notification is already in
  * notifications.jsonl regardless, so the dashboard surface is
  * unaffected; the toast is the user-eyeball signal that survives
  * a missing PWA install. */
-export async function maybePushNotification(n: Notification): Promise<void> {
-  if (n.severity === 'info') return;
+export async function maybePushNotification(
+  n: Notification,
+  opts: { mode?: 'auto' | 'force' } = {},
+): Promise<void> {
+  const mode = opts.mode ?? 'auto';
+  if (mode === 'auto' && n.severity === 'info') return;
   const result = await sendPushToAll({
     title: n.title,
     ...(n.body ? { body: n.body } : {}),
     ...(n.link ? { url: n.link } : {}),
     id: n.id,
     tag: n.source,
+    ...(n.event_type ? { event_type: n.event_type } : {}),
+    ...(n.push_data ? { data: n.push_data } : {}),
   });
   if (result.delivered === 0) {
     const { showToast } = await import('./toast-fallback.js');

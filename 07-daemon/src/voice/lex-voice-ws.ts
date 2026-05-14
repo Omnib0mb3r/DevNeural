@@ -59,6 +59,7 @@ import {
   getStore as getBrainstormStore,
 } from '../lex/brainstorm-store.js';
 import { processAssistantTurn } from '../lex/artifact-parser.js';
+import { fireForLexTurn as fireAttentionForLexTurn } from '../dashboard/lex-attention.js';
 import { buildVoiceSnapshot } from '../lex/snapshot-context.js';
 import {
   matchVoiceCommand,
@@ -542,6 +543,22 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       }
     } catch {
       /* artifact extraction is observational; never block speak() */
+    }
+    /* Real-time attention notification. When the assistant turn ends
+     * with a decision-shaped question (yes/no, pick-one, short prompt
+     * with '?') we fire a push so the user gets pulled back from
+     * whatever else they were doing. The dispatcher handles quiet
+     * hours internally - suppressed pushes still write to the in-app
+     * notification log so the user can catch up after waking. Wrapped
+     * so a notification failure cannot block the speak path. */
+    try {
+      fireAttentionForLexTurn({
+        brainstorm_id: brainstormForFeedback?.id ?? null,
+        turn_id: uuid || null,
+        text,
+      });
+    } catch {
+      /* attention dispatch is observational; never block speak() */
     }
     /* Wave 3 Lane B step 41 (LX-16). Heuristic large-fs-read detector.
      * When Lex returns a Bash tool result that looks like a grep/find
