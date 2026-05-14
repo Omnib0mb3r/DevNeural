@@ -12,9 +12,9 @@ import { listPtys, type PtyEntry } from "@/lib/daemon-client";
 import { onVoiceSettingUpdate } from "@/lib/voice-settings-bus";
 import { emitTranscriptTurn } from "@/lib/transcript-bus";
 import {
-  matchWakeWord,
   createDedupe,
   getSpeechRecognitionCtor,
+  processWakeResults,
   type VoiceCommandKind,
   type SpeechRecognitionLike,
 } from "@/lib/voice-wake-word";
@@ -560,47 +560,39 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         r.lang = "en-US";
         r.onresult = (event) => {
           if (cancelled) return;
-          /* Walk every result fragment in this event (Web Speech
-           * accumulates interim + final). Match each transcript
-           * candidate against the wake-word patterns; first match
-           * wins per fragment, and the dedupe on dispatchWakeCommand
-           * keeps a tight burst of interim results from firing the
-           * same kind repeatedly. Every fragment whose confidence
-           * crosses WAKE_LOG_CONFIDENCE_FLOOR (or whose isFinal
-           * flips true when confidence is absent on older builds)
-           * is logged so the ring buffer captures what Web Speech
-           * actually heard, regardless of whether the matcher fired. */
-          for (let i = 0; i < event.results.length; i++) {
-            const alts = event.results[i]!;
-            const isFinal = alts.isFinal === true;
-            for (let j = 0; j < alts.length; j++) {
-              const alt = alts[j];
-              const candidate = alt?.transcript ?? "";
-              const confidence =
-                typeof alt?.confidence === "number" ? alt.confidence : null;
-              const kind = matchWakeWord(candidate);
+          /* Iterate NEW results only. processWakeResults reads from
+           * event.resultIndex per the Web Speech spec so old
+           * finalised fragments are NOT re-matched on every event.
+           * Bug 2026-05-14 'Lex unmute fails after Lex shut up'
+           * was caused by a 0-based walk that re-dispatched the
+           * earlier 'lex shut up' final on every subsequent event,
+           * which the 1500ms per-kind dedupe blocked for one burst
+           * and then re-fired every ~1.5s afterwards.
+           *
+           * Logging policy mirrors the prior path: log every
+           * candidate whose confidence >= the floor, every final
+           * fragment when older Chromium builds omit confidence,
+           * and every matched fragment. */
+          processWakeResults(event, {
+            dispatch: (kind) => dispatchWakeCommandRef.current(kind),
+            onCandidate: ({ transcript, matched, confidence, isFinal }) => {
               const shouldLog =
                 (confidence !== null &&
                   confidence >= WAKE_LOG_CONFIDENCE_FLOOR) ||
                 (confidence === null && isFinal) ||
-                kind !== null;
-              if (shouldLog) {
-                logWake("heard", {
-                  transcript: candidate,
-                  matched: kind,
-                  confidence,
-                  isFinal,
-                  softMuted: softMutedRef.current,
-                  enabled,
-                  micPermissionGranted,
-                });
-              }
-              if (kind) {
-                dispatchWakeCommandRef.current(kind);
-                break;
-              }
-            }
-          }
+                matched !== null;
+              if (!shouldLog) return;
+              logWake("heard", {
+                transcript,
+                matched,
+                confidence,
+                isFinal,
+                softMuted: softMutedRef.current,
+                enabled,
+                micPermissionGranted,
+              });
+            },
+          });
         };
         r.onerror = (event) => {
           /* swallow; onend will retry. log + stash for the debug

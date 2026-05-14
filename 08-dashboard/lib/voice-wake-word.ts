@@ -114,18 +114,97 @@ export interface SpeechRecognitionResultLike
    * older builds skip it. */
   isFinal?: boolean;
 }
+/** Result event Web Speech delivers to onresult. In continuous mode
+ * results[] keeps growing across the lifetime of the recognizer;
+ * resultIndex is the spec-mandated cursor into NEW results that
+ * arrived on this event. Anything before resultIndex has already
+ * been delivered in a prior event - re-iterating from 0 re-matches
+ * old finalised fragments and causes the very bug this module
+ * exists to prevent. */
+export interface SpeechRecognitionEventLike {
+  results: ArrayLike<SpeechRecognitionResultLike>;
+  resultIndex?: number;
+}
 export interface SpeechRecognitionLike {
   continuous: boolean;
   interimResults: boolean;
   lang: string;
-  onresult:
-    | ((event: {
-        results: ArrayLike<SpeechRecognitionResultLike>;
-      }) => void)
-    | null;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
   onend: (() => void) | null;
   onerror: ((event: { error?: string }) => void) | null;
   start(): void;
   stop(): void;
   abort(): void;
+}
+
+export interface WakeCandidateInfo {
+  transcript: string;
+  matched: VoiceCommandKind | null;
+  confidence: number | null;
+  isFinal: boolean;
+  resultIndex: number;
+  altIndex: number;
+}
+
+export interface ProcessWakeResultsOptions {
+  /** Fires once per matched result fragment. The wake-word path's
+   * dedupe guard lives downstream of this callback. */
+  dispatch: (kind: VoiceCommandKind) => void;
+  /** Optional candidate observer. Fires for every alternative the
+   * walker visits (whether or not the matcher locked a kind) so
+   * the consumer can drive logging / a debug badge without having
+   * to re-walk results. */
+  onCandidate?: (info: WakeCandidateInfo) => void;
+}
+
+/**
+ * Walk the NEW results on a Web Speech recognition event and
+ * dispatch matched wake-words.
+ *
+ * Critical detail: iterates from `event.resultIndex` (default 0
+ * for older builds that omit the field) rather than 0. Web Speech
+ * in continuous mode never trims event.results between events -
+ * every finalised fragment from the lifetime of the recognizer
+ * stays at its original index. Iterating from 0 re-matches old
+ * fragments (e.g. an earlier "lex shut up") forever; the 1500ms
+ * per-kind dedupe holds for the first burst then wears off, and
+ * the same command fires every ~1.5s. resultIndex is the
+ * spec-defined cursor into "what's new on THIS event".
+ *
+ * Inner alt loop bails on the first match so a single result with
+ * two competing alternatives can't double-dispatch. dispatchWake
+ * Command's per-kind dedupe still catches a burst of interim
+ * fragments that all read the same matched kind.
+ */
+export function processWakeResults(
+  event: SpeechRecognitionEventLike,
+  opts: ProcessWakeResultsOptions,
+): void {
+  const start =
+    typeof event.resultIndex === "number" && event.resultIndex >= 0
+      ? event.resultIndex
+      : 0;
+  for (let i = start; i < event.results.length; i++) {
+    const alts = event.results[i]!;
+    const isFinal = alts.isFinal === true;
+    for (let j = 0; j < alts.length; j++) {
+      const alt = alts[j];
+      const candidate = alt?.transcript ?? "";
+      const confidence =
+        typeof alt?.confidence === "number" ? alt.confidence : null;
+      const kind = matchWakeWord(candidate);
+      opts.onCandidate?.({
+        transcript: candidate,
+        matched: kind,
+        confidence,
+        isFinal,
+        resultIndex: i,
+        altIndex: j,
+      });
+      if (kind) {
+        opts.dispatch(kind);
+        break;
+      }
+    }
+  }
 }

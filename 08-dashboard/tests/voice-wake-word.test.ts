@@ -19,11 +19,29 @@
  * VAD-driven path. That's the end-to-end behaviour the spec asked
  * for.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   matchWakeWord,
   createDedupe,
+  processWakeResults,
+  type SpeechRecognitionEventLike,
+  type SpeechRecognitionResultLike,
 } from "../lib/voice-wake-word";
+
+/* Build a Web Speech-shaped result event for tests. Each `results`
+ * entry is one finalised fragment with a single alternative; the
+ * resultIndex on the event marks where NEW results start, per the
+ * Web Speech spec. */
+function fakeEvent(
+  transcripts: string[],
+  resultIndex: number,
+): SpeechRecognitionEventLike {
+  const results: SpeechRecognitionResultLike[] = transcripts.map((t) => {
+    const alts = [{ transcript: t, confidence: 0.95 }];
+    return Object.assign(alts, { isFinal: true }) as SpeechRecognitionResultLike;
+  });
+  return { results, resultIndex };
+}
 
 describe("matchWakeWord", () => {
   it("matches the disable phrase", () => {
@@ -102,5 +120,94 @@ describe("createDedupe", () => {
     const guard = createDedupe(1500);
     expect(guard.shouldFire("panic")).toBe(true);
     expect(guard.shouldFire("panic")).toBe(false);
+  });
+});
+
+describe("processWakeResults", () => {
+  /* Regression for bug 2026-05-14: Web Speech in continuous mode
+   * never trims event.results; every finalised fragment from the
+   * lifetime of the recognizer stays at its original index. The
+   * walker now reads from event.resultIndex so only NEW finals on
+   * THIS event are dispatched. */
+  it("only dispatches the NEW result when prior 'lex shut up' final stays at index 0 and 'lex unmute' lands at index 1", () => {
+    const dispatch = vi.fn();
+    /* Simulates Chromium's second onresult after the user already
+     * said 'lex shut up' (now sitting permanently at results[0]
+     * isFinal=true) and just finished 'lex unmute' at results[1]
+     * isFinal=true. resultIndex=1 marks results[1] as the only
+     * new fragment. The buggy 0-based walk re-dispatched mute
+     * here; the fixed walker only dispatches unmute. */
+    processWakeResults(fakeEvent(["lex shut up", "lex unmute"], 1), {
+      dispatch,
+    });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith("unmute");
+  });
+
+  it("dispatches both kinds when resultIndex=0 and both fragments are new", () => {
+    const dispatch = vi.fn();
+    processWakeResults(fakeEvent(["lex shut up", "lex unmute"], 0), {
+      dispatch,
+    });
+    expect(dispatch.mock.calls.map((c) => c[0])).toEqual([
+      "mute",
+      "unmute",
+    ]);
+  });
+
+  it("defaults to resultIndex=0 when the event omits the field (older builds)", () => {
+    const dispatch = vi.fn();
+    const event: SpeechRecognitionEventLike = {
+      results: fakeEvent(["lex emergency stop"], 0).results,
+    };
+    processWakeResults(event, { dispatch });
+    expect(dispatch).toHaveBeenCalledWith("panic");
+  });
+
+  it("ignores already-delivered results before resultIndex even when they match", () => {
+    const dispatch = vi.fn();
+    processWakeResults(
+      fakeEvent(["lex shut up", "background noise", "lex disable"], 2),
+      { dispatch },
+    );
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith("disable");
+  });
+
+  it("walks alternatives within one result and bails on the first match", () => {
+    const dispatch = vi.fn();
+    const results: SpeechRecognitionResultLike[] = [
+      Object.assign(
+        [
+          { transcript: "background", confidence: 0.4 },
+          { transcript: "lex mute", confidence: 0.92 },
+          { transcript: "lex disable", confidence: 0.5 },
+        ],
+        { isFinal: true },
+      ) as SpeechRecognitionResultLike,
+    ];
+    processWakeResults({ results, resultIndex: 0 }, { dispatch });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith("mute");
+  });
+
+  it("fires onCandidate for every alternative the walker visits, with the matcher's verdict", () => {
+    const candidates: Array<{
+      transcript: string;
+      matched: string | null;
+    }> = [];
+    processWakeResults(
+      fakeEvent(["hello there", "lex unmute"], 0),
+      {
+        dispatch: () => {},
+        onCandidate: ({ transcript, matched }) => {
+          candidates.push({ transcript, matched });
+        },
+      },
+    );
+    expect(candidates).toEqual([
+      { transcript: "hello there", matched: null },
+      { transcript: "lex unmute", matched: "unmute" },
+    ]);
   });
 });
