@@ -103,12 +103,25 @@ export function getSpeechRecognitionCtor(): {
  * (SpeechRecognition + webkitSpeechRecognition) that TypeScript's
  * default lib does not declare; redeclaring the whole surface would
  * be heavier than the few methods we actually call. */
+export interface SpeechRecognitionAlternativeLike {
+  transcript: string;
+  /** Confidence is optional on older Chromium builds. */
+  confidence?: number;
+}
+export interface SpeechRecognitionResultLike
+  extends ArrayLike<SpeechRecognitionAlternativeLike> {
+  /** True once Web Speech finalises the fragment. Optional because
+   * older builds skip it. */
+  isFinal?: boolean;
+}
 export interface SpeechRecognitionLike {
   continuous: boolean;
   interimResults: boolean;
   lang: string;
   onresult:
-    | ((event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void)
+    | ((event: {
+        results: ArrayLike<SpeechRecognitionResultLike>;
+      }) => void)
     | null;
   onend: (() => void) | null;
   onerror: ((event: { error?: string }) => void) | null;

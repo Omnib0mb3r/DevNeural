@@ -18,6 +18,27 @@ import {
   type VoiceCommandKind,
   type SpeechRecognitionLike,
 } from "@/lib/voice-wake-word";
+import { logWake } from "@/lib/wake-log";
+
+/* Wake-word debug badge gating. The badge is dev-only: set
+ * NEXT_PUBLIC_LEX_DEBUG_VOICE=1 in .env.local to surface the
+ * lastWakeMatched + lastWakeError + wakeWordActive triple inside
+ * the voice pill so the post-mute stuck-state can be diagnosed
+ * without opening DevTools. Defaults off; the env var is inlined
+ * at build time by Next.js, so production bundles do not carry
+ * the debug branch. */
+const LEX_DEBUG_VOICE =
+  typeof process !== "undefined" &&
+  process.env.NEXT_PUBLIC_LEX_DEBUG_VOICE === "1";
+
+/* Confidence floor for logging Web Speech result fragments. Web
+ * Speech sometimes streams interim transcripts with low confidence
+ * (the recognizer is still narrowing down); we log every result if
+ * its alts carry a numeric .confidence >= this floor, OR every
+ * final-flagged result whose alts have no .confidence at all (older
+ * Chromium builds). The matcher still runs on every fragment - the
+ * floor only gates the log line. */
+const WAKE_LOG_CONFIDENCE_FLOOR = 0.6;
 
 /* Voice control surface exposed to UI islands outside VoiceClient
  * (TopBar mic pill, future status badges). VoiceClient wraps the
@@ -67,6 +88,13 @@ interface VoiceCtxValue {
    * Lex command capture is still on even when the foreground mic is
    * micGated during TTS playback. */
   wakeWordActive: boolean;
+  /* Dev-only observability surface. Last command kind the matcher
+   * locked in + the most recent recognizer error string. Exposed on
+   * the context so the pill can render the debug badge without
+   * having to grow a separate hook. Always populated; rendering is
+   * gated by NEXT_PUBLIC_LEX_DEBUG_VOICE on the consumer side. */
+  lastWakeMatched: VoiceCommandKind | null;
+  lastWakeError: string | null;
   /* Lex speech rate, persisted globally. Exposed on the context so
    * the TopBar pill can render an inline speed slider without re-
    * deriving from voice-preferences. */
@@ -350,6 +378,13 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * the foreground mic icon flipping to MicOff during micGated
    * read as "wake-word also muted" even though it never was). */
   const [wakeWordActive, setWakeWordActive] = useState<boolean>(false);
+  /* Observability surfaces for the wake-word path. Driven by
+   * logWake-tapped lifecycle handlers below; rendered as a tiny
+   * dev-only badge inside the pill when LEX_DEBUG_VOICE is on. */
+  const [lastWakeMatched, setLastWakeMatched] = useState<
+    VoiceCommandKind | null
+  >(null);
+  const [lastWakeError, setLastWakeError] = useState<string | null>(null);
   /* Start/stop click idempotency guard. The enable effect kicks off
    * async getUserMedia + MicVAD.new + WS connect; a rapid second
    * click can land before any of that resolves and either no-ops
@@ -530,12 +565,36 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
            * candidate against the wake-word patterns; first match
            * wins per fragment, and the dedupe on dispatchWakeCommand
            * keeps a tight burst of interim results from firing the
-           * same kind repeatedly. */
+           * same kind repeatedly. Every fragment whose confidence
+           * crosses WAKE_LOG_CONFIDENCE_FLOOR (or whose isFinal
+           * flips true when confidence is absent on older builds)
+           * is logged so the ring buffer captures what Web Speech
+           * actually heard, regardless of whether the matcher fired. */
           for (let i = 0; i < event.results.length; i++) {
             const alts = event.results[i]!;
+            const isFinal = alts.isFinal === true;
             for (let j = 0; j < alts.length; j++) {
-              const candidate = alts[j]?.transcript ?? "";
+              const alt = alts[j];
+              const candidate = alt?.transcript ?? "";
+              const confidence =
+                typeof alt?.confidence === "number" ? alt.confidence : null;
               const kind = matchWakeWord(candidate);
+              const shouldLog =
+                (confidence !== null &&
+                  confidence >= WAKE_LOG_CONFIDENCE_FLOOR) ||
+                (confidence === null && isFinal) ||
+                kind !== null;
+              if (shouldLog) {
+                logWake("heard", {
+                  transcript: candidate,
+                  matched: kind,
+                  confidence,
+                  isFinal,
+                  softMuted: softMutedRef.current,
+                  enabled,
+                  micPermissionGranted,
+                });
+              }
               if (kind) {
                 dispatchWakeCommandRef.current(kind);
                 break;
@@ -543,21 +602,37 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             }
           }
         };
-        r.onerror = () => {
-          /* swallow; onend will retry */
+        r.onerror = (event) => {
+          /* swallow; onend will retry. log + stash for the debug
+           * badge so a chain of restart-attempts whose root cause
+           * was an upstream error is visible after the fact. */
+          const reason =
+            typeof event?.error === "string" ? event.error : "unknown";
+          logWake("error", { error: reason });
+          if (!cancelled) setLastWakeError(reason);
         };
         r.onend = () => {
           if (cancelled) return;
+          logWake("end");
+          setWakeWordActive(false);
+          logWake("restart-attempt", { delayMs: 250 });
           restartTimer = setTimeout(start, 250);
         };
         recognizer = r;
         r.start();
-        if (!cancelled) setWakeWordActive(true);
-      } catch {
+        if (!cancelled) {
+          setWakeWordActive(true);
+          logWake("start");
+        }
+      } catch (err) {
         /* SpeechRecognition can throw on rapid start/stop cycles or
          * when another tab is holding the speech session. Backoff +
          * retry. */
+        const message = (err as Error | undefined)?.message ?? "throw";
+        logWake("error", { error: message, source: "start-throw" });
         if (!cancelled) {
+          setLastWakeError(message);
+          logWake("restart-attempt", { delayMs: 1000 });
           restartTimer = setTimeout(start, 1000);
         }
       }
@@ -576,6 +651,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           /* ignore */
         }
       }
+      logWake("abort-cleanup");
       setWakeWordActive(false);
     };
   }, [enabled, micPermissionGranted]);
@@ -872,7 +948,14 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * double-dispatch the same intent in the same instant. */
   const wakeDedupeRef = useRef(createDedupe(1500));
   function dispatchWakeCommand(kind: VoiceCommandKind): void {
-    if (!wakeDedupeRef.current.shouldFire(kind)) return;
+    /* Probe dedupe first WITHOUT mutating state so we can log
+     * willDedupe=true for blocked invocations. shouldFire then runs
+     * its real call below, which is the one that actually flips the
+     * per-kind timestamp on a fire. */
+    const fire = wakeDedupeRef.current.shouldFire(kind);
+    logWake("dispatch", { kind, willDedupe: !fire });
+    if (!fire) return;
+    setLastWakeMatched(kind);
     switch (kind) {
       case "disable":
         setEnabled(false);
@@ -2313,6 +2396,8 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     softMuted,
     silentMessageCount,
     wakeWordActive,
+    lastWakeMatched,
+    lastWakeError,
     speed,
     speedMin: SPEED_MIN,
     speedMax: SPEED_MAX,
@@ -2352,6 +2437,11 @@ export interface VoicePillViewProps {
    * small "wake" indicator so the user can confirm Lex commands
    * still listen even when the foreground mic is micGated. */
   wakeWordActive?: boolean;
+  /** Dev-only debug surface for the wake-word path. Rendered as a
+   * tiny badge inside row 2 when LEX_DEBUG_VOICE is set; never
+   * rendered otherwise. */
+  lastWakeMatched?: VoiceCommandKind | null;
+  lastWakeError?: string | null;
   /** Current Lex speech-rate multiplier; rendered as the slider
    * thumb position and the inline N.NNx readout. */
   speed?: number;
@@ -2373,6 +2463,8 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
     softMuted,
     silentMessageCount,
     wakeWordActive,
+    lastWakeMatched,
+    lastWakeError,
     speed,
     speedMin,
     speedMax,
@@ -2610,6 +2702,18 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
         >
           {statusLabel}
         </span>
+        {LEX_DEBUG_VOICE && (
+          <span
+            data-testid="voice-pill-wake-debug"
+            title={`wakeWordActive=${wakeWordActive ?? false} lastMatched=${
+              lastWakeMatched ?? "—"
+            } lastError=${lastWakeError ?? "—"}`}
+            className="ml-auto text-[10px] font-mono text-txt3 truncate"
+          >
+            wake={wakeWordActive ? "on" : "off"} · m=
+            {lastWakeMatched ?? "—"} · e={lastWakeError ?? "—"}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -2633,6 +2737,8 @@ export function VoiceTopBarPill(): React.ReactElement | null {
       softMuted={v.softMuted}
       silentMessageCount={v.silentMessageCount}
       wakeWordActive={v.wakeWordActive}
+      lastWakeMatched={v.lastWakeMatched}
+      lastWakeError={v.lastWakeError}
       speed={v.speed}
       speedMin={v.speedMin}
       speedMax={v.speedMax}
