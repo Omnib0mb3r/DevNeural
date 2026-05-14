@@ -2479,7 +2479,7 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
        * viewports. */}
       <div
         data-testid="voice-pill-row-controls"
-        className="flex items-center gap-1 h-9 min-w-0"
+        className="flex items-center gap-1 min-h-11 min-w-0"
       >
         <span className="text-[11px] font-emphasized text-txt2 px-1 shrink-0">
           Voice
@@ -2512,7 +2512,10 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
           aria-pressed={muted}
           onClick={() => setMicMuted(!muted)}
           disabled={!enabled}
-          className="relative w-9 h-9 grid place-items-center rounded-pill text-txt2 hover:bg-surface2 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+          /* w-11 h-11 = 44 CSS px each axis. Apple HIG + WCAG 2.5.5
+           * baseline. Inner Icon stays size 16; the click box grows
+           * around the visible glyph. */
+          className="relative w-11 h-11 grid place-items-center rounded-pill text-txt2 hover:bg-surface2 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
           title={
             micGated
               ? "Mic paused while Lex speaks. Tap to also user-mute."
@@ -2543,7 +2546,10 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
           aria-pressed={softMuted}
           onClick={() => setSoftMuted(!softMuted)}
           disabled={!enabled}
-          className="relative w-9 h-9 grid place-items-center rounded-pill text-txt2 hover:bg-surface2 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+          /* w-11 h-11 = 44 CSS px each axis. Matches the mic mute
+           * button so the symmetric controls share an identical
+           * touch target. */
+          className="relative w-11 h-11 grid place-items-center rounded-pill text-txt2 hover:bg-surface2 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
           title={
             softMuted
               ? `Lex is muted. ${silentMessageCount} silent message${
@@ -2572,7 +2578,14 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
           type="button"
           onClick={toggleEnabled}
           aria-label={enabled ? "Stop voice" : "Start voice"}
-          className={`text-[11px] px-2 py-0.5 rounded-pill hairline font-emphasized shrink-0 ${
+          /* min-w-11 min-h-11 = 44 CSS px each axis (Apple HIG +
+           * WCAG 2.5.5). inline-flex items-center justify-center
+           * keeps the small "stop"/"start" label visually unchanged
+           * inside an extended click box. The hairline ring + pill
+           * radius still paints at the natural padding bounds, so
+           * the visible affordance reads at its prior size while
+           * the tap zone grows. */
+          className={`inline-flex items-center justify-center min-w-11 min-h-11 text-[11px] px-2 py-0.5 rounded-pill hairline font-emphasized shrink-0 ${
             enabled
               ? "bg-err/15 text-err ring-1 ring-err/30 hover:bg-err/25"
               : "bg-brand/15 text-brandSoft ring-1 ring-brand/30 hover:bg-brand/25"
