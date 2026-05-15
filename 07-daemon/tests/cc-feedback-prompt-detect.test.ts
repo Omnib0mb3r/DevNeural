@@ -4,6 +4,8 @@ import {
   __CC_BOX_CHARS_RE_FOR_TEST as BOX_RE,
   __SYSTEM_PROMPT_HOLD_MS_FOR_TEST as HOLD_MS,
   isCcSystemPromptChunk,
+  shouldAutoDismissSystemPrompt,
+  CC_SYSTEM_PROMPT_DISMISS_COOLDOWN_MS,
 } from '../src/dashboard/pty-host.js';
 
 /* Wave 3 fixup (bug: 2026-05-10-cc-feedback-prompt-unanswerable).
@@ -84,5 +86,84 @@ describe('isCcSystemPromptChunk', () => {
 
   it('does NOT trip on phrase alone (no box)', () => {
     expect(isCcSystemPromptChunk('Continue? (y/n)')).toBe(false);
+  });
+
+  it('trips on the newer "How is Claude doing this session?" overlay', () => {
+    const chunk =
+      '╭──────────────────────────────────╮\n' +
+      '│ How is Claude doing this session? │\n' +
+      '│ 1: Bad                            │\n' +
+      '│ 2: Fine                           │\n' +
+      '│ 3: Good                           │\n' +
+      '│ 0: Dismiss                        │\n' +
+      '╰──────────────────────────────────╯';
+    expect(isCcSystemPromptChunk(chunk)).toBe(true);
+  });
+
+  it('still requires box-drawing even for the new variant', () => {
+    /* Without the box-drawing requirement, the new phrase would
+     * trigger on assistant prose like "I want to know how Claude
+     * is doing this session" or any documentation that quotes the
+     * dismiss menu. */
+    expect(
+      isCcSystemPromptChunk('How is Claude doing this session? Let me know.'),
+    ).toBe(false);
+  });
+});
+
+describe('shouldAutoDismissSystemPrompt', () => {
+  const COOLDOWN = CC_SYSTEM_PROMPT_DISMISS_COOLDOWN_MS;
+  const newOverlay =
+    '╭──────────────────────────────────╮\n' +
+    '│ How is Claude doing this session? │\n' +
+    '│ 0: Dismiss                        │\n' +
+    '╰──────────────────────────────────╯';
+
+  it('returns true on a fresh CC overlay chunk with no prior dismissal', () => {
+    expect(shouldAutoDismissSystemPrompt(newOverlay, 0, 1_000_000)).toBe(true);
+  });
+
+  it('returns false on a redraw chunk inside the cooldown window', () => {
+    /* CC redraws the overlay several times within a single prompt
+     * (border re-render, cursor blink); without the cooldown we
+     * would auto-write multiple '0\r' on the same prompt. */
+    const lastDismiss = 1_000_000;
+    expect(
+      shouldAutoDismissSystemPrompt(
+        newOverlay,
+        lastDismiss,
+        lastDismiss + COOLDOWN - 1,
+      ),
+    ).toBe(false);
+  });
+
+  it('returns true once the cooldown has elapsed', () => {
+    const lastDismiss = 1_000_000;
+    expect(
+      shouldAutoDismissSystemPrompt(
+        newOverlay,
+        lastDismiss,
+        lastDismiss + COOLDOWN + 1,
+      ),
+    ).toBe(true);
+  });
+
+  it('returns false for ordinary Lex prose even after cooldown elapsed', () => {
+    /* The cooldown gate only matters when the regex already matched.
+     * Non-matching prose must never trigger auto-dismiss regardless
+     * of how long ago the last real dismiss was. */
+    expect(
+      shouldAutoDismissSystemPrompt(
+        "Sure, I'll handle that.",
+        0,
+        9_999_999_999,
+      ),
+    ).toBe(false);
+  });
+
+  it('returns false for box-drawing alone (no phrase)', () => {
+    expect(
+      shouldAutoDismissSystemPrompt('╭───╮\n│ x │\n╰───╯', 0, 9_999_999_999),
+    ).toBe(false);
   });
 });

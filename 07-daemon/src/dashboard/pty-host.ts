@@ -78,6 +78,17 @@ interface PtyHandle {
    * Cleared automatically 90s after the last pattern hit; sequential
    * matches keep it alive. */
   awaitingSystemPromptUntil: number;
+  /** Last time we auto-wrote '0\r' to dismiss a CC native rating /
+   * y-n / continue prompt. Used to cooldown the auto-dismiss so a
+   * stream of redraw chunks doesn't spam multiple dismissal
+   * keystrokes within the same prompt window. Bound to PtyHandle
+   * because daemon-owned PTYs are headless: the Lex brainstorm
+   * session has no human at the keyboard to press 0 manually, so
+   * an undismissed prompt would block the session indefinitely.
+   * Bridge-tracked sessions never reach this path (they flow
+   * through worker-event-listener, not pty.onData), so this only
+   * ever affects daemon-owned spawns. */
+  lastSystemPromptDismissAt: number;
   /* Diagnostic fields stamped on exit / inject failure so the
    * dashboard TerminalMirror can render a small expandable error
    * block instead of leaving the user blind. lastCommandSent holds
@@ -110,7 +121,9 @@ interface PtyHandle {
 const CC_SYSTEM_PROMPT_RE = new RegExp(
   [
     'How would you rate',
+    'How is Claude doing this session',
     '1 = thumbs down',
+    '0: Dismiss',
     'Rate this interaction',
     'rate this session',
     'Continue\\? \\(y/n\\)',
@@ -127,6 +140,33 @@ const SYSTEM_PROMPT_HOLD_MS = 30_000;
 
 export function isCcSystemPromptChunk(data: string): boolean {
   return CC_SYSTEM_PROMPT_RE.test(data) && CC_BOX_CHARS_RE.test(data);
+}
+
+/* Auto-dismiss cooldown. CC's feedback overlay redraws several times
+ * across a single prompt session (cursor blink, terminal resize,
+ * border re-render). Without a cooldown, every redraw chunk that
+ * still matches the regex would trigger another '0\r' write, which
+ * is at best wasted bytes and at worst could land on whatever
+ * follow-up surface CC renders right after dismissal. 5s is long
+ * enough to cover the redraw burst but short enough that a fresh
+ * prompt opening 30s later (after the awaiting window expires) gets
+ * its own dismiss. */
+export const CC_SYSTEM_PROMPT_DISMISS_COOLDOWN_MS = 5_000;
+
+/* Pure decision helper: should we auto-write '0\r' to dismiss the
+ * CC native system prompt right now? Returns true only when the
+ * chunk matches isCcSystemPromptChunk AND we have not auto-
+ * dismissed within the cooldown window. Pulled out so the test
+ * suite can pin every branch without spinning a real PTY. */
+export function shouldAutoDismissSystemPrompt(
+  data: string,
+  lastDismissAt: number,
+  now: number,
+  cooldownMs: number = CC_SYSTEM_PROMPT_DISMISS_COOLDOWN_MS,
+): boolean {
+  if (!isCcSystemPromptChunk(data)) return false;
+  if (now - lastDismissAt < cooldownMs) return false;
+  return true;
 }
 
 /* Test-only re-exports for tests/cc-feedback-prompt-detect.test.ts.
@@ -345,6 +385,7 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
     cols,
     rows,
     awaitingSystemPromptUntil: 0,
+    lastSystemPromptDismissAt: 0,
     lastCommandSent: null,
     lastCommandAt: 0,
     exitCode: null,
@@ -391,6 +432,34 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
      * every turn after the first. */
     if (isCcSystemPromptChunk(data)) {
       handle.awaitingSystemPromptUntil = Date.now() + SYSTEM_PROMPT_HOLD_MS;
+      /* Auto-dismiss for daemon-owned PTYs. We are inside pty.onData
+       * which only fires on PTYs spawned by spawnLex (i.e. daemon-
+       * owned by definition); bridge-tracked external CC windows
+       * flow through worker-event-listener and never reach this
+       * callback. The cooldown via lastSystemPromptDismissAt makes
+       * sure a redraw burst within the same prompt window only
+       * writes '0\r' once. The 80ms paste-then-Enter delay mirrors
+       * ptyInject so bracketed-paste mode terminators are flushed
+       * before the carriage return commits the dismissal. */
+      const now = Date.now();
+      if (
+        shouldAutoDismissSystemPrompt(data, handle.lastSystemPromptDismissAt, now)
+      ) {
+        handle.lastSystemPromptDismissAt = now;
+        try {
+          handle.pty.write('0');
+          setTimeout(() => {
+            if (!handle.exited) {
+              try { handle.pty.write('\r'); } catch { /* swallow */ }
+            }
+          }, 80);
+          console.log(
+            `[pty-host] auto-dismissed CC native prompt pty=${handle.ptyId} session=${handle.sessionId ?? '-'}`,
+          );
+        } catch {
+          /* observability only; never crash the data handler */
+        }
+      }
     }
     /* If we've already bound, push directly into the ring. Otherwise
      * accumulate in the pre-buffer. We probe for the session-id every
