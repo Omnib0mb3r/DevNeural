@@ -19,6 +19,7 @@ import {
   type SpeechRecognitionLike,
 } from "@/lib/voice-wake-word";
 import { logWake } from "@/lib/wake-log";
+import { logVoice, computeReconnectBackoffMs } from "@/lib/voice-log";
 
 /* Wake-word debug badge gating. The badge is dev-only: set
  * NEXT_PUBLIC_LEX_DEBUG_VOICE=1 in .env.local to surface the
@@ -551,6 +552,20 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     let cancelled = false;
     let recognizer: SpeechRecognitionLike | null = null;
     let restartTimer: ReturnType<typeof setTimeout> | null = null;
+    /* Watchdog. Web Speech in continuous mode sometimes goes silent
+     * indefinitely -- no onresult, no onend, no onerror -- after
+     * Chromium loses its connection to the speech backend. Without a
+     * watchdog the only path to recovery was the user noticing voice
+     * commands had stopped and clicking restart. Track the last
+     * lifecycle event (start / result / end / error) and force a
+     * recognizer abort + restart when the silence exceeds the
+     * threshold. */
+    let lastEventMs = Date.now();
+    const WATCHDOG_INTERVAL_MS = 10_000;
+    const WATCHDOG_SILENCE_MS = 60_000;
+    const stamp = (): void => {
+      lastEventMs = Date.now();
+    };
     const start = (): void => {
       if (cancelled) return;
       try {
@@ -560,6 +575,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         r.lang = "en-US";
         r.onresult = (event) => {
           if (cancelled) return;
+          stamp();
           /* Iterate NEW results only. processWakeResults reads from
            * event.resultIndex per the Web Speech spec so old
            * finalised fragments are NOT re-matched on every event.
@@ -602,16 +618,19 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             typeof event?.error === "string" ? event.error : "unknown";
           logWake("error", { error: reason });
           if (!cancelled) setLastWakeError(reason);
+          stamp();
         };
         r.onend = () => {
           if (cancelled) return;
           logWake("end");
           setWakeWordActive(false);
+          stamp();
           logWake("restart-attempt", { delayMs: 250 });
           restartTimer = setTimeout(start, 250);
         };
         recognizer = r;
         r.start();
+        stamp();
         if (!cancelled) {
           setWakeWordActive(true);
           logWake("start");
@@ -630,8 +649,41 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       }
     };
     start();
+    const watchdogTimer = setInterval(() => {
+      if (cancelled) return;
+      const silentMs = Date.now() - lastEventMs;
+      if (silentMs < WATCHDOG_SILENCE_MS) return;
+      /* Recognizer has gone silent past the threshold. Force a
+       * restart cycle. abort() triggers onend which re-arms the
+       * recognizer via restartTimer; stamp resets the watchdog so
+       * the next probe waits a full window before kicking again. */
+      logWake("watchdog-restart", { silent_ms: silentMs });
+      logVoice(
+        "wake-watchdog-restart",
+        "wake-word recognizer silent past threshold; forcing restart",
+        { silent_ms: silentMs, threshold_ms: WATCHDOG_SILENCE_MS },
+        "warn",
+      );
+      stamp();
+      if (recognizer) {
+        try {
+          recognizer.abort();
+        } catch {
+          /* ignore; onend may not fire if abort threw, so schedule
+           * a manual restart so the watchdog doesn't end up looping
+           * on a dead recognizer. */
+          if (restartTimer) clearTimeout(restartTimer);
+          restartTimer = setTimeout(start, 250);
+        }
+      } else {
+        /* Recognizer never spawned; kick directly. */
+        if (restartTimer) clearTimeout(restartTimer);
+        restartTimer = setTimeout(start, 250);
+      }
+    }, WATCHDOG_INTERVAL_MS);
     return () => {
       cancelled = true;
+      clearInterval(watchdogTimer);
       if (restartTimer) clearTimeout(restartTimer);
       if (recognizer) {
         try {
@@ -1326,56 +1378,124 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     }
 
     let cancelled = false;
+    let reconnectAttempts = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     setStatus("connecting");
     setErrMsg("");
+    logVoice("engine-enable", "voice engine effect entering connect path");
 
     (async () => {
-      /* Open WS first so we can ack-bind before mic touches the user. */
+      /* Open WS first so we can ack-bind before mic touches the user.
+       * Wrapped in a connectWs() closure so the onclose handler can
+       * re-invoke it for auto-reconnect with exponential backoff.
+       * Without this, a transient daemon restart or a bridge bounce
+       * left the WS dead and the only path back to live voice was
+       * the user clicking 'start voice' again -- the central
+       * complaint of the 2026-05-15 voice-loop-restart escalation. */
       const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const ws = new WebSocket(`${proto}//${window.location.host}/voice/lex-ws`);
-      ws.binaryType = "arraybuffer";
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        sendJson({
-          t: "hello",
-          session_id: sessionId ?? undefined,
-          mode: modeRef.current,
-        });
-      };
-      ws.onclose = () => {
+      const wsUrl = `${proto}//${window.location.host}/voice/lex-ws`;
+      const scheduleReconnect = (reason: string): void => {
         if (cancelled) return;
-        /* If the close happened because Lex itself was just ended,
-         * the auto-stop effect is already on its way to flipping
-         * `enabled` off. Don't surface a noisy ERROR pill in that
-         * window — the user explicitly asked for the session to
-         * end, so this close is expected. */
         if (!hasLexRef.current) {
-          setStatus("idle");
-          setErrMsg("");
+          /* Lex is gone; let the auto-stop effect flip enabled off. */
           return;
         }
-        setStatus("error");
-        setErrMsg("voice connection closed");
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        const delay = computeReconnectBackoffMs(reconnectAttempts);
+        reconnectAttempts += 1;
+        logVoice("ws-reconnect-scheduled", reason, {
+          attempt: reconnectAttempts,
+          delay_ms: delay,
+        });
+        setStatus("connecting");
+        setErrMsg(
+          `voice connection lost (${reason}); reconnecting in ${Math.round(delay / 1000)}s…`,
+        );
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          if (cancelled) return;
+          if (!hasLexRef.current) return;
+          connectWs();
+        }, delay);
       };
-      ws.onerror = () => {
-        setStatus("error");
-        setErrMsg("voice ws error");
-      };
-      ws.onmessage = (ev) => {
-        if (typeof ev.data === "string") {
-          try {
-            const msg = JSON.parse(ev.data) as { t: string; [k: string]: unknown };
-            handleServerMsg(msg);
-          } catch {
-            /* malformed json, ignore */
+      const connectWs = (): void => {
+        if (cancelled) return;
+        const ws = new WebSocket(wsUrl);
+        ws.binaryType = "arraybuffer";
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          reconnectAttempts = 0;
+          logVoice("ws-open", "voice ws connected");
+          sendJson({
+            t: "hello",
+            session_id: sessionId ?? undefined,
+            mode: modeRef.current,
+          });
+        };
+        ws.onclose = (ev) => {
+          if (cancelled) return;
+          /* If the close happened because Lex itself was just ended,
+           * the auto-stop effect is already on its way to flipping
+           * `enabled` off. Don't surface a noisy ERROR pill in that
+           * window — the user explicitly asked for the session to
+           * end, so this close is expected. */
+          if (!hasLexRef.current) {
+            logVoice("ws-close", "lex ended; not reconnecting", {
+              code: ev.code,
+              reason: ev.reason,
+            });
+            setStatus("idle");
+            setErrMsg("");
+            return;
           }
-        } else if (ev.data instanceof ArrayBuffer) {
-          if (speakingRef.current) {
-            schedulePcmChunk(ev.data, ttsGenRef.current);
+          logVoice(
+            "ws-close",
+            "voice ws closed unexpectedly",
+            { code: ev.code, reason: ev.reason },
+            "warn",
+          );
+          /* Give the auto-reconnect path a finite number of tries
+           * before surfacing a hard error. The schedule caps at 30s,
+           * so 8 attempts cover ~2 minutes of outage -- past that
+           * something is wrong upstream and the user should see the
+           * error pill. */
+          if (reconnectAttempts >= 8) {
+            logVoice(
+              "ws-reconnect-giveup",
+              "exceeded max reconnect attempts; giving up",
+              { attempts: reconnectAttempts },
+              "error",
+            );
+            setStatus("error");
+            setErrMsg("voice connection lost; tap stop + start to retry");
+            return;
           }
-        }
+          scheduleReconnect(`code=${ev.code}`);
+        };
+        ws.onerror = () => {
+          logVoice("ws-error", "voice ws error event", undefined, "error");
+          /* Don't trip the error pill yet -- onclose almost always
+           * follows onerror and the reconnect path handles it. */
+        };
+        ws.onmessage = (ev) => {
+          if (typeof ev.data === "string") {
+            try {
+              const msg = JSON.parse(ev.data) as { t: string; [k: string]: unknown };
+              handleServerMsg(msg);
+            } catch {
+              /* malformed json, ignore */
+            }
+          } else if (ev.data instanceof ArrayBuffer) {
+            if (speakingRef.current) {
+              schedulePcmChunk(ev.data, ttsGenRef.current);
+            }
+          }
+        };
       };
+      /* Kick off the initial connection. Subsequent reconnects fire
+       * through scheduleReconnect() above. */
+      connectWs();
 
       function handleServerMsg(msg: { t: string; [k: string]: unknown }): void {
         switch (msg.t) {
@@ -2109,6 +2229,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
 
     return () => {
       cancelled = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      logVoice("engine-disable", "voice engine effect cleanup");
       teardown();
     };
   }, [enabled, sessionId, mode]);
