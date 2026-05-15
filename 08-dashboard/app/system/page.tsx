@@ -6,6 +6,7 @@ import { PanicAuditPanel } from "@/components/PanicAuditPanel";
 import { SmartCompactAuditPanel } from "@/components/SmartCompactAuditPanel";
 import { SmartCompactPanel } from "@/components/SmartCompactPanel";
 import { LexColdStartPreloadPanel } from "@/components/LexColdStartPreloadPanel";
+import { VoiceDiagnosticsPanel } from "@/components/VoiceDiagnosticsPanel";
 
 export default function SystemPage() {
   return (
@@ -14,6 +15,7 @@ export default function SystemPage() {
         <h1 className="font-display text-2xl font-emphasized">System</h1>
         <SystemPanel />
         <PauseModeToggle />
+        <VoiceDiagnosticsPanel />
         <LexColdStartPreloadPanel />
         <PanicAuditPanel />
         <SmartCompactPanel />
