@@ -85,33 +85,30 @@ export function PanicButton(): React.ReactElement {
           ? `${baseTitle} - last fire: pty not found`
           : baseTitle;
 
+  /* The Ctrl+Alt+. visible kbd hint used to render next to this
+   * button. It was visually orphaned in the TopBar (no other kbd
+   * hints in the right cluster, only Ctrl+K next to the search
+   * button), so the cluster looked unorganised. The shortcut is
+   * still wired via the global keydown handler above and is
+   * surfaced through the tooltip on the button itself; the
+   * dangling kbd render is gone. */
   return (
-    <div className="flex items-center gap-1.5">
-      <button
-        type="button"
-        onClick={() => void fire("dashboard")}
-        disabled={disabled}
-        aria-label="Emergency stop active worker"
-        title={resultTitle}
-        className={`lift relative w-9 h-9 rounded-card hairline grid place-items-center transition ${
-          phase === "firing"
-            ? "bg-err text-base ring-1 ring-err/60 animate-pulse"
-            : phase === "cooldown"
-              ? "bg-err/10 text-err/50 ring-1 ring-err/20 cursor-not-allowed"
-              : "bg-transparent text-err ring-1 ring-err/40 hover:bg-err/10"
-        }`}
-      >
-        <Icon name="OctagonAlert" size={16} />
-      </button>
-      {/* Visible keybind hint. Matches the top-bar kbd scale used by the
-       * command-palette search button. Hidden below md so narrow
-       * viewports keep the right-cluster controls on screen. */}
-      <kbd
-        aria-hidden="true"
-        className="hidden md:inline-flex items-center gap-1 px-1.5 h-5 rounded border border-border1 bg-surface2 text-[11px] font-mono text-txt2"
-      >
-        Ctrl+Alt+.
-      </kbd>
-    </div>
+    <button
+      type="button"
+      onClick={() => void fire("dashboard")}
+      disabled={disabled}
+      aria-label="Emergency stop active worker"
+      title={resultTitle}
+      data-testid="panic-button"
+      className={`lift relative w-9 h-9 rounded-card hairline grid place-items-center transition ${
+        phase === "firing"
+          ? "bg-err text-base ring-1 ring-err/60 animate-pulse"
+          : phase === "cooldown"
+            ? "bg-err/10 text-err/50 ring-1 ring-err/20 cursor-not-allowed"
+            : "bg-transparent text-err ring-1 ring-err/40 hover:bg-err/10"
+      }`}
+    >
+      <Icon name="OctagonAlert" size={16} />
+    </button>
   );
 }

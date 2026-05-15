@@ -197,11 +197,14 @@ describe("VoicePillView", () => {
     expect(screen.queryByTestId("voice-pill-wake-indicator")).toBeNull();
   });
 
-  it("renders the two-row layout: controls on row 1, status on row 2, with the stop button anchored to row 1", () => {
-    /* Row 1 carries Voice label + speed slider + mute icons + stop;
-     * row 2 carries the status text. The stop button MUST live
-     * inside row 1 so a long status string ('LEX THINKING') in row
-     * 2 can never push it off-screen on narrow viewports. */
+  it("renders all controls inline on a single row including the status label", () => {
+    /* Single-row layout per the 2026-05-15 TopBar reorg. The status
+     * label used to live on its own row 2 below the controls but
+     * read as a "dangling THINKING below the voice cluster with no
+     * alignment to anything" -- user feedback that promoted the
+     * inline shape. Stop button still anchors the right edge and
+     * the slider is the only flex-1 child, so a long status label
+     * compresses the slider before it can push stop off-screen. */
     render(
       <VoicePillView
         {...defaultProps()}
@@ -210,15 +213,13 @@ describe("VoicePillView", () => {
         speed={0.65}
       />,
     );
-    const controlsRow = screen.getByTestId("voice-pill-row-controls");
-    const statusRow = screen.getByTestId("voice-pill-row-status");
+    const root = screen.getByTestId("voice-pill-root");
     const stop = screen.getByLabelText("Stop voice");
-    expect(controlsRow.contains(stop)).toBe(true);
-    expect(statusRow.contains(stop)).toBe(false);
+    const status = screen.getByTestId("voice-pill-status");
+    expect(root.contains(stop)).toBe(true);
+    expect(root.contains(status)).toBe(true);
     /* status text reads as the uppercased label per spec. */
-    expect(
-      screen.getByTestId("voice-pill-status").textContent?.trim().toUpperCase(),
-    ).toBe("THINKING");
+    expect(status.textContent?.trim().toUpperCase()).toBe("THINKING");
     /* speed readout reflects the prop, two-decimal x format. */
     expect(
       screen.getByTestId("voice-pill-speed-readout").textContent,

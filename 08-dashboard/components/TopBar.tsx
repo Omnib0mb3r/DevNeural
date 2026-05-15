@@ -213,20 +213,37 @@ export function TopBar({ activeTab }: { activeTab: string }) {
           </button>
         </div>
 
-        <div className="flex items-center gap-2">
-          {/* Voice pill: status + mute + stop. Renders nothing
-           * until a Lex PTY is live so the bar stays clean on
-           * first launch. The actual VoiceClient engine is mounted
-           * at the root (app/providers.tsx); this pill consumes
-           * the same VoiceCtx for inline control. */}
+        {/* Right cluster. Reorganised into three logical groups
+         * with consistent intra-group gap and a slightly larger
+         * inter-group gap so the eye can parse the structure:
+         *
+         *   (1) Voice pill (its own visual unit; renders nothing
+         *       until Lex is live).
+         *   (2) Alerts: panic button + notifications bell. Both
+         *       attention-grab controls; they share tonal weight
+         *       so they belong together.
+         *   (3) Settings + auth: gear link + locked/unlocked badge.
+         *       Both are surfacing the user's current relationship
+         *       to the dashboard.
+         *   (4) System status pill (all systems online / degraded /
+         *       failure). Standalone because its tone shifts
+         *       independently of the rest.
+         *
+         * The orphaned Ctrl+Alt+. kbd that used to live next to the
+         * panic button is gone -- it was the only kbd hint in the
+         * right cluster (Ctrl+K next to search is the other one)
+         * and the inconsistency read as noise. The shortcut is
+         * still wired and surfaced through the panic button
+         * tooltip. */}
+        <div className="flex items-center gap-3 sm:gap-4">
+          {/* Voice cluster (group 1). */}
           <VoiceTopBarPill />
 
-          {/* Global panic button: red outline, fires double-ESC at the
-           * single resolved live anchor. Keybind: Ctrl+Alt+. */}
-          <PanicButton />
-
-          {/* Notifications dropdown */}
-          <div className="relative" ref={notifRef}>
+          {/* Alerts cluster (group 2). */}
+          <div className="flex items-center gap-1.5">
+            <PanicButton />
+            {/* Notifications dropdown */}
+            <div className="relative" ref={notifRef}>
             <button
               type="button"
               onClick={() => setNotifOpen((v) => !v)}
@@ -309,38 +326,47 @@ export function TopBar({ activeTab }: { activeTab: string }) {
                 </ul>
               </div>
             )}
+            </div>
           </div>
 
-          <Link
-            href="/settings"
-            aria-label="Settings"
-            className="lift w-9 h-9 rounded-card hairline grid place-items-center text-txt2 hover:text-txt1"
-          >
-            <Icon name="Settings" />
-          </Link>
-
-          {authState === "locked" ? (
+          {/* Settings + auth cluster (group 3). */}
+          <div className="flex items-center gap-1.5">
             <Link
-              href="/unlock"
-              aria-label="Locked: click to unlock"
-              className="flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline text-[11px] font-mono text-err hover:bg-err/10"
-              title="Session expired or missing. Click to unlock."
+              href="/settings"
+              aria-label="Settings"
+              className="lift w-9 h-9 rounded-card hairline grid place-items-center text-txt2 hover:text-txt1"
             >
-              <Icon name="Lock" size={12} />
-              <span className="hidden sm:inline">locked</span>
+              <Icon name="Settings" />
             </Link>
-          ) : (
-            <div
-              className="flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline text-[11px] font-mono text-ok"
-              title="Authenticated session active"
-            >
-              <Icon name="Unlock" size={12} />
-              <span className="hidden sm:inline">unlocked</span>
-            </div>
-          )}
 
+            {authState === "locked" ? (
+              <Link
+                href="/unlock"
+                aria-label="Locked: click to unlock"
+                className="flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline text-[11px] font-mono text-err hover:bg-err/10"
+                title="Session expired or missing. Click to unlock."
+              >
+                <Icon name="Lock" size={12} />
+                <span className="hidden sm:inline">locked</span>
+              </Link>
+            ) : (
+              <div
+                className="flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline text-[11px] font-mono text-ok"
+                title="Authenticated session active"
+              >
+                <Icon name="Unlock" size={12} />
+                <span className="hidden sm:inline">unlocked</span>
+              </div>
+            )}
+          </div>
+
+          {/* System status pill (group 4). Standalone because its
+           * tone shifts independently of the rest. Hidden below sm
+           * so the narrow viewport doesn't have to fit the long
+           * "all systems online" string; the dot alone communicates
+           * health when the label is dropped. */}
           <div
-            className={`flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline shimmer-pill text-[11px] font-mono ${
+            className={`hidden sm:flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline shimmer-pill text-[11px] font-mono ${
               rollup === "ok" ? "text-ok" : rollup === "warn" ? "text-warn" : "text-err"
             }`}
             title={rollupLabel}

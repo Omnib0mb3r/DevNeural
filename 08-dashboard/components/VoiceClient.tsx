@@ -2697,21 +2697,41 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
   return (
     <div
       data-testid="voice-pill-root"
-      className="flex flex-col gap-0.5 py-1 px-1 sm:px-2 rounded-card hairline min-w-0"
+      className="flex items-center gap-1 py-1 px-1 sm:px-2 rounded-card hairline min-w-0 min-h-11"
       title={pillTitle}
     >
-      {/* ROW 1: controls. The stop button anchors the row's right
-       * edge and never moves; the speed slider in the middle is the
-       * only flex-1 child, so growing controls budget shrinks the
-       * slider rather than ejecting the stop button on narrow
-       * viewports. */}
-      <div
-        data-testid="voice-pill-row-controls"
-        className="flex items-center gap-1 min-h-11 min-w-0"
+      {/* Single-row layout. The status label used to live on its own
+       * row below the controls; the user flagged that as "the
+       * THINKING label dangles below with no alignment to anything."
+       * Inlining the status as a small pill at the head of the row
+       * keeps the voice cluster a single self-contained unit. The
+       * stop button still anchors the right edge and the slider is
+       * still the only flex-1 child, so a long status label compresses
+       * the slider before it can push stop off-screen. */}
+      <span className="text-[11px] font-emphasized text-txt2 px-1 shrink-0">
+        Voice
+      </span>
+      {/* Status pill. Hidden on xs (below sm breakpoint) to keep the
+       * narrow-viewport pill compact; the tooltip on the root still
+       * carries the same info. */}
+      <span
+        data-testid="voice-pill-status"
+        className={`hidden sm:inline-flex text-nano font-mono uppercase tracking-wider truncate shrink-0 ${finalStatusTone}`}
       >
-        <span className="text-[11px] font-emphasized text-txt2 px-1 shrink-0">
-          Voice
+        {statusLabel}
+      </span>
+      {LEX_DEBUG_VOICE && (
+        <span
+          data-testid="voice-pill-wake-debug"
+          title={`wakeWordActive=${wakeWordActive ?? false} lastMatched=${
+            lastWakeMatched ?? "—"
+          } lastError=${lastWakeError ?? "—"}`}
+          className="text-[10px] font-mono text-txt3 truncate shrink-0"
+        >
+          wake={wakeWordActive ? "on" : "off"} · m=
+          {lastWakeMatched ?? "—"} · e={lastWakeError ?? "—"}
         </span>
+      )}
         <label
           className="flex items-center gap-1.5 min-w-0 flex-1 text-nano font-mono text-txt3"
           title="Lex speech rate. Persisted globally; applies to every voice consumer until you change it again."
@@ -2822,35 +2842,6 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
         >
           {enabled ? "stop" : "start"}
         </button>
-      </div>
-      {/* ROW 2: status. On its own line so a long status string can
-       * never push the stop button off-screen. Left-aligned + dim
-       * per spec; tone reflects the same severity tints the inline
-       * status used to carry. The label uppercases at render so
-       * "thinking" reads as the screenshot's "LEX THINKING" copy. */}
-      <div
-        data-testid="voice-pill-row-status"
-        className="flex items-center gap-1 px-1 min-w-0"
-      >
-        <span
-          data-testid="voice-pill-status"
-          className={`text-nano font-mono uppercase tracking-wider truncate ${finalStatusTone}`}
-        >
-          {statusLabel}
-        </span>
-        {LEX_DEBUG_VOICE && (
-          <span
-            data-testid="voice-pill-wake-debug"
-            title={`wakeWordActive=${wakeWordActive ?? false} lastMatched=${
-              lastWakeMatched ?? "—"
-            } lastError=${lastWakeError ?? "—"}`}
-            className="ml-auto text-[10px] font-mono text-txt3 truncate"
-          >
-            wake={wakeWordActive ? "on" : "off"} · m=
-            {lastWakeMatched ?? "—"} · e={lastWakeError ?? "—"}
-          </span>
-        )}
-      </div>
     </div>
   );
 }
