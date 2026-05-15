@@ -4582,10 +4582,10 @@ export function resolveSupervisedTargetSession(
  * commit b997f2a) map to 'live'. Legacy falsey spellings 'off' /
  * 'false' / '0' map to 'off'. Anything unrecognised falls through
  * to the next source so a typo never silently re-enables live. */
-const COLD_START_PRELOAD_CONFIG_KEY = 'lex_cold_start_preload_enabled';
-type ColdStartPreloadMode = 'off' | 'shadow' | 'live';
+export const COLD_START_PRELOAD_CONFIG_KEY = 'lex_cold_start_preload_enabled';
+export type ColdStartPreloadMode = 'off' | 'shadow' | 'live';
 
-function parseColdStartPreloadValue(
+export function parseColdStartPreloadValue(
   raw: string | null | undefined,
 ): ColdStartPreloadMode | null {
   if (raw === null || raw === undefined) return null;
@@ -4597,7 +4597,7 @@ function parseColdStartPreloadValue(
   return null;
 }
 
-function coldStartPreloadMode(
+export function coldStartPreloadMode(
   db: import('../store/index-db.js').IndexDb,
 ): ColdStartPreloadMode {
   const fromRuntime = parseColdStartPreloadValue(
