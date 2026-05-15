@@ -4,12 +4,12 @@
 
 | Date | Bug | Status | Severity |
 |------|-----|--------|----------|
-| 2026-05-14 | [Cross-session inject lands in worker input field but never auto-submits](./2026-05-14-bridge-inject-missing-enter.md) | open (intermittent) | high |
 
 ## Recently closed
 
 | Date | Bug | Status | Severity |
 |------|-----|--------|----------|
+| 2026-05-14 | [Cross-session inject lands in worker input field but never auto-submits](./2026-05-14-bridge-inject-missing-enter.md) | fixed (pending soak) | high |
 | 2026-05-14 | [VAD path uses deprecated ScriptProcessorNode](./2026-05-14-vad-scriptprocessornode-deprecation.md) | fixed (pending soak), 4ae0f0a | medium |
 | 2026-05-14 | [Wake-word stuck after "Lex shut up", "Lex unmute" never fires](./2026-05-14-wake-word-unmute-stuck.md) | fixed (pending soak), c1e3bd3 + 73fc697 | medium |
 | 2026-05-14 | [iOS PWA reminders not pushing](./2026-05-14-pwa-reminders-not-pushing.md) | fixed (pending soak) | medium |

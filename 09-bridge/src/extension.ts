@@ -26,6 +26,7 @@ import { execFile } from 'node:child_process';
 import { writePresenceFiles, presenceFilename } from './presence.js';
 import { cwdToSlug } from './slug.js';
 import { CcSessionLatch } from './cc-session-latch.js';
+import { buildBridgePayload } from './bridge-payload.js';
 
 const channel = vscode.window.createOutputChannel('DevNeural Bridge');
 
@@ -397,29 +398,28 @@ async function handleMessage(message: BridgeMessage): Promise<void> {
      * (Nav-style pointers, one-liner suggestions) skip the wrap so a
      * shell that mishandles the escapes does not regress on the
      * common path. */
-    const wrapped = needsBracketedPaste(message.text)
-      ? `${BRACKETED_PASTE_START}${message.text}${BRACKETED_PASTE_END}`
-      : message.text;
+    /* Atomic write: body + (optional) trailing '\r' in a single
+     * sendText call. The previous shape did two separate sendText
+     * calls separated by an 80ms gap; that worked most of the time
+     * but raced intermittently on a busy VS Code render frame
+     * (bug doc 2026-05-14-bridge-inject-missing-enter). The
+     * trailing '\r' occasionally landed before the bracketed-paste
+     * terminator finished flushing through VS Code's PTY write
+     * queue, so CC's TUI treated the carriage return as pasted
+     * text instead of Enter and the prompt sat in the input field
+     * forever. A single sendText delivers the bytes in one
+     * underlying PTY write, so by the time the '\r' arrives the
+     * \x1b[201~ terminator has already closed the paste envelope. */
+    const wrapped = buildBridgePayload(message.text, commit);
     terminal.sendText(wrapped, false);
     if (commit) {
-      /* Small delay between the paste body and the carriage return so
-       * the bracketed-paste terminator (\x1b[201~) is fully delivered
-       * to the TUI before the '\r' arrives. Without this, the '\r'
-       * sometimes lands inside the paste envelope and CC treats it
-       * as part of the pasted text instead of as Enter. */
-      await new Promise((resolve) => setTimeout(resolve, 80));
-      terminal.sendText('\r', false);
+      channel.appendLine(
+        `[send] enter shipped atomically with payload (len=${wrapped.length})`,
+      );
     }
   } catch (err) {
     channel.appendLine(`[error] sendText failed: ${(err as Error).message}`);
   }
-}
-
-const BRACKETED_PASTE_START = '\x1b[200~';
-const BRACKETED_PASTE_END = '\x1b[201~';
-const BRACKETED_PASTE_THRESHOLD = 200;
-function needsBracketedPaste(text: string): boolean {
-  return text.includes('\n') || text.length > BRACKETED_PASTE_THRESHOLD;
 }
 
 /* Cache: session_id -> { cwd, resolvedAt }. Bounded TTL so a session
@@ -874,11 +874,13 @@ async function runWorkspaceInject(
       cwd: vscode.Uri.file(wsPath),
     });
     target.show(true);
-    target.sendText(marker.command, false);
-    /* Same trick as queueSessionPrompt: brief delay so the paste is
-     * fully delivered before the carriage return commits the line. */
-    await new Promise((r) => setTimeout(r, 80));
-    target.sendText('\r', false);
+    /* Atomic write: command + '\r' in one sendText call. Matches the
+     * same fix applied to handleMessage for the
+     * 2026-05-14-bridge-inject-missing-enter regression. Two
+     * sequential sendText calls with an 80ms gap raced under load
+     * and the '\r' sometimes failed to commit the workspace-inject
+     * command. */
+    target.sendText(buildBridgePayload(marker.command, true), false);
     channel.appendLine(
       `[workspace-inject] ran "${marker.command}" in ${wsNormalized}`,
     );
