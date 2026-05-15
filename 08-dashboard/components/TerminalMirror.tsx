@@ -295,30 +295,49 @@ export function TerminalMirror({ sessionId }: Props) {
       termRef.current = term;
 
       /* Sticky auto-scroll: follow the live tail unless the user has
-       * scrolled up to read older output. xterm's built-in pin-to-
-       * bottom heuristic was flaky enough that pasted ANSI bursts
-       * occasionally left the viewport stuck a few lines above the
-       * cursor, so we own the decision explicitly.
+       * scrolled up to read older output.
        *
-       * "At bottom" means viewportY is within 1 line of baseY (the
-       * row where the scrollback ends and the live screen begins).
-       * That's the xterm-buffer equivalent of the DOM `scrollTop vs
-       * scrollHeight - clientHeight < 20px` check most chat / dev-
-       * tools surfaces use. */
-      const isAtBottom = (): boolean => {
+       * The previous implementation sampled `viewportY >= baseY - 1`
+       * inside writeFollowing's callback. That had two failure modes:
+       *
+       *   1. With the WebGL renderer, scrollToBottom() inside the
+       *      synchronous write callback occasionally raced the next
+       *      paint and left the viewport one row above the cursor.
+       *   2. Rapid back-to-back writes computed wasFollowing against
+       *      stale geometry: a write that grew baseY by 2 between
+       *      sampling and the callback firing made isAtBottom report
+       *      false on the next call, so the pin "popped off" after a
+       *      burst of ANSI output.
+       *
+       * Replace the read-only heuristic with an explicit `following`
+       * flag driven by xterm's onScroll event. After every viewport
+       * change (programmatic scrollToBottom included), recompute
+       * whether the viewport is at the bottom and update the flag.
+       * Then writeFollowing's only job is to call scrollToBottom on
+       * the next animation frame when the flag is true. */
+      const isAtBottomNow = (): boolean => {
         const buf = term.buffer.active;
-        return buf.viewportY >= buf.baseY - 1;
+        return buf.viewportY >= buf.baseY;
       };
+      let following = true;
+      term.onScroll(() => {
+        following = isAtBottomNow();
+      });
       const writeFollowing = (data: string): void => {
-        const wasFollowing = isAtBottom();
+        const wasFollowing = following;
         term.write(data, () => {
-          if (wasFollowing) {
+          if (!wasFollowing) return;
+          /* Defer to the next frame so WebGL has finished painting
+           * the just-written rows; scrollToBottom inside the same
+           * micro-task occasionally landed one row short. */
+          requestAnimationFrame(() => {
             try {
               term.scrollToBottom();
+              following = true;
             } catch {
               /* ignore */
             }
-          }
+          });
         });
       };
 
@@ -386,7 +405,7 @@ export function TerminalMirror({ sessionId }: Props) {
         /* Resize pulls the viewport down only if the user was already
          * tailing the output; otherwise a window resize would yank them
          * back to the bottom of a session they were reviewing. */
-        if (isAtBottom()) {
+        if (following) {
           try {
             term.scrollToBottom();
           } catch {
