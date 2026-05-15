@@ -21,6 +21,7 @@ import {
   brainstormCuesFile,
 } from '../paths.js';
 import { authMiddleware, registerAuthRoutes, isPinSet } from './auth.js';
+import { triggerShutdown, hasShutdownHook } from '../lifecycle/shutdown-hook.js';
 import { ReferenceStore } from '../reference/store.js';
 import { ingestUpload } from '../reference/process.js';
 import { getSystemMetrics } from './system-metrics.js';
@@ -3100,9 +3101,68 @@ export async function registerDashboardRoutes(
       reply.code(500);
       return { ok: false, error: `relauncher spawn failed: ${(err as Error).message}` };
     }
+    /* Exit path with EXTERNAL hard-kill watchdog.
+     *
+     * process.exit(0) alone hangs on Windows when a worker thread
+     * (pino transport, @xenova embedder, node-pty) holds a native
+     * handle. The C++ exit hook never returns. The process stays
+     * alive forever; the dashboard restart loop times out.
+     *
+     * A naive in-process setTimeout watchdog DOES NOT work — once
+     * process.exit is called the event loop is torn down and JS
+     * timers never fire. The watchdog must live in another process.
+     *
+     * So we spawn a detached PowerShell sidecar BEFORE process.exit.
+     * The sidecar sleeps 3s then unconditionally taskkill /F's our
+     * PID. If we exited cleanly the kill is a no-op (PID is gone or
+     * already reused — Stop-Process tolerates either). If we hung,
+     * the sidecar drags us down via TerminateProcess.
+     *
+     * Also: app.close() is awaited so the listen socket is released
+     * before exit, and the PID file is unlinked, so the relauncher's
+     * health probe at t+2s sees a dead daemon and respawns instead
+     * of "already alive". */
+    /* Trigger the real graceful shutdown.
+     *
+     * Root cause of past restart hangs: process.exit(0) on Windows
+     * waits for libuv to release every open native handle. chokidar's
+     * recursive watch on C:/dev/Projects holds ReadDirectoryChangesW
+     * handles that never get cleaned up unless watcher.close() runs
+     * first. The daemon's existing `shutdown()` (registered for
+     * SIGTERM/SIGINT) awaits watcher.close, app.close, transcripts,
+     * gitWatcher, store, then unlinks the PID file, then exits.
+     *
+     * We surface that via app.decorate('shutdownDaemon', ...) in
+     * daemon.ts. If it's missing for any reason (older build, test
+     * harness without main()) fall back to process.exit.
+     *
+     * Belt-and-suspenders: a detached PowerShell sidecar Stop-Process
+     * us after 6s. Long enough for shutdown to finish on a healthy
+     * system; short enough that a stuck shutdown does not leave the
+     * daemon zombie-alive after the relauncher spawns its
+     * replacement. */
+    try {
+      const selfPid = process.pid;
+      const killCmd =
+        `Start-Sleep -Seconds 6; ` +
+        `try { Stop-Process -Id ${selfPid} -Force -ErrorAction SilentlyContinue } catch {}`;
+      spawn(
+        'powershell.exe',
+        ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', killCmd],
+        { detached: true, stdio: 'ignore', windowsHide: true },
+      ).unref();
+    } catch {
+      /* sidecar is the safety net; if it fails to spawn the
+       * graceful path still runs */
+    }
     setTimeout(() => {
       log('[admin] daemon restart requested via /admin/daemon/restart; exiting');
-      process.exit(0);
+      if (hasShutdownHook()) {
+        void triggerShutdown('admin-restart');
+      } else {
+        log('[admin] shutdown hook not registered; falling back to process.exit');
+        process.exit(0);
+      }
     }, 250);
     return { ok: true, restarting: true };
   });

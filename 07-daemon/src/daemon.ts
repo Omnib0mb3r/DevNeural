@@ -13,6 +13,7 @@ import Fastify from 'fastify';
 import { ensureDataRoot, daemonLogFile, daemonPidFile } from './paths.js';
 import { writePid, readPid, removeStalePid, isAlive } from './lifecycle/pid.js';
 import { SignalCoalescer } from './lifecycle/signals.js';
+import { setShutdownHook } from './lifecycle/shutdown-hook.js';
 import { startTranscriptWatcher } from './capture/transcript-watcher.js';
 import { startFsWatcher } from './capture/fs-watcher.js';
 import { startGitWatcher } from './capture/git-watcher.js';
@@ -74,9 +75,14 @@ function logger(msg: string): void {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
   try {
     fs.appendFileSync(daemonLogFile(), line, 'utf-8');
+    return;
   } catch {
-    /* fall back to stderr */
+    /* fall through to stderr; daemon.log is unreachable */
   }
+  /* Stderr is only the fallback. If we also wrote it on every line,
+   * daemons spawned via lifecycle/spawn.ts (which pipes child stderr
+   * directly into daemon.log) would log each line twice: once via
+   * appendFileSync, once via the inherited stderr fd. */
   process.stderr.write(line);
 }
 
@@ -1193,6 +1199,14 @@ async function main(): Promise<void> {
 
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));
+
+  /* Expose the graceful shutdown to route handlers (e.g.
+   * /admin/daemon/restart). Without this, an admin restart can only
+   * call process.exit(0), which hangs on Windows when chokidar's
+   * recursive watch holds open ReadDirectoryChangesW handles on
+   * C:/dev/Projects. Routing through `shutdown` properly awaits
+   * watcher.close(), app.close(), store.close() before exit. */
+  setShutdownHook(shutdown);
   process.on('uncaughtException', (err) => {
     logger(`uncaught: ${err?.stack ?? err?.message ?? err}`);
   });

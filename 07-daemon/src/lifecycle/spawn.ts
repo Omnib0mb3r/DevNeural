@@ -35,7 +35,14 @@ export function ensureDaemonRunning(): { started: boolean; pid: number | null } 
     }
 
     ensureDataRoot();
-    const logPath = daemonLogFile();
+    /* Pipe child stdout/stderr to a sidecar file, NOT daemon.log.
+     * The daemon's own logger appends every line to daemon.log via
+     * appendFileSync; if we also wired stderr into daemon.log here,
+     * each logger() call would land twice (once via appendFile, once
+     * via the inherited stderr fd). The sidecar captures any rogue
+     * console output (uncaught throws, native warnings) that does
+     * not go through logger. */
+    const logPath = daemonLogFile().replace(/\.log$/, '.spawn.log');
     const out = fs.openSync(logPath, 'a');
     const err = fs.openSync(logPath, 'a');
 
