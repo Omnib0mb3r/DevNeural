@@ -7,6 +7,7 @@
  * acknowledge / resolve / dismiss controls. Manual triggers for
  * lint-now and self-audit-now drop into the strip header.
  */
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   listAuditFindings,
@@ -15,6 +16,23 @@ import {
   triggerSelfAudit,
   type AuditFindingRow,
 } from "@/lib/daemon-client";
+
+interface LintResult {
+  scanned?: number;
+  findings_written?: number;
+  apply?: boolean;
+}
+interface SelfAuditResult {
+  scanned?: number;
+  llm_calls?: number;
+  findings_written?: number;
+  errors?: unknown[];
+}
+type ToastTone = "ok" | "warn" | "err";
+interface Toast {
+  text: string;
+  tone: ToastTone;
+}
 
 const SEV_COLOR: Record<AuditFindingRow["severity"], string> = {
   high: "text-rose-400",
@@ -41,12 +59,59 @@ export function LintFindingsPanel() {
     mutationFn: (id: string) => updateAuditFinding(id, "dismiss"),
     onSettled: () => qc.invalidateQueries({ queryKey: ["audit-findings"] }),
   });
+  /* Inline feedback. The user reported lint-now + self-audit as
+   * "dead buttons" because the underlying routes returned 200 with
+   * real results but the panel had no visible feedback -- the table
+   * refetched silently, and if no new findings landed (because the
+   * pages were already flagged or the LLM saw nothing wrong) the
+   * UI looked unchanged. Render a transient toast with the scan
+   * summary so the click is observably acted on. */
+  const [toast, setToast] = useState<Toast | null>(null);
+  useEffect(() => {
+    if (!toast) return;
+    const id = setTimeout(() => setToast(null), 12_000);
+    return () => clearTimeout(id);
+  }, [toast]);
   const lintM = useMutation({
     mutationFn: () => triggerLintNow(),
+    onSuccess: (r) => {
+      const result = (r?.result ?? {}) as LintResult;
+      const scanned = result.scanned ?? 0;
+      const written = result.findings_written ?? 0;
+      setToast({
+        text: `lint: scanned ${scanned} pages, wrote ${written} new finding${written === 1 ? "" : "s"}`,
+        tone: written > 0 ? "warn" : "ok",
+      });
+    },
+    onError: (err) => {
+      setToast({
+        text: `lint failed: ${(err as Error).message}`,
+        tone: "err",
+      });
+    },
     onSettled: () => qc.invalidateQueries({ queryKey: ["audit-findings"] }),
   });
   const selfM = useMutation({
     mutationFn: () => triggerSelfAudit(10),
+    onSuccess: (r) => {
+      const result = (r?.result ?? {}) as SelfAuditResult;
+      const scanned = result.scanned ?? 0;
+      const llm = result.llm_calls ?? 0;
+      const written = result.findings_written ?? 0;
+      const errs = Array.isArray(result.errors) ? result.errors.length : 0;
+      const tone: ToastTone =
+        errs > 0 ? "err" : written > 0 ? "warn" : "ok";
+      setToast({
+        text: `self-audit: scanned ${scanned} pages, ${llm} LLM call${llm === 1 ? "" : "s"}, wrote ${written} finding${written === 1 ? "" : "s"}${errs > 0 ? `, ${errs} error${errs === 1 ? "" : "s"}` : ""}`,
+        tone,
+      });
+    },
+    onError: (err) => {
+      setToast({
+        text: `self-audit failed: ${(err as Error).message}`,
+        tone: "err",
+      });
+    },
     onSettled: () => qc.invalidateQueries({ queryKey: ["audit-findings"] }),
   });
   const rows: AuditFindingRow[] = q.data?.findings ?? [];
@@ -72,6 +137,20 @@ export function LintFindingsPanel() {
           {selfM.isPending ? "auditing…" : "self-audit"}
         </button>
       </div>
+      {toast && (
+        <div
+          data-testid="lint-toast"
+          className={`px-5 py-2 border-b border-border1 text-xs font-mono ${
+            toast.tone === "err"
+              ? "bg-err/10 text-err"
+              : toast.tone === "warn"
+                ? "bg-attn/10 text-attn"
+                : "bg-ok/10 text-ok"
+          }`}
+        >
+          {toast.text}
+        </div>
+      )}
       {q.isLoading ? (
         <p className="p-4 text-sm text-txt3">loading…</p>
       ) : rows.length === 0 ? (
