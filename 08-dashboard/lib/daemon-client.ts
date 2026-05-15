@@ -374,7 +374,7 @@ export const startClaude = (
 ): Promise<{ ok: boolean; project_id?: string; root?: string; command?: string; warnings?: string[]; error?: string }> =>
   request(`/projects/${encodeURIComponent(projectId)}/start-claude`, {
     method: "POST",
-    body: JSON.stringify({ dangerous }),
+    body: { dangerous },
   });
 
 // ── Daemon-PTY (Lex) ─────────────────────────────────────────────
@@ -1539,8 +1539,7 @@ export const smartCompactToggle = () =>
 export const setSmartCompactToggle = (mode: SmartCompactMode) =>
   request<SmartCompactToggle>(`/lex/smart-compact/toggle`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mode }),
+    body: { mode },
   });
 
 // ── Lex cold-start preload toggle ───────────────────────────────
@@ -1558,8 +1557,7 @@ export const coldStartPreloadToggle = () =>
 export const setColdStartPreloadToggle = (mode: ColdStartPreloadMode) =>
   request<ColdStartPreloadToggle>(`/lex/cold-start-preload/toggle`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mode }),
+    body: { mode },
   });
 
 export interface InjectionLogRow {
