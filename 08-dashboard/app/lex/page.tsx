@@ -271,18 +271,13 @@ export default function LexPage() {
              * full panel UI into this div, and on every other
              * route a floating mini-badge takes over. */}
             <div id="voice-panel-mount" />
-            {/* Transcript panel sits above the terminal mirror so the
-             * conversational view is the primary surface; the raw
-             * terminal stream is still reachable underneath for the
-             * cases where the user wants to read the tool calls
-             * directly. */}
+            {/* Layout order is: transcripts → Talk-to-Lex form →
+             * TerminalMirror. The conversational surface (history +
+             * compose box) stays together at the top so reading and
+             * responding don't require scrolling past the raw
+             * terminal stream. The mirror sits below for the cases
+             * where the user wants to inspect tool calls directly. */}
             <LexTranscriptHistoryPanel />
-            {/* Reuse the existing TerminalMirror. It expects a session
-             * id and pulls from the same terminal-stream ring the
-             * daemon-PTY pumps into post-binding. Before binding we
-             * still render the panel; the mirror starts streaming
-             * once the session-id appears. */}
-            <TerminalMirror sessionId={lexPty?.sessionId ?? ""} />
             <div className="rounded-panel bg-surface1 hairline">
               <div className="px-5 py-3 border-b border-border1 flex items-center gap-2">
                 <Icon name="MessageSquare" className="text-brandSoft" size={16} />
@@ -380,6 +375,13 @@ export default function LexPage() {
                 )}
               </form>
             </div>
+            {/* TerminalMirror lives below the compose box so the
+             * conversational pair (history + form) reads top-down
+             * without the raw terminal stream interrupting it. The
+             * mirror still pulls from the same terminal-stream ring;
+             * before the daemon binds a session id, the panel is
+             * empty and starts streaming once binding completes. */}
+            <TerminalMirror sessionId={lexPty?.sessionId ?? ""} />
             <LexArtifactsPanel
               brainstormId={activeAnchorId}
               active={Boolean(lexPty)}
