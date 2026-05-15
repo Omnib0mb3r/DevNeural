@@ -386,6 +386,21 @@ export interface PtyEntry {
   startedAt: number;
   lastActivity: number;
   exited: boolean;
+  /* Diagnostic fields stamped by pty-host on exit / inject error.
+   * Surfaced by TerminalMirror as an expandable error block so a
+   * silent PTY death isn't invisible to the user. exit_* are null
+   * while the PTY is alive; last_command + last_error track the most
+   * recent inject for post-mortem context. output_tail is the trailing
+   * ~1 KB of merged stdout/stderr the process printed before
+   * exit / error. */
+  exit_code?: number | null;
+  exit_signal?: number | null;
+  exited_at?: number | null;
+  last_error?: string | null;
+  last_error_class?: string | null;
+  last_command?: string | null;
+  last_command_at?: number | null;
+  output_tail?: string;
 }
 export const listPtys = () =>
   request<{ ok: boolean; ptys: PtyEntry[] }>("/pty");

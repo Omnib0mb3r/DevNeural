@@ -78,6 +78,24 @@ interface PtyHandle {
    * Cleared automatically 90s after the last pattern hit; sequential
    * matches keep it alive. */
   awaitingSystemPromptUntil: number;
+  /* Diagnostic fields stamped on exit / inject failure so the
+   * dashboard TerminalMirror can render a small expandable error
+   * block instead of leaving the user blind. lastCommandSent holds
+   * the most recent text injected via ptyInject (truncated). exit*
+   * fields are populated by the onExit handler. lastError is set
+   * when an inject or spawn throws. */
+  lastCommandSent: string | null;
+  lastCommandAt: number;
+  exitCode: number | null;
+  exitSignal: number | null;
+  exitedAt: number;
+  lastError: string | null;
+  /** Constructor / .name of the Error thrown on the last inject or
+   * spawn failure. Carried alongside lastError so the diagnostic
+   * panel can distinguish e.g. a node-pty "process has exited" from a
+   * generic Error from a TypeError. Always null for normal-exit
+   * paths; populated only when an exception was actually caught. */
+  lastErrorClass: string | null;
 }
 
 /* Regexes that identify a CC native feedback / prompt overlay in the
@@ -327,6 +345,13 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
     cols,
     rows,
     awaitingSystemPromptUntil: 0,
+    lastCommandSent: null,
+    lastCommandAt: 0,
+    exitCode: null,
+    exitSignal: null,
+    exitedAt: 0,
+    lastError: null,
+    lastErrorClass: null,
   };
   ptys.set(ptyId, handle);
 
@@ -385,12 +410,44 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
     tryDiscoverSession(handle);
   });
 
-  pty.onExit(({ exitCode }) => {
+  pty.onExit((event) => {
+    const exitCode = event?.exitCode ?? null;
+    const signal =
+      typeof (event as { signal?: number })?.signal === "number"
+        ? (event as { signal?: number }).signal!
+        : null;
     handle.exited = true;
+    handle.exitCode = exitCode;
+    handle.exitSignal = signal;
+    handle.exitedAt = Date.now();
+    /* Tail bytes from the pre-binding buffer act as a stderr/stdout
+     * surrogate: PTYs merge both streams so the trailing data is the
+     * last thing the process printed before exiting. Cap at 4 KB so
+     * the diagnostic stays readable. */
+    const tail = handle.preBuffer.join("").slice(-4096);
+    const errSummary =
+      exitCode !== 0 || signal !== null
+        ? `exit_code=${exitCode ?? "?"} signal=${signal ?? "-"}`
+        : null;
+    if (errSummary) {
+      handle.lastError = errSummary;
+    }
+    /* Explicit, structured log line so daemon.log carries the full
+     * diagnostic. Without this, a non-zero exit (or a kill-9 from the
+     * panic path) left no breadcrumb anywhere. */
+    console.log(
+      `[pty-host] exit pty=${handle.ptyId} session=${
+        handle.sessionId ?? "-"
+      } code=${exitCode ?? "?"} signal=${
+        signal ?? "-"
+      } last_command=${JSON.stringify(
+        (handle.lastCommandSent ?? "").slice(0, 200),
+      )} tail=${JSON.stringify(tail.slice(-512))}`,
+    );
     if (handle.sessionId) {
       pushTerminalData(
         handle.sessionId,
-        `\r\n[lex pty exited: code=${exitCode}]\r\n`,
+        `\r\n[lex pty exited: code=${exitCode} signal=${signal ?? "-"}]\r\n`,
       );
       sessionToPty.delete(handle.sessionId);
     }
@@ -490,6 +547,21 @@ export function listPtys(): {
   startedAt: number;
   lastActivity: number;
   exited: boolean;
+  /* Diagnostic surface. Populated on inject error / exit so the
+   * TerminalMirror can render an expandable error block instead of
+   * leaving the user blind. exit_code is null while the PTY is
+   * alive; lastCommandSent carries a truncated copy of the most
+   * recent inject. tail is the trailing 1 KB of the PTY's pre-
+   * buffer (PTYs merge stdout+stderr so this is the last thing the
+   * process actually printed). */
+  exit_code: number | null;
+  exit_signal: number | null;
+  exited_at: number | null;
+  last_error: string | null;
+  last_error_class: string | null;
+  last_command: string | null;
+  last_command_at: number | null;
+  output_tail: string;
 }[] {
   return [...ptys.values()].map((h) => ({
     ptyId: h.ptyId,
@@ -499,6 +571,14 @@ export function listPtys(): {
     startedAt: h.startedAt,
     lastActivity: h.lastActivity,
     exited: h.exited,
+    exit_code: h.exitCode,
+    exit_signal: h.exitSignal,
+    exited_at: h.exitedAt > 0 ? h.exitedAt : null,
+    last_error: h.lastError,
+    last_error_class: h.lastErrorClass,
+    last_command: h.lastCommandSent ? h.lastCommandSent.slice(0, 200) : null,
+    last_command_at: h.lastCommandAt > 0 ? h.lastCommandAt : null,
+    output_tail: h.preBuffer.join("").slice(-1024),
   }));
 }
 
@@ -546,6 +626,8 @@ export function ptyInject(
   if (!handle) return { ok: false, error: 'pty not found' };
   if (handle.exited) return { ok: false, error: 'pty has exited' };
   try {
+    handle.lastCommandSent = text.slice(0, 4096);
+    handle.lastCommandAt = Date.now();
     handle.pty.write(text);
     if (commit) {
       /* Brief gap mirrors the bridge's 80ms paste-then-Enter delay so
@@ -558,7 +640,19 @@ export function ptyInject(
     handle.lastActivity = Date.now();
     return { ok: true };
   } catch (err) {
-    return { ok: false, error: (err as Error).message };
+    const e = err as Error;
+    const message = e.message;
+    const klass = e.name ?? 'Error';
+    handle.lastError = message;
+    handle.lastErrorClass = klass;
+    console.log(
+      `[pty-host] inject error pty=${handle.ptyId} session=${
+        handle.sessionId ?? "-"
+      } class=${klass} error=${JSON.stringify(message)} last_command=${JSON.stringify(
+        text.slice(0, 200),
+      )}`,
+    );
+    return { ok: false, error: message };
   }
 }
 

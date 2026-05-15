@@ -2,7 +2,11 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { sessions as sessionsClient, listPtys } from "@/lib/daemon-client";
+import {
+  sessions as sessionsClient,
+  listPtys,
+  type PtyEntry,
+} from "@/lib/daemon-client";
 import "@xterm/xterm/css/xterm.css";
 
 interface MirrorState {
@@ -164,6 +168,114 @@ function describeBridge(
   };
 }
 
+function fmtAgo(ms: number | null | undefined): string {
+  if (!ms) return "—";
+  const delta = Math.max(0, Date.now() - ms);
+  if (delta < 60_000) return `${Math.floor(delta / 1000)}s ago`;
+  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)}m ago`;
+  return `${Math.floor(delta / 3_600_000)}h ago`;
+}
+
+/**
+ * Expandable diagnostic block. Shown when the PTY backing this
+ * session has exited (any code, including 0 since we still want a
+ * "session ended" pill in that case) or when the most recent inject
+ * recorded a non-null last_error. Collapsed by default; click to
+ * reveal the structured fields (exit code, signal, error class,
+ * error message, last-injected command, output tail).
+ *
+ * The block exists because daemon-PTY sessions that die from a
+ * non-obvious cause (crash, OOM, panic-kill, a TypeError thrown
+ * inside ptyInject) previously left no visible evidence: the
+ * terminal mirror just stopped streaming and the user had no
+ * indication of what happened. The bridge-mirror pill was
+ * insufficient because daemon-hosted sessions don't use the bridge.
+ */
+function PtyDiagnosticBlock({ pty }: { pty: PtyEntry }): React.ReactElement {
+  const exited = pty.exited;
+  const exitCode = pty.exit_code ?? null;
+  const exitSignal = pty.exit_signal ?? null;
+  const lastError = pty.last_error ?? null;
+  const lastErrorClass = pty.last_error_class ?? null;
+  const lastCommand = pty.last_command ?? null;
+  const lastCommandAt = pty.last_command_at ?? null;
+  const exitedAt = pty.exited_at ?? null;
+  const outputTail = pty.output_tail ?? "";
+  /* Tone picks the chrome. A non-zero exit, any signal, or a recorded
+   * error is treated as an error condition; a clean exit (code 0, no
+   * signal, no error) renders in the neutral warn tone. */
+  const tone =
+    lastError || (exitCode !== null && exitCode !== 0) || exitSignal !== null
+      ? "err"
+      : exited
+        ? "warn"
+        : "warn";
+  const headline = exited
+    ? `Session terminated (exit code ${exitCode ?? "?"}${
+        exitSignal !== null ? `, signal ${exitSignal}` : ""
+      })`
+    : "Last inject errored";
+  return (
+    <details
+      data-testid="pty-diagnostic-block"
+      className={`px-5 py-2 border-b border-border1 text-nano font-mono ${
+        tone === "err" ? "bg-err/10 text-err" : "bg-attn/10 text-attn"
+      }`}
+    >
+      <summary className="cursor-pointer select-none">
+        {tone === "err" ? "⚠ " : ""}
+        {headline}
+        {exitedAt ? ` · ${fmtAgo(exitedAt)}` : ""}
+        <span className="text-txt3 ml-2">(click to expand)</span>
+      </summary>
+      <div className="mt-2 space-y-1 text-txt2">
+        <div>
+          <span className="text-txt3">pty_id:</span>{" "}
+          {pty.ptyId.slice(0, 12)}
+        </div>
+        {pty.sessionId ? (
+          <div>
+            <span className="text-txt3">session_id:</span>{" "}
+            {pty.sessionId.slice(0, 12)}
+          </div>
+        ) : null}
+        <div>
+          <span className="text-txt3">command:</span> {pty.command}
+        </div>
+        {exited ? (
+          <div>
+            <span className="text-txt3">exit:</span> code={exitCode ?? "?"}
+            {exitSignal !== null ? ` signal=${exitSignal}` : ""}
+          </div>
+        ) : null}
+        {lastError ? (
+          <div className="break-all">
+            <span className="text-txt3">last_error:</span>{" "}
+            {lastErrorClass ? `[${lastErrorClass}] ` : ""}
+            {lastError}
+          </div>
+        ) : null}
+        {lastCommand ? (
+          <div className="break-all">
+            <span className="text-txt3">
+              last_command{lastCommandAt ? ` (${fmtAgo(lastCommandAt)})` : ""}:
+            </span>{" "}
+            {lastCommand}
+          </div>
+        ) : null}
+        {outputTail ? (
+          <div>
+            <div className="text-txt3 mt-2">output_tail (last bytes):</div>
+            <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all bg-surface2 p-2 rounded-card text-txt2">
+              {outputTail}
+            </pre>
+          </div>
+        ) : null}
+      </div>
+    </details>
+  );
+}
+
 /**
  * Read-only mirror of a Claude Code terminal.
  *
@@ -223,6 +335,27 @@ export function TerminalMirror({ sessionId }: Props) {
   const daemonPtyPending = Boolean(
     !daemonPtyOwnsSession &&
       ptysQ.data?.ptys?.some((p) => !p.exited && !p.sessionId),
+  );
+  /* Diagnostic surface. Find the matching PTY for this session so the
+   * mirror can render an expandable error block if the process exited
+   * non-zero, was killed, or an inject threw. We look for an exited
+   * PTY first (a session that died is the failure mode the user most
+   * needs to see), then fall back to a live PTY that has a non-null
+   * last_error from a recent inject. */
+  const diagnosticPty: PtyEntry | undefined = sessionId
+    ? ptysQ.data?.ptys
+        ?.filter((p) => p.sessionId === sessionId)
+        .sort((a, b) => {
+          /* exited first, then most-recent activity */
+          if (a.exited && !b.exited) return -1;
+          if (!a.exited && b.exited) return 1;
+          return b.lastActivity - a.lastActivity;
+        })[0]
+    : undefined;
+  const hasDiagnostic = Boolean(
+    diagnosticPty &&
+      (diagnosticPty.exited ||
+        (diagnosticPty.last_error && diagnosticPty.last_error.length > 0)),
   );
 
   useEffect(() => {
@@ -656,6 +789,9 @@ export function TerminalMirror({ sessionId }: Props) {
         <div className="px-5 py-2 border-b border-border1 text-nano text-txt2 bg-surface2">
           {bridgeView.detail}
         </div>
+      ) : null}
+      {hasDiagnostic && diagnosticPty ? (
+        <PtyDiagnosticBlock pty={diagnosticPty} />
       ) : null}
       <div
         ref={containerRef}
