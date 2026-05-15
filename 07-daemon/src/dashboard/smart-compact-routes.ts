@@ -462,18 +462,30 @@ export function fireSmartCompact(
     };
   }
 
-  const ptyId = anchor?.current_pty_id ?? null;
+  /* Pick a target the injector can resolve. Prefer current_pty_id
+   * when the anchor was bound to a daemon-owned PTY; fall back to
+   * current_session_id when the anchor is bound to a bridge-only
+   * session (worker launched outside the daemon, e.g. via the
+   * dashboard "Sessions" button or a VS Code-side claude). The
+   * route-level injector wired in registerSmartCompactRoutes does
+   * listPtys-then-bridge resolution against this string, mirroring
+   * the cross-session-inject path that already handles both
+   * transports. Without this fallback, fireSmartCompact returned
+   * pty_not_found on every bridge-bound anchor and the worker never
+   * actually received /clear + the resume summary. */
+  const target =
+    anchor?.current_pty_id ?? anchor?.current_session_id ?? null;
   let injectResult: FireResult['inject_result'] = 'pty_not_found';
-  if (ptyId) {
+  if (target) {
     if (opts.action === 'wrap') {
-      const r = opts.injector(ptyId, WRAP_AND_COMMIT_PROMPT, true);
+      const r = opts.injector(target, WRAP_AND_COMMIT_PROMPT, true);
       injectResult = r.ok ? 'wrap-injected' : 'pty_not_found';
     } else {
       /* fire: /clear then summary. Two injects with the existing 80ms
        * paste-then-Enter delay built into ptyInject. */
-      const cleared = opts.injector(ptyId, '/clear', true);
+      const cleared = opts.injector(target, '/clear', true);
       const summary = opts.summary ?? '';
-      const ship = opts.injector(ptyId, summary, true);
+      const ship = opts.injector(target, summary, true);
       injectResult = cleared.ok && ship.ok ? 'accepted' : 'pty_not_found';
     }
   }

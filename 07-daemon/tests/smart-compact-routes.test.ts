@@ -93,7 +93,8 @@ function seedAnchor(opts: {
     cwd: opts.cwd ?? `C:/p/${opts.id}`,
     title: opts.id,
     status: 'live',
-    current_session_id: opts.cc ?? 'cc-' + opts.id,
+    current_session_id:
+      opts.cc === undefined ? 'cc-' + opts.id : opts.cc,
     current_bridge_id: 'b-' + opts.id,
     current_pty_id:
       opts.pty === undefined ? 'pty-' + opts.id : opts.pty,
@@ -195,8 +196,10 @@ describe('fireSmartCompact', () => {
     expect(recentSmartCompacts(db)[0]!.action).toBe('wrap');
   });
 
-  it('records inject_result=pty_not_found when anchor has no current_pty_id', () => {
-    seedAnchor({ id: 'a', pty: null });
+  it('records inject_result=pty_not_found only when anchor has no pty_id AND no session_id', () => {
+    /* Both missing → no resolvable target. Bridge fallback can't be
+     * tried either since queueSessionPrompt needs a session id. */
+    seedAnchor({ id: 'a', pty: null, cc: null });
     const injector = vi.fn(() => ({ ok: true as const }));
     const r = fireSmartCompact(db, 'a', {
       caller: 'lex',
@@ -209,6 +212,27 @@ describe('fireSmartCompact', () => {
     expect(r.ok).toBe(false);
     expect(r.inject_result).toBe('pty_not_found');
     expect(injector).not.toHaveBeenCalled();
+  });
+
+  it('falls back to current_session_id when current_pty_id is null (bridge-bound anchor)', () => {
+    /* The route-level injector wired in registerSmartCompactRoutes
+     * resolves the target string against listPtys first, then bridge
+     * queueSessionPrompt. fireSmartCompact itself just needs to hand
+     * SOME identifier; it should prefer pty_id, then session_id. */
+    seedAnchor({ id: 'a', pty: null, cc: 'cc-A' });
+    const injector = vi.fn(() => ({ ok: true as const }));
+    const r = fireSmartCompact(db, 'a', {
+      caller: 'lex',
+      reason: 'window-open',
+      action: 'fire',
+      ctxPct: 60,
+      summary: 'resume here',
+      injector,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.inject_result).toBe('accepted');
+    expect(injector).toHaveBeenNthCalledWith(1, 'cc-A', '/clear', true);
+    expect(injector).toHaveBeenNthCalledWith(2, 'cc-A', 'resume here', true);
   });
 
   it('force=true bypasses the shadow gate', () => {

@@ -161,9 +161,34 @@ export async function registerDashboardRoutes(
   /* Smart-compact surface (SMART-COMPACT.md). Lex polls evaluate,
    * decides to fire, daemon executes /clear + resume summary via the
    * existing PTY transport. Shadow mode for the first N attempts per
-   * anchor; audit row on every decision. */
+   * anchor; audit row on every decision.
+   *
+   * Injector wraps listPtys → ptyInject → bridge queueSessionPrompt
+   * the same way cross-session-inject does. fireSmartCompact passes
+   * the anchor's current_pty_id (or current_session_id when no PTY
+   * is bound) as the target string; this resolver finds a live
+   * daemon-owned PTY first, then falls back to the bridge for
+   * sessions launched outside the daemon (VS Code terminal, etc).
+   * Without this fallback, /lex/smart-compact/fire returned
+   * pty_not_found on every bridge-bound worker and the /clear +
+   * resume summary never actually shipped. */
+  const smartCompactInjector = (
+    target: string,
+    text: string,
+    commit: boolean,
+  ): { ok: true } | { ok: false; error: string } => {
+    const ptys = listPtys();
+    const live = ptys.find(
+      (p) => !p.exited && (p.ptyId === target || p.sessionId === target),
+    );
+    if (live) return ptyInject(live.ptyId, text, commit);
+    const r = commit
+      ? queueSessionPrompt(target, text)
+      : queueSessionSuggestion(target, text);
+    return r;
+  };
   const { registerSmartCompactRoutes } = await import('./smart-compact-routes.js');
-  registerSmartCompactRoutes(app, store.db, ptyInject, log);
+  registerSmartCompactRoutes(app, store.db, smartCompactInjector, log);
 
   /* Background poll that binds a daemon-owned PTY to its claude
    * session_id once the .jsonl file appears. Single global timer; no
