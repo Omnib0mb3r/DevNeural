@@ -52,6 +52,11 @@ import {
   deriveContextFromTail,
 } from './dashboard/sessions.js';
 import { makeSmartCompactInjector } from './dashboard/smart-compact-injector.js';
+import { jsonlForAnchor } from './dashboard/smart-compact-routes.js';
+import {
+  runWorkerStallTick,
+  readTail as readStallTail,
+} from './dashboard/worker-stall-watch.js';
 import { startBridgePresenceLoop } from './dashboard/bridge-presence.js';
 import { startDistillationBackfillScheduler } from './lex/distillation-scheduler.js';
 import { startWorkerEventListener } from './dashboard/worker-event-listener.js';
@@ -451,6 +456,47 @@ async function main(): Promise<void> {
   }, 90_000);
   if (typeof smartCompactTimer.unref === 'function') {
     smartCompactTimer.unref();
+  }
+
+  /* Worker mid-turn stall watch. Walks live anchors every
+   * DEVNEURAL_STALL_TICK_MS (default 60s) and fires the existing
+   * fireForStall notification when a tool_use turn has been open
+   * past DEVNEURAL_STALL_TOOL_MS or a user message has gone
+   * unanswered past DEVNEURAL_STALL_USER_MS. Cooldown per anchor
+   * is DEVNEURAL_STALL_COOLDOWN_MS so a wedged worker doesn't
+   * spam pushes. State lives in this closure's Map; daemon
+   * restart resets the cooldowns, which is fine -- a new daemon
+   * boot is a real signal that ought to re-fire if the stall is
+   * still present. */
+  const stallTickMs = Number(
+    process.env.DEVNEURAL_STALL_TICK_MS ?? 60_000,
+  );
+  const stallState = new Map<string, number>();
+  async function tickStallWatch(): Promise<void> {
+    try {
+      const r = await runWorkerStallTick({
+        db: store.db,
+        jsonlForAnchor,
+        readTail: readStallTail,
+        log: (m) => logger(m),
+        state: stallState,
+      });
+      if (r.fired.length || r.stalls.length) {
+        logger(
+          `[stall-watch] evaluated=${r.evaluated} stalled=${r.stalls.length} fired=${r.fired.length} cooldown=${r.cooldown.length}`,
+        );
+      }
+    } catch (err) {
+      logger(`[stall-watch] tick failed: ${(err as Error).message}`);
+    }
+  }
+  const stallTimer = setTimeout(() => {
+    void tickStallWatch();
+    const repeat = setInterval(() => void tickStallWatch(), stallTickMs);
+    if (typeof repeat.unref === 'function') repeat.unref();
+  }, 120_000);
+  if (typeof stallTimer.unref === 'function') {
+    stallTimer.unref();
   }
 
   /* Memory janitor (Wave 3 Lane B step 37 / LX-14). Runs weekly at

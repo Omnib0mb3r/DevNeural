@@ -64,7 +64,7 @@ export interface EvaluateResult {
   anchor_id: string;
 }
 
-function jsonlForAnchor(db: IndexDb, anchorId: string): string | null {
+export function jsonlForAnchor(db: IndexDb, anchorId: string): string | null {
   const refs = db.listProjectTranscriptRefs(anchorId);
   if (refs.length === 0) return null;
   return refs[refs.length - 1]!.jsonl_path;
