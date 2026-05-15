@@ -45,7 +45,13 @@ import {
 import { runDistillationBackfill, BACKFILL_DEFAULT_LIMIT } from './lex/sibling-distillation-backfill.js';
 import { createLlmDistillationGenerator } from './lex/distillation-generator.js';
 import { runSmartCompactTick } from './dashboard/smart-compact-scheduler.js';
-import { ptyInject } from './dashboard/pty-host.js';
+import { ptyInject, listPtys } from './dashboard/pty-host.js';
+import {
+  queueSessionPrompt,
+  queueSessionSuggestion,
+  deriveContextFromTail,
+} from './dashboard/sessions.js';
+import { makeSmartCompactInjector } from './dashboard/smart-compact-injector.js';
 import { startBridgePresenceLoop } from './dashboard/bridge-presence.js';
 import { startDistillationBackfillScheduler } from './lex/distillation-scheduler.js';
 import { startWorkerEventListener } from './dashboard/worker-event-listener.js';
@@ -397,11 +403,36 @@ async function main(): Promise<void> {
   const smartCompactTickMs = Number(
     process.env.DEVNEURAL_SMART_COMPACT_TICK_MS ?? 60_000,
   );
+  /* Scheduler shares the same bridge-fallback resolver as the REST
+   * route. Without this, the tick called bare ptyInject which always
+   * returned pty_not_found on bridge-only workers, so context never
+   * auto-compacted on sessions launched outside the daemon. */
+  const schedulerInjector = makeSmartCompactInjector({
+    listPtys,
+    ptyInject,
+    queueSessionPrompt,
+    queueSessionSuggestion,
+  });
+  /* Production ctxProvider. The scheduler was previously passing
+   * no ctxProvider, so evaluateSmartCompact's `if (opts.ctxProvider)`
+   * branch never ran, ctxPct stayed null, and every anchor was
+   * resolved as 'wait' / 'below-window' regardless of how much
+   * context it had actually consumed. Workers happily ran past the
+   * 60% / 65% / 90% gates without a single fire. Bind to the same
+   * derivation the dashboard already uses for the session-detail
+   * context bar (deriveContextFromTail) and return a percent so the
+   * evaluator can compare it against the thresholds. */
+  const ctxProvider = (jsonlPath: string): number | null => {
+    const ctx = deriveContextFromTail(jsonlPath);
+    if (!ctx || ctx.max <= 0) return null;
+    return Math.round((ctx.tokens / ctx.max) * 1000) / 10;
+  };
   async function tickSmartCompact(): Promise<void> {
     try {
       const r = await runSmartCompactTick({
         db: store.db,
-        injector: ptyInject,
+        injector: schedulerInjector,
+        ctxProvider,
         log: (m) => logger(m),
       });
       if (r.fired.length || r.wrapped.length || r.errors.length) {

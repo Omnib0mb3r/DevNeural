@@ -215,7 +215,7 @@ interface UsageSnapshot {
   output_tokens: number;
 }
 
-function deriveContextFromTail(
+export function deriveContextFromTail(
   file: string,
 ): { tokens: number; max: number } | null {
   try {
