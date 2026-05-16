@@ -3923,6 +3923,33 @@ export async function registerDashboardRoutes(
       reply.code(400);
       return { ok: false, error: 'session_id required' };
     }
+    const sessionId = body.session_id;
+    /* Every exit from this route writes an audit row so operators
+     * can tell "hook never fired" apart from "hook fired and bailed
+     * at brainstorm-resolve". Pre-fix: only the successful render
+     * path wrote a row; the no-brainstorm / no-label / no-siblings
+     * / disabled paths were silent. Operators saw zero rows and
+     * incorrectly assumed the hook was not wired. */
+    const { randomUUID } = await import('node:crypto');
+    function auditEarlyOut(
+      reject_reason: string,
+      brainstormId: string | null,
+    ): void {
+      try {
+        store.db.insertCrossSessionLog({
+          id: randomUUID(),
+          target_session: sessionId,
+          caller_label: 'cold-start-preload',
+          text_preview: '',
+          text_length: 0,
+          decision: 'shadow',
+          reject_reason,
+          brainstorm_id: brainstormId,
+        });
+      } catch {
+        /* observational; never block the preload response */
+      }
+    }
     /* Three-state runtime mode: off / shadow / live. Off short-
      * circuits before any work. Shadow + live still compute the
      * block so the operator can audit what would have shipped; the
@@ -3930,15 +3957,16 @@ export async function registerDashboardRoutes(
      * whether the audit row is decision='shadow' or 'accepted'. */
     const mode = coldStartPreloadMode(store.db);
     if (mode === 'off') {
+      auditEarlyOut('disabled', null);
       return { ok: true, block: '', reason: 'disabled', mode };
     }
-    const sessionId = body.session_id;
     const { getBrainstormByClaudeSessionId } = await import(
       '../lex/brainstorm-store.js'
     );
     const { buildSiblingIndex } = await import('../lex/sibling-index.js');
     const bs = getBrainstormByClaudeSessionId(sessionId);
     if (!bs) {
+      auditEarlyOut('no-brainstorm-bound', null);
       return {
         ok: true,
         block: '',
@@ -3948,6 +3976,7 @@ export async function registerDashboardRoutes(
     }
     const label = bs.user_label ?? bs.derived_label ?? null;
     if (!label) {
+      auditEarlyOut('no-label', bs.id);
       return {
         ok: true,
         block: '',
@@ -4022,6 +4051,7 @@ export async function registerDashboardRoutes(
       distillationWords: 20,
     });
     if (!block) {
+      auditEarlyOut('no-siblings', bs.id);
       return {
         ok: true,
         block: '',
@@ -4036,7 +4066,6 @@ export async function registerDashboardRoutes(
      * have done versus 'accepted' for real fires. caller_label
      * remains 'cold-start-preload' in both states. */
     try {
-      const { randomUUID } = await import('node:crypto');
       store.db.insertCrossSessionLog({
         id: randomUUID(),
         target_session: sessionId,
