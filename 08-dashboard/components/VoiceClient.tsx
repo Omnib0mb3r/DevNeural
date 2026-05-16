@@ -21,6 +21,7 @@ import {
 import { logWake } from "@/lib/wake-log";
 import { logVoice, computeReconnectBackoffMs } from "@/lib/voice-log";
 import { configureVadOrt } from "@/lib/voice-ort-config";
+import { warmAudioContext } from "@/lib/voice-audio-warm";
 import { VoiceErrorPill } from "./VoiceErrorPill";
 
 /* Wake-word debug badge gating. The badge is dev-only: set
@@ -1616,24 +1617,17 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             }
             const rate = Number(msg.rate) || 22050;
             ttsRateRef.current = rate;
-            if (!audioCtxRef.current) {
-              try {
-                const Cls =
-                  (window as unknown as { AudioContext?: typeof AudioContext })
-                    .AudioContext ??
-                  (window as unknown as { webkitAudioContext?: typeof AudioContext })
-                    .webkitAudioContext;
-                if (Cls) audioCtxRef.current = new Cls({ sampleRate: rate });
-              } catch {
-                /* fallback: no audio */
-              }
-            }
+            /* AudioContext is warmed inside the toggleEnabled() click
+             * handler (a user gesture), not here. Lazy-creating in
+             * this network callback used to ship a context iOS
+             * Safari refused to start, silencing the first reply.
+             * The ref should be live by the time we land here; if
+             * for any reason it is not (teardown raced ahead of a
+             * late tts-start) we skip the audio path rather than
+             * fabricate a broken context. */
             /* Chrome / Safari suspend the AudioContext when the tab
-             * loses focus or no user gesture has triggered audio
-             * playback yet on this context. The "start voice" click
-             * is a gesture, but mute/unmute and tab switches can
-             * leave us suspended. Resume defensively on every
-             * tts-start so the scheduled buffers actually play. */
+             * loses focus. Resume defensively on every tts-start so
+             * the scheduled buffers actually play. */
             const ctx = audioCtxRef.current;
             if (ctx && ctx.state === "suspended") {
               void ctx.resume().catch(() => undefined);
@@ -2261,6 +2255,25 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     if (now < enableBusyUntilRef.current) return;
     enableBusyUntilRef.current = now + 400;
     if (!enabled) {
+      /* Warm the AudioContext INSIDE this user-gesture handler. iOS
+       * Safari refuses to start the audio clock on a context that
+       * was created from a network callback (the tts-start WS
+       * message used to do this), so the first reply's PCM chunks
+       * were silently dropped. Calling warmAudioContext here commits
+       * the gesture; by the time tts-start lands the context is
+       * already running and chunks schedule on time. Idempotent;
+       * the [enabled] teardown nulls the ref before any second
+       * enable. */
+      if (!audioCtxRef.current) {
+        const win = window as unknown as {
+          AudioContext?: typeof AudioContext;
+          webkitAudioContext?: typeof AudioContext;
+        };
+        audioCtxRef.current = warmAudioContext({
+          AudioContextCtor: win.AudioContext,
+          WebkitAudioContextCtor: win.webkitAudioContext,
+        });
+      }
       setEnabled(true);
       return;
     }
