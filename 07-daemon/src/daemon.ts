@@ -61,6 +61,10 @@ import {
 import { startBridgePresenceLoop } from './dashboard/bridge-presence.js';
 import { startDistillationBackfillScheduler } from './lex/distillation-scheduler.js';
 import { startWorkerEventListener } from './dashboard/worker-event-listener.js';
+import {
+  startDashboardSupervisor,
+  type DashboardSupervisorHandle,
+} from './dashboard/dashboard-supervisor.js';
 import { emitAwarenessEvent } from './lex/awareness.js';
 import fastifyCookie from '@fastify/cookie';
 import fastifyMultipart from '@fastify/multipart';
@@ -1121,6 +1125,26 @@ async function main(): Promise<void> {
   const fsWatcher = startFsWatcher({ log: logger });
   const gitWatcher = startGitWatcher({ log: logger });
 
+  /* Dashboard `next dev` supervisor. Manages a single child process
+   * running next dev so dashboard edits rebuild without the operator
+   * having to remember a separate terminal. Toggle:
+   * runtime_config.dashboard_supervisor_enabled (default on;
+   * CI=true forces off). The supervisor itself is responsible for
+   * the toggle check + the "next bin missing" early-out; this site
+   * just calls start and wires stop() into shutdown(). */
+  let dashboardSupervisor: DashboardSupervisorHandle | null = null;
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const dashboardDir = path.resolve(here, '..', '..', '08-dashboard');
+    dashboardSupervisor = startDashboardSupervisor({
+      db: store.db,
+      dashboardDir,
+      log: logger,
+    });
+  } catch (err) {
+    logger(`dashboard-supervisor bootstrap failed: ${(err as Error).message}`);
+  }
+
   /* Periodic auto-ingest tick. Catches activity that didn't produce a
    * hook signal (background work, idle sessions that left chunks in the
    * transcript). Default 5 min; tunable via env. The brain stays current
@@ -1194,6 +1218,11 @@ async function main(): Promise<void> {
     }
     try {
       gitWatcher.stop();
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (dashboardSupervisor) await dashboardSupervisor.stop();
     } catch {
       /* ignore */
     }
