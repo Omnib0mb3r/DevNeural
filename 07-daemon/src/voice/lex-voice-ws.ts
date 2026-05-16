@@ -181,6 +181,94 @@ function findJsonlBySessionId(sessionId: string): string | null {
  * whenever a fresh hello binds. */
 const activeByBindKey = new Map<string, ConnState>();
 
+/* Lex dashboard voice controls. Mirrors the spoken voice-command path
+ * (mute / unmute / disable) over HTTP so Lex can mute itself or stop
+ * the voice session from a tool call. The browser handles each frame
+ * the same way it does for a voice-triggered command:
+ *   voice-mute    halt TTS, keep socket
+ *   voice-unmute  resume TTS
+ *   voice-disable stop voice session (panel flips off)
+ * Stop maps to voice-disable rather than session-end so the underlying
+ * brainstorm row stays live; teardown of the brainstorm is its own
+ * end_session command. */
+export type VoiceControlKind = 'mute' | 'unmute' | 'stop';
+
+const VOICE_CONTROL_FRAMES: Record<VoiceControlKind, string> = {
+  mute: 'voice-mute',
+  unmute: 'voice-unmute',
+  stop: 'voice-disable',
+};
+
+export interface VoiceControlOptions {
+  /** Reason string surfaced to the client (audit trail / UI badge). */
+  reason?: string;
+  /** Target a single connection by bindKey (session_id or pty_id).
+   * Omitted -> broadcast to every active voice client. */
+  bindKey?: string | null;
+}
+
+export interface VoiceControlResult {
+  ok: boolean;
+  delivered: number;
+  bind_keys: string[];
+  reason: string;
+}
+
+/* Test seam: each test reconstructs the connection set without
+ * standing up real sockets. Production paths leave this null and
+ * fall back to the module-level activeByBindKey map. */
+let testRegistryOverride:
+  | Map<string, { ws: { send: (data: string) => void }; closed: boolean; bindKey: string | null }>
+  | null = null;
+
+export function _setVoiceControlRegistryForTests(
+  registry:
+    | Map<string, { ws: { send: (data: string) => void }; closed: boolean; bindKey: string | null }>
+    | null,
+): void {
+  testRegistryOverride = registry;
+}
+
+export function broadcastVoiceControl(
+  kind: VoiceControlKind,
+  opts: VoiceControlOptions = {},
+): VoiceControlResult {
+  const reason = (opts.reason ?? 'http-request').slice(0, 256);
+  const frame = VOICE_CONTROL_FRAMES[kind];
+  const registry = testRegistryOverride ??
+    (activeByBindKey as unknown as Map<
+      string,
+      { ws: { send: (data: string) => void }; closed: boolean; bindKey: string | null }
+    >);
+  const targets: Array<{
+    ws: { send: (data: string) => void };
+    closed: boolean;
+    bindKey: string | null;
+  }> = [];
+  if (opts.bindKey) {
+    const target = registry.get(opts.bindKey);
+    if (target && !target.closed) targets.push(target);
+  } else {
+    for (const c of registry.values()) {
+      if (!c.closed) targets.push(c);
+    }
+  }
+  let delivered = 0;
+  const reached: string[] = [];
+  const payload = JSON.stringify({ t: frame, reason });
+  for (const c of targets) {
+    try {
+      c.ws.send(payload);
+      delivered += 1;
+      if (c.bindKey) reached.push(c.bindKey);
+    } catch {
+      /* socket already gone; never block the broadcaster on a
+       * single dead client. */
+    }
+  }
+  return { ok: true, delivered, bind_keys: reached, reason };
+}
+
 export function attachLexVoiceWs(socket: FastifyWS): void {
   const state: ConnState = {
     ws: socket,

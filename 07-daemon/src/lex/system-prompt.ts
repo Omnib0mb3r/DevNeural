@@ -518,6 +518,17 @@ Most-used:
 - GET  /dashboard/daily-brief
     Morning briefing payload: open work, due reminders, hot
     projects. Useful when Michael opens with "where are we?".
+- POST /voice/mute    { reason?, bind_key? }
+- POST /voice/unmute  { reason?, bind_key? }
+- POST /voice/stop    { reason?, bind_key? }
+    Push voice-control frames to the dashboard voice client.
+    /voice/mute halts in-flight TTS without closing the socket;
+    /voice/unmute resumes; /voice/stop ends the voice session
+    (panel flips off) without ending the brainstorm row. Use
+    when Michael says "shut up", "be quiet", or asks you to
+    stop talking. Omit bind_key to broadcast to every active
+    voice client. Response carries delivered count + reached
+    bind_keys.
 
 Always prefer /lex/recall over /search/all for retrieval; the
 source classification and session grouping are why it exists.

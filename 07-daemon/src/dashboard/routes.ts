@@ -100,7 +100,11 @@ import {
   setVadSensitivity,
   setVadRedemptionMs,
 } from '../voice/piper.js';
-import { attachLexVoiceWs } from '../voice/lex-voice-ws.js';
+import {
+  attachLexVoiceWs,
+  broadcastVoiceControl,
+  type VoiceControlKind,
+} from '../voice/lex-voice-ws.js';
 import { lintQueueStatus } from '../wiki/lint-queue.js';
 import { providerStatus } from '../llm/index.js';
 import { embedderStats } from '../embedder/index.js';
@@ -1516,6 +1520,28 @@ export async function registerDashboardRoutes(
   app.get('/voice/lex-ws', { websocket: true }, (socket) => {
     attachLexVoiceWs(socket as unknown as Parameters<typeof attachLexVoiceWs>[0]);
   });
+
+  /* Lex-callable voice control endpoints. Each one fans out a single
+   * frame to every active voice WS (or the bindKey-targeted one) so
+   * Lex can mute itself or stop the voice session from a tool call.
+   * The browser handles each frame identically to the same-named
+   * voice command (mute/unmute/disable). Reasoning: hands-busy
+   * control without touching the UI. */
+  const handleVoiceControl = (kind: VoiceControlKind) =>
+    async (req: { body?: unknown }, reply: { code(c: number): { send(b: unknown): void } | unknown }): Promise<unknown> => {
+      const body = (req.body ?? {}) as { bind_key?: string; reason?: string };
+      const bindKey = typeof body.bind_key === 'string' && body.bind_key ? body.bind_key : null;
+      const reason = typeof body.reason === 'string' && body.reason ? body.reason : 'http-request';
+      const r = broadcastVoiceControl(kind, { bindKey, reason });
+      /* 200 OK even when delivered=0 so a script that fires a stop
+       * during a silent gap does not have to special-case "no client
+       * connected" as an error. The delivered counter is the truth. */
+      void reply;
+      return r;
+    };
+  app.post('/voice/mute', handleVoiceControl('mute'));
+  app.post('/voice/unmute', handleVoiceControl('unmute'));
+  app.post('/voice/stop', handleVoiceControl('stop'));
 
   app.post('/voice/transcribe', async (req, reply) => {
     const body = (req.body ?? {}) as {
