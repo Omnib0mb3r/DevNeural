@@ -676,6 +676,18 @@ async function main(): Promise<void> {
       if (!fs.existsSync(target)) return done();
       try {
         const html = fs.readFileSync(target, 'utf-8');
+        /* HTML must NOT be cached. fastify-static's setHeaders only
+         * fires for files served BY fastify-static; this hook
+         * short-circuits before that runs, so HTML sent here would
+         * otherwise inherit the browser's default caching heuristic.
+         * iOS Safari + desktop Chrome happily cache an un-headered
+         * 200 response, then keep serving the stale shell after a
+         * deploy that rotated every chunk hash. Force no-store
+         * inline so the early-hook path stays consistent with the
+         * fastify-static HTML path. */
+        reply.header('Cache-Control', 'no-store, no-cache, must-revalidate');
+        reply.header('Pragma', 'no-cache');
+        reply.header('Expires', '0');
         reply.type('text/html').send(html);
       } catch {
         return done();
@@ -1074,6 +1086,14 @@ async function main(): Promise<void> {
             fs.existsSync(candidate)
           ) {
             try {
+              /* Mirror the early HTML hook: this fallback also sends
+               * HTML via readFileSync, bypassing fastify-static's
+               * setHeaders callback. Without no-store the SPA shell
+               * gets cached and a deploy that rotated every chunk
+               * hash keeps serving the stale wrapper. */
+              reply.header('Cache-Control', 'no-store, no-cache, must-revalidate');
+              reply.header('Pragma', 'no-cache');
+              reply.header('Expires', '0');
               reply.type('text/html').send(fs.readFileSync(candidate, 'utf-8'));
               return;
             } catch {
