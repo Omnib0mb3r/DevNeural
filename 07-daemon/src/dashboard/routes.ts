@@ -3872,6 +3872,33 @@ export async function registerDashboardRoutes(
     };
   });
 
+  /* POST /worker/clear-handoff
+   *
+   * Called by Claude Code's SessionStart hook for project-anchor
+   * worker sessions (parallel to /lex/cold-start-preload for Lex
+   * brainstorms). Returns a structured handoff doc covering: where
+   * the prior session left off (branch / last commit / in-flight
+   * files), the active task and its acceptance criteria, the next
+   * 2-3 queued backlog items, and any open blockers. The hook prints
+   * the block to stdout so CC injects it as additionalContext on the
+   * first turn.
+   *
+   * Empty block + reason='not-a-project-anchor' for cwds that aren't
+   * bound to a project_session row. The hook treats empty as no-op.
+   *
+   * Body: { session_id: string; cwd: string }
+   */
+  app.post('/worker/clear-handoff', async (req, reply) => {
+    const body = (req.body ?? {}) as { session_id?: string; cwd?: string };
+    if (!body.cwd || typeof body.cwd !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'cwd required' };
+    }
+    const { buildWorkerHandoff } = await import('../lex/worker-handoff.js');
+    const result = buildWorkerHandoff({ cwd: body.cwd, db: store.db });
+    return result;
+  });
+
   /* POST /lex/cold-start-preload
    *
    * Called by Claude Code's SessionStart hook the moment a fresh Lex

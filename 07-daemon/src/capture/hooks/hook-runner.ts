@@ -201,6 +201,48 @@ async function postColdStartPreload(
   }
 }
 
+/* Ask the daemon to build a worker-handoff doc for the new session
+ * and print it to stdout so CC injects it as additionalContext on
+ * the first turn. Mirrors postColdStartPreload but targets project
+ * anchor worker sessions instead of Lex brainstorms. The daemon's
+ * /worker/clear-handoff endpoint returns an empty block (without
+ * error) when the cwd is not bound to a project_session row, so
+ * non-worker sessions are no-ops.
+ *
+ * Bounded timeout; daemon-down silently skips. Fires on every
+ * SessionStart (startup AND clear/compact) so a /clear inside a
+ * project anchor restores the full context, not just a one-line
+ * stop hook summary. */
+async function postWorkerHandoff(
+  sessionId: string,
+  cwd: string,
+): Promise<void> {
+  if (!sessionId || !cwd) return;
+  const flag = String(process.env.DEVNEURAL_WORKER_HANDOFF_ENABLED ?? '')
+    .trim()
+    .toLowerCase();
+  if (flag === 'off' || flag === 'false' || flag === '0') return;
+  const url = `http://127.0.0.1:${DAEMON_PORT}/worker/clear-handoff`;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 2000);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, cwd }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return;
+    const json = (await res.json()) as { ok?: boolean; block?: string };
+    if (!json.ok || !json.block || json.block.trim().length === 0) return;
+    process.stdout.write(json.block + '\n');
+  } catch {
+    /* daemon down / network error / timeout: silent no-op */
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 /* Tell the daemon a SessionStart fired from /clear so it can mark the
  * previous session in this workspace as superseded. Without this the
  * Stream Deck rail keeps the old tile around for ACTIVE_THRESHOLD_MS. */
@@ -487,6 +529,14 @@ async function main(): Promise<void> {
        * additionalContext on the first turn. Flag-gated and
        * timeout-bounded; on any failure the session starts normally. */
       await postColdStartPreload(sessionId, cwd);
+    }
+    /* Worker-handoff doc. Fires on every SessionStart source so a
+     * /clear inside a project anchor restores the full context (git
+     * state + active task + next-up queue + open blockers) instead
+     * of riding on a one-line stop hook summary. Empty for non-
+     * project-anchor cwds; no-op when the daemon is down. */
+    if (sessionId) {
+      await postWorkerHandoff(sessionId, cwd);
     }
     // Lazy-spawn daemon so the supersede arrives even on cold start.
     const pid = readPid();
