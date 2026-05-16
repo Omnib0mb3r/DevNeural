@@ -314,6 +314,42 @@ export interface ProjectSessionRow {
    * the column with default 'polling'. Optional on write so legacy
    * call sites still compile; reads always populate the field. */
   supervision_mode?: SupervisionMode;
+  /* Autonomous supervisor phase 3 (migration 027). Lease holder for
+   * the auto-advance loop + a monotonically increasing epoch the
+   * loop bumps each time it claims the lease. Used to fence stale
+   * writes when a daemon restart or a second supervisor process
+   * tries to act on a session another instance is already owning. */
+  auto_advance_owner?: string | null;
+  auto_advance_epoch?: number;
+}
+
+export interface AutoAdvanceLogRow {
+  id: string;
+  created_at: string;
+  anchor_id: string | null;
+  turn_uuid: string | null;
+  item_id: string | null;
+  mode: 'off' | 'shadow' | 'live';
+  decision: 'shadow' | 'would-inject' | 'accepted' | 'skip' | 'error';
+  reason: string | null;
+  would_inject_preview: string | null;
+  footer_status: string | null;
+  footer_needs_attention: number | null;
+  epoch: number | null;
+}
+
+export interface AutoAdvanceLogInsert {
+  id: string;
+  anchor_id: string | null;
+  turn_uuid: string | null;
+  item_id: string | null;
+  mode: AutoAdvanceLogRow['mode'];
+  decision: AutoAdvanceLogRow['decision'];
+  reason?: string | null;
+  would_inject_preview?: string | null;
+  footer_status?: string | null;
+  footer_needs_attention?: boolean | null;
+  epoch?: number | null;
 }
 
 export const VALID_SUPERVISION_MODES: ReadonlySet<SupervisionMode> = new Set([
@@ -2415,6 +2451,104 @@ export class IndexDb {
         notes: opts.notes ?? null,
       });
     return info.changes;
+  }
+
+  /* ─── Auto-advance supervisor (migrations 027 + 028) ───────────
+   *
+   * Phase 3 lands the loop in shadow-only operation. Every decision
+   * the supervisor makes lands in auto_advance_log; the lease
+   * primitive on project_session prevents two daemons from acting
+   * on the same anchor at once.
+   */
+
+  insertAutoAdvanceLog(row: AutoAdvanceLogInsert): void {
+    this.db
+      .prepare(
+        `INSERT INTO auto_advance_log
+           (id, anchor_id, turn_uuid, item_id, mode, decision,
+            reason, would_inject_preview, footer_status,
+            footer_needs_attention, epoch)
+         VALUES (@id, @anchor_id, @turn_uuid, @item_id, @mode,
+                 @decision, @reason, @would_inject_preview,
+                 @footer_status, @footer_needs_attention, @epoch)`,
+      )
+      .run({
+        id: row.id,
+        anchor_id: row.anchor_id,
+        turn_uuid: row.turn_uuid,
+        item_id: row.item_id,
+        mode: row.mode,
+        decision: row.decision,
+        reason: row.reason ?? null,
+        would_inject_preview: row.would_inject_preview ?? null,
+        footer_status: row.footer_status ?? null,
+        footer_needs_attention:
+          row.footer_needs_attention === undefined ||
+          row.footer_needs_attention === null
+            ? null
+            : row.footer_needs_attention
+              ? 1
+              : 0,
+        epoch: row.epoch ?? null,
+      });
+  }
+
+  listAutoAdvanceLog(opts: {
+    anchor_id?: string;
+    mode?: AutoAdvanceLogRow['mode'];
+    decision?: AutoAdvanceLogRow['decision'];
+    limit?: number;
+  } = {}): AutoAdvanceLogRow[] {
+    const limit = Math.min(500, Math.max(1, opts.limit ?? 100));
+    const wheres: string[] = [];
+    const params: unknown[] = [];
+    if (opts.anchor_id) {
+      wheres.push('anchor_id = ?');
+      params.push(opts.anchor_id);
+    }
+    if (opts.mode) {
+      wheres.push('mode = ?');
+      params.push(opts.mode);
+    }
+    if (opts.decision) {
+      wheres.push('decision = ?');
+      params.push(opts.decision);
+    }
+    const clause = wheres.length > 0 ? `WHERE ${wheres.join(' AND ')}` : '';
+    params.push(limit);
+    return this.db
+      .prepare(
+        `SELECT * FROM auto_advance_log ${clause}
+           ORDER BY created_at DESC LIMIT ?`,
+      )
+      .all(...params) as AutoAdvanceLogRow[];
+  }
+
+  /**
+   * Atomic lease bump. Succeeds when the row exists and its current
+   * owner is either NULL or the supplied owner (re-entry); fails
+   * silently when a different owner already holds the lease. The
+   * epoch increments on every successful bump so a subsequent
+   * writer can detect that it's been superseded. Returns the new
+   * epoch on success, null on contention or unknown anchor.
+   */
+  bumpAutoAdvanceLease(anchorId: string, owner: string): number | null {
+    const info = this.db
+      .prepare(
+        `UPDATE project_session
+           SET auto_advance_owner = ?,
+               auto_advance_epoch = COALESCE(auto_advance_epoch, 0) + 1
+         WHERE id = ?
+           AND (auto_advance_owner IS NULL OR auto_advance_owner = ?)`,
+      )
+      .run(owner, anchorId, owner);
+    if (info.changes === 0) return null;
+    const row = this.db
+      .prepare(
+        `SELECT auto_advance_epoch AS epoch FROM project_session WHERE id = ?`,
+      )
+      .get(anchorId) as { epoch?: number } | undefined;
+    return row?.epoch ?? null;
   }
 
   close(): void {

@@ -201,6 +201,41 @@ export async function registerDashboardRoutes(
   const { setStore: setBacklogStore } = await import('../lex/backlog-store.js');
   setBacklogStore(store);
 
+  /* Autonomous supervisor auto-advance loop (phase 3). Default
+   * mode is 'off' so a daemon boot is a no-op until the operator
+   * flips auto_advance_mode via runtime_config. The tick itself
+   * re-reads the mode every fire so an operator flip is picked up
+   * without a restart. */
+  try {
+    const {
+      registerAutoAdvanceLoop,
+      getAutoAdvanceMode,
+    } = await import('../lex/auto-advance-supervisor.js');
+    const initialMode = getAutoAdvanceMode(store.db);
+    if (initialMode === 'off') {
+      log('auto-advance: mode=off; loop dormant (use runtime_config to enable)');
+    } else {
+      log(`auto-advance: starting loop in mode=${initialMode}`);
+    }
+    const { claimBacklogItem, listBacklog } = await import(
+      '../lex/backlog-store.js'
+    );
+    const { listProjectSessions: listAnchors } = store.db;
+    registerAutoAdvanceLoop({
+      deps: {
+        db: store.db,
+        listAnchors: (opts) => store.db.listProjectSessions(opts),
+        listBacklog,
+        claimBacklog: (input) => claimBacklogItem(input),
+        listPtys,
+        log,
+      },
+    });
+    void listAnchors;
+  } catch (err) {
+    log(`auto-advance: bootstrap failed: ${(err as Error).message}`);
+  }
+
   /* Boot reaper. PTY exit hook in pty-host closes brainstorm rows on
    * normal exit; a daemon crash (SIGKILL, fatal SqliteError, etc.)
    * skips that path and leaves rows stuck at status='active'. Reap
