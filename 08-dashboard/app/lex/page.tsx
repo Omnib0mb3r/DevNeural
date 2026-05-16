@@ -18,6 +18,7 @@ import {
 import { LexSessionList } from "@/components/LexSessionList";
 import { LexArtifactsPanel } from "@/components/LexArtifactsPanel";
 import { LexTranscriptHistoryPanel } from "@/components/LexTranscriptHistoryPanel";
+import { emitTranscriptTurn } from "@/lib/transcript-bus";
 
 /**
  * Brainstorming with Lex.
@@ -96,11 +97,23 @@ export default function LexPage() {
       const target = lexPty.sessionId ?? lexPty.ptyId;
       return ptyInject(target, text, true);
     },
-    onSuccess: (data) => {
+    onSuccess: (data, text) => {
       if (data?.ok === false) {
         setSendError(data.error ?? "inject refused");
         return;
       }
+      /* Mirror the voice STT path. VoiceClient pushes every recognised
+       * utterance into the transcript bus so LexTranscriptHistoryPanel
+       * surfaces it; the typed-textarea submit went straight to the
+       * PTY and never emitted, so the panel only ever showed voice
+       * turns. Reaching the same bus here closes the gap. The turn
+       * id is local-only — the daemon doesn't ack a stable id for
+       * typed injects yet, so prefix with "u-typed-" so the panel
+       * can distinguish the source if it ever needs to. */
+      const id = `u-typed-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`;
+      emitTranscriptTurn({ id, role: "user", text });
       setPendingText("");
       setSendError(null);
     },
