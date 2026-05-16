@@ -7,6 +7,7 @@ import {
   listPtys,
   type PtyEntry,
 } from "@/lib/daemon-client";
+import { createAutoScrollController } from "@/lib/terminal-auto-scroll";
 import "@xterm/xterm/css/xterm.css";
 
 interface MirrorState {
@@ -385,6 +386,7 @@ export function TerminalMirror({ sessionId }: Props) {
     if (!el) return;
     let disposed = false;
     let unbindResize: (() => void) | undefined;
+    let autoScrollHandle: { dispose(): void } | null = null;
 
     (async () => {
       const [{ Terminal }, { FitAddon }] = await Promise.all([
@@ -427,37 +429,34 @@ export function TerminalMirror({ sessionId }: Props) {
 
       termRef.current = term;
 
-      /* Sticky auto-scroll: follow the live tail unless the user has
-       * scrolled up to read older output.
-       *
-       * The previous implementation sampled `viewportY >= baseY - 1`
-       * inside writeFollowing's callback. That had two failure modes:
-       *
-       *   1. With the WebGL renderer, scrollToBottom() inside the
-       *      synchronous write callback occasionally raced the next
-       *      paint and left the viewport one row above the cursor.
-       *   2. Rapid back-to-back writes computed wasFollowing against
-       *      stale geometry: a write that grew baseY by 2 between
-       *      sampling and the callback firing made isAtBottom report
-       *      false on the next call, so the pin "popped off" after a
-       *      burst of ANSI output.
-       *
-       * Replace the read-only heuristic with an explicit `following`
-       * flag driven by xterm's onScroll event. After every viewport
-       * change (programmatic scrollToBottom included), recompute
-       * whether the viewport is at the bottom and update the flag.
-       * Then writeFollowing's only job is to call scrollToBottom on
-       * the next animation frame when the flag is true. */
+      /* Sticky auto-scroll with timed resume. The viewport pins to
+       * bottom by default; if the user scrolls up the controller
+       * flips following=false and arms a resume timer. After
+       * resumeMs of no further scroll activity the timer snaps the
+       * viewport back to bottom and resumes tailing. New output
+       * while scrolled up does NOT pull the viewport — the user is
+       * reading older output. State machine lives in
+       * lib/terminal-auto-scroll.ts so it can be tested without
+       * standing up xterm. */
       const isAtBottomNow = (): boolean => {
         const buf = term.buffer.active;
         return buf.viewportY >= buf.baseY;
       };
-      let following = true;
+      const autoScroll = createAutoScrollController({
+        scrollToBottom: () => {
+          try {
+            term.scrollToBottom();
+          } catch {
+            /* ignore */
+          }
+        },
+      });
+      autoScrollHandle = autoScroll;
       term.onScroll(() => {
-        following = isAtBottomNow();
+        autoScroll.onScroll(isAtBottomNow());
       });
       const writeFollowing = (data: string): void => {
-        const wasFollowing = following;
+        const wasFollowing = autoScroll.isFollowing();
         term.write(data, () => {
           if (!wasFollowing) return;
           /* Defer to the next frame so WebGL has finished painting
@@ -466,7 +465,6 @@ export function TerminalMirror({ sessionId }: Props) {
           requestAnimationFrame(() => {
             try {
               term.scrollToBottom();
-              following = true;
             } catch {
               /* ignore */
             }
@@ -538,7 +536,7 @@ export function TerminalMirror({ sessionId }: Props) {
         /* Resize pulls the viewport down only if the user was already
          * tailing the output; otherwise a window resize would yank them
          * back to the bottom of a session they were reviewing. */
-        if (following) {
+        if (autoScroll.isFollowing()) {
           try {
             term.scrollToBottom();
           } catch {
@@ -713,6 +711,11 @@ export function TerminalMirror({ sessionId }: Props) {
         /* ignore */
       }
       unbindResize?.();
+      try {
+        autoScrollHandle?.dispose();
+      } catch {
+        /* ignore */
+      }
       const term = termRef.current as { dispose?: () => void } | null;
       try {
         term?.dispose?.();
