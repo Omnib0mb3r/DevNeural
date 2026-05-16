@@ -20,10 +20,13 @@
  * VoiceErrorPill renders the full multi-line RangeError text plus a
  * working retry handler.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import {
   configureVadOrt,
+  getVadModule,
+  isVadModuleConfigured,
+  resetVadModuleCacheForTests,
   VAD_NUM_THREADS,
   VAD_PROXY,
   VAD_SIMD,
@@ -98,6 +101,56 @@ describe('configureVadOrt', () => {
     expect(written).not.toContain('numThreads');
     expect(wasm.wasmPaths).toBe(VAD_WASM_PATHS);
     expect(wasm.numThreads).toBe(4); // unchanged, locked
+  });
+});
+
+describe('getVadModule singleton', () => {
+  beforeEach(() => {
+    resetVadModuleCacheForTests();
+    vi.resetModules();
+  });
+  afterEach(() => {
+    resetVadModuleCacheForTests();
+    vi.doUnmock('@ricky0123/vad-web');
+  });
+
+  it('imports vad-web once and configures ORT once across repeated calls', async () => {
+    const okState = vi.hoisted(() => ({
+      count: 0,
+      wasm: {} as Record<string, unknown>,
+    }));
+    vi.doMock('@ricky0123/vad-web', () => {
+      okState.count += 1;
+      return { ort: { env: { wasm: okState.wasm } } };
+    });
+
+    expect(isVadModuleConfigured()).toBe(false);
+    const a = await getVadModule();
+    const b = await getVadModule();
+    const c = await getVadModule();
+    expect(a).toBe(b);
+    expect(b).toBe(c);
+    expect(okState.count).toBe(1);
+    expect(isVadModuleConfigured()).toBe(true);
+    expect(okState.wasm).toMatchObject({
+      wasmPaths: VAD_WASM_PATHS,
+      numThreads: VAD_NUM_THREADS,
+      simd: VAD_SIMD,
+      proxy: VAD_PROXY,
+    });
+  });
+
+});
+
+describe('VAD_NUM_THREADS isolation gating', () => {
+  it('stays at 1 when crossOriginIsolated is false (jsdom default)', () => {
+    /* In jsdom, globalThis.crossOriginIsolated is undefined/false, so
+     * the threaded WASM path must NOT be requested. This guards the
+     * "no available backend" cascade on dev/Tailscale boxes that
+     * haven't picked up the COOP/COEP headers yet. */
+    expect((globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated)
+      .not.toBe(true);
+    expect(VAD_NUM_THREADS).toBe(1);
   });
 });
 

@@ -28,7 +28,30 @@
  */
 
 export const VAD_WASM_PATHS = '/vad/';
-export const VAD_NUM_THREADS = 1;
+/* numThreads pinning rule:
+ *   - When the dashboard tab is crossOriginIsolated (COOP+COEP shipped
+ *     by the daemon / Next dev server) we can ask ORT for the threaded
+ *     WASM build, which uses a SharedArrayBuffer-backed WebAssembly
+ *     Memory that can grow past the per-tab single-thread heap budget.
+ *     This is what makes VAD remount survive without the
+ *     `[wasm] RangeError: Out of memory` cascade.
+ *   - When the tab is not isolated (no headers, a stale cache, or
+ *     served from an origin we don't control yet) we stay on the
+ *     single-thread SIMD path. Asking for threads without isolation
+ *     forces the pthread shim to fail and ORT cascades into "no
+ *     available backend".
+ * Cap at 2 threads because the silero VAD model is tiny; more threads
+ * just burn worker spin-up on every remount. */
+function pickInitialNumThreads(): number {
+  const g = typeof globalThis === 'undefined'
+    ? null
+    : (globalThis as { crossOriginIsolated?: boolean });
+  const isolated = g?.crossOriginIsolated === true;
+  if (!isolated) return 1;
+  const hc = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 2;
+  return Math.min(2, Math.max(1, hc));
+}
+export const VAD_NUM_THREADS = pickInitialNumThreads();
 export const VAD_SIMD = true;
 export const VAD_PROXY = false;
 
@@ -71,4 +94,60 @@ export function configureVadOrt(mod: unknown): string[] {
     }
   }
   return written;
+}
+
+/* Singleton vad-web import + ORT pin.
+ *
+ * Why: a fresh dynamic import always returns the same cached module
+ * record, but `configureVadOrt` mutates `mod.ort.env.wasm` and
+ * MicVAD.new triggers ORT's internal WASM compile/init. We do not
+ * want to re-walk that compile every time VoiceClient remounts (page
+ * nav, mic toggle, dev HMR), because each remount used to cost a
+ * fresh WASM instantiation and steadily grew the tab's heap until
+ * the next instantiation OOM'd.
+ *
+ * The singleton:
+ *   - Caches the module promise so repeated `getVadModule()` calls
+ *     share one in-flight load.
+ *   - Runs `configureVadOrt` exactly once. ORT keys its internal
+ *     WASM module cache by the env.wasm settings; keeping them
+ *     stable lets the underlying ort-wasm module instance be reused
+ *     across MicVAD.new calls instead of being torn down and
+ *     re-compiled on every remount.
+ *
+ * MicVAD instance itself is NOT cached here. Per-mount instances
+ * keep their own callbacks (onSpeechStart/End, runtime params), and
+ * a stale instance would fire handlers into a torn-down React tree.
+ * vad-web's destroy() releases the session but leaves the ORT
+ * module/WASM intact, which is the layer we want to keep warm. */
+let vadModulePromise: Promise<unknown> | null = null;
+let vadModuleConfigured = false;
+
+export async function getVadModule(): Promise<unknown> {
+  if (vadModulePromise) return vadModulePromise;
+  vadModulePromise = (async () => {
+    const mod = await import('@ricky0123/vad-web');
+    if (!vadModuleConfigured) {
+      configureVadOrt(mod);
+      vadModuleConfigured = true;
+    }
+    return mod;
+  })().catch((err) => {
+    /* Surface the load failure but clear the cache so the next
+     * retry attempt (VoiceErrorPill -> retry button) actually
+     * re-tries instead of resolving to the same rejected promise. */
+    vadModulePromise = null;
+    vadModuleConfigured = false;
+    throw err;
+  });
+  return vadModulePromise;
+}
+
+export function resetVadModuleCacheForTests(): void {
+  vadModulePromise = null;
+  vadModuleConfigured = false;
+}
+
+export function isVadModuleConfigured(): boolean {
+  return vadModuleConfigured;
 }

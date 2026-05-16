@@ -20,7 +20,7 @@ import {
 } from "@/lib/voice-wake-word";
 import { logWake } from "@/lib/wake-log";
 import { logVoice, computeReconnectBackoffMs } from "@/lib/voice-log";
-import { configureVadOrt } from "@/lib/voice-ort-config";
+import { getVadModule } from "@/lib/voice-ort-config";
 import { warmAudioContext } from "@/lib/voice-audio-warm";
 import { VoiceErrorPill } from "./VoiceErrorPill";
 
@@ -1808,27 +1808,16 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         }
         await initParallelCapture();
         try {
-          /* Dynamic import so the package only loads on /lex. */
-          const mod = await import("@ricky0123/vad-web");
+          /* Singleton load: getVadModule caches the dynamic import +
+           * the configureVadOrt pin, so VoiceClient remount (page
+           * nav, mic-mode toggle, dev HMR) reuses the ORT module
+           * record instead of forcing a fresh WASM
+           * compile/instantiate cycle. The previous behavior re-ran
+           * configureVadOrt on every mount; with the threaded WASM
+           * build the second remount would OOM the per-tab heap.
+           * See lib/voice-ort-config.ts. */
+          const mod = await getVadModule();
           if (cancelled) return;
-          /* Configure ONNX runtime so voice works on Tailscale-only
-           * / offline boxes with no internet egress + the
-           * single-thread SIMD pin lands on the ORT instance MicVAD
-           * actually uses.
-           *
-           * The previous version (commit 637ae73) did
-           * `import("onnxruntime-web")` and wrote env.wasm.* there.
-           * vad-web bundles its own copy via `import * as ort from
-           * "onnxruntime-web/wasm"` and re-exports it as the named
-           * `ort` export, so the pin landed on a sibling module
-           * record and never reached MicVAD. The threaded WASM
-           * build kept getting picked, SharedArrayBuffer was
-           * unavailable, and ORT cascaded into `no available
-           * backend found. ERR: [wasm] RangeError: Out of memory`.
-           *
-           * configureVadOrt mutates mod.ort.env.wasm directly. See
-           * lib/voice-ort-config.ts for the rationale. */
-          configureVadOrt(mod);
           /* Helper to ship the captured audio + finalize the utterance.
            * Used by both the natural VAD speech-end path and the
            * forced-finalize cap so the server-side handling stays the

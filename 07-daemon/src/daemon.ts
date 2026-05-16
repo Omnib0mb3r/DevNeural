@@ -687,6 +687,22 @@ async function main(): Promise<void> {
     done();
   });
 
+  /* Cross-origin isolation: COOP + COEP unlock SharedArrayBuffer in the
+   * dashboard tab, which onnxruntime-web's threaded WASM build needs to
+   * grow past the single-thread heap budget. Without these the VAD silero
+   * load cascades into `RangeError: Out of memory` on remount. CORP on
+   * every response keeps same-origin sub-resources (vad-web wasm/model,
+   * Next chunks, service worker, manifest) loadable under COEP
+   * require-corp. The dashboard makes no cross-origin requests; if any
+   * are added later they must ship CORP same-origin or cross-origin or
+   * they will be blocked. */
+  app.addHook('onSend', (_req, reply, payload, done) => {
+    reply.header('Cross-Origin-Opener-Policy', 'same-origin');
+    reply.header('Cross-Origin-Embedder-Policy', 'require-corp');
+    reply.header('Cross-Origin-Resource-Policy', 'same-origin');
+    done(null, payload);
+  });
+
   await registerDashboardRoutes(app, store, logger);
   app.get('/health', async () => ({
     ok: true,
