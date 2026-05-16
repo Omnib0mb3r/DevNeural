@@ -42,7 +42,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { randomUUID } from 'node:crypto';
 import type { WebSocket as FastifyWS } from '@fastify/websocket';
 import { transcribeWav, pcm16ToWav } from './whisper.js';
 import { synthesize, piperStatus } from './piper.js';
@@ -598,13 +597,16 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     /* Land an assistant turn into brainstorm_chunks the moment it
      * arrives so brainstorm_sessions.turn_count + the /lex/recall
      * retrieval surface track live conversation, not just the
-     * session-end backfill. Wrapped so a chunk insert failure cannot
-     * block the speak path. The pattern mirrors the user-side insert
-     * landed alongside this commit in handleUtteranceEnd. */
-    if (brainstormForFeedback?.id) {
+     * session-end backfill. Chunk id is the CC turn uuid so the
+     * brainstorm-jsonl-ingestor's next tick re-insert is a no-op
+     * via INSERT OR REPLACE. When the uuid is missing (rare race
+     * where the jsonl entry has not flushed) we skip; the ingestor
+     * will land the row on its tick. Wrapped so a chunk insert
+     * failure cannot block the speak path. */
+    if (brainstormForFeedback?.id && uuid) {
       try {
         getStore().db.insertBrainstormChunk({
-          id: uuid || randomUUID(),
+          id: uuid,
           brainstorm_id: brainstormForFeedback.id,
           turn_index: getStore().db.nextTurnIndex(brainstormForFeedback.id),
           role: 'lex',
@@ -1000,35 +1002,13 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         if (consentOk) {
           appendSessionAudio(bs.id, pcm, 16000);
         }
-        /* Land the user turn into brainstorm_chunks immediately so the
-         * session's turn_count + /lex/recall surface track live
-         * conversation rather than waiting on the session-end pipeline.
-         * Empty transcripts are skipped further below; we mirror that
-         * here so we don't store noise rows. */
-        if (result.text.trim()) {
-          try {
-            const bsMode = (bs as { mode?: string }).mode;
-            const stateMode = state.mode;
-            const mode: 'conversation' | 'notes' | 'push-to-talk' =
-              bsMode === 'notes' || bsMode === 'push-to-talk'
-                ? bsMode
-                : stateMode === 'notes' || stateMode === 'push-to-talk'
-                  ? stateMode
-                  : 'conversation';
-            getStore().db.insertBrainstormChunk({
-              id: randomUUID(),
-              brainstorm_id: bs.id,
-              turn_index: getStore().db.nextTurnIndex(bs.id),
-              role: 'user',
-              mode,
-              text: result.text,
-              model_id: '',
-              no_decay: 1,
-            });
-          } catch {
-            /* chunk insert is observational; never block the turn */
-          }
-        }
+        /* User-turn chunk insert moved into brainstorm-jsonl-ingestor.
+         * Previously this block wrote a brainstorm_chunks row keyed on
+         * a fresh randomUUID, which produced a duplicate alongside the
+         * ingestor's deterministic id (= cc turn uuid). The ingestor
+         * runs every 5s and walks the same jsonl on the next tick, so
+         * the lag for /lex/recall is bounded but the transcript stream
+         * stays a single coherent artifact across voice + typed input. */
       }
     } catch {
       /* audio bundle is observational; never block the turn */

@@ -408,6 +408,31 @@ async function main(): Promise<void> {
     distillBackfillTimer.unref();
   }
 
+  /* Brainstorm jsonl ingestor. Tails every active brainstorm
+   * session's CC jsonl and lands each user / assistant turn into
+   * brainstorm_chunks. Single source of truth so typed-textarea
+   * inputs land alongside voice STT in the same transcript stream
+   * with proper turn ordering + speaker tagging. Idempotent via
+   * deterministic chunk id (= cc turn uuid) + INSERT OR REPLACE on
+   * the brainstorm_chunks primary key, so concurrent writes from
+   * the voice WS path are no-ops rather than duplicates. */
+  try {
+    const { startBrainstormJsonlIngestor } = await import(
+      './lex/brainstorm-jsonl-ingestor.js'
+    );
+    startBrainstormJsonlIngestor({
+      deps: {
+        db: store.db,
+        log: logger,
+      },
+    });
+    logger('brainstorm-jsonl-ingestor: started');
+  } catch (err) {
+    logger(
+      `brainstorm-jsonl-ingestor bootstrap failed: ${(err as Error).message}`,
+    );
+  }
+
   /* Smart-compact scheduler. Walks every live project_session anchor,
    * runs evaluateSmartCompact, and fires the resulting fire/wrap
    * through fireSmartCompact. Global toggle
