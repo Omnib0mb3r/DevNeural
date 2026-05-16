@@ -749,31 +749,14 @@ export function buildLexSystemPrompt(
   return buildLexSystemPromptVersioned(opts).prompt;
 }
 
-export function buildLexSystemPromptVersioned(
-  opts: BuildLexSystemPromptOptions = {},
-): BuildLexSystemPromptResult {
-  const mode = opts.mode ?? 'conversation';
-  const archive = opts.archive !== false;
-  const ts = new Date().toISOString();
-  const snapshot = `# Live snapshot (as of ${ts})
-
-This is the head-start so you do not have to ask "what are we
-working on" every time Michael says hi. Stale the moment it is
-rendered; for current state, hit GET /health, GET /sessions,
-GET /reminders, GET /lex/anchors, or GET /lex/snapshot.
-
-## Registered projects
-${snapshotProjects()}
-
-## Active Claude Code sessions
-${snapshotSessions()}
-
-## Open reminders
-${snapshotReminders()}
-
-## Recent wiki pages
-${snapshotRecentWiki()}
-`;
+/* Assemble the stable (snapshot-free) prompt body for a given
+ * mode. Stable means the section ordering and content that
+ * participates in the version hash. The live snapshot is appended
+ * by buildLexSystemPromptVersioned afterwards; backfill callers
+ * skip the snapshot and write only this body. */
+export function buildLexSystemPromptStable(
+  mode: 'conversation' | 'push-to-talk' | 'notes' = 'conversation',
+): string {
   const fewShot = loadFewShot(mode);
   const refusalBlocks: string[] = [loadRefusalContract()];
   if (mode === 'notes') refusalBlocks.push(loadRefusalContractMeeting());
@@ -805,12 +788,39 @@ ${snapshotRecentWiki()}
     SELF_CHECK,
     refusalBlocks.join('\n\n'),
     fewShot,
-    snapshot,
   ];
+  return layers.join('\n\n');
+}
+
+export function buildLexSystemPromptVersioned(
+  opts: BuildLexSystemPromptOptions = {},
+): BuildLexSystemPromptResult {
+  const mode = opts.mode ?? 'conversation';
+  const archive = opts.archive !== false;
+  const ts = new Date().toISOString();
+  const snapshot = `# Live snapshot (as of ${ts})
+
+This is the head-start so you do not have to ask "what are we
+working on" every time Michael says hi. Stale the moment it is
+rendered; for current state, hit GET /health, GET /sessions,
+GET /reminders, GET /lex/anchors, or GET /lex/snapshot.
+
+## Registered projects
+${snapshotProjects()}
+
+## Active Claude Code sessions
+${snapshotSessions()}
+
+## Open reminders
+${snapshotReminders()}
+
+## Recent wiki pages
+${snapshotRecentWiki()}
+`;
   /* Snapshot section drifts every call (timestamp + live state); it
    * must NOT participate in the version hash or the archive grows
    * one row per spawn. Hash everything BEFORE the snapshot. */
-  const stable = layers.slice(0, -1).join('\n\n');
+  const stable = buildLexSystemPromptStable(mode);
   const prompt = `${stable}\n\n${snapshot}`;
   let version = 'unarchived';
   if (archive) {

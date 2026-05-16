@@ -1145,6 +1145,27 @@ async function main(): Promise<void> {
     logger(`dashboard-supervisor bootstrap failed: ${(err as Error).message}`);
   }
 
+  /* Prompt-archive backfill (step 20 / LX-1). On a fresh checkout the
+   * <data>/lex-prompts directory is empty and the A/B replay harness
+   * (step 21) has no baseline to compare against. Walk the canonical
+   * modes once at boot so every mode has at least one archived body
+   * before the first Lex session spawns. On an already-primed install
+   * every call is a hash-dedup no-op. Observational: any failure is
+   * logged and swallowed because prompt assembly handles its own
+   * archive writes during real session spawns. */
+  try {
+    const { backfillPromptVersions } = await import('./lex/prompt-archive.js');
+    const { buildLexSystemPromptStable } = await import('./lex/system-prompt.js');
+    const r = backfillPromptVersions((mode) => buildLexSystemPromptStable(mode));
+    logger(
+      `prompt-archive backfill: written=${r.written} skipped=${r.skipped}${
+        r.errors.length ? ' errors=' + r.errors.join('; ') : ''
+      }`,
+    );
+  } catch (err) {
+    logger(`prompt-archive backfill failed: ${(err as Error).message}`);
+  }
+
   /* Periodic auto-ingest tick. Catches activity that didn't produce a
    * hook signal (background work, idle sessions that left chunks in the
    * transcript). Default 5 min; tunable via env. The brain stays current
