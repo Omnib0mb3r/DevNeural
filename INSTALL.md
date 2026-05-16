@@ -64,13 +64,13 @@ This is the short version. The detailed steps are in `04-step-by-step.md` and th
 [ ]   code --install-extension devneural-bridge.vsix
 [ ] cd 07-daemon && npm run install-backup-task # CRITICAL — your data root is irreplaceable
 [ ] cd 07-daemon && npm run start               # daemon on :3747; dashboard at /
-[ ] Open http://localhost:3747, set a PIN, verify the home view loads
+[ ] Open http://localhost:3747, verify the home view loads
 [ ] Verify: npm run status returns all green or actionable warnings
 [ ] Optional: install Tailscale on phone + sign into same tailnet (docs/install/TAILSCALE.md)
 [ ] Optional: install whisper.cpp + ffmpeg for audio/video (docs/install/AUDIO-VIDEO.md)
 ```
 
-For the full ship gate (auth, backup, push, hooks, PWA, etc.), walk [`../SHIP-CHECKLIST.md`](../SHIP-CHECKLIST.md) before declaring production-ready.
+For the full ship gate (backup, push, hooks, PWA, etc.), walk [`../SHIP-CHECKLIST.md`](../SHIP-CHECKLIST.md) before declaring production-ready.
 
 ---
 

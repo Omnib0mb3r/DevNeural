@@ -51,17 +51,15 @@ Dashboard binds to `0.0.0.0:7474` on `OTLCDEV`. Tailscale handles the rest:
 
 No public exposure. No reverse proxy. No certificates to renew. No DDNS.
 
-### 3.2 PIN unlock
+### 3.2 PIN unlock (removed 2026-05-15)
 
-Tailscale handles "is this device allowed?" The PIN handles "is this *person* on the device allowed?" Threat model: someone picks up your unlocked phone.
-
-- 6-digit PIN, hashed with bcrypt, stored at `c:/dev/data/skill-connections/dashboard/auth.json`.
-- First boot: dashboard prompts you to set the PIN.
-- Successful unlock issues a signed session token (HttpOnly, SameSite=Lax cookie). Token TTL: 12 hours of inactivity, refresh on use.
-- `Reset PIN` is a CLI command (`npm run dashboard:reset-pin`) that requires local shell access on `OTLCDEV`.
-- Lockout: 5 wrong PINs in 60 seconds locks the dashboard for 5 minutes.
-
-Not per-device. The PIN is yours, it travels.
+The PIN gate was removed. Trust now lives entirely at the network layer
+(localhost / Tailscale binding). The locked indicator never reached the
+renderer (the daemon refused to push state while locked) and the gate
+blocked Chrome DevTools / Playwright MCP from auditing the dashboard, so
+the layer cost more than it bought. The dashboard HMAC secret persists
+at `dashboard/auth.json` (read-only consumer: cross-session prompt
+injection), but no PIN, cookie, or lockout state is stored.
 
 ### 3.3 What's NOT in scope for v1
 
@@ -553,7 +551,7 @@ The dashboard should feel like a tool a senior engineer keeps open all day. Not 
 | Icons | Lucide | Clean, consistent |
 | Backend | Existing 07-daemon (Fastify) extended | One process, less surface area |
 | WebSocket | `@fastify/websocket` (already installed) for real-time events | Same daemon, single port |
-| Auth | Lucia or hand-rolled (PIN + bcrypt + signed cookie) | Simple. No third-party. |
+| Auth | None at app layer; trust via host-binding (localhost / Tailscale) | Simpler than a PIN, and the PIN gate blocked tooling like Chrome DevTools / Playwright MCP. |
 | File upload | `@fastify/multipart` | Streaming uploads, progress |
 | Document processing | `pdf-parse`, `tesseract.js`, `whisper-node` (whisper.cpp wrapper), `ffmpeg-static`, `mammoth` | All local, no API |
 | Push notifications | `web-push` | Standard VAPID flow |
@@ -571,7 +569,7 @@ The dashboard should feel like a tool a senior engineer keeps open all day. Not 
 
 ### 10.2 What NOT to use
 
-- No server-side authentication providers (NextAuth/Auth.js): overkill for a single-user PIN-locked dashboard.
+- No server-side authentication providers (NextAuth/Auth.js): trust is host-binding via Tailscale, the dashboard is single-user and never internet-exposed.
 - No external database: all state lives in the daemon's existing SQLite + filesystem.
 - No paid services anywhere (no Vercel hosting, no Pinecone, no Supabase). Self-hosted on `OTLCDEV`.
 - No remote MCP servers in production. Magic MCP and Figma MCP are dev-time tools used to iterate the UI; they don't ship.
@@ -614,12 +612,10 @@ POST /notifications/subscribe       # web push subscription
 
 GET  /services                      # service status manifest
 
-POST /auth/pin                      # set PIN (first run)
-POST /auth/unlock                   # unlock with PIN, set cookie
-POST /auth/lock                     # log out
+POST /auth/cross-session-token      # short-lived HMAC for cross-session prompt injection
 ```
 
-All write endpoints require the auth cookie. Read endpoints also require it (single user, simpler).
+No app-level auth gate. Trust is host-binding (localhost / Tailscale).
 
 ---
 
@@ -634,7 +630,7 @@ c:/dev/Projects/DevNeural/
     src/
       ...
       dashboard/                    # NEW: dashboard-specific server logic
-        auth.ts                     # PIN, cookie, lockout
+        auth-secret.ts              # HMAC secret store (cross-session injection)
         daily-brief.ts              # generation + caching
         system-metrics.ts           # OS metrics
         services.ts                 # status manifest checker
@@ -687,7 +683,6 @@ c:/dev/Projects/DevNeural/
       project-grid/
       session-detail/
       upload-modal/
-      pin-prompt/
       ...
     lib/
       daemon-client.ts              # fetch wrapper, WS wrapper
@@ -714,7 +709,7 @@ c:/dev/Projects/DevNeural/
 c:/dev/data/skill-connections/
   ...                               # existing stuff
   dashboard/                        # NEW
-    auth.json                       # PIN hash + lockout state
+    auth.json                       # HMAC secret (cross-session injection); legacy PIN fields stripped on read
     notifications.jsonl
     reminders.jsonl
     push-subscriptions.jsonl
@@ -738,10 +733,10 @@ Phase 3 is large. Sub-phases so each is shippable.
 
 | # | Sub-phase | Scope | Verifies |
 |---|---|---|---|
-| 3.1 | **Daemon API extensions** | New routes (no UI yet): /dashboard/*, /sessions, /projects/new, /reference upload + process, /search/all, /reminders, /notifications, /services, /auth | Curl every endpoint, returns sensible data |
+| 3.1 | **Daemon API extensions** | New routes (no UI yet): /dashboard/*, /sessions, /projects/new, /reference upload + process, /search/all, /reminders, /notifications, /services | Curl every endpoint, returns sensible data |
 | 3.2 | **Reference corpus pipeline** | Upload → extract → chunk → embed → store, for PDF + image. Audio/video deferred to 3.5 | Upload a real PDF, search returns relevant chunks |
 | 3.3 | **Session bridge (09-bridge)** | VS Code extension that receives daemon messages and pastes into terminal. Focus-window action | Send "echo hello" from curl to a running session, see it appear and execute |
-| 3.4 | **Dashboard scaffold (08-dashboard)** | Next.js app, Tailwind + shadcn, PIN auth, daemon-client wrapper, layout shell, all pages stubbed with real data wiring | Open in browser, unlock, see real data populated everywhere |
+| 3.4 | **Dashboard scaffold (08-dashboard)** | Next.js app, Tailwind + shadcn, daemon-client wrapper, layout shell, all pages stubbed with real data wiring | Open in browser, see real data populated everywhere |
 | 3.5 | **Audio + video processing** | whisper.cpp + ffmpeg, video frame sampling | Upload a video, transcript appears in search |
 | 3.6 | **Stream Deck + session detail** | Polished left rail + per-session steering panel, send prompt works end to end | Tap a session card on phone, type a prompt, watch the host machine's session receive it |
 | 3.7 | **Notifications + reminders + push** | In-dashboard banners, web push subscription, reminder CRUD, alert routing | Set a reminder for 1 minute from now, get a push on the phone |
@@ -779,7 +774,7 @@ Phase 3 is large. Sub-phases so each is shippable.
 
 11. **Authentication for the WebSocket.** Token in subprotocol or in a query param? Both work. Decide.
 
-12. **PIN reset workflow if you forget it.** Local CLI command on `OTLCDEV`. No remote reset (security).
+12. ~~**PIN reset workflow if you forget it.**~~ Resolved: PIN removed entirely 2026-05-15. Trust is host-binding (localhost / Tailscale).
 
 ---
 
