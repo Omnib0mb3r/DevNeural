@@ -95,16 +95,61 @@ export interface InjectResult {
 }
 
 /**
+ * Test seams + tunables for crossSessionInject. The defaults wire up
+ * the real PTY host, bridge writer, and setTimeout-based scheduler;
+ * tests pass stubs so the inject path can be exercised without a
+ * live PTY or a live VS Code bridge.
+ */
+export interface CrossSessionInjectDeps {
+  listPtys?: typeof listPtys;
+  ptyInject?: typeof ptyInject;
+  queueSessionPrompt?: typeof queueSessionPrompt;
+  queueSessionSuggestion?: typeof queueSessionSuggestion;
+  /** Schedule the bare-CR nudge after the primary inject. Default
+   * is setTimeout with .unref() so a daemon shutdown is not held
+   * open by pending timers. */
+  scheduleCommit?: (fn: () => void, delayMs: number) => void;
+  /** Delay between primary inject and the bare-CR nudge. The
+   * default sits in the middle of the bracketed-paste settle
+   * window observed on the bridge VSIX path (~750-1000ms). */
+  commitDelayMs?: number;
+}
+
+const DEFAULT_COMMIT_DELAY_MS = 850;
+
+function defaultScheduleCommit(fn: () => void, delayMs: number): void {
+  const t = setTimeout(fn, delayMs);
+  if (typeof (t as { unref?: () => void }).unref === 'function') {
+    (t as { unref: () => void }).unref();
+  }
+}
+
+/**
  * Attempt a cross-session injection.  Always writes an audit row to db.
  * Never throws; errors are returned in InjectResult.
+ *
+ * After a successful primary inject, schedules a bare CR through the
+ * SAME transport ~850 ms later so the worker's input box submits
+ * even when the bridge VSIX strips the trailing CR off the bracketed
+ * paste. The CR nudge is fire-and-forget; its outcome is not
+ * surfaced in the returned InjectResult. The audit row covers the
+ * primary inject only.
  */
 export function crossSessionInject(
   req: InjectRequest,
   db: IndexDb,
+  deps?: CrossSessionInjectDeps,
 ): InjectResult {
   const { target_session, token, text, caller_label, commit = true } = req;
   const text_preview = text.slice(0, 120);
   const text_length = text.length;
+  const listPtysFn = deps?.listPtys ?? listPtys;
+  const ptyInjectFn = deps?.ptyInject ?? ptyInject;
+  const queueSessionPromptFn = deps?.queueSessionPrompt ?? queueSessionPrompt;
+  const queueSessionSuggestionFn =
+    deps?.queueSessionSuggestion ?? queueSessionSuggestion;
+  const scheduleCommit = deps?.scheduleCommit ?? defaultScheduleCommit;
+  const commitDelayMs = deps?.commitDelayMs ?? DEFAULT_COMMIT_DELAY_MS;
 
   function audit(
     decision: InjectResult['decision'],
@@ -154,18 +199,34 @@ export function crossSessionInject(
    * (faster, no bridge round-trip). Falls through to the bridge
    * marker-drop path for sessions launched outside daemon-owned
    * spawns (e.g. dashboard "Sessions" button → VS Code terminal). */
-  const ptys = listPtys();
+  const ptys = listPtysFn();
   const live = ptys.find(
     (p) => !p.exited && (p.ptyId === target_session || p.sessionId === target_session),
   );
   if (live) {
-    const injectResult = ptyInject(live.ptyId, text, commit);
+    const injectResult = ptyInjectFn(live.ptyId, text, commit);
     if (!injectResult.ok) {
       const reason = (injectResult as { ok: false; error: string }).error;
       audit('rejected_pty', reason);
       return { ok: false, decision: 'rejected_pty', error: reason };
     }
     audit('accepted');
+    /* Auto-CR nudge. Some workers attached over the daemon-owned PTY
+     * still leave the input box without a submit after the primary
+     * inject; firing a bare CR through the same channel settles
+     * that without needing an external poker. commit=false on the
+     * nudge so the underlying ptyInject does not double-append a
+     * second CR onto the already-CR-terminated text. */
+    if (commit) {
+      scheduleCommit(() => {
+        try {
+          ptyInjectFn(live.ptyId, '\r', false);
+        } catch {
+          /* nudge is fire-and-forget; primary inject already
+           * succeeded so a CR failure does not fail the caller. */
+        }
+      }, commitDelayMs);
+    }
     return { ok: true, decision: 'accepted', transport: 'pty' };
   }
 
@@ -174,8 +235,8 @@ export function crossSessionInject(
    * a UUID prefix or full UUID — the same shape sessions.ts resolves
    * via .claude jsonl scan. */
   const bridgeResult = commit
-    ? queueSessionPrompt(target_session, text)
-    : queueSessionSuggestion(target_session, text);
+    ? queueSessionPromptFn(target_session, text)
+    : queueSessionSuggestionFn(target_session, text);
   if (!bridgeResult.ok) {
     audit(
       'rejected_pty',
@@ -189,6 +250,23 @@ export function crossSessionInject(
   }
 
   audit('accepted');
+  /* Auto-CR nudge through the bridge transport. The VS Code bridge
+   * VSIX delivers the primary text via bracketed paste, which the
+   * worker treats as a multi-character paste that does NOT include
+   * the trailing CR -- so the text sits in the input box and Enter
+   * never fires. A second bridge entry carrying just '\r' goes
+   * through as a one-character paste and is interpreted as a
+   * submit. ~850 ms gives the bridge time to drain the first entry
+   * before the second one lands. */
+  if (commit) {
+    scheduleCommit(() => {
+      try {
+        queueSessionPromptFn(target_session, '\r');
+      } catch {
+        /* nudge is fire-and-forget */
+      }
+    }, commitDelayMs);
+  }
   return { ok: true, decision: 'accepted', transport: 'bridge' };
 }
 
