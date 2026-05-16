@@ -6,6 +6,7 @@ import { PanicAuditPanel } from "@/components/PanicAuditPanel";
 import { SmartCompactAuditPanel } from "@/components/SmartCompactAuditPanel";
 import { SmartCompactPanel } from "@/components/SmartCompactPanel";
 import { LexColdStartPreloadPanel } from "@/components/LexColdStartPreloadPanel";
+import { AutoAdvanceModePanel } from "@/components/AutoAdvanceModePanel";
 import { VoiceDiagnosticsPanel } from "@/components/VoiceDiagnosticsPanel";
 
 export default function SystemPage() {
@@ -20,6 +21,7 @@ export default function SystemPage() {
         <PanicAuditPanel />
         <SmartCompactPanel />
         <SmartCompactAuditPanel />
+        <AutoAdvanceModePanel />
         <LintFindingsPanel />
       </div>
     </AppShell>

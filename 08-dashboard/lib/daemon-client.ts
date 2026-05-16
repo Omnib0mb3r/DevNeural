@@ -1505,6 +1505,57 @@ export const recentSmartCompacts = (limit: number = 20) =>
     `/lex/smart-compact/recent?limit=${limit}`,
   );
 
+// ── Auto-advance supervisor runtime toggle (phase 4) ────────────
+export type AutoAdvanceMode = "off" | "shadow" | "live";
+
+export interface AutoAdvanceToggle {
+  ok: boolean;
+  mode: AutoAdvanceMode;
+  runtime_value: string | null;
+  env_value: string | null;
+  default_mode: AutoAdvanceMode;
+}
+export const autoAdvanceToggle = () =>
+  request<AutoAdvanceToggle>(`/lex/auto-advance/toggle`);
+export const setAutoAdvanceToggle = (mode: AutoAdvanceMode) =>
+  request<AutoAdvanceToggle>(`/lex/auto-advance/toggle`, {
+    method: "POST",
+    body: { mode },
+  });
+
+export interface AutoAdvanceLogRow {
+  id: string;
+  created_at: string;
+  anchor_id: string | null;
+  turn_uuid: string | null;
+  item_id: string | null;
+  mode: AutoAdvanceMode;
+  decision: "shadow" | "would-inject" | "accepted" | "skip" | "error";
+  reason: string | null;
+  would_inject_preview: string | null;
+  footer_status: string | null;
+  footer_needs_attention: number | null;
+  epoch: number | null;
+}
+export const recentAutoAdvance = (
+  opts: {
+    limit?: number;
+    anchor_id?: string;
+    mode?: AutoAdvanceMode;
+    decision?: AutoAdvanceLogRow["decision"];
+  } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  if (opts.anchor_id) qs.set("anchor_id", opts.anchor_id);
+  if (opts.mode) qs.set("mode", opts.mode);
+  if (opts.decision) qs.set("decision", opts.decision);
+  const q = qs.toString();
+  return request<{ ok: boolean; rows: AutoAdvanceLogRow[] }>(
+    `/lex/auto-advance/recent${q ? `?${q}` : ""}`,
+  );
+};
+
 // ── Smart-compact runtime toggle ────────────────────────────────
 export type SmartCompactMode = "off" | "shadow" | "live";
 

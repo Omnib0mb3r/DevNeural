@@ -403,3 +403,157 @@ brainstorm" without queuing 50 LLM calls.
 `cross_session_injection_log` grouped by `caller_label` is the
 single highest-signal table for "who injected what when" across
 every pipeline above.
+
+---
+
+## 7. Auto-advance supervisor (Lex-cron handoff)
+
+Phase 4 of the autonomous supervisor pipeline. The daemon-side loop
+replaces Lex's heuristic auto-advance for the clean-idle-done case.
+Lex keeps every judgment branch (worker rebuts, options, blocked,
+needs_input, needs_attention); the daemon only takes over the
+straightforward path where the worker said `status=done` and asked
+for nothing in return.
+
+### What the loop does
+
+Every tick (default 30s, env
+`DEVNEURAL_AUTO_ADVANCE_INTERVAL_MS`), for each project anchor
+with `supervision_mode='event'` and runtime
+`auto_advance_mode` in `(shadow, live)`:
+
+1. Read the worker's CC jsonl tail. Pull the last assistant
+   message.
+2. Quiescence gate: no trailing `tool_use`, PTY idle for at
+   least 5s, the SAME `assistant turn uuid` observed across
+   two consecutive ticks.
+3. Footer gate: `parseWorkerStatusFooter` on the terminal
+   text. Hard require `status=done`, `needs_input=false`,
+   `needs_attention=false`. Absence of a footer is a no-go.
+4. Idempotency gate: refuse to fire twice on the same
+   assistant turn uuid (per-anchor in-memory state). Double-
+   fire raises a `voice-alert` of kind `double-fire`.
+5. Atomic claim: `claimBacklogItem` against `lex_backlog_items`
+   keyed on `(anchor_id, turn_uuid)`.
+6. Lease bump: `bumpAutoAdvanceLease` increments
+   `project_session.auto_advance_epoch` so a second
+   supervisor process is fenced.
+7. Mode branch:
+   - `shadow` → write `auto_advance_log` row with
+     `decision='shadow'` + `would_inject_preview`. No inject.
+   - `live` → write `auto_advance_log` row with
+     `decision='accepted'` AND invoke `crossSessionInject`
+     with `caller_label='auto-supervisor'`,
+     `target_session=anchor.current_session_id`, `commit=true`.
+
+Every gate failure lands in `auto_advance_log` with
+`decision='skip'` + a typed `reason` (`awaiting-stability`,
+`trailing-tool-use`, `pty-still-active`, `no-footer`,
+`status-needs_input`, `status-blocked`, `status-in_progress`,
+`needs-attention`, `already-advanced-this-turn`,
+`backlog-empty`, `claim-already-claimed`, `lease-contention`,
+`no-current-session`, `live-injector-not-wired`). Reviewer
+queries:
+
+```sql
+SELECT decision, reason, COUNT(*) FROM auto_advance_log
+  WHERE created_at > datetime('now','-1 hour')
+  GROUP BY decision, reason
+  ORDER BY 3 DESC;
+```
+
+### Runtime kill-switch (three-state)
+
+`runtime_config.auto_advance_mode`:
+
+- `off` (default) — loop dormant. No quiescence eval, no
+  audit rows.
+- `shadow` — loop runs, every clean-idle-done turn writes a
+  `decision='shadow'` row + `would_inject_preview`. No
+  `crossSessionInject`.
+- `live` — loop runs and fires `crossSessionInject` on every
+  clean-idle-done turn.
+
+Flip via the dashboard `/system` page (AutoAdvanceModePanel
+mirrors SmartCompactPanel) or via curl:
+
+```bash
+curl -X POST http://localhost:3747/lex/auto-advance/toggle \
+  -H 'content-type: application/json' \
+  -d '{"mode":"live","updated_by":"operator"}'
+```
+
+Flip takes effect on the next tick; no daemon restart.
+
+### Audit endpoint
+
+`GET /lex/auto-advance/recent?limit=50&decision=&mode=&anchor_id=`
+returns the most recent log rows for the dashboard panel and for
+post-mortem review.
+
+### Handoff from the Lex-side cron
+
+Lex used to run its own heuristic auto-advance: every N seconds
+it polled `/sessions/:id` for the worker session, applied
+prose-shaped checks ("looks done?", "looks idle?", "no question
+marks?"), and fired a manual cross-session inject. This was the
+Codex review's core complaint: prose heuristics are not a control
+plane.
+
+After Phase 1 (worker footer protocol + parser) and Phase 2
+(sqlite backlog with atomic claim), Phase 3 built the daemon-side
+loop and ran it in shadow for at least one productive session.
+With shadow output reviewed and the audit log clean, Phase 4
+explicitly stops the Lex-side cron for the DevNeural anchor:
+
+> **Action: Lex stops the Claude-side supervision cron for
+> brainstorm `4bbafb48-bbfd-47e6-b076-e1a58a334303`.** No more
+> heuristic polling on the worker session id
+> `f98dd3b5-d41a-4a13-87f2-992421b6d527`; the daemon's
+> auto-advance loop is the canonical owner of the
+> clean-idle-done path. Lex still handles every judgment
+> branch (worker rebuts, options, disagreement,
+> `status=needs_input`, `needs_attention=true`) because the
+> daemon loop hard-gates on `status=done AND
+> needs_input=false AND needs_attention=false`.
+
+How to drop a Lex cron: from the brainstorm Lex prompt,
+acknowledge the handoff and stop scheduling the heuristic poll.
+On future sessions the worker handoff doc (the SessionStart
+additionalContext block built by `src/lex/worker-handoff.ts`)
+already carries the `WORKER_STATUS_FOOTER_TEMPLATE` reminder so
+the worker emits the machine-parsable footer on every terminal
+turn. No code changes needed Lex-side; the cron is decided by
+Lex's own routine, which is now told via this doc that the
+daemon owns the path.
+
+### Voice-alert escalations
+
+The supervisor surfaces four escalations through a
+`VoiceAlertSink` dep:
+
+- `claim-ok-inject-failed` — backlog claim succeeded but the
+  subsequent `crossSessionInject` returned non-ok. Backlog row
+  is left in-flight; operator must investigate.
+- `accepted-no-user-turn` — inject accepted but no new user
+  turn arrived within the timeout window. Reserved for the
+  follow-up phase that wires turn-detection.
+- `double-fire` — supervisor tried to advance the same
+  assistant turn uuid twice. The idempotency gate blocked it;
+  alert exists so operators see the race.
+- `kill-switch` — operator-driven hard stop. Implemented in the
+  next phase.
+
+Phase 4 leaves the sink unwired in production (the daemon
+bootstrap does not pass `voiceAlert`); a future phase plugs it
+into `logVoice` + push notifications.
+
+### Symptom-first debug table
+
+| Symptom | First check |
+|---|---|
+| Panel reads `mode=off` after flipping | `getRuntimeConfig('auto_advance_mode')` vs env override |
+| Loop runs but never advances | `auto_advance_log` decision=skip rows + reason column |
+| Live mode silent on a known idle worker | confirm footer landed via `parseWorkerStatusFooter` + check `awaiting-stability` reason (needs two consecutive ticks) |
+| Same item fires twice | `claimed_turn_uuid` in `lex_backlog_items` + `already-advanced-this-turn` log |
+| Concurrent daemons fight | `auto_advance_epoch` mismatches; `lease-contention` rows |

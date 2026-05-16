@@ -4256,6 +4256,90 @@ export async function registerDashboardRoutes(
     };
   });
 
+  /* Auto-advance supervisor toggle (autonomous supervisor phase 4).
+   *
+   * Three-state runtime kill-switch backing the auto-advance loop.
+   * Reads + writes runtime_config so the flip takes effect on the
+   * next tick without a daemon restart. Mirrors the shape of
+   * /lex/smart-compact/toggle so the dashboard panel can be a
+   * near-clone of SmartCompactPanel.
+   *
+   * GET response: { ok, mode, runtime_value, env_value, default_mode } */
+  app.get('/lex/auto-advance/toggle', async () => {
+    const { AUTO_ADVANCE_CONFIG_KEY, getAutoAdvanceMode } = await import(
+      '../lex/auto-advance-supervisor.js'
+    );
+    const runtimeValue = store.db.getRuntimeConfig(AUTO_ADVANCE_CONFIG_KEY);
+    const envValue = process.env.DEVNEURAL_AUTO_ADVANCE_MODE ?? null;
+    return {
+      ok: true,
+      mode: getAutoAdvanceMode(store.db),
+      runtime_value: runtimeValue,
+      env_value: envValue,
+      default_mode: 'off',
+    };
+  });
+
+  app.post('/lex/auto-advance/toggle', async (req, reply) => {
+    const { AUTO_ADVANCE_CONFIG_KEY, getAutoAdvanceMode, parseAutoAdvanceMode } =
+      await import('../lex/auto-advance-supervisor.js');
+    const body = (req.body ?? {}) as {
+      mode?: string;
+      updated_by?: string;
+    };
+    const next = parseAutoAdvanceMode(body.mode);
+    if (!next) {
+      reply.code(400);
+      return {
+        ok: false,
+        error: "mode must be 'off' | 'shadow' | 'live'",
+      };
+    }
+    store.db.setRuntimeConfig(
+      AUTO_ADVANCE_CONFIG_KEY,
+      next,
+      body.updated_by,
+    );
+    log(
+      `[auto-advance] mode -> ${next} by=${body.updated_by ?? 'unknown'}`,
+    );
+    return {
+      ok: true,
+      mode: getAutoAdvanceMode(store.db),
+      runtime_value: store.db.getRuntimeConfig(AUTO_ADVANCE_CONFIG_KEY),
+      env_value: process.env.DEVNEURAL_AUTO_ADVANCE_MODE ?? null,
+      default_mode: 'off',
+    };
+  });
+
+  /* Recent auto-advance log rows for post-mortem review. Mirrors
+   * /lex/smart-compact/recent so the dashboard panel can paginate
+   * a tidy table of every decision the loop has made. */
+  app.get('/lex/auto-advance/recent', async (req) => {
+    const q = (req.query ?? {}) as {
+      anchor_id?: string;
+      mode?: string;
+      decision?: string;
+      limit?: string;
+    };
+    const limit = q.limit ? Math.min(200, Math.max(1, Number(q.limit))) : 50;
+    return {
+      ok: true,
+      rows: store.db.listAutoAdvanceLog({
+        anchor_id: q.anchor_id,
+        mode: q.mode as 'off' | 'shadow' | 'live' | undefined,
+        decision: q.decision as
+          | 'shadow'
+          | 'would-inject'
+          | 'accepted'
+          | 'skip'
+          | 'error'
+          | undefined,
+        limit,
+      }),
+    };
+  });
+
   /* Lex backlog REST surface (autonomous supervisor phase 2).
    *
    * Migration 026 created lex_backlog_items; backlog-store.ts owns
