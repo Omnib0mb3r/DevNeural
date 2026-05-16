@@ -30,7 +30,7 @@
 
 import * as crypto from 'node:crypto';
 import { randomUUID } from 'node:crypto';
-import { getAuthSecret } from '../dashboard/auth.js';
+import { getAuthSecret } from '../dashboard/auth-secret.js';
 import { ptyInject, listPtys } from '../dashboard/pty-host.js';
 import { queueSessionPrompt, queueSessionSuggestion } from '../dashboard/sessions.js';
 import type { IndexDb } from '../store/index-db.js';

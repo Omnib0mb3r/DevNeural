@@ -3,7 +3,10 @@
  *
  * One function that wires every Phase 3 endpoint onto the existing
  * Fastify instance owned by the daemon. Auth middleware applied to
- * every route except the small public set in auth.ts.
+ * No auth gate: dashboard binds to localhost/Tailscale, trust is at the
+ * network layer. The /auth/cross-session-token endpoint below issues
+ * short-lived HMACs for prompt-injection and is the only remaining
+ * remnant of the old auth surface.
  */
 import type { FastifyInstance } from 'fastify';
 import type { MultipartFile } from '@fastify/multipart';
@@ -20,7 +23,6 @@ import {
   brainstormAudioFile,
   brainstormCuesFile,
 } from '../paths.js';
-import { authMiddleware, registerAuthRoutes, isPinSet } from './auth.js';
 import { triggerShutdown, hasShutdownHook } from '../lifecycle/shutdown-hook.js';
 import { ReferenceStore } from '../reference/store.js';
 import { ingestUpload } from '../reference/process.js';
@@ -224,20 +226,12 @@ export async function registerDashboardRoutes(
     }
   }, 30_000);
 
-  // Auth middleware on every request before route handlers
-  app.addHook('preHandler', (req, reply, done) => {
-    authMiddleware(req, reply, done);
-  });
-
-  registerAuthRoutes(app);
-
   // ── Dashboard surface ─────────────────────────────────────────────
   app.get('/dashboard/health', async () => {
     const metrics = await getSystemMetrics();
     const services = await checkAll();
     return {
       ok: true,
-      pin_set: isPinSet(),
       rollup: rollupStatus(services),
       services_total: services.length,
       services_failing: services.filter((s) => s.status === 'fail').length,
@@ -2942,10 +2936,10 @@ export async function registerDashboardRoutes(
   });
 
   // ── Admin: one-time backfill of historical Claude transcripts ───
-  /* These endpoints are gated behind authMiddleware (registered above on
-   * preHandler). They kick off long-running in-process work and return
+  /* These endpoints kick off long-running in-process work and return
    * immediately; clients poll /admin/backfill/status for progress. Single
-   * -flight per mode; calling start while one is running is a no-op. */
+   * -flight per mode; calling start while one is running is a no-op.
+   * Host-binding (localhost/Tailscale) is the only trust boundary. */
   app.get('/admin/backfill/status', async () => ({
     ok: true,
     ...getBackfillStatus(),
