@@ -36,6 +36,7 @@
 import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import type { IndexDb } from '../store/index-db.js';
+import { WORKER_STATUS_FOOTER_TEMPLATE } from '../dashboard/worker-status-footer.js';
 
 export interface BacklogEntry {
   id: string;
@@ -267,6 +268,14 @@ function renderBlock(sections: WorkerHandoffSections): string {
       lines.push(`- ${b.id}: ${trimTitle(b.finding, 200)}`);
     }
   }
+  /* Phase 1 of the autonomous supervisor: every worker SessionStart
+   * additionalContext carries the status footer protocol reminder so
+   * the worker emits a machine-parsable footer on every terminal
+   * turn. The parser lives at dashboard/worker-status-footer.ts;
+   * Phase 1 lands the protocol + parser only and does NOT wire any
+   * decision logic on top yet. */
+  lines.push('');
+  lines.push(WORKER_STATUS_FOOTER_TEMPLATE);
   return lines.join('\n');
 }
 
