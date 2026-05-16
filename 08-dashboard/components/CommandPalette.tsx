@@ -3,14 +3,14 @@
 import { useEffect, useState, useRef, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { searchAll, sessions as sessionsClient, lock } from "@/lib/daemon-client";
+import { searchAll, sessions as sessionsClient } from "@/lib/daemon-client";
 import { Icon } from "./Icon";
 
 interface Action {
   id: string;
   label: string;
   hint: string;
-  icon: "Home" | "BookOpen" | "Terminal" | "FolderGit2" | "Cpu" | "BellRing" | "Brain" | "Plus" | "Upload" | "Lock" | "Search";
+  icon: "Home" | "BookOpen" | "Terminal" | "FolderGit2" | "Cpu" | "BellRing" | "Brain" | "Plus" | "Upload" | "Search";
   run: () => void;
 }
 
@@ -81,7 +81,6 @@ export function CommandPalette() {
       { id: "go-orb",       label: "Go to Neural network", hint: "/orb",  icon: "Brain" as const,       run: () => router.push("/orb") },
       { id: "new-project",  label: "New project",     hint: "scaffold",   icon: "Plus" as const,        run: () => router.push("/projects?new=1") },
       { id: "upload-ref",   label: "Upload reference",hint: "PDF/img/md", icon: "Upload" as const,      run: () => router.push("/wiki?upload=1") },
-      { id: "lock",         label: "Lock dashboard",  hint: "log out",    icon: "Lock" as const,        run: () => lock().then(() => router.replace("/unlock")) },
     ],
     [router],
   );

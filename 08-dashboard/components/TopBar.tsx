@@ -95,17 +95,6 @@ export function TopBar({ activeTab }: { activeTab: string }) {
   const rollupLabel =
     rollup === "ok" ? "all systems online" : rollup === "warn" ? "degraded" : "failure";
 
-  /* Visible auth state. dashboardHealth is auth-gated: a 401 there means
-   * the dn_session cookie is missing or expired, so the user is locked
-   * out even if pages render. Surface this as an explicit pill instead
-   * of letting the user guess from "data is stale" symptoms. */
-  const authState: "ok" | "locked" | "loading" = health.isLoading
-    ? "loading"
-    : health.error &&
-        (health.error as { status?: number }).status === 401
-      ? "locked"
-      : "ok";
-
   const [notifOpen, setNotifOpen] = useState(false);
   const notifRef = useRef<HTMLDivElement>(null);
   /* Keyboard chord glyph for the search button hint. Defaults to
@@ -222,9 +211,7 @@ export function TopBar({ activeTab }: { activeTab: string }) {
          *   (2) Alerts: panic button + notifications bell. Both
          *       attention-grab controls; they share tonal weight
          *       so they belong together.
-         *   (3) Settings + auth: gear link + locked/unlocked badge.
-         *       Both are surfacing the user's current relationship
-         *       to the dashboard.
+         *   (3) Settings link (gear).
          *   (4) System status pill (all systems online / degraded /
          *       failure). Standalone because its tone shifts
          *       independently of the rest.
@@ -329,36 +316,14 @@ export function TopBar({ activeTab }: { activeTab: string }) {
             </div>
           </div>
 
-          {/* Settings + auth cluster (group 3). */}
-          <div className="flex items-center gap-1.5">
-            <Link
-              href="/settings"
-              aria-label="Settings"
-              className="lift w-9 h-9 rounded-card hairline grid place-items-center text-txt2 hover:text-txt1"
-            >
-              <Icon name="Settings" />
-            </Link>
-
-            {authState === "locked" ? (
-              <Link
-                href="/unlock"
-                aria-label="Locked: click to unlock"
-                className="flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline text-[11px] font-mono text-err hover:bg-err/10"
-                title="Session expired or missing. Click to unlock."
-              >
-                <Icon name="Lock" size={12} />
-                <span className="hidden sm:inline">locked</span>
-              </Link>
-            ) : (
-              <div
-                className="flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline text-[11px] font-mono text-ok"
-                title="Authenticated session active"
-              >
-                <Icon name="Unlock" size={12} />
-                <span className="hidden sm:inline">unlocked</span>
-              </div>
-            )}
-          </div>
+          {/* Settings cluster (group 3). */}
+          <Link
+            href="/settings"
+            aria-label="Settings"
+            className="lift w-9 h-9 rounded-card hairline grid place-items-center text-txt2 hover:text-txt1"
+          >
+            <Icon name="Settings" />
+          </Link>
 
           {/* System status pill (group 4). Standalone because its
            * tone shifts independently of the rest. Hidden below sm

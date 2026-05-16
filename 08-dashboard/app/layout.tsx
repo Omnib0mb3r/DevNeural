@@ -1,7 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { Inter, Inter_Tight, JetBrains_Mono } from "next/font/google";
 import { Providers } from "./providers";
-import { AuthGuard } from "@/components/AuthGuard";
 import { RegisterServiceWorker } from "@/components/RegisterServiceWorker";
 import "./globals.css";
 
@@ -44,9 +43,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       className={`${inter.variable} ${interTight.variable} ${jetbrains.variable}`}
     >
       <body className="min-h-screen bg-base text-txt1 antialiased grid-bg">
-        <Providers>
-          <AuthGuard>{children}</AuthGuard>
-        </Providers>
+        <Providers>{children}</Providers>
         <RegisterServiceWorker />
       </body>
     </html>

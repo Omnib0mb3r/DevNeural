@@ -2,8 +2,8 @@
  * Thin daemon client.
  *
  * In dev, every request hits the Next dev server which rewrites to the daemon
- * (see next.config.mjs). The browser sees a single origin, so HttpOnly cookies
- * set by the daemon (dn_session) flow normally.
+ * (see next.config.mjs). The browser sees a single origin, so any cookies set
+ * by the daemon flow normally.
  *
  * In prod the daemon serves the static export directly, so all paths
  * resolve to the same origin without any rewriting.
@@ -59,21 +59,6 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   }
 
   if (!res.ok) {
-    /* Auto-redirect to /unlock on any 401. Without this the dashboard
-     * happily sat on a stale "unlocked" pill until react-query's next
-     * scheduled refetch (up to 5s + retry delays) flagged the error,
-     * during which every other API call also failed silently. The
-     * /auth and /unlock paths must be excluded so the unlock flow
-     * itself doesn't loop. */
-    if (
-      res.status === 401 &&
-      typeof window !== "undefined" &&
-      !path.startsWith("/auth/") &&
-      window.location.pathname !== "/unlock"
-    ) {
-      const here = window.location.pathname + window.location.search;
-      window.location.replace(`/unlock?from=${encodeURIComponent(here)}`);
-    }
     throw new DaemonError(res.status, payload, `daemon ${res.status} on ${path}`);
   }
   // Guard against the daemon serving the SPA index.html (or any other
@@ -90,28 +75,9 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   return payload as T;
 }
 
-// ── auth ──────────────────────────────────────────────────────────
-export const authStatus = () =>
-  request<{ pin_set: boolean; locked: boolean }>("/auth/status");
-
-export const setPin = (pin: string, current_pin?: string) =>
-  request<{ ok: boolean; error?: string }>("/auth/pin", {
-    method: "POST",
-    body: current_pin ? { pin, current_pin } : { pin },
-  });
-
-export const unlock = (pin: string) =>
-  request<{ ok: boolean; reason?: string; retry_after_ms?: number }>(
-    "/auth/unlock",
-    { method: "POST", body: { pin } },
-  );
-
-export const lock = () => request("/auth/lock", { method: "POST" });
-
 // ── dashboard ────────────────────────────────────────────────────
 export interface DashboardHealth {
   ok: boolean;
-  pin_set: boolean;
   rollup: "ok" | "warn" | "fail";
   services_total: number;
   services_failing: number;

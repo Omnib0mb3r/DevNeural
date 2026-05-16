@@ -23,10 +23,8 @@ const DAEMON_PATHS = [
 
 const nextConfig = PROD
   ? {
-      // Static export — daemon serves 08-dashboard/out/ via @fastify/static.
-      // No middleware on a static export, so the daemon's authMiddleware is
-      // the only auth gate; the dashboard handles unauthenticated state by
-      // detecting 401s and redirecting to /unlock client-side.
+      // Static export, daemon serves 08-dashboard/out/ via @fastify/static.
+      // No app-level auth gate: trust is host-binding (localhost / Tailscale).
       output: 'export',
       reactStrictMode: true,
       // Convert dynamic [id] route to a parameterized SPA fallback during
