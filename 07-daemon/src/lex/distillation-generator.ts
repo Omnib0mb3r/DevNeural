@@ -29,10 +29,13 @@ export interface CreateGeneratorOptions {
   db: IndexDb;
   log?: (msg: string) => void;
   /** Cap the bytes of transcript shipped to the provider. Default
-   * 3000 to keep prompts cheap on ollama. */
+   * 8000 so the structured-density prompt has enough source material
+   * to extract decisions, planted markers, and recent verbatim turns
+   * without truncating mid-conversation. */
   maxTranscriptBytes?: number;
-  /** Cap the provider's reply tokens. Default 180 to fit the 3-4 line
-   * cold-start handoff format below. */
+  /** Cap the provider's reply tokens. Default 600 to fit the
+   * couple-paragraph structured cold-start handoff (Topic, Active
+   * topics, Key decisions, Planted markers, Open, Recent turns). */
   maxTokens?: number;
   /** Cap the chunks pulled per session. Default 50. */
   chunkLimit?: number;
@@ -40,15 +43,32 @@ export interface CreateGeneratorOptions {
   provider?: LlmProvider | null;
 }
 
-const SYSTEM_BLOCK = {
+export const SYSTEM_BLOCK = {
   text:
-    'Summarize the brainstorm transcript for the next Lex session to ' +
-    'pick up where this one left off. Output 3-4 short lines, plain ' +
-    'prose, no fences or markdown. Cover: line 1 the headline topic, ' +
-    'line 2 the most recent concrete decision or commit landed, line ' +
-    '3 the open questions or unresolved items, line 4 (optional) any ' +
-    'blockers or next-action queued. Keep the whole thing under 80 ' +
-    'words. Be specific. Skip pleasantries.',
+    'Summarize this brainstorm transcript for the next Lex session ' +
+    'so it can pick up where this one left off without re-reading ' +
+    'the full history. The user is a brainstormer-first; their work ' +
+    'must never decay to lossy one-liners. Output structured ' +
+    "Markdown with the following bolded sections in this order, " +
+    'each on its own line:\n\n' +
+    '**Topic**: one sentence on the headline subject.\n\n' +
+    '**Active topics**: 2-5 bullets, the threads the conversation ' +
+    'kept circling back to. Be specific (named files, components, ' +
+    'protocols), not generic ("we discussed the project").\n\n' +
+    '**Key decisions**: 2-5 bullets, concrete decisions or commits ' +
+    'landed during the session. Include enough context that the ' +
+    'decision is meaningful out of conversation. Empty bullet ' +
+    'allowed when no decisions were made; do not invent.\n\n' +
+    '**Planted markers**: 1-3 bullets, forward-looking notes / ' +
+    'seeds / TODOs the user wanted to revisit. Empty allowed.\n\n' +
+    '**Open**: 1-3 bullets, unresolved questions or blockers.\n\n' +
+    '**Recent turns** (verbatim, last 5-10): each bullet is ' +
+    "ROLE: <text>, trimmed to ~200 chars, in chronological order " +
+    'so the new session can resume the thread without paging ' +
+    'transcript. Use USER / LEX / TOOL.\n\n' +
+    'Total target: two short paragraphs of structured content plus ' +
+    'the recent-turns block. No fences, no preamble, no commentary ' +
+    'about the summary itself. Skip pleasantries. Be specific.',
   cache: true,
 };
 
@@ -72,8 +92,8 @@ export function createLlmDistillationGenerator(
   opts: CreateGeneratorOptions,
 ): DistillationGenerator {
   const log = opts.log ?? (() => undefined);
-  const maxTranscriptBytes = opts.maxTranscriptBytes ?? 3000;
-  const maxTokens = opts.maxTokens ?? 180;
+  const maxTranscriptBytes = opts.maxTranscriptBytes ?? 8000;
+  const maxTokens = opts.maxTokens ?? 600;
   const chunkLimit = opts.chunkLimit ?? 50;
   return async (row: BrainstormSessionRow): Promise<string | null> => {
     const provider = opts.provider ?? pickProvider();

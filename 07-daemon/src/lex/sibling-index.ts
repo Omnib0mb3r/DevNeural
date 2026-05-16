@@ -174,7 +174,8 @@ function renderPriorRefSection(args: {
   const turns = jsonlText
     ? extractLastTurnPairs(jsonlText, args.pairsPerRef)
     : [];
-  if (turns.length === 0 && !brainstorm?.last_summary) {
+  const real = brainstorm ? distillationOrPlaceholder(brainstorm) : null;
+  if (turns.length === 0 && !real) {
     /* Nothing to surface for this ref; skip rather than render an
      * empty header that wastes context. */
     return null;
@@ -185,10 +186,7 @@ function renderPriorRefSection(args: {
    * we feed them newest-first to the renderer, so the human-readable
    * sequence reads "session 1 (older), session 2 (newer)". */
   const seq = total - index;
-  const distillation =
-    brainstorm?.last_summary && brainstorm.last_summary.trim().length > 0
-      ? brainstorm.last_summary.trim()
-      : '(no distillation yet)';
+  const distillation = real ?? '(no distillation yet)';
   const lines: string[] = [
     `## Prior session ${seq} (ago: ${ago})`,
     `Summary: ${distillation}`,
@@ -246,6 +244,29 @@ function buildAnchorTranscriptBlock(opts: BuildSiblingIndexOptions): string {
   return header + sections.join('\n\n');
 }
 
+/* Legacy reaper rows used to set last_summary to a short reason
+ * string like "daemon restart: orphaned active session". Those are
+ * not distillations; they are status notes that stomped real
+ * distillations when a session was killed mid-flight. The reaper no
+ * longer writes them, but historical rows still carry the value, so
+ * the injector treats anything matching this shape as "no distillation
+ * yet" to avoid bleeding one-liners into the cold-start prompt. */
+export function looksLikeReapReason(s: string | null | undefined): boolean {
+  if (!s) return false;
+  const t = s.trim();
+  if (!t) return false;
+  return /^(daemon restart|continuous reaper|pty no longer alive|orphaned active session)\b/i.test(t);
+}
+
+function distillationOrPlaceholder(
+  row: BrainstormSessionRow,
+): string | null {
+  if (!row.last_summary) return null;
+  if (looksLikeReapReason(row.last_summary)) return null;
+  const trimmed = row.last_summary.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 function formatLabelLine(
   row: BrainstormSessionRow,
   distillationWords: number,
@@ -253,9 +274,8 @@ function formatLabelLine(
   const idShort = row.id.slice(0, 8);
   const label = row.user_label?.trim() || row.derived_label?.trim() || '(unnamed)';
   const startedIso = new Date(row.started_ms).toISOString();
-  const distillation = row.last_summary
-    ? truncateWords(row.last_summary, distillationWords)
-    : '';
+  const real = distillationOrPlaceholder(row);
+  const distillation = real ? truncateWords(real, distillationWords) : '';
   const tail = distillation ? ` — ${distillation}` : '';
   return `- ${idShort} "${label}" started ${startedIso}${tail}`;
 }

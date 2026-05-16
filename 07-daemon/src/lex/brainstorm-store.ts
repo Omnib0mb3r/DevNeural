@@ -177,11 +177,15 @@ export function reapOrphansAgainstLivePtys(
   let touched = 0;
   for (const row of rows) {
     if (row.pty_id && livePtyIds.has(row.pty_id)) continue;
+    /* Reaper does NOT touch last_summary / last_summary_ms. Those
+     * belong to the distillation pipeline. Overwriting them with the
+     * reap reason ("continuous reaper: pty no longer alive") stomped
+     * real distillations and surfaced as one-line cold-start
+     * preloads. The reap reason is still logged via the caller's
+     * log() for diagnostics. */
     db().updateBrainstorm(row.id, {
       status: 'ended',
       ended_ms: now,
-      last_summary: reason,
-      last_summary_ms: now,
     });
     touched += 1;
   }
@@ -290,11 +294,13 @@ export function reapAllActive(reason: string): number {
     if (chunks === 0 && !hasAudio && !hasDistilled) {
       db().deleteBrainstorm(row.id);
     } else {
+      /* Preserve any existing last_summary the distillation pipeline
+       * landed; reap reason belongs in the daemon log, not the
+       * summary column. Bug: cold-start preload was reading reap
+       * reasons as one-line distillations. */
       db().updateBrainstorm(row.id, {
         status: 'ended',
         ended_ms: now,
-        last_summary: reason,
-        last_summary_ms: now,
       });
     }
     touched += 1;

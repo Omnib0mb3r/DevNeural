@@ -138,7 +138,7 @@ describe('createLlmDistillationGenerator', () => {
     expect(out).toBe('neat summary');
   });
 
-  it('ships the 3-4 line cold-start handoff prompt + role=distillation', async () => {
+  it('ships the structured cold-start handoff prompt + role=distillation', async () => {
     insertBs({ id: 'bs-prompt', started_ms: 1_000 });
     insertChunk({
       id: 'c-pp',
@@ -158,12 +158,13 @@ describe('createLlmDistillationGenerator', () => {
     const systemText = (callOpts as { systemBlocks: { text: string }[] })
       .systemBlocks[0]!.text;
     expect(systemText).toMatch(/pick up where this one left off/);
-    expect(systemText).toMatch(/line 1 the headline topic/);
-    expect(systemText).toMatch(/line 2 the most recent concrete decision/);
-    expect(systemText).toMatch(/line 3 the open questions/);
-    expect(systemText).toMatch(/under 80 words/);
+    expect(systemText.toLowerCase()).toMatch(/key decisions/);
+    expect(systemText.toLowerCase()).toMatch(/active topics/);
+    expect(systemText.toLowerCase()).toMatch(/planted markers/);
+    expect(systemText.toLowerCase()).toMatch(/recent turns/);
+    expect(systemText.toLowerCase()).toMatch(/verbatim/);
     expect((callOpts as { maxTokens: number }).maxTokens).toBeGreaterThanOrEqual(
-      160,
+      600,
     );
   });
 

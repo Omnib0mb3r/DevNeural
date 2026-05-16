@@ -102,8 +102,28 @@ describe('reapAllActive substance gate', () => {
     const row = db.getBrainstorm(id);
     expect(row).not.toBeNull();
     expect(row?.status).toBe('ended');
-    expect(row?.last_summary).toBe('daemon restart: orphaned active session');
+    /* Reaper must NOT write a reap reason into last_summary. That
+     * column belongs to the distillation pipeline; the reap reason
+     * stays in the daemon log only. Bug: cold-start preload was
+     * reading reap reasons as one-line distillations. */
+    expect(row?.last_summary).toBeNull();
+    expect(row?.last_summary_ms).toBeNull();
     expect(row?.turn_count).toBe(1);
+  });
+
+  it('preserves an existing distillation when reaping', () => {
+    const id = seedActive({ withChunk: true });
+    /* Simulate a real distillation already landed before the daemon
+     * crashed. The reaper must not stomp it. */
+    db.updateBrainstorm(id, {
+      last_summary: '**Topic**: refactor X. **Key decisions**: chose Y.',
+      last_summary_ms: Date.now() - 1000,
+    });
+    reapAllActive('daemon restart: orphaned active session');
+    const row = db.getBrainstorm(id);
+    expect(row?.status).toBe('ended');
+    expect(row?.last_summary).toMatch(/Topic/);
+    expect(row?.last_summary).toMatch(/Key decisions/);
   });
 
   it('marks rows with audio_path ended in place', () => {
