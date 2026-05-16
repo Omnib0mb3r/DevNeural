@@ -159,6 +159,42 @@ export interface CrossSessionInjectionLogRow {
   brainstorm_id: string | null;
 }
 
+/* lex_backlog_items row (migration 026). Canonical store for the
+ * autonomous supervisor backlog after the move off
+ * c:/tmp/lex-backlog-queue.json. */
+export interface BacklogItemRow {
+  id: string;
+  title: string;
+  status: 'queued' | 'in-flight' | 'done' | 'parked';
+  priority: string;
+  added_at: string;
+  injected_at: string | null;
+  done_at: string | null;
+  /** JSON-encoded array of short SHAs. */
+  commit_shas: string | null;
+  claimed_by: string | null;
+  claimed_at: string | null;
+  claimed_turn_uuid: string | null;
+  anchor_id: string | null;
+  notes: string | null;
+}
+
+export interface BacklogItemInsert {
+  id: string;
+  title: string;
+  status: BacklogItemRow['status'];
+  priority?: string;
+  added_at: string;
+  injected_at?: string | null;
+  done_at?: string | null;
+  commit_shas?: string | null;
+  claimed_by?: string | null;
+  claimed_at?: string | null;
+  claimed_turn_uuid?: string | null;
+  anchor_id?: string | null;
+  notes?: string | null;
+}
+
 /* smart_compact_log row. SMART-COMPACT.md "Audit". One row per
  * smart-compact decision (evaluate fire / wrap injection / hard
  * ceiling / shadow). Dashboard panel reads this to surface a
@@ -2152,6 +2188,233 @@ export class IndexDb {
     } catch {
       return [];
     }
+  }
+
+  /* ─── Lex backlog (migration 026) ─────────────────────────────
+   *
+   * Canonical store for the autonomous supervisor backlog. Moved
+   * off c:/tmp/lex-backlog-queue.json so the atomic claim primitive
+   * gets real transaction semantics under concurrent callers.
+   */
+
+  insertBacklogItem(row: BacklogItemInsert): void {
+    this.db
+      .prepare(
+        `INSERT INTO lex_backlog_items
+           (id, title, status, priority, added_at, injected_at,
+            done_at, commit_shas, claimed_by, claimed_at,
+            claimed_turn_uuid, anchor_id, notes)
+         VALUES (@id, @title, @status, @priority, @added_at,
+                 @injected_at, @done_at, @commit_shas, @claimed_by,
+                 @claimed_at, @claimed_turn_uuid, @anchor_id,
+                 @notes)`,
+      )
+      .run({
+        id: row.id,
+        title: row.title,
+        status: row.status,
+        priority: row.priority ?? 'polish',
+        added_at: row.added_at,
+        injected_at: row.injected_at ?? null,
+        done_at: row.done_at ?? null,
+        commit_shas: row.commit_shas ?? null,
+        claimed_by: row.claimed_by ?? null,
+        claimed_at: row.claimed_at ?? null,
+        claimed_turn_uuid: row.claimed_turn_uuid ?? null,
+        anchor_id: row.anchor_id ?? null,
+        notes: row.notes ?? null,
+      });
+  }
+
+  upsertBacklogItem(row: BacklogItemInsert): void {
+    /* Used by the one-shot JSON seeder so a re-run does not crash
+     * on PRIMARY KEY collisions. Production callers should go
+     * through insertBacklogItem; upsert is a seeding tool. */
+    this.db
+      .prepare(
+        `INSERT INTO lex_backlog_items
+           (id, title, status, priority, added_at, injected_at,
+            done_at, commit_shas, claimed_by, claimed_at,
+            claimed_turn_uuid, anchor_id, notes)
+         VALUES (@id, @title, @status, @priority, @added_at,
+                 @injected_at, @done_at, @commit_shas, @claimed_by,
+                 @claimed_at, @claimed_turn_uuid, @anchor_id,
+                 @notes)
+         ON CONFLICT(id) DO UPDATE SET
+           title = excluded.title,
+           status = excluded.status,
+           priority = excluded.priority,
+           injected_at = excluded.injected_at,
+           done_at = excluded.done_at,
+           commit_shas = excluded.commit_shas,
+           notes = excluded.notes`,
+      )
+      .run({
+        id: row.id,
+        title: row.title,
+        status: row.status,
+        priority: row.priority ?? 'polish',
+        added_at: row.added_at,
+        injected_at: row.injected_at ?? null,
+        done_at: row.done_at ?? null,
+        commit_shas: row.commit_shas ?? null,
+        claimed_by: row.claimed_by ?? null,
+        claimed_at: row.claimed_at ?? null,
+        claimed_turn_uuid: row.claimed_turn_uuid ?? null,
+        anchor_id: row.anchor_id ?? null,
+        notes: row.notes ?? null,
+      });
+  }
+
+  getBacklogItem(id: string): BacklogItemRow | null {
+    return (
+      (this.db
+        .prepare(`SELECT * FROM lex_backlog_items WHERE id = ?`)
+        .get(id) as BacklogItemRow | undefined) ?? null
+    );
+  }
+
+  listBacklogItems(opts: {
+    status?: BacklogItemRow['status'];
+    limit?: number;
+  } = {}): BacklogItemRow[] {
+    const limit = Math.min(500, Math.max(1, opts.limit ?? 200));
+    if (opts.status) {
+      return this.db
+        .prepare(
+          `SELECT * FROM lex_backlog_items WHERE status = ?
+             ORDER BY added_at DESC LIMIT ?`,
+        )
+        .all(opts.status, limit) as BacklogItemRow[];
+    }
+    return this.db
+      .prepare(
+        `SELECT * FROM lex_backlog_items
+           ORDER BY added_at DESC LIMIT ?`,
+      )
+      .all(limit) as BacklogItemRow[];
+  }
+
+  /**
+   * Atomic claim. Only flips the row to in-flight when:
+   *   - the row exists, AND
+   *   - status='queued', AND
+   *   - claimed_by IS NULL.
+   *
+   * Returns the number of rows changed (0 or 1). Concurrent
+   * callers racing to claim the same id will both fire the
+   * UPDATE; only one observes changes=1 because sqlite serialises
+   * writers and the WHERE clause re-evaluates on the loser's
+   * attempt. Loser observes changes=0 and reports ok=false in the
+   * wrapping store.
+   */
+  claimBacklogItem(opts: {
+    id: string;
+    claimed_by: string;
+    claimed_at: string;
+    claimed_turn_uuid: string | null;
+    anchor_id: string | null;
+    injected_at: string | null;
+  }): number {
+    const info = this.db
+      .prepare(
+        `UPDATE lex_backlog_items
+           SET status='in-flight',
+               claimed_by=@claimed_by,
+               claimed_at=@claimed_at,
+               claimed_turn_uuid=@claimed_turn_uuid,
+               anchor_id=@anchor_id,
+               injected_at=COALESCE(injected_at, @injected_at)
+         WHERE id=@id
+           AND status='queued'
+           AND claimed_by IS NULL`,
+      )
+      .run({
+        id: opts.id,
+        claimed_by: opts.claimed_by,
+        claimed_at: opts.claimed_at,
+        claimed_turn_uuid: opts.claimed_turn_uuid,
+        anchor_id: opts.anchor_id,
+        injected_at: opts.injected_at,
+      });
+    return info.changes;
+  }
+
+  releaseBacklogItem(opts: {
+    id: string;
+    claimed_by: string;
+    target_status: 'queued' | 'parked';
+  }): number {
+    /* Release only fires when the caller owns the claim. Prevents
+     * one worker dropping another's in-flight row by accident. */
+    const info = this.db
+      .prepare(
+        `UPDATE lex_backlog_items
+           SET status=@target_status,
+               claimed_by=NULL,
+               claimed_at=NULL,
+               claimed_turn_uuid=NULL
+         WHERE id=@id
+           AND status='in-flight'
+           AND claimed_by=@claimed_by`,
+      )
+      .run({
+        id: opts.id,
+        claimed_by: opts.claimed_by,
+        target_status: opts.target_status,
+      });
+    return info.changes;
+  }
+
+  markBacklogItemDone(opts: {
+    id: string;
+    claimed_by: string | null;
+    done_at: string;
+    commit_shas: string | null;
+    notes?: string | null;
+  }): number {
+    /* Done flip accepts either the owning claimant OR no claim
+     * filter (when claimed_by===null) so a re-run can finalise a
+     * row whose claim was dropped. The status filter ensures we
+     * only retire an in-flight row; already-done rows are no-ops. */
+    if (opts.claimed_by) {
+      const info = this.db
+        .prepare(
+          `UPDATE lex_backlog_items
+             SET status='done',
+                 done_at=@done_at,
+                 commit_shas=COALESCE(@commit_shas, commit_shas),
+                 notes=COALESCE(@notes, notes)
+           WHERE id=@id
+             AND status='in-flight'
+             AND claimed_by=@claimed_by`,
+        )
+        .run({
+          id: opts.id,
+          claimed_by: opts.claimed_by,
+          done_at: opts.done_at,
+          commit_shas: opts.commit_shas,
+          notes: opts.notes ?? null,
+        });
+      return info.changes;
+    }
+    const info = this.db
+      .prepare(
+        `UPDATE lex_backlog_items
+           SET status='done',
+               done_at=@done_at,
+               commit_shas=COALESCE(@commit_shas, commit_shas),
+               notes=COALESCE(@notes, notes)
+         WHERE id=@id
+           AND status='in-flight'`,
+      )
+      .run({
+        id: opts.id,
+        done_at: opts.done_at,
+        commit_shas: opts.commit_shas,
+        notes: opts.notes ?? null,
+      });
+    return info.changes;
   }
 
   close(): void {

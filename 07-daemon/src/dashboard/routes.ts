@@ -192,6 +192,15 @@ export async function registerDashboardRoutes(
    * threading the store through every layer. */
   setBrainstormStore(store);
 
+  /* Bind the lex_backlog_items store to the same daemon Store
+   * reference so the REST surface (GET/POST/PATCH /lex/backlog)
+   * and any future supervisor logic share one canonical handle.
+   * Migration 026 created the table; the seed script
+   * (scripts/seed-lex-backlog.ts) does a one-shot import from the
+   * legacy c:/tmp/lex-backlog-queue.json file. */
+  const { setStore: setBacklogStore } = await import('../lex/backlog-store.js');
+  setBacklogStore(store);
+
   /* Boot reaper. PTY exit hook in pty-host closes brainstorm rows on
    * normal exit; a daemon crash (SIGKILL, fatal SqliteError, etc.)
    * skips that path and leaves rows stuck at status='active'. Reap
@@ -4210,6 +4219,141 @@ export async function registerDashboardRoutes(
       ok: true,
       groups: groupPreloadEventsBySession({ perSessionLimit }),
     };
+  });
+
+  /* Lex backlog REST surface (autonomous supervisor phase 2).
+   *
+   * Migration 026 created lex_backlog_items; backlog-store.ts owns
+   * the typed CRUD. Three endpoints expose the canonical queue
+   * over HTTP so the dashboard panel + future supervisor logic
+   * both go through the atomic claim primitive instead of the
+   * legacy c:/tmp file-CAS.
+   *
+   *   GET   /lex/backlog                list (optional ?status=)
+   *   POST  /lex/backlog                add a new item
+   *   PATCH /lex/backlog/:id            claim | release | done
+   */
+  app.get('/lex/backlog', async (req) => {
+    const { listBacklog } = await import('../lex/backlog-store.js');
+    const q = (req.query ?? {}) as { status?: string; limit?: string };
+    const status = q.status as
+      | 'queued'
+      | 'in-flight'
+      | 'done'
+      | 'parked'
+      | undefined;
+    const limit = q.limit ? Number(q.limit) : undefined;
+    const items = listBacklog({ status, limit });
+    return { ok: true, items };
+  });
+
+  app.post('/lex/backlog', async (req, reply) => {
+    const { addBacklogItem } = await import('../lex/backlog-store.js');
+    const body = (req.body ?? {}) as {
+      id?: string;
+      title?: string;
+      priority?: string;
+      notes?: string;
+      status?: 'queued' | 'parked';
+    };
+    if (!body.title || typeof body.title !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'title required' };
+    }
+    if (
+      body.status !== undefined &&
+      body.status !== 'queued' &&
+      body.status !== 'parked'
+    ) {
+      reply.code(400);
+      return {
+        ok: false,
+        error: 'status must be queued or parked on add',
+      };
+    }
+    try {
+      const row = addBacklogItem({
+        id: body.id,
+        title: body.title,
+        priority: body.priority,
+        notes: body.notes ?? null,
+        status: body.status ?? 'queued',
+      });
+      return { ok: true, item: row };
+    } catch (err) {
+      reply.code(409);
+      return { ok: false, error: (err as Error).message };
+    }
+  });
+
+  app.patch<{
+    Params: { id: string };
+    Body: {
+      action?: 'claim' | 'release' | 'done';
+      claimed_by?: string;
+      claimed_turn_uuid?: string | null;
+      anchor_id?: string | null;
+      target_status?: 'queued' | 'parked';
+      commit_shas?: string[];
+      notes?: string | null;
+    };
+  }>('/lex/backlog/:id', async (req, reply) => {
+    const {
+      claimBacklogItem,
+      releaseBacklogItem,
+      markBacklogDone,
+    } = await import('../lex/backlog-store.js');
+    const id = req.params.id;
+    const body = req.body ?? {};
+    if (!id) {
+      reply.code(400);
+      return { ok: false, error: 'id required' };
+    }
+    switch (body.action) {
+      case 'claim': {
+        if (!body.claimed_by) {
+          reply.code(400);
+          return { ok: false, error: 'claimed_by required for claim' };
+        }
+        const r = claimBacklogItem({
+          id,
+          claimed_by: body.claimed_by,
+          claimed_turn_uuid: body.claimed_turn_uuid ?? null,
+          anchor_id: body.anchor_id ?? null,
+        });
+        if (!r.ok) reply.code(409);
+        return r;
+      }
+      case 'release': {
+        if (!body.claimed_by) {
+          reply.code(400);
+          return { ok: false, error: 'claimed_by required for release' };
+        }
+        const r = releaseBacklogItem({
+          id,
+          claimed_by: body.claimed_by,
+          target_status: body.target_status ?? 'queued',
+        });
+        if (!r.ok) reply.code(409);
+        return r;
+      }
+      case 'done': {
+        const r = markBacklogDone({
+          id,
+          claimed_by: body.claimed_by ?? null,
+          commit_shas: body.commit_shas ?? null,
+          notes: body.notes ?? null,
+        });
+        if (!r.ok) reply.code(409);
+        return r;
+      }
+      default:
+        reply.code(400);
+        return {
+          ok: false,
+          error: 'action must be claim | release | done',
+        };
+    }
   });
 
   app.get('/lex/injection-log', async (req) => {
