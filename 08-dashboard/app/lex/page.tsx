@@ -231,7 +231,7 @@ export default function LexPage() {
                 onClick={() => endAnchorM.mutate(activeAnchorId)}
                 disabled={endAnchorM.isPending || newAnchorM.isPending}
                 className="text-xs px-3 py-1.5 rounded-pill bg-surface2 hairline hover:bg-surface3 text-txt2 disabled:opacity-40 disabled:cursor-not-allowed"
-                title="End this brainstorm session"
+                title="End this Lex conversation"
               >
                 {endAnchorM.isPending ? "ending…" : "end session"}
               </button>
@@ -241,7 +241,7 @@ export default function LexPage() {
               onClick={() => newAnchorM.mutate()}
               disabled={newAnchorM.isPending || endAnchorM.isPending}
               className="text-xs px-3 py-1.5 rounded-pill bg-brand/10 hairline ring-1 ring-brand/30 text-brandSoft hover:bg-brand/15 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
-              title={lexPty ? "Spawn a fresh Lex anchor (the current one stays alive)" : "Spawn Lex"}
+              title={lexPty ? "Start a fresh Lex conversation (the current one stays open)" : "Start a Lex conversation"}
             >
               <Icon name="Plus" size={12} />
               {newAnchorM.isPending
@@ -254,11 +254,7 @@ export default function LexPage() {
         </div>
 
         <p className="text-sm text-txt3 max-w-3xl">
-          Lex is your supervisory AI for DevNeural. He runs locally on
-          OTLCDEV with full access to the wiki, sessions, projects, and
-          web. Brainstorm out loud, frame projects, take notes, ask him
-          to act. He can scaffold projects, queue prompts to running
-          worker sessions, and create reminders.
+          Lex is your local AI partner. Talk through ideas, plan projects, take notes, or hand off work. He can read your wiki, send tasks to running workers, and set reminders.
         </p>
 
         <LexSessionList
@@ -269,8 +265,7 @@ export default function LexPage() {
         {!lexPty && !newAnchorM.isPending && (
           <div className="rounded-panel bg-surface1 hairline p-8 text-center">
             <p className="text-sm text-txt3 mb-3">
-              Lex isn&apos;t running. Click <strong>start lex</strong> above
-              to spin up a session.
+              Lex is offline. Click <strong>start lex</strong> above to begin a conversation.
             </p>
           </div>
         )}
