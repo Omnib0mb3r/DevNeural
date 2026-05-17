@@ -333,6 +333,42 @@ export function registerProjectAnchorRoutes(
     return { ok: true, anchor: detail.anchor, transcripts: detail.transcripts };
   });
 
+  /* Fix 16 — project-anchor lookup by CC session uuid.
+   *
+   * External state-keying consumers (Stream Deck deck-hook.sh,
+   * future second-agent supervisors, dashboard plugins) need a
+   * stable identifier per session that survives /clear-driven uuid
+   * flips. The daemon already maps uuid → anchor via
+   * findProjectSessionBySessionId (current_session_id OR
+   * previous_session_id, added in Fix 15 migration 029). This route
+   * exposes that lookup so callers can persist state at
+   * <anchor_id>.<ext> instead of <session_uuid>.<ext>.
+   *
+   * Response shape kept minimal so it is cheap to call from a hook
+   * script under a 200ms timeout: { ok, anchor_id, project_slug,
+   * status }. 404 when the uuid does not map to any anchor. */
+  app.get('/projects/anchors/by-session/:uuid', async (req, reply) => {
+    const uuid = (req.params as { uuid: string }).uuid;
+    if (!uuid || typeof uuid !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'uuid required' };
+    }
+    const anchor = db.findProjectSessionBySessionId(uuid);
+    if (!anchor) {
+      reply.code(404);
+      return { ok: false, error: 'no anchor owns this session uuid' };
+    }
+    return {
+      ok: true,
+      anchor_id: anchor.id,
+      project_slug: anchor.project_slug,
+      status: anchor.status,
+      cwd: anchor.cwd,
+      current_session_id: anchor.current_session_id,
+      previous_session_id: anchor.previous_session_id ?? null,
+    };
+  });
+
   app.post('/projects/:id/open', async (req, reply) => {
     const id = (req.params as { id: string }).id;
     const body = (req.body ?? {}) as { dangerous?: boolean };
