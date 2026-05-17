@@ -23,3 +23,7 @@ skill-connections/
 # slash commands); these two files are per-machine and must not ship.
 /.claude/scheduled_tasks.lock
 /.claude/settings.local.json
+
+# Build artifacts
+07-daemon/scripts/silent-shim/*.lscache
+08-dashboard/test-results/
