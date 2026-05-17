@@ -261,7 +261,7 @@ export function CommandPalette() {
             <kbd className="font-mono">↵</kbd> select
           </span>
           <span>
-            <kbd className="font-mono">⌘K</kbd> toggle
+            <kbd className="font-mono">Ctrl+K</kbd> toggle
           </span>
         </div>
       </div>

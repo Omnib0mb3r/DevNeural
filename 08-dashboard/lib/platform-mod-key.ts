@@ -43,20 +43,13 @@ export function pickModKey(platform: string | null | undefined): ModKey {
   return /^mac/i.test(platform) ? "\u2318" : "Ctrl";
 }
 
-/** Browser-side resolver. Returns "Ctrl" when called from a non-DOM
- * environment (SSR, jsdom without navigator) so the caller can use it
- * as the initial useState value without producing a hydration
- * mismatch on the server render. The useEffect that follows refreshes
- * the value once the real navigator is available. */
+/** Browser-side resolver. DevNeural ships as a Windows-only build, so
+ * every host renders "Ctrl" regardless of what the navigator reports.
+ * The pickModKey / pickModKeyStrict pure helpers stay exported (and
+ * tested) for the day the dashboard ships cross-platform builds; if
+ * that day arrives, swap this body back to pickModKeyStrict on the
+ * UA-CH + legacy navigator strings. Until then, hard-coding Ctrl is
+ * what the rendered UI must show. */
 export function resolveModKey(): ModKey {
-  if (typeof navigator === "undefined") return "Ctrl";
-  const uaData = (
-    navigator as unknown as {
-      userAgentData?: { platform?: string };
-    }
-  ).userAgentData;
-  return pickModKeyStrict(
-    uaData?.platform ?? null,
-    navigator.platform ?? null,
-  );
+  return "Ctrl";
 }

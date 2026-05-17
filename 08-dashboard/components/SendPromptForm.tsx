@@ -214,7 +214,7 @@ export function SendPromptForm({ sessionId }: Props) {
               className="hidden"
               aria-hidden="true"
             />
-            <span><kbd className="font-mono">⌘↵</kbd> to send</span>
+            <span><kbd className="font-mono">Ctrl+Enter</kbd> to send</span>
           </div>
           <button
             type="submit"

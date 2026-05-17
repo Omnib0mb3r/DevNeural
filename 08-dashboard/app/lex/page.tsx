@@ -328,7 +328,7 @@ export default function LexPage() {
                       injectM.mutate(pendingText);
                     }
                   }}
-                  placeholder="What's on your mind? (⌘+Enter to send, paste a screenshot to attach)"
+                  placeholder="What's on your mind? (Ctrl+Enter to send, paste a screenshot to attach)"
                   rows={3}
                   className="w-full px-3 py-2 rounded-input bg-surface2 hairline text-txt1 outline-none focus:ring-1 focus:ring-brand/60 text-sm font-mono resize-y placeholder:text-txt3"
                   disabled={!lexPty?.sessionId && !lexPty?.ptyId}
