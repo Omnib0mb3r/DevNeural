@@ -1235,9 +1235,17 @@ export interface Notification {
   dismissed: boolean;
   dismissed_scopes: NotificationScope[];
 }
-export const notifications = (limit = 50) =>
+/** Surface gate for /notifications. 'bell' drops notify_class=
+ * 'conversation' rows so the top-bar dropdown stays high-signal;
+ * 'activity' returns every row for the right-rail live feed. The
+ * daemon-side default (no `surface` param) returns every row. */
+export type NotificationSurface = "bell" | "activity";
+export const notifications = (
+  limit = 50,
+  surface?: NotificationSurface,
+) =>
   request<{ ok: boolean; notifications: Notification[] }>(
-    `/notifications?limit=${limit}`,
+    `/notifications?limit=${limit}${surface ? `&surface=${surface}` : ""}`,
   );
 /* Scope optional. 'bell' clears just the top-bar dropdown row, 'activity'
  * clears just the right-rail row, omitted clears both (legacy). */

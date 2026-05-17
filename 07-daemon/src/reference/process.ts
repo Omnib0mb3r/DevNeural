@@ -286,6 +286,7 @@ function handleMissingBinary(
   emitNotification({
     severity: 'warn',
     source: 'reference-ingest',
+    notify_class: 'signal',
     title: `Audio/video processing requires ${binary}`,
     body: detail,
   });

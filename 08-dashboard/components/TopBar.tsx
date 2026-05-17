@@ -51,7 +51,11 @@ export function TopBar({ activeTab }: { activeTab: string }) {
   });
   const notifs = useQuery({
     queryKey: ["notifications", "recent"],
-    queryFn: () => notificationsClient(20),
+    /* Bell surface gate: drops notify_class='conversation' rows so the
+     * top-bar dropdown shows only report / followup / signal. The
+     * right-rail activity feed uses surface='activity' (or no param)
+     * and still sees every row. */
+    queryFn: () => notificationsClient(20, "bell"),
     refetchInterval: 10_000,
   });
   const dismissM = useMutation({

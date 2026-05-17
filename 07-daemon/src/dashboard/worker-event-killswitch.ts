@@ -73,6 +73,7 @@ export function applyKillSwitch(
   const n = emit({
     severity: 'warn',
     source: 'supervision',
+    notify_class: 'signal',
     title: `Event-supervision kill-switch tripped for ${label}`,
     body: 'Too many worker events forwarded to Lex in a 10-minute window. supervision_mode flipped to polling. Re-enable from the Project tile after investigating.',
     link: '/projects',

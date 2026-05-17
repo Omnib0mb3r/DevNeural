@@ -205,6 +205,7 @@ export function fireForLexTurn(
     body: snippet,
     link,
     event_type: 'attention',
+    notify_class: 'followup',
     push: mode,
     push_data: {
       kind: 'lex-turn',
@@ -248,6 +249,7 @@ export function fireForStall(
     body: input.reason.slice(0, 200),
     link,
     event_type: 'attention',
+    notify_class: 'signal',
     push: mode,
     push_data: {
       kind: 'stall',

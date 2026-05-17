@@ -713,6 +713,7 @@ export async function registerDashboardRoutes(
     emitNotification({
       severity: 'warn',
       source: 'permission',
+      notify_class: 'followup',
       title: `Claude waiting on you (${body.kind ?? 'notification'})`,
       body: body.message.slice(0, 200),
       link: `/sessions/detail?id=${encodeURIComponent(id)}`,
@@ -774,9 +775,16 @@ export async function registerDashboardRoutes(
       return null;
     }
     lastLexPulseHash.set(id, sig);
+    /* lex-pulse is the "Lex finished a turn" surface. By definition
+     * every fire is conversational. Per Fix 9, conversational
+     * notifications are filtered out of the bell so the bell stays
+     * a high-signal stream. The activity rail (RightRail) still
+     * renders these because its listing call passes surface='activity'
+     * which bypasses the bell filter. */
     const n = emitNotification({
       severity: pulse.severity,
       source: 'lex',
+      notify_class: 'conversation',
       title: pulse.title,
       body: pulse.body,
       link: `/sessions/detail?id=${encodeURIComponent(id)}`,
@@ -2123,8 +2131,21 @@ export async function registerDashboardRoutes(
 
   // ── Notifications ────────────────────────────────────────────────
   app.get('/notifications', async (req) => {
-    const limit = Number((req.query as { limit?: string }).limit ?? '50');
-    return { ok: true, notifications: listNotifications({ limit }) };
+    const q = req.query as { limit?: string; surface?: string };
+    const limit = Number(q.limit ?? '50');
+    /* Surface gate. The bell (TopBar dropdown) passes surface=bell
+     * to drop notify_class='conversation' rows; the activity rail
+     * passes surface=activity (or omits the param) to receive the
+     * full stream. */
+    const surface =
+      q.surface === 'bell' || q.surface === 'activity' ? q.surface : undefined;
+    return {
+      ok: true,
+      notifications: listNotifications({
+        limit,
+        ...(surface ? { surface } : {}),
+      }),
+    };
   });
 
   app.post('/notifications', async (req, reply) => {
@@ -2134,16 +2155,23 @@ export async function registerDashboardRoutes(
       title?: string;
       body?: string;
       link?: string;
+      notify_class?: 'conversation' | 'report' | 'followup' | 'signal';
     };
     if (!body.title || !body.severity || !body.source) {
       reply.code(400);
       return { ok: false, error: 'severity, source, title required' };
     }
+    /* External callers post here for ad-hoc notifications. Default
+     * to 'signal' for HTTP-posted rows because anything coming over
+     * the wire is presumed system-class; conversational Lex emits
+     * never go through this endpoint. Caller may override with an
+     * explicit notify_class. */
     return {
       ok: true,
       notification: emitNotification({
         severity: body.severity,
         source: body.source,
+        notify_class: body.notify_class ?? 'signal',
         title: body.title,
         ...(body.body ? { body: body.body } : {}),
         ...(body.link ? { link: body.link } : {}),

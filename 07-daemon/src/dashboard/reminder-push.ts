@@ -130,6 +130,7 @@ export function firePushForReminder(
   const n = emit({
     severity: 'warn',
     source: 'reminder',
+    notify_class: 'followup',
     title: reminder.title.slice(0, 120) || 'Reminder due',
     body: dueBody(reminder),
     link: '/reminders',

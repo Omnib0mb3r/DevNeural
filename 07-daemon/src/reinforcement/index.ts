@@ -138,6 +138,7 @@ function appendReinforcementLog(entry: Record<string, unknown>): void {
           emitNotification({
             severity: 'info',
             source: 'curator',
+            notify_class: 'signal',
             title: `Lex injected ${source}: ${target || '(unknown)'}`,
             body: `Lex pulled this into the next prompt as additional context. Click to inspect; if it looks wrong, ignore it in your reply and the reinforcement loop will demote it on its own.`,
             ...(targetLink ? { link: targetLink } : {}),
@@ -148,6 +149,7 @@ function appendReinforcementLog(entry: Record<string, unknown>): void {
           emitNotification({
             severity: 'info',
             source: 'reinforcement',
+            notify_class: 'signal',
             title: `Wiki promoted: ${page || '(unknown)'}`,
             body: `Pending page reinforced into canonical (cosine ${(entry.cosine as number | undefined)?.toFixed(2) ?? '?'}).`,
             ...(link ? { link } : {}),
@@ -157,6 +159,7 @@ function appendReinforcementLog(entry: Record<string, unknown>): void {
           emitNotification({
             severity: 'info',
             source: 'reinforcement',
+            notify_class: 'signal',
             title: `Wiki reinforced: ${page || '(unknown)'}`,
             body: `Page weight raised on retrieval hit (cosine ${(entry.cosine as number | undefined)?.toFixed(2) ?? '?'}).`,
             ...(link ? { link } : {}),
@@ -166,6 +169,7 @@ function appendReinforcementLog(entry: Record<string, unknown>): void {
           emitNotification({
             severity: 'info',
             source: 'reinforcement',
+            notify_class: 'signal',
             title: `Transcript chunk reinforced`,
             body: `Raw transcript hit queued for wiki distillation (cosine ${(entry.cosine as number | undefined)?.toFixed(2) ?? '?'}).`,
             ...(link ? { link } : {}),
@@ -175,6 +179,7 @@ function appendReinforcementLog(entry: Record<string, unknown>): void {
           emitNotification({
             severity: 'warn',
             source: 'reinforcement',
+            notify_class: 'signal',
             title: `Page demoted: ${page || '(unknown)'}`,
             body: `User correction signal lowered the page weight.`,
             ...(link ? { link } : {}),
