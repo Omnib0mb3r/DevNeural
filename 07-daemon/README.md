@@ -215,7 +215,7 @@ Claude Code session
 npm test
 ```
 
-Vitest. 47+ tests. Covers: secret scrubbing, project ID, vector store persistence and search, SQLite + FTS, wiki schema parse/render/validate, validator (parse + repair + retry budgeting), curation (prompt filter, glossary parse and match).
+Vitest. 703 unit + integration tests as of 2026-05-16 (two pre-existing timeouts in audit-findings + session-end-pipeline excluded; tracked as separate issues). Covers: secret scrubbing, project ID, vector store persistence and search, SQLite + FTS, wiki schema parse/render/validate, validator (parse + repair + retry budgeting), curation (prompt filter, glossary parse and match), smart compact, supervisor, brainstorm pipelines, voice commands.
 
 LLM calls are not exercised in tests to avoid token cost and ollama dependency.
 

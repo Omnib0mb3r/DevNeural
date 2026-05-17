@@ -9,7 +9,7 @@
 ## A. Code health
 
 - [x] Daemon `npm run build` passes (tsc clean)
-- [x] Daemon `npm test` passes (53/53 unit tests)
+- [x] Daemon `npm test` passes (703 unit + integration tests as of 2026-05-16; two pre-existing timeouts in audit-findings + session-end-pipeline tracked separately)
 - [x] Dashboard `NODE_ENV=production npx next build` passes (13 static routes prerender)
 - [x] Dashboard `npx tsc --noEmit` clean
 - [x] Bridge `npm run build` passes

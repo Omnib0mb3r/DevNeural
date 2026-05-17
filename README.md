@@ -222,7 +222,7 @@ npm run verify-backup               # PRAGMA integrity_check + JSON parse on lat
 npm run restore                     # restore latest (refuses while daemon is up)
 npm run install-backup-task         # daily 03:00, retain 14, configurable target
 npm run backup-where                # show current backup target + schedule + last run + snapshots on disk
-npm test                            # 53 unit tests
+npm test                            # 703 unit + integration tests (as of 2026-05-16)
 ```
 
 ### Current backup configuration
