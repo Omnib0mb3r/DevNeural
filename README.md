@@ -46,9 +46,9 @@ A second brain has six properties. DevNeural has all six.
 | 4 | Orb rebind to wiki data model — force-directed graph + /graph endpoint | done, shipped |
 | 5 | Settings audit + personalized recovery docs + robust backup pipeline | done, shipped |
 | 6 | Notification hook → dashboard permission UI (CC permission/elicitation prompts surface in /sessions with answer buttons) | done, shipped |
-| 7 | Lex supervisory voice loop: daemon-PTY hosts a personality-typed Claude Code session; whisper.cpp cuBLAS STT in, Piper TTS out, silero VAD with mute auto-finalize, three voice modes (conversation / notes / push-to-talk), browser voice picker, barge-in. First-class brainstorm_sessions records, source-classed retrieval (`/lex/recall`), fenced-JSON artifact extraction (research-note, wiki-draft, project-intent, notes-summary), supervisor primitives (`/lex/steer`, `/lex/capture`, `/lex/snapshot`), conflict-overlap signal on retrieval. | shipped Slices A through E, plus voice UX and STT-config defence. See `.continue-here.md` for the residuals list. |
+| 7 | Lex supervisory voice loop: daemon-PTY hosts a personality-typed Claude Code session; whisper.cpp cuBLAS STT in, Piper TTS out, silero VAD with mute auto-finalize, three voice modes (conversation / notes / push-to-talk), browser voice picker, barge-in. First-class brainstorm_sessions records, source-classed retrieval (`/lex/recall`), fenced-JSON artifact extraction (research-note, wiki-draft, project-intent, notes-summary), supervisor primitives (`/lex/steer`, `/lex/capture`, `/lex/snapshot`), conflict-overlap signal on retrieval. | shipped Slices A through E, plus voice UX and STT-config defence. Phase Two follow-on work (cross-session supervision, awareness broadcaster, personality, smart compact) is tracked in `docs/spec/PHASE-TWO-IMPLEMENTATION.md`. |
 
-See [docs/SESSION-HANDOVER.md](docs/SESSION-HANDOVER.md) for what state the repo was in at the most recent session boundary, and `.continue-here.md` for the most recent in-progress work.
+See [docs/SESSION-HANDOVER.md](docs/SESSION-HANDOVER.md) for what state the repo was in at the most recent session boundary. Active multi-session work is tracked under `docs/HANDOVER-*.md` plus the spec files under `docs/spec/`.
 
 ---
 
