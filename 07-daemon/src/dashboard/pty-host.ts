@@ -432,17 +432,33 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
      * every turn after the first. */
     if (isCcSystemPromptChunk(data)) {
       handle.awaitingSystemPromptUntil = Date.now() + SYSTEM_PROMPT_HOLD_MS;
-      /* Auto-dismiss for daemon-owned PTYs. We are inside pty.onData
-       * which only fires on PTYs spawned by spawnLex (i.e. daemon-
-       * owned by definition); bridge-tracked external CC windows
-       * flow through worker-event-listener and never reach this
-       * callback. The cooldown via lastSystemPromptDismissAt makes
-       * sure a redraw burst within the same prompt window only
-       * writes '0\r' once. The 80ms paste-then-Enter delay mirrors
-       * ptyInject so bracketed-paste mode terminators are flushed
-       * before the carriage return commits the dismissal. */
+      /* Auto-dismiss for worker daemon-owned PTYs only. The Lex
+       * brainstorm PTY (handle.brainstormId !== null) renders user
+       * messages back into its own terminal stream — including
+       * pasted screenshot text the operator hands to Lex via a
+       * Read tool call. A screenshot of another worker's CC
+       * feedback overlay contains the same phrase + box-drawing
+       * chars the auto-dismiss matcher locks on, so the dismiss
+       * fired into the Lex PTY and the resulting '0\r' submitted
+       * a user turn that derailed Lex. The CC feedback overlay
+       * never legitimately appears inside a Lex brainstorm
+       * session (Lex is the operator-facing wrapper, not a worker
+       * eligible to rate sessions), so gating on brainstormId
+       * has no downside on the Lex side.
+       *
+       * Bridge-tracked external CC windows still flow through
+       * worker-event-listener and never reach this callback;
+       * fixing the bridge-attached auto-dismiss path is tracked
+       * separately (2026-05-16-feedback-auto-dismiss-misses-
+       * bridge-sessions.md). The cooldown via
+       * lastSystemPromptDismissAt makes sure a redraw burst
+       * within the same prompt window only writes '0\r' once. The
+       * 80ms paste-then-Enter delay mirrors ptyInject so
+       * bracketed-paste mode terminators are flushed before the
+       * carriage return commits the dismissal. */
       const now = Date.now();
       if (
+        handle.brainstormId === null &&
         shouldAutoDismissSystemPrompt(data, handle.lastSystemPromptDismissAt, now)
       ) {
         handle.lastSystemPromptDismissAt = now;
