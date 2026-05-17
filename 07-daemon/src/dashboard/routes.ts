@@ -3963,17 +3963,91 @@ export async function registerDashboardRoutes(
       reply.code(400);
       return { ok: false, error: 'text too long (max 4096 chars)' };
     }
+    /* Fix 15 — anchor-resolved dispatch.
+     *
+     * target_session is treated as a hint, not absolute. If the uuid
+     * is still the live current_session_id for its owning anchor (or
+     * the caller addressed a session with no known anchor), the
+     * dispatch path is unchanged. If the uuid is stale and the
+     * anchor is live under a different uuid, redirect and log. If
+     * the anchor is dormant, return 422 with a structured reason
+     * the caller can park on. */
+    const { randomUUID } = await import('node:crypto');
+    const { resolveAnchorDispatch } = await import('../lex/cross-session-resolve.js');
+    const signedSession = targetSession;
+    let dispatchSession = targetSession;
+    let resolvedAnchorId: string | undefined;
+    const outcome = resolveAnchorDispatch(store.db, targetSession);
+    if (outcome.kind === 'dormant') {
+      try {
+        store.db.insertCrossSessionLog({
+          id: randomUUID(),
+          target_session: targetSession,
+          caller_label: body.caller_label ?? null,
+          text_preview: body.text.slice(0, 120),
+          text_length: body.text.length,
+          decision: 'dispatched_dead_session',
+          reject_reason: JSON.stringify({
+            anchor_id: outcome.anchor_id,
+            reason: 'bound-anchor-dormant',
+          }),
+          brainstorm_id: null,
+        });
+      } catch {
+        /* never let audit failures block the response */
+      }
+      reply.code(422);
+      return {
+        ok: false,
+        error:
+          'anchor owning target_session is dormant; queue for next live session',
+        reason: 'bound-anchor-dormant',
+        anchor_id: outcome.anchor_id,
+      };
+    }
+    if (outcome.kind === 'redirect') {
+      try {
+        store.db.insertCrossSessionLog({
+          id: randomUUID(),
+          target_session: targetSession,
+          caller_label: body.caller_label ?? null,
+          text_preview: body.text.slice(0, 120),
+          text_length: body.text.length,
+          decision: 'redirected',
+          reject_reason: JSON.stringify({
+            old_session: outcome.old_session,
+            new_session: outcome.dispatch_session,
+            anchor_id: outcome.anchor_id,
+          }),
+          brainstorm_id: null,
+        });
+      } catch {
+        /* never let audit failures block the response */
+      }
+      dispatchSession = outcome.dispatch_session;
+      resolvedAnchorId = outcome.anchor_id;
+    } else if (outcome.kind === 'live-direct') {
+      resolvedAnchorId = outcome.anchor_id;
+    }
     const { crossSessionInject } = await import('../lex/cross-session-inject.js');
     const result = crossSessionInject(
       {
-        target_session: targetSession,
+        target_session: dispatchSession,
         token: body.token,
         text: body.text,
         caller_label: body.caller_label,
         commit: body.commit !== false,
+        signed_session: signedSession,
+        anchor_id: resolvedAnchorId,
       },
       store.db,
     );
+    if (resolvedAnchorId) {
+      result.anchor_id = resolvedAnchorId;
+    }
+    if (dispatchSession !== signedSession) {
+      result.dispatched_to = dispatchSession;
+    }
     if (!result.ok) {
       const code =
         result.decision === 'rejected_auth'

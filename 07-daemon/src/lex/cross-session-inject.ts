@@ -42,41 +42,53 @@ function getAllowlist(): string[] {
 }
 
 /**
- * Derive the expected HMAC token for a given target_session and minute
- * offset (0 = current minute, -1 = previous minute for skew tolerance).
+ * Derive the expected HMAC token for a given signing subject and
+ * minute offset (0 = current minute, -1 = previous minute for skew
+ * tolerance). Subject may be either a session uuid (legacy) or an
+ * anchor id (Fix 15 alternate path); both share the same scheme.
  */
-function deriveToken(targetSession: string, minuteOffset: number = 0): string {
+function deriveToken(subject: string, minuteOffset: number = 0): string {
   const secret = getAuthSecret();
   const minute = Math.floor(Date.now() / 60_000) + minuteOffset;
   return crypto
     .createHmac('sha256', secret)
-    .update(`${targetSession}:${minute}`)
+    .update(`${subject}:${minute}`)
     .digest('hex');
 }
 
 /**
  * Verify that the provided token matches either the current or the
- * previous unix-minute slot (2-minute window).
+ * previous unix-minute slot (2-minute window) against one or more
+ * acceptable signing subjects. Any subject matching against any slot
+ * accepts the request. Subjects with empty/falsy values are skipped.
  */
-function verifyToken(targetSession: string, token: string): boolean {
+function verifyToken(subjects: string[], token: string): boolean {
   if (!token) return false;
-  /* timing-safe compare for both slots */
-  const t0 = deriveToken(targetSession, 0);
-  const t1 = deriveToken(targetSession, -1);
   const buf = Buffer.from(token, 'hex');
-  const b0 = Buffer.from(t0, 'hex');
-  const b1 = Buffer.from(t1, 'hex');
   if (buf.length !== 32) return false; /* sha256 = 32 bytes */
-  return (
-    crypto.timingSafeEqual(buf, b0) ||
-    crypto.timingSafeEqual(buf, b1)
-  );
+  for (const subject of subjects) {
+    if (!subject) continue;
+    const t0 = deriveToken(subject, 0);
+    const t1 = deriveToken(subject, -1);
+    const b0 = Buffer.from(t0, 'hex');
+    const b1 = Buffer.from(t1, 'hex');
+    if (
+      crypto.timingSafeEqual(buf, b0) ||
+      crypto.timingSafeEqual(buf, b1)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export interface InjectRequest {
   /** PTY id or brainstorm session name to inject into. */
   target_session: string;
-  /** HMAC token derived from auth secret + target_session + unix_minute. */
+  /** HMAC token derived from auth secret + (signed subject) + unix_minute.
+   * Subject defaults to target_session; can be overridden via
+   * signed_session (when the route redirected a stale uuid onto a
+   * live one) or signed_anchor_id (anchor-based signing). */
   token: string;
   /** Text to inject.  Max 4096 chars. */
   text: string;
@@ -84,14 +96,39 @@ export interface InjectRequest {
   caller_label?: string;
   /** If true, append \r to commit the line (default: true). */
   commit?: boolean;
+  /** Fix 15 — HMAC verification runs against this string instead of
+   * target_session. Set by the route layer when it redirected the
+   * inject onto a different (live) session uuid than the one the
+   * caller signed for. Defaults to target_session. */
+  signed_session?: string;
+  /** Fix 15 — alternate signing subject. When set, verification
+   * accepts a token computed against this anchor id in addition to
+   * the session-based form. Anchor ids are stable across /clear, so
+   * supervisory callers should prefer this signing path. */
+  signed_anchor_id?: string;
+  /** Fix 15 — anchor id stamped onto the audit row when known. */
+  anchor_id?: string;
 }
 
 export interface InjectResult {
   ok: boolean;
-  decision: 'accepted' | 'rejected_auth' | 'rejected_allowlist' | 'rejected_pty';
+  decision:
+    | 'accepted'
+    | 'rejected_auth'
+    | 'rejected_allowlist'
+    | 'rejected_pty'
+    | 'redirected'
+    | 'dispatched_dead_session'
+    | 'rejected_anchor_dormant';
   /** When 'accepted', which transport delivered the prompt. */
   transport?: 'pty' | 'bridge';
   error?: string;
+  /** Fix 15 — when the route layer rewrote target_session because the
+   * caller's uuid was stale, the inject path records the chosen
+   * dispatch target so the audit row reflects what actually fired. */
+  dispatched_to?: string;
+  /** Fix 15 — anchor id resolved for this dispatch, when known. */
+  anchor_id?: string;
 }
 
 /**
@@ -140,7 +177,16 @@ export function crossSessionInject(
   db: IndexDb,
   deps?: CrossSessionInjectDeps,
 ): InjectResult {
-  const { target_session, token, text, caller_label, commit = true } = req;
+  const {
+    target_session,
+    token,
+    text,
+    caller_label,
+    commit = true,
+    signed_session,
+    signed_anchor_id,
+    anchor_id,
+  } = req;
   const text_preview = text.slice(0, 120);
   const text_length = text.length;
   const listPtysFn = deps?.listPtys ?? listPtys;
@@ -171,8 +217,15 @@ export function crossSessionInject(
     }
   }
 
-  /* 1. Token auth */
-  if (!verifyToken(target_session, token)) {
+  /* 1. Token auth. Fix 15 — accept tokens signed against the legacy
+   * target_session, the route-overridden signed_session (when the
+   * route redirected a stale uuid), or the anchor id (stable across
+   * /clear-driven session uuid flips). */
+  const subjects = [
+    signed_session ?? target_session,
+    signed_anchor_id ?? '',
+  ];
+  if (!verifyToken(subjects, token)) {
     audit('rejected_auth', 'HMAC verification failed');
     return { ok: false, decision: 'rejected_auth', error: 'invalid token' };
   }

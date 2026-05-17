@@ -305,6 +305,12 @@ export interface ProjectSessionRow {
   title: string | null;
   status: 'live' | 'dormant';
   current_session_id: string | null;
+  /* Prior current_session_id captured at the moment bridge-presence
+   * flips this anchor onto a new CC session uuid (or back to dormant).
+   * Lets cross-session-inject map a stale uuid back to its owning
+   * anchor without a separate history table. Updated by
+   * bridge-presence.reconcileBridgePresence (Fix 15). */
+  previous_session_id?: string | null;
   current_bridge_id: string | null;
   current_pty_id: string | null;
   created_ms: number;
@@ -1767,6 +1773,28 @@ export class IndexDb {
     );
   }
 
+  /* Fix 15 — anchor lookup by CC session uuid.
+   *
+   * Returns the project_session row whose current_session_id matches
+   * `sessionId` (live anchor) or whose previous_session_id matches
+   * (anchor that flipped onto a new uuid since the caller last cached
+   * one). Used by /lex/inject-cross-session to redirect injects that
+   * target a stale uuid onto the anchor's live session, and to surface
+   * bound-anchor-dormant rejects when the anchor has gone away. */
+  findProjectSessionBySessionId(sessionId: string): ProjectSessionRow | null {
+    if (!sessionId) return null;
+    return (
+      (this.db
+        .prepare(
+          `SELECT * FROM project_session
+             WHERE current_session_id = ? OR previous_session_id = ?
+             ORDER BY status = 'live' DESC, last_seen_ms DESC
+             LIMIT 1`,
+        )
+        .get(sessionId, sessionId) as ProjectSessionRow | undefined) ?? null
+    );
+  }
+
   listProjectSessions(opts: {
     status?: 'live' | 'dormant';
     limit?: number;
@@ -2092,7 +2120,10 @@ export class IndexDb {
       | 'rejected_auth'
       | 'rejected_allowlist'
       | 'rejected_pty'
-      | 'shadow';
+      | 'shadow'
+      | 'redirected'
+      | 'dispatched_dead_session'
+      | 'rejected_anchor_dormant';
     reject_reason?: string | null;
     brainstorm_id?: string | null;
   }): void {

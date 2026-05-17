@@ -231,11 +231,20 @@ export function reconcileBridgePresence(
     if (primary.ccSessionIds.length > 0) {
       currentSession = primary.ccSessionIds[0]!;
     }
+    /* Fix 15 — preserve the prior uuid so /lex/inject-cross-session
+     * can map a stale uuid back to this anchor and redirect to the
+     * live session. Only update when the uuid actually changed; a
+     * no-op rebind shouldn't clobber a still-useful history pointer. */
+    const previousSessionPatch =
+      priorSession && currentSession && priorSession !== currentSession
+        ? { previous_session_id: priorSession }
+        : {};
     db.updateProjectSession(anchor.id, {
       status: 'live',
       current_bridge_id: marker,
       current_session_id: currentSession,
       last_seen_ms: now,
+      ...previousSessionPatch,
     });
     /* Transcript-ref bookkeeping. Anchor just bound a CC session UUID,
      * either fresh from dormant or because the bridge reported a new
@@ -274,11 +283,15 @@ export function reconcileBridgePresence(
     if (row.current_session_id) {
       db.closeProjectTranscriptRef(row.current_session_id, now);
     }
+    /* Fix 15 — anchor going dormant. Stash the prior uuid so a late
+     * inject targeting it gets the bound-anchor-dormant reject rather
+     * than a silent rejected_pty (no PTY found). */
     db.updateProjectSession(row.id, {
       status: 'dormant',
       current_bridge_id: null,
       current_session_id: null,
       current_pty_id: null,
+      previous_session_id: row.current_session_id ?? row.previous_session_id ?? null,
       last_seen_ms: now,
     });
     dormantAnchorIds.push(row.id);

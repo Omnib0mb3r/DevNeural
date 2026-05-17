@@ -1,0 +1,151 @@
+/**
+ * Fix 15 C1 — anchor-resolved cross-session inject dispatch.
+ *
+ * Verifies that resolveAnchorDispatch produces the three outcomes the
+ * route layer needs to decide between (pass-through, redirect to
+ * live, reject dormant). Migrations are run against a tmp index.db so
+ * the previous_session_id column from migration 029 is available.
+ */
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { IndexDb } from '../src/store/index-db.js';
+import { runMigrations } from '../src/db/migrate.js';
+import { resolveAnchorDispatch } from '../src/lex/cross-session-resolve.js';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const MIGRATIONS_DIR = path.resolve(HERE, '..', 'scripts', 'migrations');
+
+let tmpDir: string;
+let dbFile: string;
+let db: IndexDb;
+
+const LIVE_UUID = '11111111-1111-1111-1111-111111111111';
+const STALE_UUID = '22222222-2222-2222-2222-222222222222';
+
+beforeEach(async () => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devneural-fix15-c1-'));
+  dbFile = path.join(tmpDir, 'index.db');
+  /* Legacy IndexDb constructor seeds tables (raw_chunks_meta, etc.)
+   * that early SQL migrations ALTER. Open + close once so the schema
+   * exists, then run the migration runner. */
+  const seed = new IndexDb(dbFile);
+  seed.close();
+  await runMigrations({ dbPath: dbFile, migrationsDir: MIGRATIONS_DIR });
+  db = new IndexDb(dbFile);
+});
+
+afterEach(() => {
+  db.close();
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+function insertAnchor(opts: {
+  id: string;
+  status: 'live' | 'dormant';
+  current_session_id: string | null;
+  previous_session_id?: string | null;
+}): void {
+  const now = Date.now();
+  db.insertProjectSession({
+    id: opts.id,
+    project_slug: `slug-${opts.id}`,
+    cwd: `/tmp/${opts.id}`,
+    title: null,
+    status: opts.status,
+    current_session_id: opts.current_session_id,
+    current_bridge_id: null,
+    current_pty_id: null,
+    created_ms: now,
+    last_seen_ms: now,
+  });
+  if (opts.previous_session_id) {
+    db.updateProjectSession(opts.id, {
+      previous_session_id: opts.previous_session_id,
+    });
+  }
+}
+
+describe('resolveAnchorDispatch (Fix 15 C1)', () => {
+  it('redirects stale uuid to live current_session_id when anchor flipped', () => {
+    insertAnchor({
+      id: 'anchor-a',
+      status: 'live',
+      current_session_id: LIVE_UUID,
+      previous_session_id: STALE_UUID,
+    });
+    const outcome = resolveAnchorDispatch(db, STALE_UUID);
+    expect(outcome.kind).toBe('redirect');
+    if (outcome.kind !== 'redirect') throw new Error('narrowing');
+    expect(outcome.dispatch_session).toBe(LIVE_UUID);
+    expect(outcome.old_session).toBe(STALE_UUID);
+    expect(outcome.anchor_id).toBe('anchor-a');
+  });
+
+  it('returns dormant outcome when owning anchor has gone dormant', () => {
+    insertAnchor({
+      id: 'anchor-b',
+      status: 'dormant',
+      current_session_id: null,
+      previous_session_id: STALE_UUID,
+    });
+    const outcome = resolveAnchorDispatch(db, STALE_UUID);
+    expect(outcome.kind).toBe('dormant');
+    if (outcome.kind !== 'dormant') throw new Error('narrowing');
+    expect(outcome.anchor_id).toBe('anchor-b');
+  });
+
+  it('passes through when no anchor knows this session uuid', () => {
+    const outcome = resolveAnchorDispatch(db, 'orphan-uuid-xxxx');
+    expect(outcome.kind).toBe('pass');
+    if (outcome.kind !== 'pass') throw new Error('narrowing');
+    expect(outcome.dispatch_session).toBe('orphan-uuid-xxxx');
+  });
+
+  it('reports live-direct when uuid is still the anchors current session', () => {
+    insertAnchor({
+      id: 'anchor-c',
+      status: 'live',
+      current_session_id: LIVE_UUID,
+    });
+    const outcome = resolveAnchorDispatch(db, LIVE_UUID);
+    expect(outcome.kind).toBe('live-direct');
+    if (outcome.kind !== 'live-direct') throw new Error('narrowing');
+    expect(outcome.dispatch_session).toBe(LIVE_UUID);
+    expect(outcome.anchor_id).toBe('anchor-c');
+  });
+
+  it('audit log decision enum accepts new Fix 15 values', () => {
+    /* Sanity: the migration that widens the CHECK constraint must
+     * have applied, otherwise inserting these decisions would throw
+     * a SQLITE_CONSTRAINT_CHECK error. */
+    expect(() => {
+      db.insertCrossSessionLog({
+        id: 'r1',
+        target_session: STALE_UUID,
+        text_preview: 'preview',
+        text_length: 7,
+        decision: 'redirected',
+        reject_reason: JSON.stringify({ anchor_id: 'x' }),
+      });
+      db.insertCrossSessionLog({
+        id: 'r2',
+        target_session: STALE_UUID,
+        text_preview: 'preview',
+        text_length: 7,
+        decision: 'dispatched_dead_session',
+        reject_reason: 'bound-anchor-dormant',
+      });
+      db.insertCrossSessionLog({
+        id: 'r3',
+        target_session: STALE_UUID,
+        text_preview: 'preview',
+        text_length: 7,
+        decision: 'rejected_anchor_dormant',
+        reject_reason: null,
+      });
+    }).not.toThrow();
+  });
+});
