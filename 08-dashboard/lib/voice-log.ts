@@ -38,6 +38,8 @@ export type VoiceLogKind =
   | "engine-disable"
   | "tts-start"
   | "tts-end"
+  | "settings-reset-on-reconnect"
+  | "settings-reset-on-reconnect-failed"
   | "error";
 
 export interface VoiceLogEntry {

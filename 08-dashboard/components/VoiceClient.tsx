@@ -9,7 +9,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Icon } from "./Icon";
 import { LexThumbs } from "./LexThumbs";
 import { listPtys, type PtyEntry } from "@/lib/daemon-client";
-import { onVoiceSettingUpdate } from "@/lib/voice-settings-bus";
+import { emitVoiceSettingUpdate, onVoiceSettingUpdate } from "@/lib/voice-settings-bus";
 import { emitTranscriptTurn } from "@/lib/transcript-bus";
 import {
   createDedupe,
@@ -413,6 +413,28 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     brainstorm_id: string | null;
   } | null>(null);
   const [errMsg, setErrMsg] = useState<string>("");
+  /* Transient neutral banner. Used for non-error notifications that
+   * should fade on their own (Settings reset on reconnect, etc.). A
+   * separate channel from errMsg so it never lights up the error pill
+   * or blocks the retry CTA. Auto-clears via infoMsgTimerRef. */
+  const [infoMsg, setInfoMsg] = useState<string>("");
+  const infoMsgTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showInfoToast = React.useCallback((msg: string, ms = 4000): void => {
+    setInfoMsg(msg);
+    if (infoMsgTimerRef.current) clearTimeout(infoMsgTimerRef.current);
+    infoMsgTimerRef.current = setTimeout(() => {
+      setInfoMsg("");
+      infoMsgTimerRef.current = null;
+    }, ms);
+  }, []);
+  useEffect(() => {
+    return () => {
+      if (infoMsgTimerRef.current) {
+        clearTimeout(infoMsgTimerRef.current);
+        infoMsgTimerRef.current = null;
+      }
+    };
+  }, []);
   /* Live counter shown while the user is talking so they know the
    * mic is still capturing and roughly how much they've said. */
   const [utteranceMs, setUtteranceMs] = useState<number>(0);
@@ -1438,13 +1460,98 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         wsRef.current = ws;
 
         ws.onopen = () => {
+          const wasReconnect = reconnectAttempts > 0;
           reconnectAttempts = 0;
-          logVoice("ws-open", "voice ws connected");
+          logVoice("ws-open", "voice ws connected", { reconnect: wasReconnect });
           sendJson({
             t: "hello",
             session_id: sessionId ?? undefined,
             mode: modeRef.current,
           });
+          if (wasReconnect) {
+            /* Daemon restart breaks voice: on reconnect the WS re-binds
+             * but every cached voice setting (mic gain, VAD threshold,
+             * barge cooldown, voice/speed) has to be re-pushed from
+             * disk through the bus, otherwise the capture path keeps
+             * running on the pre-restart values it cached at mount.
+             * Re-fetch /voice/piper-status and broadcast the same
+             * voice-settings-bus updates the SettingsPanel emits on a
+             * slider change. No modal: one transient toast confirms
+             * the silent re-sync. */
+            void (async () => {
+              try {
+                const r = await fetch("/voice/piper-status", {
+                  credentials: "include",
+                });
+                if (!r.ok) return;
+                const j = (await r.json()) as {
+                  active_voice?: unknown;
+                  speed?: unknown;
+                  barge_cooldown_ms?: unknown;
+                  vad_sensitivity?: unknown;
+                  vad_redemption_ms?: unknown;
+                  mic_gain?: unknown;
+                };
+                if (typeof j.active_voice === "string" && j.active_voice) {
+                  emitVoiceSettingUpdate({
+                    key: "active_voice",
+                    value: j.active_voice,
+                  });
+                }
+                if (typeof j.speed === "number" && Number.isFinite(j.speed)) {
+                  emitVoiceSettingUpdate({ key: "speed", value: j.speed });
+                }
+                if (
+                  typeof j.barge_cooldown_ms === "number" &&
+                  Number.isFinite(j.barge_cooldown_ms)
+                ) {
+                  emitVoiceSettingUpdate({
+                    key: "barge_cooldown_ms",
+                    value: j.barge_cooldown_ms,
+                  });
+                }
+                if (
+                  typeof j.vad_sensitivity === "number" &&
+                  Number.isFinite(j.vad_sensitivity)
+                ) {
+                  emitVoiceSettingUpdate({
+                    key: "vad_sensitivity",
+                    value: j.vad_sensitivity,
+                  });
+                }
+                if (
+                  typeof j.vad_redemption_ms === "number" &&
+                  Number.isFinite(j.vad_redemption_ms)
+                ) {
+                  emitVoiceSettingUpdate({
+                    key: "vad_redemption_ms",
+                    value: j.vad_redemption_ms,
+                  });
+                }
+                if (
+                  typeof j.mic_gain === "number" &&
+                  Number.isFinite(j.mic_gain)
+                ) {
+                  emitVoiceSettingUpdate({
+                    key: "mic_gain",
+                    value: j.mic_gain,
+                  });
+                }
+                logVoice(
+                  "settings-reset-on-reconnect",
+                  "voice settings re-synced after daemon reconnect",
+                );
+                showInfoToast("voice settings re-synced after daemon restart");
+              } catch (err) {
+                logVoice(
+                  "settings-reset-on-reconnect-failed",
+                  (err as Error).message,
+                  undefined,
+                  "warn",
+                );
+              }
+            })();
+          }
         };
         ws.onclose = (ev) => {
           if (cancelled) return;
@@ -2457,6 +2564,15 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           >
             {pttHolding ? "release to send" : "hold to talk"}
           </button>
+        </div>
+      )}
+      {infoMsg && (
+        <div
+          className="px-5 py-2 text-xs text-txt2 bg-brand/10 ring-1 ring-brand/20 mx-5 mt-3 rounded-card"
+          role="status"
+          aria-live="polite"
+        >
+          {infoMsg}
         </div>
       )}
       {(lastTurn || errMsg) && (
