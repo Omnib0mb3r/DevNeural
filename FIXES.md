@@ -25,6 +25,11 @@ Status legend: ⏳ queued, 🔄 in progress, ✅ shipped, ❌ blocked.
 | 15a | Cross-session-inject: anchor-resolved dispatch + auto-redirect | ✅ | 6c2f8c2 | migration 029, previous_session_id, redirect/dormant audit rows, resolveAnchorDispatch helper. |
 | 15b | Cross-session-inject: anchor_id-signed HMAC alternate | ✅ | aef80dc | verifyToken multi-subject, route accepts signed_anchor_id, /auth/cross-session-token gains anchor_id mode. |
 | 15c | Smart-compact: replay parked injects on resume | ✅ | 57c5304 | migration 030 payload_text col, findParkedInjectsForAnchor, fireSmartCompact replays max 3 before summary. |
+| 16a | deck-hook tolerate missing tmp file (defense) | ✅ | stream-deck 83f46c7 | `[ -f "$TMP" ]` guard stops the `mv: cannot stat` flood on the CC UI immediately. |
+| 16b | GET /projects/anchors/by-session/:uuid (DevNeural side) | ✅ | dc8f41a | additive endpoint for external state-keying consumers (deck-hook, future supervisors). |
+| 16c | deck-hook anchor-keyed state + race-safety | ✅ | stream-deck 77db4c2 | bounded retry on daemon lookup, pid+nanos TMP suffix for concurrent hooks, AnchorId/RecordedSessionId in payload. |
+| 16d | one-shot migration of legacy uuid-keyed state files | ✅ | stream-deck 505c43d | mtime>60s guard for Race 3, marker file gate at `.migrated-fix16`, content-idempotent. |
+| 16e | virtual deck source change | ⏭ skipped | — | Per amendment 2 conditional: virtual deck reads `/sessions` endpoint, not state files; layout change is transparent. No commit needed. |
 
 > **Note: no Fix 8.** The slot was skipped intentionally between
 > Fix 7 and Fix 9; the original Fix 8 placeholder did not earn its
