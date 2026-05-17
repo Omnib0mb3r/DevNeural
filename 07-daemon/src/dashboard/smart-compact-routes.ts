@@ -19,6 +19,7 @@
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import type { IndexDb, SmartCompactLogRow } from '../store/index-db.js';
@@ -32,6 +33,12 @@ import {
   type EvalReason,
   type Phase,
 } from '../lex/smart-compact.js';
+import {
+  awaitNewSessionReady,
+  capturePreClearJsonlSet,
+  ccProjectsDirForCwd,
+  type SessionReadyResult,
+} from './smart-compact-injector.js';
 
 export interface PtyInjector {
   (
@@ -336,6 +343,25 @@ export interface FireOptions {
    * dashboard). When true, the audit row uses action as provided and
    * inject runs regardless of the shadow count. */
   force?: boolean;
+  /** Optional event-driven readiness gate for the resume summary
+   * paste. When provided AND action='fire' AND the path is not
+   * shadow/off, fireSmartCompact runs /clear synchronously, then
+   * kicks off a fire-and-forget async sequence that awaits this
+   * gate before injecting the summary. If the gate resolves with
+   * ready=false the sequence falls back to a 850ms wait so the
+   * summary still ships. Tests that omit this option exercise the
+   * legacy back-to-back inject path (the 24-test regression). */
+  awaitSessionReady?: () => Promise<SessionReadyResult>;
+  /** Fallback wait when awaitSessionReady resolves !ready. Default
+   * 850ms - the legacy time-based settle window. */
+  fallbackWaitMs?: number;
+  /** Notification of the deferred summary inject's outcome. Fires
+   * exactly once when awaitSessionReady is configured, after the
+   * summary inject resolves. Best-effort; failures swallowed. */
+  onResumeComplete?: (info: {
+    ship_ok: boolean;
+    wait: SessionReadyResult | null;
+  }) => void;
 }
 
 export interface FireResult {
@@ -343,7 +369,11 @@ export interface FireResult {
   action: EvalAction | 'shadow';
   shadow: boolean;
   log_id: string;
-  inject_result?: 'accepted' | 'pty_not_found' | 'wrap-injected';
+  inject_result?:
+    | 'accepted'
+    | 'pty_not_found'
+    | 'wrap-injected'
+    | 'accepted-pending-ready';
   anchor_id: string;
 }
 
@@ -480,9 +510,50 @@ export function fireSmartCompact(
     if (opts.action === 'wrap') {
       const r = opts.injector(target, WRAP_AND_COMMIT_PROMPT, true);
       injectResult = r.ok ? 'wrap-injected' : 'pty_not_found';
+    } else if (opts.awaitSessionReady) {
+      /* Event-driven path: /clear synchronously, then wait for the
+       * fresh CC session to finish its SessionStart attachment chain
+       * before pasting the resume summary. Without this gate the
+       * summary's auto-CR nudge fired during the new-session init
+       * window and got swallowed, parking the summary in the input
+       * box. The /clear inject result is reflected in the audit row
+       * upfront; the summary inject is fire-and-forget and surfaced
+       * via onResumeComplete. */
+      const cleared = opts.injector(target, '/clear', true);
+      if (!cleared.ok) {
+        injectResult = 'pty_not_found';
+      } else {
+        injectResult = 'accepted-pending-ready';
+        const summary = opts.summary ?? '';
+        const fallbackWaitMs = opts.fallbackWaitMs ?? 850;
+        void (async () => {
+          let wait: SessionReadyResult | null = null;
+          try {
+            wait = await opts.awaitSessionReady!();
+          } catch {
+            wait = null;
+          }
+          if (!wait || !wait.ready) {
+            await new Promise<void>((resolve) => {
+              const t = setTimeout(resolve, fallbackWaitMs);
+              if (typeof (t as { unref?: () => void }).unref === 'function') {
+                (t as { unref: () => void }).unref();
+              }
+            });
+          }
+          const ship = opts.injector(target, summary, true);
+          try {
+            opts.onResumeComplete?.({ ship_ok: ship.ok, wait });
+          } catch {
+            /* observational */
+          }
+        })();
+      }
     } else {
-      /* fire: /clear then summary. Two injects with the existing 80ms
-       * paste-then-Enter delay built into ptyInject. */
+      /* Legacy back-to-back path: /clear then summary inline. Two
+       * injects with the existing 80ms paste-then-Enter delay built
+       * into ptyInject. Tests exercise this branch by omitting
+       * awaitSessionReady. */
       const cleared = opts.injector(target, '/clear', true);
       const summary = opts.summary ?? '';
       const ship = opts.injector(target, summary, true);
@@ -561,6 +632,25 @@ export function registerSmartCompactRoutes(
       reply.code(400);
       return { ok: false, error: 'anchor_id, reason, action required' };
     }
+    /* Build the event-driven readiness gate for the resume summary
+     * paste. Skipped for action='wrap' since wrap does a single
+     * inject. Skipped when the anchor has no resolvable cwd (no
+     * project dir to watch) - fireSmartCompact will fall back to the
+     * legacy back-to-back inject in that case. */
+    let awaitSessionReady: (() => Promise<SessionReadyResult>) | undefined;
+    if (body.action === 'fire') {
+      const anchor = db.getProjectSession(body.anchor_id);
+      if (anchor?.cwd) {
+        const ccProjectsDir = ccProjectsDirForCwd(os.homedir(), anchor.cwd);
+        const preClearFiles = capturePreClearJsonlSet(ccProjectsDir);
+        awaitSessionReady = () =>
+          awaitNewSessionReady({
+            ccProjectsDir,
+            preClearFiles,
+            io: { log: (msg) => log(msg) },
+          });
+      }
+    }
     const r = fireSmartCompact(db, body.anchor_id, {
       caller: body.caller ?? 'lex',
       reason: body.reason,
@@ -569,9 +659,15 @@ export function registerSmartCompactRoutes(
       summary: body.summary,
       injector,
       force: body.force === true,
+      ...(awaitSessionReady ? { awaitSessionReady } : {}),
+      onResumeComplete: (info) => {
+        log(
+          `[smart-compact] resume ship_ok=${info.ship_ok} wait=${info.wait?.reason ?? 'none'} elapsed=${info.wait?.elapsed_ms ?? 0}ms`,
+        );
+      },
     });
     log(
-      `[smart-compact] anchor=${body.anchor_id} reason=${body.reason} action=${r.action} shadow=${r.shadow}`,
+      `[smart-compact] anchor=${body.anchor_id} reason=${body.reason} action=${r.action} shadow=${r.shadow} inject=${r.inject_result ?? 'n/a'}`,
     );
     return r;
   });

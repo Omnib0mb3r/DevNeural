@@ -13,6 +13,7 @@
  * logs decisions so the audit panel reflects intended fires even
  * when the operator has the kill-switch on.
  */
+import * as os from 'node:os';
 import type { IndexDb } from '../store/index-db.js';
 import {
   evaluateSmartCompact,
@@ -21,6 +22,12 @@ import {
   type EvaluateResult,
   type PtyInjector,
 } from './smart-compact-routes.js';
+import {
+  awaitNewSessionReady,
+  capturePreClearJsonlSet,
+  ccProjectsDirForCwd,
+  type SessionReadyResult,
+} from './smart-compact-injector.js';
 
 export interface SchedulerDeps {
   db: IndexDb;
@@ -67,6 +74,23 @@ export async function runSmartCompactTick(
         result.waited.push(row.id);
         continue;
       }
+      /* Mirror the /lex/smart-compact/fire route's readiness gate so
+       * scheduler-driven fires get the same /clear + wait + summary
+       * sequencing on bridge-bound workers. Skipped for action='wrap'
+       * (single inject) and when row.cwd is empty. */
+      let awaitSessionReady:
+        | (() => Promise<SessionReadyResult>)
+        | undefined;
+      if (v.action === 'fire' && row.cwd) {
+        const ccProjectsDir = ccProjectsDirForCwd(os.homedir(), row.cwd);
+        const preClearFiles = capturePreClearJsonlSet(ccProjectsDir);
+        awaitSessionReady = () =>
+          awaitNewSessionReady({
+            ccProjectsDir,
+            preClearFiles,
+            io: { log },
+          });
+      }
       const r = fireSmartCompact(deps.db, row.id, {
         caller: 'scheduler',
         reason: v.reason,
@@ -74,6 +98,7 @@ export async function runSmartCompactTick(
         ctxPct: v.ctx_pct,
         ...(v.summary !== undefined ? { summary: v.summary } : {}),
         injector: deps.injector,
+        ...(awaitSessionReady ? { awaitSessionReady } : {}),
       });
       if (v.action === 'fire') result.fired.push(row.id);
       else result.wrapped.push(row.id);
