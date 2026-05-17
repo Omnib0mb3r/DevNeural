@@ -104,23 +104,23 @@ function seedAnchor(opts: {
 }
 
 describe('evaluateSmartCompact', () => {
-  it('returns 404-style error when anchor is unknown', () => {
-    const r = evaluateSmartCompact(db, 'missing');
+  it('returns 404-style error when anchor is unknown', async () => {
+    const r = await evaluateSmartCompact(db, 'missing');
     expect(r.ok).toBe(false);
     expect(r.error).toBe('anchor not found');
   });
 
-  it('returns wait + null ctx_pct when no transcript ref or ctx provider', () => {
+  it('returns wait + null ctx_pct when no transcript ref or ctx provider', async () => {
     seedAnchor({ id: 'a' });
-    const r = evaluateSmartCompact(db, 'a');
+    const r = await evaluateSmartCompact(db, 'a');
     expect(r.ok).toBe(true);
     expect(r.action).toBe('wait');
     expect(r.ctx_pct).toBeNull();
   });
 
-  it('passes through explicit ctx_pct and phase to the evaluator', () => {
+  it('passes through explicit ctx_pct and phase to the evaluator', async () => {
     seedAnchor({ id: 'a' });
-    const r = evaluateSmartCompact(db, 'a', {
+    const r = await evaluateSmartCompact(db, 'a', {
       ctxPct: 60,
       phase: 'idle',
       lastCommitMs: null,
@@ -132,10 +132,10 @@ describe('evaluateSmartCompact', () => {
     expect(r.summary).toMatch(/Context refreshed/);
   });
 
-  it('returns shadow=true while attempt count is under threshold', () => {
+  it('returns shadow=true while attempt count is under threshold', async () => {
     process.env.DEVNEURAL_SMART_COMPACT_SHADOW_N = '3';
     seedAnchor({ id: 'a' });
-    const r = evaluateSmartCompact(db, 'a', { ctxPct: 60, phase: 'idle' });
+    const r = await evaluateSmartCompact(db, 'a', { ctxPct: 60, phase: 'idle' });
     expect(r.shadow).toBe(true);
   });
 });

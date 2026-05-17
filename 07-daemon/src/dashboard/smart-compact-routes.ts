@@ -24,7 +24,6 @@ import * as path from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import type { IndexDb, SmartCompactLogRow } from '../store/index-db.js';
 import {
-  assembleSummary,
   defaults,
   evaluateTrigger,
   isShadow,
@@ -33,6 +32,10 @@ import {
   type EvalReason,
   type Phase,
 } from '../lex/smart-compact.js';
+import {
+  buildSixSectionResume,
+  type FailedAttemptsExtractor,
+} from '../lex/six-section-resume.js';
 import {
   awaitNewSessionReady,
   capturePreClearJsonlSet,
@@ -145,20 +148,144 @@ function recentCommits(cwd: string, n: number = 10): string[] {
   }
 }
 
-function diffStat(cwd: string): string {
-  if (!cwd || !fs.existsSync(cwd)) return '';
+/* Six-section "Files in flight" feeder. `git status --short` returns
+ * one line per dirty path, prefixed with a two-char status code. The
+ * builder treats each line as a discrete entry; the caller does not
+ * need to parse the codes for the resume to be useful. */
+function diffStatShort(cwd: string): string[] {
+  if (!cwd || !fs.existsSync(cwd)) return [];
   try {
     const out = execFileSync(
       'git',
-      ['-C', cwd, 'diff', '--stat'],
+      ['-C', cwd, 'status', '--short'],
       { encoding: 'utf-8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] },
     );
-    /* Last line of --stat is the summary, e.g.
-     * " 3 files changed, 42 insertions(+), 5 deletions(-)". */
-    const lines = out.split('\n').filter((l) => l.trim());
-    return lines[lines.length - 1] ?? '';
+    return out
+      .split('\n')
+      .map((l) => l.replace(/\s+$/, ''))
+      .filter((l) => l.length > 0);
   } catch {
-    return '';
+    return [];
+  }
+}
+
+/* Six-section "Files in flight" feeder: scan the recent jsonl tail
+ * for tool_use entries whose name is Read, Edit, or Write, and pull
+ * the `path` / `file_path` argument out of input. Newest last. Caller
+ * (six-section-resume.ts) dedupes and caps to the most recent 8. */
+function recentToolPathsFromJsonl(jsonlPath: string | null): string[] {
+  if (!jsonlPath || !fs.existsSync(jsonlPath)) return [];
+  try {
+    const stat = fs.statSync(jsonlPath);
+    const tailLen = Math.min(stat.size, 64 * 1024);
+    const start = stat.size - tailLen;
+    const fd = fs.openSync(jsonlPath, 'r');
+    try {
+      const buf = Buffer.alloc(tailLen);
+      fs.readSync(fd, buf, 0, tailLen, start);
+      const text = buf.toString('utf-8');
+      const lines = text.split('\n').filter((l) => l.trim());
+      const out: string[] = [];
+      for (const line of lines) {
+        try {
+          const rec = JSON.parse(line) as {
+            message?: {
+              content?: Array<{
+                type?: string;
+                name?: string;
+                input?: { file_path?: unknown; path?: unknown };
+              }>;
+            };
+          };
+          for (const c of rec.message?.content ?? []) {
+            if (c?.type !== 'tool_use') continue;
+            const n = c.name;
+            if (n !== 'Read' && n !== 'Edit' && n !== 'Write') continue;
+            const p =
+              (typeof c.input?.file_path === 'string' && c.input.file_path) ||
+              (typeof c.input?.path === 'string' && c.input.path) ||
+              '';
+            if (p) out.push(p);
+          }
+        } catch {
+          continue;
+        }
+      }
+      return out;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return [];
+  }
+}
+
+/* Six-section "Next step" feeder. Workers writing an away-summary
+ * conventionally end with a "Next:" prefix on the last paragraph. We
+ * scan the tail jsonl for the most recent assistant message that
+ * contains a "Next:" line and return the text after the prefix. */
+function nextStepFromAwaySummary(jsonlPath: string | null): string {
+  if (!jsonlPath || !fs.existsSync(jsonlPath)) return '';
+  const turns = recentAssistantTurnsFromJsonl(jsonlPath);
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = turns[i] ?? '';
+    const match = t.match(/(?:^|\n)\s*Next:\s*([^\n]+)/i);
+    if (match && match[1]) {
+      return match[1].trim();
+    }
+  }
+  return '';
+}
+
+/* Six-section "Failed attempts" feeder: pull the most recent N assistant
+ * turn texts so the LLM extractor has something to scan. Cap to the
+ * last 6 turns to keep the extractor prompt short. */
+function recentAssistantTurnsFromJsonl(
+  jsonlPath: string | null,
+  maxTurns: number = 6,
+): string[] {
+  if (!jsonlPath || !fs.existsSync(jsonlPath)) return [];
+  try {
+    const stat = fs.statSync(jsonlPath);
+    const tailLen = Math.min(stat.size, 128 * 1024);
+    const start = stat.size - tailLen;
+    const fd = fs.openSync(jsonlPath, 'r');
+    try {
+      const buf = Buffer.alloc(tailLen);
+      fs.readSync(fd, buf, 0, tailLen, start);
+      const text = buf.toString('utf-8');
+      const lines = text.split('\n').filter((l) => l.trim());
+      const out: string[] = [];
+      for (const line of lines) {
+        try {
+          const rec = JSON.parse(line) as {
+            type?: string;
+            message?: { content?: unknown };
+          };
+          if (rec.type !== 'assistant') continue;
+          const content = rec.message?.content;
+          if (typeof content === 'string') {
+            out.push(content);
+          } else if (Array.isArray(content)) {
+            const texts: string[] = [];
+            for (const c of content) {
+              const block = c as { type?: string; text?: string };
+              if (block?.type === 'text' && typeof block.text === 'string') {
+                texts.push(block.text);
+              }
+            }
+            if (texts.length > 0) out.push(texts.join('\n'));
+          }
+        } catch {
+          continue;
+        }
+      }
+      return out.slice(-maxTurns);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return [];
   }
 }
 
@@ -202,20 +329,28 @@ function jsonlTailSummary(jsonlPath: string | null): string {
 
 export interface BuildSummaryOptions {
   recentCommits?: (cwd: string) => string[];
-  diffStat?: (cwd: string) => string;
+  diffStatShort?: (cwd: string) => string[];
   lastActionSummary?: (jsonlPath: string | null) => string;
+  recentToolPaths?: (jsonlPath: string | null) => string[];
+  nextStepFromAwaySummary?: (jsonlPath: string | null) => string;
+  recentAssistantTurns?: (jsonlPath: string | null) => string[];
+  /** Pluggable failed-attempts extractor. The route wires the LLM-
+   * driven implementation from six-section-resume-extractors.ts;
+   * tests pass a deterministic fake. When omitted the failed-
+   * attempts section is dropped with reason='no-extractor'. */
+  extractFailedAttempts?: FailedAttemptsExtractor;
 }
 
-export function buildAnchorSummary(
+export async function buildAnchorSummary(
   db: IndexDb,
   anchorId: string,
   opts: BuildSummaryOptions = {},
-): { summary: string; jsonlPath: string | null } | null {
+): Promise<{ summary: string; jsonlPath: string | null; dropped: string[] } | null> {
   const anchor = db.getProjectSession(anchorId);
   if (!anchor) return null;
   const jsonlPath = jsonlForAnchor(db, anchorId);
   const commits = (opts.recentCommits ?? recentCommits)(anchor.cwd);
-  const diff = (opts.diffStat ?? diffStat)(anchor.cwd);
+  const diff = (opts.diffStatShort ?? diffStatShort)(anchor.cwd);
   const lastAction = (opts.lastActionSummary ?? jsonlTailSummary)(jsonlPath);
   const findings = (() => {
     try {
@@ -228,20 +363,29 @@ export function buildAnchorSummary(
     }
   })();
   const activeWork = pickActiveWork(anchor.cwd);
-  return {
-    jsonlPath,
-    summary: assembleSummary({
-      projectSlug: anchor.project_slug,
-      title: anchor.title,
-      cwd: anchor.cwd,
+  const recentToolPaths = (opts.recentToolPaths ?? recentToolPathsFromJsonl)(jsonlPath);
+  const nextStep = (opts.nextStepFromAwaySummary ?? nextStepFromAwaySummary)(jsonlPath);
+  const recentTurns = (opts.recentAssistantTurns ?? recentAssistantTurnsFromJsonl)(jsonlPath);
+  const built = await buildSixSectionResume(
+    {
+      projectName: anchor.title?.trim() || anchor.project_slug,
       activeWork,
-      recentCommits: commits,
-      diffStat: diff,
-      jsonlPath: jsonlPath ?? '',
       lastActionSummary: lastAction,
+      diffStatShort: diff,
+      recentToolPaths,
+      recentCommits: commits,
+      nextStepFromAwaySummary: nextStep,
       openAuditFindings: findings,
-    }),
-  };
+      jsonlPath: jsonlPath ?? '',
+      recentAssistantTurns: recentTurns,
+    },
+    {
+      ...(opts.extractFailedAttempts
+        ? { extractFailedAttempts: opts.extractFailedAttempts }
+        : {}),
+    },
+  );
+  return { jsonlPath, summary: built.text, dropped: built.dropped };
 }
 
 function pickActiveWork(cwd: string): string {
@@ -263,11 +407,11 @@ function pickActiveWork(cwd: string): string {
   return 'see TODO.md / docs/spec for current focus';
 }
 
-export function evaluateSmartCompact(
+export async function evaluateSmartCompact(
   db: IndexDb,
   anchorId: string,
   opts: EvaluateOptions = {},
-): EvaluateResult {
+): Promise<EvaluateResult> {
   const anchor = db.getProjectSession(anchorId);
   if (!anchor) {
     return {
@@ -317,7 +461,7 @@ export function evaluateSmartCompact(
   const shadow = isShadow(db, anchorId);
   let summary: string | undefined;
   if (verdict.action === 'fire' || verdict.action === 'wrap') {
-    const built = buildAnchorSummary(db, anchorId);
+    const built = await buildAnchorSummary(db, anchorId);
     summary = built?.summary;
   }
   return {
@@ -610,7 +754,7 @@ export function registerSmartCompactRoutes(
       reply.code(400);
       return { ok: false, error: 'anchor_id required' };
     }
-    const r = evaluateSmartCompact(db, body.anchor_id, {
+    const r = await evaluateSmartCompact(db, body.anchor_id, {
       ctxPct: typeof body.ctx_pct === 'number' ? body.ctx_pct : undefined,
       phase: body.phase,
     });

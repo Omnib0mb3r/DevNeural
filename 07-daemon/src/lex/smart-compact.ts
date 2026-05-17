@@ -5,9 +5,13 @@
  * the Lex tool surface calls over HTTP:
  *
  *   evaluateTrigger    decides fire / wrap / wait from a state snapshot
- *   assembleSummary    builds the resume prompt from durable sources
  *   isShadow           gates the first N attempts per anchor to audit-only
  *   ctxPctFromJsonl    convenience wrapper around deriveContextFromTail
+ *
+ * Resume-prompt assembly lives in `six-section-resume.ts`. The legacy
+ * `assembleSummary` single-paragraph builder was removed in the same
+ * commit that introduced the six-section schema; no feature flag, no
+ * dual path. The new builder is the only resume surface.
  *
  * No daemon-side scheduler thread per spec. The Lex tool polls / asks
  * for evaluate, decides whether to fire, then calls fire which records
@@ -90,41 +94,6 @@ export function evaluateTrigger(input: EvalInput): EvalResult {
   /* ctxPct in (hi, hardCeiling). Window closed without a stop; inject
    * the wrap-and-commit prompt and wait for the worker to settle. */
   return { action: 'wrap', reason: 'forced-no-stop' };
-}
-
-export interface SummaryInput {
-  projectSlug: string;
-  title: string | null;
-  cwd: string;
-  activeWork: string;
-  recentCommits: string[];
-  diffStat: string;
-  jsonlPath: string;
-  lastActionSummary: string;
-  openAuditFindings: number;
-}
-
-export function assembleSummary(input: SummaryInput): string {
-  const name = input.title?.trim() || input.projectSlug;
-  const commitsBlock = input.recentCommits.length
-    ? input.recentCommits.map((c) => `  ${c}`).join('\n')
-    : '  (none)';
-  const diff = input.diffStat.trim() || 'clean';
-  const auditLine =
-    input.openAuditFindings > 0
-      ? `\nOpen audit findings for this project: ${input.openAuditFindings}.`
-      : '';
-  return [
-    `You were working on ${name}. Context refreshed for capacity.`,
-    '',
-    `Active work: ${input.activeWork}`,
-    `Recent commits:`,
-    commitsBlock,
-    `Uncommitted: ${diff}`,
-    `Last action: ${input.lastActionSummary || '(none)'}${auditLine}`,
-    '',
-    `Resume from where you left off. Full transcript is at ${input.jsonlPath || '(unknown)'} if you need to look anything up.`,
-  ].join('\n');
 }
 
 export const WRAP_AND_COMMIT_PROMPT =

@@ -68,7 +68,7 @@ export async function runSmartCompactTick(
     try {
       const opts: EvaluateOptions = {};
       if (deps.ctxProvider) opts.ctxProvider = deps.ctxProvider;
-      const v: EvaluateResult = evaluate(deps.db, row.id, opts);
+      const v: EvaluateResult = await evaluate(deps.db, row.id, opts);
       if (!v.ok) continue;
       if (v.action === 'wait') {
         result.waited.push(row.id);
