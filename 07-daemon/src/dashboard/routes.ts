@@ -3902,6 +3902,13 @@ export async function registerDashboardRoutes(
       caller_label?: string;
       caller_brainstorm_id?: string;
       commit?: boolean;
+      /* Fix 15 C2 — explicit signing-subject override. When the
+       * caller signed its HMAC against an anchor id (recommended
+       * for supervisory paths) instead of the session uuid, it must
+       * tell the daemon which anchor so verification picks the
+       * right subject. Omitted = auto: the daemon also tries the
+       * resolved anchor id when it knows one. */
+      signed_anchor_id?: string;
     };
     /* Phase C fallback: when Lex omits target_session and identifies
      * itself with caller_brainstorm_id, resolve the bound project
@@ -4030,6 +4037,17 @@ export async function registerDashboardRoutes(
       resolvedAnchorId = outcome.anchor_id;
     }
     const { crossSessionInject } = await import('../lex/cross-session-inject.js');
+    /* Fix 15 C2 — anchor_id-signed HMAC alternate. When the request
+     * resolved to a known anchor, accept tokens signed against
+     * either the session uuid (legacy) or the anchor id (stable
+     * across /clear). Callers should prefer the anchor form for
+     * supervisory injects: session uuids flip; anchor ids do not.
+     * If the caller explicitly passes signed_anchor_id, honour
+     * exactly that subject. */
+    const explicitSignedAnchor =
+      typeof body.signed_anchor_id === 'string' && body.signed_anchor_id
+        ? body.signed_anchor_id
+        : undefined;
     const result = crossSessionInject(
       {
         target_session: dispatchSession,
@@ -4038,6 +4056,7 @@ export async function registerDashboardRoutes(
         caller_label: body.caller_label,
         commit: body.commit !== false,
         signed_session: signedSession,
+        signed_anchor_id: explicitSignedAnchor ?? resolvedAnchorId,
         anchor_id: resolvedAnchorId,
       },
       store.db,
@@ -4061,16 +4080,40 @@ export async function registerDashboardRoutes(
   });
 
   app.post('/auth/cross-session-token', async (req, reply) => {
-    const body = (req.body ?? {}) as { target_session?: string };
-    if (!body.target_session || typeof body.target_session !== 'string') {
+    /* Fix 15 C2 — supports two subject modes:
+     *
+     *   { target_session }   — legacy, signs against the session uuid
+     *   { anchor_id }        — preferred for supervisory callers; the
+     *                           signature stays valid across /clear-
+     *                           driven uuid flips because anchor ids
+     *                           are durable
+     *
+     * Exactly one must be provided; anchor_id wins if both are
+     * present. */
+    const body = (req.body ?? {}) as {
+      target_session?: string;
+      anchor_id?: string;
+    };
+    const anchorSubject =
+      typeof body.anchor_id === 'string' && body.anchor_id
+        ? body.anchor_id
+        : null;
+    const sessionSubject =
+      typeof body.target_session === 'string' && body.target_session
+        ? body.target_session
+        : null;
+    if (!anchorSubject && !sessionSubject) {
       reply.code(400);
-      return { ok: false, error: 'target_session required' };
+      return { ok: false, error: 'target_session or anchor_id required' };
     }
+    const subject = anchorSubject ?? sessionSubject!;
     const { issueToken } = await import('../lex/cross-session-inject.js');
     return {
       ok: true,
-      token: issueToken(body.target_session),
-      target_session: body.target_session,
+      token: issueToken(subject),
+      target_session: sessionSubject ?? undefined,
+      anchor_id: anchorSubject ?? undefined,
+      subject_kind: anchorSubject ? ('anchor' as const) : ('session' as const),
       valid_for_s: 120,
     };
   });
