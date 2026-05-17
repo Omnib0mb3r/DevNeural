@@ -43,7 +43,7 @@ export default function HomePage() {
             <div className="px-5 py-3 border-b border-border1 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Icon name="Brain" className="text-brandSoft" size={16} />
-                <h2 className="font-display text-sm font-emphasized">Neural network</h2>
+                <h2 className="font-display text-sm font-emphasized">Knowledge map</h2>
               </div>
               <Link
                 href="/orb"

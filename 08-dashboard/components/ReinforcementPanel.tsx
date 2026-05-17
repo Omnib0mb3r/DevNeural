@@ -71,15 +71,20 @@ export function ReinforcementPanel() {
 
   return (
     <section className="rounded-panel bg-surface1 hairline overflow-hidden">
-      <div className="px-5 py-3 border-b border-border1 flex items-center gap-2">
-        <Icon name="Activity" className="text-brandSoft" size={16} />
-        <h2 className="font-display text-sm font-emphasized">
-          Reinforcement events
-        </h2>
-        <span className="text-nano text-txt3 ml-auto">
-          {events.length} of{" "}
-          {q.data?.total_bytes ? `${Math.round((q.data.total_bytes / 1024) * 10) / 10} KB` : "0 KB"}
-        </span>
+      <div className="px-5 py-3 border-b border-border1 flex flex-col gap-1">
+        <div className="flex items-center gap-2">
+          <Icon name="Activity" className="text-brandSoft" size={16} />
+          <h2 className="font-display text-sm font-emphasized">
+            Wiki match history
+          </h2>
+          <span className="text-nano text-txt3 ml-auto">
+            {events.length} of{" "}
+            {q.data?.total_bytes ? `${Math.round((q.data.total_bytes / 1024) * 10) / 10} KB` : "0 KB"}
+          </span>
+        </div>
+        <p className="text-nano text-txt3">
+          Every time Lex pulled a wiki page into a worker's context, scored by whether the page actually helped.
+        </p>
       </div>
 
       {q.isLoading && (
