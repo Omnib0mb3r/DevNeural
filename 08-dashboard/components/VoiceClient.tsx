@@ -1812,15 +1812,58 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
              * playback, drop queued chunks (handled inside
              * setSoftMuted via resetTtsPlayback), keep the WS open
              * so transcript turns continue rendering with a silent
-             * marker. */
+             * marker. Mic capture is NOT touched - the user can
+             * keep talking AND the wake-word recognizer can still
+             * hear the unmute command. */
+            logVoice("wake-fire", "soft-mute (TTS halted; mic untouched)", {
+              kind: "mute",
+              pre_softMuted: softMutedRef.current,
+              post_softMuted: true,
+            });
             setSoftMuted(true);
             break;
           case "voice-unmute":
-            /* "lex unmute" voice command. Lift the soft mute and
-             * clear the unread-silent badge. Future TTS plays
-             * normally; messages received during the mute window
-             * are NOT auto-replayed. */
+            /* "lex unmute" voice command (and synonyms: resume,
+             * come back, you can talk, start talking again). Lift
+             * the soft mute and clear the unread-silent badge.
+             * Future TTS plays normally; messages received during
+             * the mute window are NOT auto-replayed. The setSoft
+             * Muted setter (line 980) flips softMutedRef and the
+             * sample-rate-locked Web Audio output path picks up
+             * fresh chunks on the next tts-start frame, so the
+             * next assistant turn plays audibly without requiring
+             * a stop+start cycle. */
+            logVoice("wake-fire", "soft-unmute (TTS resumes)", {
+              kind: "unmute",
+              pre_softMuted: softMutedRef.current,
+              post_softMuted: false,
+            });
             setSoftMuted(false);
+            break;
+          case "voice-standby":
+            /* "lex stand by" family. Soft mic pause: halt STT
+             * capture but leave TTS state and the wake-word
+             * recognizer alone so the user can rearm with
+             * `lex listen`. Mic is muted via the same setMicMuted
+             * path the mic-pill click uses; the wake recognizer
+             * runs off its own Web Speech stream and is unaffected. */
+            logVoice("wake-fire", "standby (mic paused; TTS + wake untouched)", {
+              kind: "standby",
+              pre_muted: mutedRef.current,
+              post_muted: true,
+            });
+            setMicMuted(true);
+            break;
+          case "voice-listen":
+            /* "lex listen" family. Rearm STT capture after a
+             * standby. Wake recognizer is already running; TTS is
+             * independent of this path. */
+            logVoice("wake-fire", "listen (mic rearmed)", {
+              kind: "listen",
+              pre_muted: mutedRef.current,
+              post_muted: false,
+            });
+            setMicMuted(false);
             break;
           case "error":
             setStatus("error");

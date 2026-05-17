@@ -40,6 +40,7 @@ export type VoiceLogKind =
   | "tts-end"
   | "settings-reset-on-reconnect"
   | "settings-reset-on-reconnect-failed"
+  | "wake-fire"
   | "error";
 
 export interface VoiceLogEntry {

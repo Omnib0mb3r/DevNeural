@@ -89,22 +89,90 @@ describe('matchVoiceCommand', () => {
     });
   });
 
-  describe('unmute', () => {
+  describe('unmute family', () => {
     it('matches "lex unmute"', () => {
       expect(matchVoiceCommand('lex unmute')).toEqual({ kind: 'unmute' });
+    });
+
+    it('matches "lex resume" synonym (Fix 10 regression)', () => {
+      /* The bug that motivated Fix 10: "lex resume" used to fall
+       * through and the user had to press stop+start to recover
+       * TTS after a mute. */
+      expect(matchVoiceCommand('lex resume')).toEqual({ kind: 'unmute' });
+      expect(matchVoiceCommand('Lex resume!')).toEqual({ kind: 'unmute' });
+    });
+
+    it('matches "lex come back"', () => {
+      expect(matchVoiceCommand('lex come back')).toEqual({ kind: 'unmute' });
+    });
+
+    it('matches "lex you can talk"', () => {
+      expect(matchVoiceCommand('lex you can talk')).toEqual({ kind: 'unmute' });
+    });
+
+    it('matches "lex start talking again"', () => {
+      expect(matchVoiceCommand('lex start talking again')).toEqual({
+        kind: 'unmute',
+      });
     });
 
     it('matches with casing and punctuation', () => {
       expect(matchVoiceCommand('Lex, unmute.')).toEqual({ kind: 'unmute' });
     });
 
-    it('does NOT match bare "unmute"', () => {
+    it('does NOT match bare "unmute" / "resume"', () => {
       expect(matchVoiceCommand('unmute')).toBeNull();
+      expect(matchVoiceCommand('resume')).toBeNull();
     });
 
-    it('does NOT match "lex resume" (reserved phrase)', () => {
-      expect(matchVoiceCommand('lex resume')).toBeNull();
-      expect(matchVoiceCommand('Lex resume!')).toBeNull();
+    it('"lex resume listening" lands on listen, NOT unmute', () => {
+      /* Disambiguation: bare "lex resume" is unmute (TTS axis), but
+       * the qualified "lex resume listening" is the STT-axis listen
+       * command. */
+      expect(matchVoiceCommand('lex resume listening')).toEqual({
+        kind: 'listen',
+      });
+    });
+  });
+
+  describe('standby family (Fix 10A soft mic pause)', () => {
+    it('matches "lex stand by"', () => {
+      expect(matchVoiceCommand('lex stand by')).toEqual({ kind: 'standby' });
+    });
+
+    it('matches "lex pause listening"', () => {
+      expect(matchVoiceCommand('lex pause listening')).toEqual({
+        kind: 'standby',
+      });
+    });
+
+    it('matches "lex hold on"', () => {
+      expect(matchVoiceCommand('lex hold on')).toEqual({ kind: 'standby' });
+    });
+
+    it('does NOT match bare "stand by" / "hold on"', () => {
+      expect(matchVoiceCommand('stand by')).toBeNull();
+      expect(matchVoiceCommand('hold on')).toBeNull();
+    });
+  });
+
+  describe('listen family (Fix 10A mic rearm after standby)', () => {
+    it('matches "lex listen"', () => {
+      expect(matchVoiceCommand('lex listen')).toEqual({ kind: 'listen' });
+    });
+
+    it('matches "lex resume listening"', () => {
+      expect(matchVoiceCommand('lex resume listening')).toEqual({
+        kind: 'listen',
+      });
+    });
+
+    it("matches \"lex i'm back\"", () => {
+      expect(matchVoiceCommand("lex i'm back")).toEqual({ kind: 'listen' });
+    });
+
+    it('does NOT match bare "listen"', () => {
+      expect(matchVoiceCommand('listen')).toBeNull();
     });
   });
 

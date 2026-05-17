@@ -27,7 +27,9 @@ export type VoiceCommandKind =
   | "mute"
   | "unmute"
   | "panic"
-  | "end_session";
+  | "end_session"
+  | "standby"
+  | "listen";
 
 const LEX_PREFIX = String.raw`\blex\s+`;
 
@@ -36,7 +38,18 @@ const END_SESSION_RE = new RegExp(LEX_PREFIX + String.raw`end\s+session\b`);
 const MUTE_RE = new RegExp(
   LEX_PREFIX + String.raw`(?:mute|shut\s+up|be\s+quiet|stop\s+talking)\b`,
 );
-const UNMUTE_RE = new RegExp(LEX_PREFIX + String.raw`unmute\b`);
+/* Unmute synonyms. Mirrors the daemon-side matcher; see
+ * 07-daemon/src/voice/lex-voice-commands.ts for the canonical doc. */
+const UNMUTE_RE = new RegExp(
+  LEX_PREFIX +
+    String.raw`(?:unmute|resume(?!\s+listening)|come\s+back|you\s+can\s+talk|start\s+talking\s+again)\b`,
+);
+const STANDBY_RE = new RegExp(
+  LEX_PREFIX + String.raw`(?:stand\s+by|pause\s+listening|hold\s+on)\b`,
+);
+const LISTEN_RE = new RegExp(
+  LEX_PREFIX + String.raw`(?:listen|resume\s+listening|i\s+m\s+back)\b`,
+);
 const DISABLE_RE = new RegExp(LEX_PREFIX + String.raw`disable\b`);
 
 function normalize(text: string): string {
@@ -54,6 +67,10 @@ export function matchWakeWord(text: string): VoiceCommandKind | null {
   if (PANIC_RE.test(norm)) return "panic";
   if (END_SESSION_RE.test(norm)) return "end_session";
   if (MUTE_RE.test(norm)) return "mute";
+  /* STANDBY + LISTEN before UNMUTE so qualified "resume listening"
+   * lands on listen and bare "lex resume" lands on unmute. */
+  if (STANDBY_RE.test(norm)) return "standby";
+  if (LISTEN_RE.test(norm)) return "listen";
   if (UNMUTE_RE.test(norm)) return "unmute";
   if (DISABLE_RE.test(norm)) return "disable";
   return null;

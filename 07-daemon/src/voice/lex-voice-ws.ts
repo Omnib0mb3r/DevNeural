@@ -946,7 +946,23 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         send({ t: 'voice-unmute', reason: 'voice-command' });
         return true;
       }
+      case 'standby': {
+        /* Soft mic pause. Client halts STT capture but keeps the
+         * wake-word recognizer + TTS state untouched so the operator
+         * can rearm with `lex listen`. */
+        send({ t: 'voice-standby', reason: 'voice-command' });
+        return true;
+      }
+      case 'listen': {
+        /* Rearm STT capture after standby. Wake recognizer is
+         * already on; TTS state is independent. */
+        send({ t: 'voice-listen', reason: 'voice-command' });
+        return true;
+      }
       case 'disable': {
+        /* One-way teardown. Mic + WS go away; no voice command can
+         * rearm because the recognizers are gone. The user must
+         * click `start voice` to recover. */
         send({ t: 'voice-disable', reason: 'voice-command' });
         return true;
       }

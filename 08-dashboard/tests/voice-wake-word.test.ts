@@ -60,9 +60,33 @@ describe("matchWakeWord", () => {
     expect(matchWakeWord("lex stop talking")).toBe("mute");
   });
 
-  it("matches unmute and refuses the reserved 'lex resume' phrase", () => {
+  it("matches the full unmute family including the 'resume' synonyms", () => {
+    /* Fix 10 regression: "lex resume" used to return null and the
+     * user had to press stop+start to recover TTS after a mute. */
     expect(matchWakeWord("lex unmute")).toBe("unmute");
-    expect(matchWakeWord("lex resume")).toBeNull();
+    expect(matchWakeWord("lex resume")).toBe("unmute");
+    expect(matchWakeWord("lex come back")).toBe("unmute");
+    expect(matchWakeWord("lex you can talk")).toBe("unmute");
+    expect(matchWakeWord("lex start talking again")).toBe("unmute");
+  });
+
+  it("matches the standby family (soft mic pause)", () => {
+    expect(matchWakeWord("lex stand by")).toBe("standby");
+    expect(matchWakeWord("lex pause listening")).toBe("standby");
+    expect(matchWakeWord("lex hold on")).toBe("standby");
+  });
+
+  it("matches the listen family (rearm mic after standby)", () => {
+    expect(matchWakeWord("lex listen")).toBe("listen");
+    expect(matchWakeWord("lex resume listening")).toBe("listen");
+    expect(matchWakeWord("lex i'm back")).toBe("listen");
+  });
+
+  it("'lex resume listening' disambiguates to listen, not unmute", () => {
+    /* Bare "lex resume" is the unmute TTS-axis synonym; qualifying
+     * with "listening" picks the STT-axis listen command. */
+    expect(matchWakeWord("lex resume listening")).toBe("listen");
+    expect(matchWakeWord("lex resume")).toBe("unmute");
   });
 
   it("matches panic and end_session", () => {
