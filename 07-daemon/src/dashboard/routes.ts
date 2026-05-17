@@ -1000,7 +1000,22 @@ export async function registerDashboardRoutes(
          * placeholder vs real id doesn't change behaviour. */
         lexSessionId: 'pending-new-anchor',
         transcriptPaths: [],
+        cwd,
       });
+      /* Fix 12 audit: log which feedback rules were baked into the
+       * system prompt for this anchor at session start. Reads
+       * cleanly off the brainstorm CWD so two anchors in different
+       * directories never cross-pollinate. */
+      if (built.feedback_memories.kept.length > 0 || built.feedback_memories.status === 'over-cap') {
+        log(
+          `[lex-anchor] hard-rules cwd=${cwd} kept=${built.feedback_memories.kept.length} dropped=${built.feedback_memories.dropped.length} status=${built.feedback_memories.status} titles=${JSON.stringify(built.feedback_memories.kept.map((r) => r.title))}`,
+        );
+      }
+      if (built.feedback_memories.status === 'over-cap') {
+        log(
+          `[lex-anchor] WARN hard-rules over cap; truncated ${built.feedback_memories.dropped.length} oldest rules`,
+        );
+      }
       const r = spawnLexSession({
         cwd,
         title: body.title,
@@ -1074,7 +1089,23 @@ export async function registerDashboardRoutes(
         const built = buildLexSpawnPrompt({
           lexSessionId: id,
           transcriptPaths: refs.map((r) => r.transcript_path),
+          cwd: row.cwd,
         });
+        /* Fix 12 audit on reopen path. Same logging shape as the
+         * new-anchor route above so /admin/logs can grep both. */
+        if (
+          built.feedback_memories.kept.length > 0 ||
+          built.feedback_memories.status === 'over-cap'
+        ) {
+          log(
+            `[lex-anchor] hard-rules cwd=${row.cwd} kept=${built.feedback_memories.kept.length} dropped=${built.feedback_memories.dropped.length} status=${built.feedback_memories.status} titles=${JSON.stringify(built.feedback_memories.kept.map((r) => r.title))}`,
+          );
+        }
+        if (built.feedback_memories.status === 'over-cap') {
+          log(
+            `[lex-anchor] WARN hard-rules over cap; truncated ${built.feedback_memories.dropped.length} oldest rules`,
+          );
+        }
         const r = spawnLexSession({
           lexSessionId: id,
           cwd: row.cwd,

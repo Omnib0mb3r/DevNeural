@@ -756,10 +756,26 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
               return { ok: false, error: 'no anchor handle' };
             }
             try {
+              /* Lookup the brainstorm cwd so feedback memories rebake
+               * into the compaction-restart prompt. The handle resolves
+               * via the current bindKey; if it has been torn down (rare
+               * during the restart window) the cwd falls back to
+               * undefined and the hard-rules block is simply absent
+               * for this restart. */
+              const handle = state.bindKey
+                ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
+                : undefined;
+              const restartCwd = handle?.cwd;
               const built = buildLexSpawnPrompt({
                 lexSessionId: brainstormAnchorId,
                 transcriptPaths: [],
+                ...(restartCwd ? { cwd: restartCwd } : {}),
               });
+              if (built.feedback_memories.kept.length > 0) {
+                console.log(
+                  `[lex-compaction] hard-rules baked into restart prompt kept=${built.feedback_memories.kept.length} cwd=${restartCwd}`,
+                );
+              }
               const fresh = spawnLexSession({
                 lexSessionId: brainstormAnchorId,
                 extraArgs: ['--dangerously-skip-permissions'],

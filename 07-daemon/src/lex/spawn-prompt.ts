@@ -20,6 +20,11 @@ import {
   buildLexSystemPromptVersioned,
   type BuildLexSystemPromptResult,
 } from './system-prompt.js';
+import {
+  loadFeedbackMemories,
+  renderFeedbackMemoriesBlock,
+  type LoadFeedbackMemoriesResult,
+} from './feedback-memories.js';
 
 export type LexSpawnVariant = 'new' | 'reopen';
 
@@ -35,10 +40,21 @@ export interface BuildLexSpawnPromptOptions {
   /** Forwarded to buildLexSystemPromptVersioned. Default true; set
    * false from test harnesses so the prompt archive stays clean. */
   archive?: boolean;
+  /** Brainstorm CWD. When supplied, `<cwd>/memory/*.md` with
+   * frontmatter `type: feedback` is loaded and rendered into a
+   * "Hard rules from operator" section appended to the system
+   * prompt. Strictly scoped to this anchor's CWD; never crosses
+   * brainstorms. Omitted = no hard rules block (back-compat for
+   * call sites that have not threaded the cwd through yet). */
+  cwd?: string;
 }
 
 export interface BuildLexSpawnPromptResult extends BuildLexSystemPromptResult {
   variant: LexSpawnVariant;
+  /** Feedback-memories loader output, surfaced for the audit-log
+   * row caller. Always populated, even when no rules are loaded,
+   * so the audit row can record status='no-memory-dir'. */
+  feedback_memories: LoadFeedbackMemoriesResult;
 }
 
 const NEW_HEADER = (lexSessionId: string): string =>
@@ -101,10 +117,22 @@ export function buildLexSpawnPrompt(
     variant === 'new'
       ? NEW_HEADER(opts.lexSessionId)
       : REOPEN_HEADER(opts.lexSessionId, paths);
+  /* Bake feedback-class operator rules into the prompt as a hard
+   * rules block. Loader is best-effort: a missing memory directory
+   * is the common case (most brainstorms have none) and is treated
+   * as status='no-memory-dir' so the audit row still records the
+   * non-event. */
+  const feedback_memories = opts.cwd
+    ? loadFeedbackMemories(opts.cwd)
+    : { kept: [], dropped: [], status: 'no-memory-dir' as const };
+  const hardRulesBlock = renderFeedbackMemoriesBlock(feedback_memories);
+  const parts: string[] = [base.prompt, header];
+  if (hardRulesBlock) parts.push(hardRulesBlock);
   return {
-    prompt: `${base.prompt}\n\n${header}`,
+    prompt: parts.join('\n\n'),
     version: base.version,
     mode: base.mode,
     variant,
+    feedback_memories,
   };
 }
