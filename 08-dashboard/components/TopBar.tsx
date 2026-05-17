@@ -143,7 +143,13 @@ export function TopBar({ activeTab }: { activeTab: string }) {
    * media query: this is a primary nav surface. */
   return (
     <header className="relative z-40 flex flex-col shrink-0 bg-base">
-      <div className="flex items-center h-14 px-3 sm:px-5 hairline-soft gap-2 min-w-0">
+      {/* Outer header row is flex-wrap from below sm: so the voice
+       * pill drops to its own line at narrow-portrait widths instead
+       * of overlapping the search button's Ctrl+K chip or the alerts
+       * cluster. h-14 swapped for min-h-14 + py-1 so the row can grow
+       * vertically when wrapping. At sm+ widths flex-nowrap restores
+       * the original single-row layout. */}
+      <div className="flex flex-wrap sm:flex-nowrap items-center min-h-14 sm:h-14 py-1 sm:py-0 px-3 sm:px-5 hairline-soft gap-2 min-w-0">
         <button
           type="button"
           onClick={() =>
@@ -230,9 +236,16 @@ export function TopBar({ activeTab }: { activeTab: string }) {
          * and the inconsistency read as noise. The shortcut is
          * still wired and surfaced through the panic button
          * tooltip. */}
-        <div className="flex items-center gap-3 sm:gap-4">
-          {/* Voice cluster (group 1). */}
+        {/* Voice cluster (group 1) lives OUTSIDE the right cluster
+         * div so it can wrap to its own row independently. At sm+
+         * the order classes restore the original sequence
+         * (brand -> search -> voice -> alerts). At <sm, voice gets
+         * order-last + basis-full so it takes its own row beneath
+         * the brand/search row. */}
+        <div className="order-last sm:order-none basis-full sm:basis-auto flex justify-center sm:justify-start">
           <VoiceTopBarPill />
+        </div>
+        <div className="flex items-center gap-3 sm:gap-4">
 
           {/* Alerts cluster (group 2). */}
           <div className="flex items-center gap-1.5">
@@ -365,7 +378,18 @@ export function TopBar({ activeTab }: { activeTab: string }) {
                 }`}
               >
                 <Icon name={t.icon} size={16} />
-                <span className="hidden sm:inline">{t.label}</span>
+                {/* Narrow-landscape collapse: between sm (640px) and
+                 * lg (1024px), only the active tab shows its label;
+                 * the rest are icon-only with a tooltip via `title`
+                 * on the parent <Link>. Below sm everything stays
+                 * icon-only. At lg+ every tab shows its label. */}
+                <span
+                  className={
+                    isActive ? "hidden sm:inline" : "hidden lg:inline"
+                  }
+                >
+                  {t.label}
+                </span>
               </Link>
             );
           })}
