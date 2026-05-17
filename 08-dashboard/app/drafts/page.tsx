@@ -22,9 +22,9 @@ export default function DraftsPage() {
   return (
     <AppShell>
       <div className="flex flex-col gap-3 p-4">
-        <h1 className="text-xl font-semibold">Drafts</h1>
+        <h1 className="text-xl font-semibold">Wiki drafts</h1>
         <p className="text-xs text-txt3">
-          pending wiki drafts from auto-distillation. promote, edit, or discard.
+          New wiki pages Lex wrote from your recent brainstorms. Review each one and accept, edit, or discard before it lands in the wiki.
         </p>
         {q.isLoading ? (
           <p className="text-sm text-txt3">loading…</p>
