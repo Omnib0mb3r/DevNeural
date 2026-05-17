@@ -50,12 +50,18 @@
          │               │                │
          ▼               ▼                ▼
    ┌──────────┐  ┌──────────────┐  ┌──────────────────┐
-   │ ollama   │  │ Chroma       │  │ wiki/ + ref/ on  │
-   │ :11434   │  │ (in-process) │  │ disk + SQLite    │
-   │ qwen3:8b │  │ raw_chunks   │  │ (index.db)       │
-   └──────────┘  │ wiki_pages   │  └──────────────────┘
+   │ ollama   │  │ Vector store │  │ wiki/ + ref/ on  │
+   │ :11434   │  │ (custom,     │  │ disk + SQLite    │
+   │ qwen3:8b │  │  in-process) │  │ (index.db)       │
+   └──────────┘  │ raw_chunks   │  └──────────────────┘
+                 │ wiki_pages   │
                  │ reference    │
                  └──────────────┘
+
+> The "Vector store" is a custom in-process linear-scan implementation
+> in `07-daemon/src/store/vector-store.ts`. It is NOT Chroma DB; the
+> on-disk directory is still named `chroma/` for historical reasons
+> only (a rename is a separate refactor with migration cost).
 ```
 
 **Phase 3 adds (above):**
@@ -88,7 +94,7 @@
 
 | Path | Role | Phase |
 |---|---|---|
-| `07-daemon/` | The brain. Capture, ingest, query, lint, reinforcement, HTTP/WS API, Chroma + SQLite, embedder, ollama client | Phase 1 (built) |
+| `07-daemon/` | The brain. Capture, ingest, query, lint, reinforcement, HTTP/WS API, in-process vector store + SQLite, embedder, ollama client | Phase 1 (built) |
 | `03-web-app/` | The orb (Three.js visualization). Currently bound to v1; rebinds to wiki data model | Phase 4 |
 | `05-voice-interface/` | Voice query layer | reshapes later |
 | `06-notebooklm-integration/` | Obsidian / NotebookLM sync | reshapes later |
@@ -179,7 +185,7 @@ External (separate repo):
 | Hook runner | Daemon | Spawn detached node process | Lazy-start when not running |
 | Daemon | ollama | HTTP `POST /api/chat`, `GET /api/tags` | LLM calls |
 | Daemon | Wiki on disk | Read/write markdown + git commits | Persist pages |
-| Daemon | Chroma in-process | Library calls | Vector store |
+| Daemon | In-process vector store | Direct function calls | Embedding lookup (custom linear-scan, not Chroma) |
 | Daemon | SQLite via better-sqlite3 | Library calls (sync) | Metadata + FTS5 |
 | Daemon | Transcript files | chokidar + offset reads | Capture session prose |
 | Dashboard (Phase 3) | Daemon | HTTP + WS (over Tailscale) | All operations |
@@ -226,7 +232,7 @@ Knowing where things break helps reconstruction.
 | ollama not running | Daemon can't ingest | `LLM call failed: fetch failed` in daemon.log | Start ollama, daemon retries |
 | Model not pulled | Daemon errors on first ingest | "model not pulled" error | `ollama pull qwen3:8b` |
 | Hook can't reach daemon | Injection silent-skipped | No injection appears in Claude responses | Daemon down; restart or wait for lazy-spawn |
-| Chroma corruption | Searches return nothing | `/health` shows zero counts | Delete `chroma/` dir; corpus reseed rebuilds |
+| Vector store corruption | Searches return nothing | `/health` shows zero counts | Delete the on-disk `chroma/` dir (historical name only; this is the custom in-process vector store, not Chroma DB); corpus reseed rebuilds |
 | SQLite locked | Daemon hangs | `database is locked` error | Kill daemon, remove `index.db-shm` + `-wal`, restart |
 | Wiki git conflict | Auto-commit fails | Errors in daemon.log on each ingest | `cd wiki && git status && git stash` |
 | Disk full | All writes fail | Multiple errors | Free disk |
@@ -256,7 +262,7 @@ What does NOT run constantly:
 ## Why these choices
 
 - **Local LLM (ollama) over API**: zero cost, full privacy, offline-capable.
-- **In-process vector store over Chroma server**: one less moving part, simpler ops, fast enough for single-developer volumes.
+- **Custom in-process vector store, not Chroma DB**: linear cosine scan in `07-daemon/src/store/vector-store.ts`. One less moving part than a separate Chroma server, simpler ops, fast enough for single-developer volumes. The on-disk directory is still named `chroma/` for historical reasons only.
 - **Better-sqlite3 over Postgres/MySQL**: zero install, embedded, fast, sufficient.
 - **Single daemon process**: one PID, one log, one port. Simpler to monitor and recover.
 - **File-system as the wiki source of truth**: you can read pages with any text editor, version with git, back up with any tool.

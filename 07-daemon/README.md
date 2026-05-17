@@ -1,6 +1,6 @@
 # 07-daemon
 
-The DevNeural v2 daemon. Owns capture, ingest, query, lint, reconcile, the wiki, Chroma, SQLite, the WebSocket. Local-first by default: no API keys required, no cloud calls.
+The DevNeural v2 daemon. Owns capture, ingest, query, lint, reconcile, the wiki, the in-process vector store, SQLite, and the WebSocket. Local-first by default: no API keys required, no cloud calls.
 
 ## What it does
 
@@ -72,7 +72,7 @@ c:/dev/data/skill-connections/
     .observer-signal-counter
     .last-purge
   global/observations.jsonl                # fallback (no project detected)
-  chroma/collections/                      # local vector store
+  chroma/collections/                      # custom in-process vector store (historical name; not Chroma DB)
     raw_chunks/
     wiki_pages/
   models/                                  # ONNX embedder cache

@@ -122,7 +122,7 @@ New module `07-daemon/src/reference/`:
 - `chunk.ts` — paragraph-aware chunking, sentence-fallback for oversize paragraphs. Target 800 chars, 100-char overlap, min 200 (smaller merge into neighbors).
 - `pdf.ts` — `pdf-parse` for text extraction. Warns when output looks scanned.
 - `image.ts` — `tesseract.js` OCR (English default).
-- `store.ts` — `ReferenceStore` class. Owns `reference_chunks` Chroma collection, `reference_meta` SQLite table, `reference_fts` FTS5 virtual table. Detects kind from extension.
+- `store.ts` — `ReferenceStore` class. Owns the `reference_chunks` in-process vector store collection (not Chroma DB), `reference_meta` SQLite table, `reference_fts` FTS5 virtual table. Detects kind from extension.
 - `process.ts` — `ingestUpload` pipeline. Saves original, extracts text, chunks, embeds, persists `chunks.jsonl`, builds FTS index.
 
 Endpoints:
@@ -266,7 +266,7 @@ For prod (single-origin, daemon serves the static export): `npm run build` then 
 
 ## Important architectural choices
 
-- **In-process vector store, not Chroma server.** `07-daemon/src/store/vector-store.ts`. Linear cosine scan + persistent file format. Single-developer volumes are fine.
+- **Custom in-process vector store, not Chroma DB.** `07-daemon/src/store/vector-store.ts` is a linear cosine scan with a persistent file format. Fast enough for single-developer volumes. The on-disk directory is still named `chroma/` for historical reasons; the runtime has no Chroma dependency.
 - **Local LLM via ollama.** Default `qwen3:8b`, fallback `qwen2.5:7b-instruct`. Set via `DEVNEURAL_OLLAMA_MODEL`.
 - **MiniLM embedder via @xenova/transformers.** 384-dim, ONNX. Cached at `c:/dev/data/skill-connections/models/`.
 - **SQLite + FTS5** via `better-sqlite3`. WAL mode.
@@ -274,7 +274,7 @@ For prod (single-origin, daemon serves the static export): `npm run build` then 
 - **Hooks lazy-spawn the daemon.** No need to start manually after install.
 - **Five-layer self-loop guards** prevent the daemon from observing its own LLM-driven sessions.
 - **Daemon binds 0.0.0.0 by default** for Tailscale. Override with `DEVNEURAL_BIND=127.0.0.1` if you want strict localhost.
-- **Reference corpus is a third Chroma collection (`reference_chunks`)** alongside `raw_chunks` and `wiki_pages`. Insights still only come from your own work; uploaded docs are searchable but never become wiki pages.
+- **Reference corpus is a third vector-store collection (`reference_chunks`)** alongside `raw_chunks` and `wiki_pages`. Same custom in-process vector store as the rest of the daemon (not Chroma DB). Insights still only come from your own work; uploaded docs are searchable but never become wiki pages.
 
 ---
 
