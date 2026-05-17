@@ -56,6 +56,8 @@ See [docs/SESSION-HANDOVER.md](docs/SESSION-HANDOVER.md) for what state the repo
 
 Run these once on `OTLCDEV` (the host machine) in order. Each step is idempotent; re-running does nothing harmful.
 
+> **Before you start**: read [`outbound.md`](outbound.md) in the repo root for the canonical list of off-host calls. DevNeural is local-first by default; that file is the authoritative inventory of every opt-in flag (Pass 2 schema fallback, cross-project pattern verifier, etc.) that could put a request on the wire. If you would rather review each call type before installing, do it now.
+
 ```powershell
 # 1. Prereqs (one-shot, see docs/install/01-prerequisites.md for the long version)
 winget install OpenJS.NodeJS.LTS
