@@ -18,13 +18,17 @@ Captured 2026-05-04. Living list. Tick when shipped.
 - [ ] Trigger a real reinforcement event in conversation. Send Claude a prompt where the wiki should match, watch dashboard ReinforcementPanel for an `injected` row, then watch for `hit` / `raw-hit` after the reply lands. Confirms curator + reinforcement + panel chain end-to-end.
 - [ ] Live verify Lex session rewrite (commit `5af07d0`). Open past anchor on /lex, confirm spawn-or-bind works, check Brainstorms group renders in Stream Deck, hit end on a session.
 
+## TTS sanitizer (low priority, deferred 2026-05-16)
+
+- [ ] Daemon-side `sanitizeForTts(text)` hook in TTS pipeline, runs before Piper synth. Strips: full filesystem paths to basenames (`C:/dev/Projects/DevNeural/foo/bar.ts` -> `bar.ts`), long URLs to host only, angle-bracket / JSX / HTML markup (describe rendered text or drop), UUIDs / SHAs / hex IDs (spell character-by-character or replace with "opaque ID"), telemetry shorthand. Belt-and-suspenders: rules currently enforced only by Lex behavior via memory; server-side filter so a slip never reaches the user. Touchpoints: `07-daemon/src/voice/piper.ts` (or wherever TTS text enters synth), new module `07-daemon/src/voice/tts-sanitize.ts`. Reason: voice-mode rules (no paths, no markup chars, no UUIDs as numbers) have leaked through Lex despite memory; daemon enforcement closes the gap.
+
 ## Deferred Wave 2 Day 5 (Lex personality track)
 
 - [ ] Step 20 (LX-1) prompt versioning archive. Daemon writes `07-daemon/data/lex-prompts/<version>.md` on every prompt change. Version = monotonic ISO timestamp + short hash. Backfill existing prompts on first run. Foundation for step 21 A/B replay harness.
 
 ## Next after project-anchors spec
 
-- [ ] Global panic button on the main dashboard, next to mute/stop. Single click sends double-ESC (`\x1b\x1b`) to the currently active session via the existing PTY inject path. New endpoint variant (or flag on inject) for raw key bytes, `commit=false`. Defer per-tile mini panic until usage shows it's needed. Reason: emergency stop for a runaway session, muscle memory next to existing stop.
+- [x] Global panic button shipped. `08-dashboard/components/PanicButton.tsx`, POST /panic, double-ESC, top bar next to voice stop, Ctrl+Alt+. global keybind, three visual states (idle/firing/cooldown).
 - [ ] Smart compact (queued after panic button). Spec at `docs/spec/SMART-COMPACT.md`. Default threshold 60% +/- 5, two-condition trigger (window + stop point), forced wrap-and-commit fallback, hard ceiling 90%, shadow mode first per anchor.
 - [ ] Lex dashboard controls (queued after smart compact). Add endpoints like `POST /voice/mute`, `POST /voice/unmute`, `POST /voice/stop` that push state changes over the existing voice WS to the dashboard client. Expose as Lex tools so Lex can mute/unmute itself or stop the voice session on voice command. Reason: hands-busy control without touching the UI.
 
@@ -59,11 +63,29 @@ Captured 2026-05-04. Living list. Tick when shipped.
 - [x] **Dashboard lock state has no visible indicator. Operator can't tell when /unlock is required.** First pass shipped as Task D top-level `AuthGuard` (commit pending). Mounted at `app/layout.tsx`, polls `GET /auth/status` on 30s tick + visibility/focus events, redirects to `/unlock` on `locked=true`, and surfaces a yellow `Session expired — click to unlock.` banner the moment the state flips. Still open as polish: persistent lock pip + remaining-TTL tooltip in TopBar, explicit "Lock now" affordance, sliding-window refresh.
 - [ ] **C-4 live verify gated on daemon restart (2026-05-13).** Bind anchor `4bbafb48-bbfd-47e6-b076-e1a58a334303` (DevNeural Testing brainstorm) to project anchor `391b88f6-396c-4c46-a8d7-b656a2d5ad1d` (DevNeural) via `PATCH /lex/anchors/4bbafb48.../` body `{supervises_project_anchor_id: '391b88f6...'}`, then `POST /lex/inject-cross-session` with `caller_brainstorm_id` only (omit target_session) and confirm the inject lands in the bound project's live worker. Attempted today, blocked: live DB has no `supervises_project_anchor_id` column (migration 025 not applied) and the running daemon predates 295feff / d828762 / ae0a973, so PATCH silently no-op'd `{ok:true}` without persisting and the inject returned the legacy `400 target_session required`. Action: bounce the daemon so migration 025 + the new validate / setLexSessionSupervises / resolveSupervisedTargetSession code paths come up, then rerun. The current_session_id on the project anchor is also stale (`0d25363c` from the pre-/clear era); after Task E (4796aa8) the bridge needs to reload its VS Code extension so the latch flips the presence file onto the live jsonl before the inject can land.
 - [ ] **Cold-start preload SessionStart hook may not be firing on Lex sessions.** With `mode=live` set on `/lex/cold-start-preload/toggle`, `injection-log?caller_label=cold-start-preload` returns zero rows. This Lex session (`03525f9f`) bound its anchor via `[lex-anchor] reopen` but the new preload audit/inject path never ran. Verify: which hook event the route is wired to, whether Lex sessions pass the brainstorm-resolve gate, whether errors are being swallowed pre-audit.
+- [ ] **First voice-mode response always silent (2026-05-13).** Fresh Lex session: first reply renders as text but is not spoken; every subsequent reply speaks normally. Suspect TTS pipeline not initialized on first turn (voice client warm-up, audio context unlocked only after first user gesture, or speak-on-response handler bound after first model emit). Repro: open new Lex brainstorm in voice mode, send any prompt, observe first response is silent then loud thereafter. Check: client-side speakResponse() call site, audio-context unlock timing, whether first SSE/stream chunk arrives before TTS handler is wired.
 - [ ] **WASM/VAD mic init OOM under load (2026-05-13).** Initial fix shipped 637ae73 (pin single-thread WASM + retry button). Open follow-ups: (b) COOP/COEP headers to unlock SharedArrayBuffer + bigger heap, (d) singleton ORT init so VAD remount reuses the existing WASM module instead of re-firing initWasm(). Without (b) and (d), long-running tabs or multi-tab sessions can still accumulate heap pressure and OOM. Smoke test: open dashboard via tailscale, exercise /lex repeatedly (mode switches, page hops), open a second dashboard tab, leave running for >1 hour, watch DevTools console for new VAD init failures. If failures recur post-fix, escalate to (b) + (d). Track as ongoing memory-management concern, not single-bug closeout.
+
+## Captured 2026-05-14 brainstorm
+
+- [ ] **Read distilled brainstorm summaries.** Distillations live in SQLite, not flat files. Storage:
+  - DB: `C:\dev\data\skill-connections\index.db`
+  - Table: `brainstorm_sessions`
+  - Columns: `last_summary` (the prose distillation), `last_summary_ms` (timestamp), `distilled_at`
+  - Wiki distillation drafts live in separate `wiki_drafts` table keyed by `brainstorm_id`, column `body_markdown`, status pending/promoted/discarded/auto-promoted/auto-dropped/superseded.
+
+  Three ways to read them:
+  1. **Dashboard UI**: past-sessions panel renders `last_summary` per session (cleanest).
+  2. **HTTP endpoint**: existing route in `07-daemon/src/dashboard/routes.ts:3395` returns the meeting/brainstorm summary by id (path TBD, confirm before use).
+  3. **Direct DB query**: `sqlite3 C:\dev\data\skill-connections\index.db "SELECT id, user_label, datetime(last_summary_ms/1000, 'unixepoch'), substr(last_summary,1,500) FROM brainstorm_sessions WHERE last_summary IS NOT NULL ORDER BY last_summary_ms DESC LIMIT 10;"`. Note: sqlite3 not on PATH in OTLCDEV's bash; use DB Browser for SQLite, or run via `npx better-sqlite3` inline script.
+
+  Open: build a quick dump-to-markdown helper that walks recent distillations and writes them to `C:\tmp\distillations-YYYY-MM-DD.md` for casual scanning.
 
 ## Pre-publish (before GitHub release)
 
 - [ ] Comprehensive docs rewrite. Audit + rewrite every README, in-tree note, and how-to so an outside reader can understand: what each subsystem does (daemon, bridge, dashboard, lex, hooks, curator, wiki, orb, stream-deck), how they connect (data flow, IPC, presence files, HMAC tokens, runtime_config), and how to operate them (install, run, troubleshoot, observability). One canonical top-level README pointing into per-subdir READMEs. Captured 2026-05-13 during brainstorm.
+- [ ] **Dead-code and dead-reference sweep across the project tree.** Walk every subdir and delete anything that is parked, never imported, never installed, or referenced only by itself. Known starting points: `06-notebooklm-integration/` (research + plan + spec docs + `implementation/` dir, zero runtime imports outside an archived v1 comment), `archive/v1/` (legacy code path, retained "in case", reassess), stale Playwright fixtures, dead screenshots in test-results, abandoned migration scripts, orphaned test artifacts, dead npm deps with no in-tree import. Also strip dangling doc references that point at deleted files/modules. Goal: every line of code, every dependency, every doc page either justifies itself or gets removed. Captured 2026-05-14.
+- [ ] Comprehensive smoke-test pass after the cleanup. End-to-end run through every shipped feature on real hardware (voice, push, brainstorm, supervision, projects panel, wiki, orb, stream-deck) so the public release sits on a verified product. Captured 2026-05-14.
 
 ## Operational
 

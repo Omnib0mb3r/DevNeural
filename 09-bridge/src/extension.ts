@@ -153,10 +153,31 @@ function isEnabled(): boolean {
 }
 
 /* Cache of terminal id -> "is this running claude" so we don't shell
- * out to wmic on every tick. Cleared when terminals open or close. */
-const claudeTerminalCache = new Map<vscode.Terminal, boolean>();
+ * out to wmic on every tick. Cleared when terminals open or close.
+ *
+ * Negative entries time out after 5s so a terminal that was empty at
+ * first check (user opens VS Code, claude not started yet) becomes
+ * eligible for re-detection once the user runs `claude` in that
+ * shell. Without this, claudeTerminalCache.set(t, false) is sticky
+ * for the life of the Terminal object and the bridge never picks the
+ * worker up. Regression observed 2026-05-15. */
+type ClaudeCacheEntry = { value: boolean; ts: number };
+const NEG_CACHE_TTL_MS = 5_000;
+const claudeTerminalCache = new Map<vscode.Terminal, ClaudeCacheEntry>();
 function clearClaudeTerminalCache(): void {
   claudeTerminalCache.clear();
+}
+function readClaudeCache(t: vscode.Terminal): boolean | undefined {
+  const e = claudeTerminalCache.get(t);
+  if (!e) return undefined;
+  if (e.value === false && Date.now() - e.ts > NEG_CACHE_TTL_MS) {
+    claudeTerminalCache.delete(t);
+    return undefined;
+  }
+  return e.value;
+}
+function writeClaudeCache(t: vscode.Terminal, value: boolean): void {
+  claudeTerminalCache.set(t, { value, ts: Date.now() });
 }
 
 interface ProcRow {
@@ -249,7 +270,7 @@ function runProcessSnapshot(): Promise<ProcRow[]> {
 }
 
 async function isClaudeTerminal(t: vscode.Terminal): Promise<boolean> {
-  const cached = claudeTerminalCache.get(t);
+  const cached = readClaudeCache(t);
   if (cached !== undefined) return cached;
   let pid: number | undefined;
   try {
@@ -258,11 +279,11 @@ async function isClaudeTerminal(t: vscode.Terminal): Promise<boolean> {
     pid = undefined;
   }
   if (!pid) {
-    claudeTerminalCache.set(t, false);
+    writeClaudeCache(t, false);
     return false;
   }
   const found = await findClaudeDescendant(pid);
-  claudeTerminalCache.set(t, found);
+  writeClaudeCache(t, found);
   return found;
 }
 
@@ -413,8 +434,22 @@ async function handleMessage(message: BridgeMessage): Promise<void> {
     const wrapped = buildBridgePayload(message.text, commit);
     terminal.sendText(wrapped, false);
     if (commit) {
+      /* Safety-net Enter: on bracketed-paste-wrapped payloads the
+       * atomic body+\r sometimes loses the trailing CR because VS
+       * Code's PTY write queue closes the paste envelope after the
+       * \r byte (observed 2026-05-15 on multi-hundred-char wrapped
+       * payloads). A follow-up bare \r 120ms later commits the
+       * input. If the original \r already fired, this fires on an
+       * empty prompt, which CC's TUI treats as a no-op. */
+      setTimeout(() => {
+        try {
+          terminal.sendText('\r', false);
+        } catch {
+          /* terminal disposed; nothing to commit */
+        }
+      }, 120);
       channel.appendLine(
-        `[send] enter shipped atomically with payload (len=${wrapped.length})`,
+        `[send] payload shipped (len=${wrapped.length}); safety-net Enter scheduled +120ms`,
       );
     }
   } catch (err) {
