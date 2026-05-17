@@ -20,7 +20,7 @@ Status legend: ⏳ queued, 🔄 in progress, ✅ shipped, ❌ blocked.
 | 10 | Wake-word audit + standby/listen + voice-commands.md | ✅ | ec614a6, a06c838 | |
 | 11 | Dashboard Help page scaffold + content | ✅ | 927b88b, bfa0d1b, 488e5f6 | |
 | 12 | Feedback memories baked into Lex system prompt | ✅ | 2eb63b7 | |
-| 13 | TTS speak on stop_reason=tool_use (pre-tool ack) | 🔄 | | mid-implementation |
+| 13 | TTS speak on stop_reason=tool_use (pre-tool ack) | ✅ | TBD | |
 
 > **Note: no Fix 8.** The slot was skipped intentionally between
 > Fix 7 and Fix 9; the original Fix 8 placeholder did not earn its

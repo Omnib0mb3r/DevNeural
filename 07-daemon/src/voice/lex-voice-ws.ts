@@ -78,6 +78,7 @@ import { getStore } from '../lex/brainstorm-store.js';
 import { checkToolGate, notifyLargeFsRead, LARGE_FS_READ_LINE_THRESHOLD } from '../lex/tool-gate.js';
 import { runSessionEndPipeline } from '../lex/session-end-pipeline.js';
 import { appendUtterance as appendSessionAudio } from './audio-bundle.js';
+import { selectTtsContent } from './select-tts-content.js';
 
 /* Voice modes drive whether the daemon synthesizes Lex's response
  * out loud. The browser still receives transcript + assistant-text
@@ -467,10 +468,15 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
   }
 
-  /* Track the last observed assistant turn we've already TTS'd so the
-   * watcher doesn't keep speaking the same response if the file is
-   * rewritten or we re-read it. */
-  let lastSpokenUuid: string | null = null;
+  /* Track which assistant-text segments have already been TTS'd so the
+   * watcher does not double-speak. Per-segment hashing (not per-uuid)
+   * because a single Lex turn can split a text ack into several
+   * pre-tool blocks before the eventual end_turn record, and the
+   * end_turn record's content array can echo earlier text blocks.
+   * Storing a hash per text block lets us dedupe across both stop_
+   * reason paths (end_turn and tool_use) without re-speaking text
+   * the client has already heard. */
+  const spokenSegmentHashes: Set<string> = new Set();
 
   function pollJsonl(): void {
     if (!state.jsonlPath && state.watchSessionId) {
@@ -554,8 +560,8 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     /* Read-only watch mode: when the client supplied a watchSessionId
      * but we have no PTY to inject into, the WS can't drive the request
      * side, so awaitingResponseSince never gets set. Speak every fresh
-     * end_turn from the watched session instead. lastSpokenUuid still
-     * dedupes against re-reads. */
+     * end_turn from the watched session instead. spokenSegmentHashes
+     * dedupes against re-reads at segment granularity. */
     const readOnly = state.watchSessionId && !state.bindKey;
     if (!readOnly && !state.awaitingResponseSince) return;
     const message = rec.message as
@@ -566,17 +572,27 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         }
       | undefined;
     if (!message) return;
-    if (message.stop_reason !== 'end_turn') return;
+    /* Fix 13: speak text content on BOTH stop_reason='end_turn' and
+     * stop_reason='tool_use'. The tool_use path covers the pre-tool
+     * ack ("Investigating...", "On it..."): Lex emits a text block
+     * AND a tool_use block in the same turn, stop_reason on that
+     * record is 'tool_use' (not 'end_turn'), and the legacy gate
+     * dropped the entire turn before extraction. Per-segment dedupe
+     * (spokenSegmentHashes) keeps the eventual end_turn record from
+     * re-speaking text the user already heard.
+     *
+     * Filter + dedupe live in the pure selectTtsContent helper so
+     * the rules can be unit-tested without standing up the WS. */
+    const decision = selectTtsContent(rec as unknown as Parameters<typeof selectTtsContent>[0], spokenSegmentHashes);
+    if (decision.drop) return;
+    const isPreToolAck = decision.is_pre_tool_ack;
+    const text = decision.new_text;
+    const fullText = decision.full_text;
     const uuid = String(rec.uuid ?? '');
-    if (uuid && uuid === lastSpokenUuid) return;
-    const texts: string[] = [];
-    for (const c of message.content ?? []) {
-      if (c?.type === 'text' && typeof c.text === 'string') texts.push(c.text);
-    }
-    const text = texts.join('\n').trim();
-    if (!text) return;
-    lastSpokenUuid = uuid || null;
-    state.awaitingResponseSince = 0;
+    /* Stamp the dedupe set BEFORE speak() so a re-read of the same
+     * jsonl line cannot double-speak. */
+    for (const h of decision.new_hashes) spokenSegmentHashes.add(h);
+    if (!isPreToolAck) state.awaitingResponseSince = 0;
     /* Always tell the client the response text, regardless of mode.
      * The panel renders it on screen. Notes-only mode skips the TTS
      * synth so Lex stays silent (the user is dictating, doesn't want
@@ -616,40 +632,61 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     } catch {
       /* observability only */
     }
-    send({
-      t: 'assistant-text',
-      text,
-      ...(uuid ? { turn_id: uuid } : {}),
-      ...(brainstormForFeedback?.id ? { brainstorm_id: brainstormForFeedback.id } : {}),
-      ...(brainstormForFeedback?.prompt_version
-        ? { prompt_version: brainstormForFeedback.prompt_version }
-        : {}),
-    });
-    /* Land an assistant turn into brainstorm_chunks the moment it
-     * arrives so brainstorm_sessions.turn_count + the /lex/recall
-     * retrieval surface track live conversation, not just the
-     * session-end backfill. Chunk id is the CC turn uuid so the
-     * brainstorm-jsonl-ingestor's next tick re-insert is a no-op
-     * via INSERT OR REPLACE. When the uuid is missing (rare race
-     * where the jsonl entry has not flushed) we skip; the ingestor
-     * will land the row on its tick. Wrapped so a chunk insert
-     * failure cannot block the speak path. */
-    if (brainstormForFeedback?.id && uuid) {
-      try {
-        getStore().db.insertBrainstormChunk({
-          id: uuid,
-          brainstorm_id: brainstormForFeedback.id,
-          turn_index: getStore().db.nextTurnIndex(brainstormForFeedback.id),
-          role: 'lex',
-          mode: brainstormModeForChunk,
-          text,
-          model_id: process.env.DEVNEURAL_LEX_MODEL_ID ?? 'claude',
-          no_decay: 1,
-        });
-      } catch {
-        /* observational; never block speak() */
+    /* Speak the newly-extracted text. The assistant-text frame, the
+     * brainstorm-chunk insert, and the speak() call all gate on
+     * `text` being non-empty. When pre-tool segments have already
+     * been spoken in an earlier tool_use record AND the end_turn
+     * record echoes only those segments, `text` is empty and these
+     * blocks are skipped; the post-end_turn pipeline (artifacts,
+     * attention, compaction) still runs on `fullText`. */
+    if (text) {
+      send({
+        t: 'assistant-text',
+        text,
+        ...(uuid ? { turn_id: uuid } : {}),
+        ...(brainstormForFeedback?.id ? { brainstorm_id: brainstormForFeedback.id } : {}),
+        ...(brainstormForFeedback?.prompt_version
+          ? { prompt_version: brainstormForFeedback.prompt_version }
+          : {}),
+        ...(isPreToolAck ? { pre_tool_ack: true } : {}),
+      });
+      /* Land an assistant turn into brainstorm_chunks the moment it
+       * arrives so brainstorm_sessions.turn_count + the /lex/recall
+       * retrieval surface track live conversation, not just the
+       * session-end backfill. Chunk id is the CC turn uuid so the
+       * brainstorm-jsonl-ingestor's next tick re-insert is a no-op
+       * via INSERT OR REPLACE. When the uuid is missing (rare race
+       * where the jsonl entry has not flushed) we skip; the ingestor
+       * will land the row on its tick. Wrapped so a chunk insert
+       * failure cannot block the speak path. The pre-tool-ack write
+       * lands the partial text; the eventual end_turn write replaces
+       * it with the full message text under the same uuid. */
+      if (brainstormForFeedback?.id && uuid) {
+        try {
+          getStore().db.insertBrainstormChunk({
+            id: uuid,
+            brainstorm_id: brainstormForFeedback.id,
+            turn_index: getStore().db.nextTurnIndex(brainstormForFeedback.id),
+            role: 'lex',
+            mode: brainstormModeForChunk,
+            text: isPreToolAck ? text : fullText,
+            model_id: process.env.DEVNEURAL_LEX_MODEL_ID ?? 'claude',
+            no_decay: 1,
+          });
+        } catch {
+          /* observational; never block speak() */
+        }
+      }
+      if (state.mode === 'notes') {
+        send({ t: 'tts-skipped', reason: 'notes-mode' });
+      } else {
+        speak(text);
       }
     }
+    /* Pre-tool ack stops here. The follow-on end_turn record from
+     * the same Lex turn will run artifacts / attention / large-fs /
+     * compaction on the full message text. */
+    if (isPreToolAck) return;
     /* Slice C: scan the assistant turn for fenced artifact blocks
      * (research-note / wiki-draft / project-intent / notes-summary),
      * persist them, and link the artifact ids into the brainstorm
@@ -660,9 +697,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * brainstorm jsonl watcher is the follow-up. */
     try {
       const brainstormId = brainstormForFeedback?.id ?? null;
-      const persisted = processAssistantTurn(text, {
+      const persisted = processAssistantTurn(fullText, {
         brainstormId,
-        fallbackTitle: text.slice(0, 60),
+        fallbackTitle: fullText.slice(0, 60),
         ...(uuid ? { dedupeKey: uuid } : {}),
       });
       if (persisted.length > 0) {
@@ -691,7 +728,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       fireAttentionForLexTurn({
         brainstorm_id: brainstormForFeedback?.id ?? null,
         turn_id: uuid || null,
-        text,
+        text: fullText,
       });
     } catch {
       /* attention dispatch is observational; never block speak() */
@@ -702,10 +739,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * awareness event so the dashboard trace shows the read. The
      * detection is line-count only; it does not parse tool_use blocks. */
     try {
-      const lineCount = text.split('\n').length;
+      const lineCount = fullText.split('\n').length;
       if (lineCount >= LARGE_FS_READ_LINE_THRESHOLD) {
         /* Extract first word-like pattern as a proxy for the grep arg. */
-        const patternMatch = text.match(/grep\s+(?:-[a-z]+\s+)*["']?([^\s"']+)["']?/i);
+        const patternMatch = fullText.match(/grep\s+(?:-[a-z]+\s+)*["']?([^\s"']+)["']?/i);
         const pattern = patternMatch?.[1] ?? '(large output)';
         let brainstormId: string | null = null;
         try {
@@ -722,13 +759,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     } catch {
       /* observational; never block turn */
     }
-    if (state.mode === 'notes') {
-      /* Surface a short ack so the panel can show "captured" — but
-       * no audio. */
-      send({ t: 'tts-skipped', reason: 'notes-mode' });
-    } else {
-      speak(text);
-    }
+    /* The speak / tts-skipped frame fires earlier (inside the
+     * `if (text)` block before the pre-tool-ack early return) so a
+     * tool_use record's pre-ack text reaches the speaker. The end_
+     * turn record may have already-spoken segments (newText empty);
+     * in that case there is nothing left to speak here and the
+     * pipeline below runs against fullText. */
     /* Mid-session compaction check. End-of-turn is the ONLY boundary
      * at which a restart is safe (the spec is strict: never cut
      * mid-sentence). When shouldTriggerCompaction crosses 75% of the
@@ -809,7 +845,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
                *     of-life pipeline can fire later and so the new
                *     session can also compact when it crosses the
                *     threshold.
-               *   - lastSpokenUuid clears so the speak dedupe doesn't
+               *   - spokenSegmentHashes clears so the speak dedupe doesn't
                *     accidentally suppress a reply whose uuid happens
                *     to match the prior session's last spoken record.
                *   - activeByBindKey re-keyed on the new bindKey so a
@@ -826,7 +862,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
               state.awaitingResponseSince = Date.now();
               state.sessionEndFired = false;
               state.compaction.compactedAt = 0;
-              lastSpokenUuid = null;
+              spokenSegmentHashes.clear();
               activeByBindKey.set(state.bindKey, state);
               startJsonlWatch();
               /* Kill the prior PTY AFTER the internal rebind so the
