@@ -165,7 +165,7 @@ export function processChange(
   if (!ccSessionId) return { outcome: 'skipped-no-anchor' };
   const anchor = resolveAnchorForCc(deps.db, ccSessionId);
   if (!anchor) return { outcome: 'skipped-no-anchor' };
-  if ((anchor.supervision_mode ?? 'polling') !== 'event') {
+  if ((anchor.supervision_mode ?? deps.db.getDefaultSupervisionMode()) !== 'event') {
     return { outcome: 'skipped-mode', anchor_id: anchor.id };
   }
   const tail = readTail(

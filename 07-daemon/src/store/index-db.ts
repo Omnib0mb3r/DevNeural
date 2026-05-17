@@ -358,6 +358,36 @@ export const VALID_SUPERVISION_MODES: ReadonlySet<SupervisionMode> = new Set([
   'off',
 ]);
 
+/* runtime_config key that overrides the hard-coded 'polling' default
+ * applied to anchor rows whose supervision_mode is NULL (legacy
+ * pre-migration rows, project_session inserts that omit the field,
+ * and the 5+ read-side fallbacks scattered across routes + the
+ * event-driven supervisor). Setting this key to 'event' makes new
+ * anchors auto-enroll into event-driven supervision instead of
+ * needing a manual PATCH per anchor. The killswitch still flips to
+ * 'polling' on overflow regardless of this default; the default
+ * governs the steady state, not the safety valve.
+ *
+ * Parser tolerates leading/trailing whitespace + any case so a
+ * shell `sqlite3 ... UPDATE runtime_config SET value='EVENT'` does
+ * not silently bypass the validator and leave the daemon reading
+ * garbage. Invalid values fall through to the hard-coded
+ * 'polling' default so a bad write cannot ever flip the daemon
+ * into an undefined mode. */
+export const DEFAULT_SUPERVISION_MODE_CONFIG_KEY = 'default_supervision_mode';
+
+export function parseSupervisionModeValue(
+  raw: string | null | undefined,
+): SupervisionMode | null {
+  if (raw === null || raw === undefined) return null;
+  const v = raw.trim().toLowerCase();
+  if (!v) return null;
+  if (VALID_SUPERVISION_MODES.has(v as SupervisionMode)) {
+    return v as SupervisionMode;
+  }
+  return null;
+}
+
 /* project_transcript_ref row. Ordered list of CC jsonl pointers per
  * project_session anchor. cc_session_id is UNIQUE across the table so
  * the same jsonl never lands under two anchors. closed_ms is NULL
@@ -998,6 +1028,16 @@ export class IndexDb {
       .prepare(`SELECT value FROM runtime_config WHERE key = ?`)
       .get(key) as { value: string } | undefined;
     return row?.value ?? null;
+  }
+
+  /* Resolve the operator-configured default supervision_mode for
+   * new / null-mode anchors. Falls back to 'polling' when the
+   * runtime_config row is unset or carries an unparseable value.
+   * Centralised so every read-side fallback and the
+   * project_session insert default agree. */
+  getDefaultSupervisionMode(): SupervisionMode {
+    const raw = this.getRuntimeConfig(DEFAULT_SUPERVISION_MODE_CONFIG_KEY);
+    return parseSupervisionModeValue(raw) ?? 'polling';
   }
 
   setRuntimeConfig(key: string, value: string, updatedBy?: string): void {
@@ -1688,7 +1728,7 @@ export class IndexDb {
         row.current_pty_id,
         row.created_ms,
         row.last_seen_ms,
-        row.supervision_mode ?? 'polling',
+        row.supervision_mode ?? this.getDefaultSupervisionMode(),
       );
   }
 

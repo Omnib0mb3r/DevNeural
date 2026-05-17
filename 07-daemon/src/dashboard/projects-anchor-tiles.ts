@@ -113,7 +113,7 @@ export function buildProjectAnchorTile(
     pending_prompt: pending,
     last_activity_ms: lastActivityMs(row, refs),
     transcript_count: refs.length,
-    supervision_mode: (row.supervision_mode ?? 'polling') as
+    supervision_mode: (row.supervision_mode ?? db.getDefaultSupervisionMode()) as
       | 'polling'
       | 'event'
       | 'off',

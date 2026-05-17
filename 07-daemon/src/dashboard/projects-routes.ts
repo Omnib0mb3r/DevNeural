@@ -49,7 +49,10 @@ export interface ProjectAnchorView {
   supervision_mode: 'polling' | 'event' | 'off';
 }
 
-export function toAnchorView(row: ProjectSessionRow): ProjectAnchorView {
+export function toAnchorView(
+  row: ProjectSessionRow,
+  defaultSupervisionMode: 'polling' | 'event' | 'off' = 'polling',
+): ProjectAnchorView {
   const decoded = decodeBridgeMarker(row.current_bridge_id);
   let exists = false;
   try {
@@ -70,7 +73,7 @@ export function toAnchorView(row: ProjectSessionRow): ProjectAnchorView {
     created_ms: row.created_ms,
     last_seen_ms: row.last_seen_ms,
     exists_on_disk: exists,
-    supervision_mode: (row.supervision_mode ?? 'polling') as
+    supervision_mode: (row.supervision_mode ?? defaultSupervisionMode) as
       | 'polling'
       | 'event'
       | 'off',
@@ -86,7 +89,8 @@ export function listProjectAnchors(
   db: IndexDb,
   opts: ListOptions = {},
 ): ProjectAnchorView[] {
-  return db.listProjectSessions(opts).map(toAnchorView);
+  const defaultMode = db.getDefaultSupervisionMode();
+  return db.listProjectSessions(opts).map((row) => toAnchorView(row, defaultMode));
 }
 
 export function getProjectAnchorDetail(
@@ -96,7 +100,7 @@ export function getProjectAnchorDetail(
   const row = db.getProjectSession(id);
   if (!row) return null;
   return {
-    anchor: toAnchorView(row),
+    anchor: toAnchorView(row, db.getDefaultSupervisionMode()),
     transcripts: db.listProjectTranscriptRefs(id),
   };
 }
@@ -174,7 +178,7 @@ export async function openProjectAnchor(
     return {
       ok: true,
       mode: 'bind',
-      anchor: toAnchorView(row),
+      anchor: toAnchorView(row, db.getDefaultSupervisionMode()),
     };
   }
   const existing = inflight.get(id);
@@ -225,7 +229,7 @@ export async function openProjectAnchor(
     return {
       ok: true,
       mode,
-      anchor: toAnchorView(final),
+      anchor: toAnchorView(final, db.getDefaultSupervisionMode()),
       command,
       warnings: warnings.length ? warnings : undefined,
     };
@@ -257,7 +261,7 @@ export function endProjectAnchor(
     current_pty_id: null,
     last_seen_ms: nowMs,
   });
-  return updated ? toAnchorView(updated) : null;
+  return updated ? toAnchorView(updated, db.getDefaultSupervisionMode()) : null;
 }
 
 export interface PatchOptions {
@@ -272,6 +276,7 @@ export function patchProjectAnchor(
 ): ProjectAnchorView | null {
   const row = db.getProjectSession(id);
   if (!row) return null;
+  const defaultMode = db.getDefaultSupervisionMode();
   const updates: Partial<typeof row> = {};
   if (patch.title !== undefined) updates.title = patch.title;
   if (patch.supervision_mode !== undefined) {
@@ -280,13 +285,13 @@ export function patchProjectAnchor(
       patch.supervision_mode !== 'event' &&
       patch.supervision_mode !== 'off'
     ) {
-      return toAnchorView(row);
+      return toAnchorView(row, defaultMode);
     }
     updates.supervision_mode = patch.supervision_mode;
   }
-  if (Object.keys(updates).length === 0) return toAnchorView(row);
+  if (Object.keys(updates).length === 0) return toAnchorView(row, defaultMode);
   const updated = db.updateProjectSession(id, updates);
-  return updated ? toAnchorView(updated) : null;
+  return updated ? toAnchorView(updated, defaultMode) : null;
 }
 
 export function deleteProjectAnchor(db: IndexDb, id: string): boolean {
