@@ -35,7 +35,7 @@ A second brain has six properties. DevNeural has all six.
 | 3.2 | Reference corpus pipeline (PDF, image, markdown, DOCX upload + extract + chunk + embed) | done, shipped |
 | 3.3 | Session bridge VS Code extension | done, shipped |
 | 3.4 | Dashboard frontend (Next.js 15 + Tailwind v4 + Tanstack Query, PIN auth, all panels real, mobile responsive, PWA) | done, shipped |
-| 3.5 | Audio + video processing (whisper.cpp + ffmpeg wrappers) | code shipped, needs binaries installed (see below) |
+| 3.5 | Audio + video processing (whisper.cpp + ffmpeg wrappers) | done, shipped (whisper.cpp + ffmpeg binaries installed on OTLCDEV; setup instructions for fresh hosts below) |
 | 3.6 | Stream Deck + session detail polish | done in 3.4.2 |
 | 3.7 | Notifications + reminders + web push (VAPID) | done, shipped |
 | 3.8 | System panel + Tremor sparklines | done, shipped |
