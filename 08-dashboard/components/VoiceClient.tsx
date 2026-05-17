@@ -1653,25 +1653,19 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
              * configured cooldown window. */
             lastTtsStartAtRef.current = Date.now();
             setStatus("speaking");
-            /* Hard mic gate for the duration of TTS playback. The
-             * speaker's own audio bleeds into the mic (laptop
-             * speakers, AirPods leak, room echo) and used to come
-             * back through whisper as the user's "next utterance",
-             * making Lex talk over herself. Pause silero VAD,
-             * disarm the parallel capture rig, and surface a UI flag
-             * so the TopBar pill can show MicOff during playback.
-             * Resumed on tts-end below. */
+            /* Keep micGated as a UI signal (TopBar mic-icon flips
+             * to MicOff during playback) and disarm the parallel
+             * capture rig so a mute-finalize during TTS does not
+             * ship Lex's own audio. VAD itself stays live (path 1
+             * of the voice-cmd-blocked-during-TTS audit) so the
+             * wake matcher can catch interrupt commands mid-reply.
+             * AEC on the parallel-capture stream + the daemon-side
+             * `utteranceStartedDuringTts` gate keep AEC residual
+             * out of the inject path. */
             micGatedRef.current = true;
             setMicGated(true);
             captureCapturingRef.current = false;
             captureBufRef.current = [];
-            try {
-              const v = vadRef.current as { pause?: () => void } | null;
-              v?.pause?.();
-            } catch {
-              /* non-fatal: gate via the onSpeechStart early-return
-               * still applies even if pause() throws. */
-            }
             break;
           }
           case "tts-end": {
@@ -1862,13 +1856,17 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             onnxWASMBasePath: "/vad/",
             onSpeechStart: () => {
               if (mutedRef.current) return;
-              /* Hard gate: while the daemon is streaming TTS, the
-               * mic must not produce any whisper-bound frames or
-               * fire barge-in. The tts-start / tts-end handlers
-               * pause+resume the VAD itself, but a stray
-               * onSpeechStart that races the pause still lands here
-               * and would otherwise call utterance-start. Drop it. */
-              if (micGatedRef.current) return;
+              /* No more micGated early-return here. Path 1 of the
+               * voice-cmd-blocked-during-TTS audit: VAD stays live
+               * during TTS so the wake matcher can catch "Lex
+               * disable" / "Lex shut up" mid-reply. The daemon
+               * gates the inject on its end so AEC residual that
+               * gets transcribed but does not match a wake phrase
+               * never lands as a phantom user turn (see
+               * `state.utteranceStartedDuringTts` in
+               * lex-voice-ws.ts). The barge-in path below still
+               * cancels the in-flight TTS playback so the user is
+               * heard immediately. */
               if (speakingRef.current) {
                 /* Self-echo guard: Lex's own audio bleeds into the mic
                  * (laptop speakers, AirPods leak, etc.) and trips VAD

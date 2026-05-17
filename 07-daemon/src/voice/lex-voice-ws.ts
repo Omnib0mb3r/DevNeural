@@ -125,6 +125,16 @@ interface ConnState {
    * the gap between the wake-word fire and the trailing transcript
    * landing through utterance-end. */
   lastVoiceCmdMs: Partial<Record<VoiceCommandKind, number>>;
+  /* True when the current utterance began while ttsActive was
+   * non-null (i.e. the user spoke during a Lex TTS reply). Stamped
+   * on the utterance-start frame and read inside handleUtteranceEnd
+   * after dispatch. When set, a transcript that does NOT match a
+   * voice command is dropped instead of injected, so AEC residual
+   * (Lex's own audio bleeding into the mic) cannot land as a
+   * phantom user turn that derails the brainstorm. Wake commands
+   * (matchVoiceCommand returns non-null) still fire via the
+   * dispatch path before this gate. */
+  utteranceStartedDuringTts: boolean;
   /* Mid-session compaction trigger state. Flips compactedAt the
    * moment shouldTriggerCompaction crosses 75% so a trailing
    * end_turn record in the same jsonl tail cannot re-fire the
@@ -284,6 +294,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     mode: 'conversation',
     sessionEndFired: false,
     lastVoiceCmdMs: {},
+    utteranceStartedDuringTts: false,
     compaction: { compactedAt: 0 },
   };
 
@@ -1038,6 +1049,23 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     const cmd = matchVoiceCommand(result.text);
     if (cmd) {
       dispatchVoiceCommand(cmd.kind, 'transcript');
+      state.utteranceStartedDuringTts = false;
+      return;
+    }
+    /* Wake-during-TTS gate (path 1 of the voice-cmd-blocked-during-
+     * TTS audit). If this utterance began while Lex was streaming TTS
+     * and the wake matcher did NOT match a command, drop the inject.
+     * The most likely source of such a transcript is AEC residual:
+     * Lex's own audio bleeding into the mic, transcribed by whisper
+     * as nonsense or as a fragment of Lex's reply. Injecting that as
+     * a user turn would derail the brainstorm. The transcript frame
+     * already went to the client so the operator can see what
+     * happened; only the daemon-side inject is suppressed. */
+    if (state.utteranceStartedDuringTts) {
+      console.log(
+        `[voice-ws] suppressed non-wake utterance during TTS: ${JSON.stringify(result.text.slice(0, 80))}`,
+      );
+      state.utteranceStartedDuringTts = false;
       return;
     }
     if (!state.bindKey) {
@@ -1167,6 +1195,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       case 'utterance-start':
         state.micBuf = [];
         state.micBufBytes = 0;
+        /* Path-1 of the wake-during-TTS work. Stamp whether this
+         * utterance began inside the daemon's TTS stream so
+         * handleUtteranceEnd can run dispatch but suppress the
+         * inject for a non-wake transcript (likely AEC bleed
+         * coming back through whisper). */
+        state.utteranceStartedDuringTts = state.ttsActive !== null;
         break;
       case 'utterance-end':
         void handleUtteranceEnd();
