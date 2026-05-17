@@ -2126,13 +2126,19 @@ export class IndexDb {
       | 'rejected_anchor_dormant';
     reject_reason?: string | null;
     brainstorm_id?: string | null;
+    /* Fix 15 C3 — full inject text, populated only when the audit
+     * row is destined for replay by smart-compact resume
+     * (decision='dispatched_dead_session'). Nullable on all other
+     * decisions to keep audit storage bounded. Requires migration
+     * 030 to be present; silently nulled if the column is missing. */
+    payload_text?: string | null;
   }): void {
     try {
       this.db
         .prepare(
           `INSERT INTO cross_session_injection_log
-             (id, target_session, caller_label, text_preview, text_length, decision, reject_reason, brainstorm_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+             (id, target_session, caller_label, text_preview, text_length, decision, reject_reason, brainstorm_id, payload_text)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           row.id,
@@ -2143,9 +2149,79 @@ export class IndexDb {
           row.decision,
           row.reject_reason ?? null,
           row.brainstorm_id ?? null,
+          row.payload_text ?? null,
         );
     } catch {
-      /* table may not exist yet; not fatal */
+      /* table or column may not exist yet; not fatal */
+    }
+  }
+
+  /* Fix 15 C3 — parked-inject replay lookup. Returns the most recent
+   * dispatched_dead_session audit rows that name `anchorId` in their
+   * structured reject_reason payload and still carry a non-null
+   * payload_text, capped at `limit` (default 3) and bounded to the
+   * last `sinceMs` ms (default 5 min). Smart-compact's resume hook
+   * calls this just before firing the resume summary so any injects
+   * that landed while the anchor was dormant get re-delivered to the
+   * fresh session uuid. */
+  findParkedInjectsForAnchor(
+    anchorId: string,
+    opts: { sinceMs?: number; limit?: number; nowMs?: number } = {},
+  ): Array<{
+    id: string;
+    target_session: string;
+    caller_label: string | null;
+    payload_text: string;
+    ts: string;
+  }> {
+    if (!anchorId) return [];
+    const sinceMs = opts.sinceMs ?? 5 * 60 * 1000;
+    const limit = opts.limit ?? 3;
+    const nowMs = opts.nowMs ?? Date.now();
+    const cutoffIso = new Date(nowMs - sinceMs).toISOString();
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT id, target_session, caller_label, payload_text, ts
+             FROM cross_session_injection_log
+            WHERE decision = 'dispatched_dead_session'
+              AND payload_text IS NOT NULL
+              AND ts >= ?
+              AND reject_reason LIKE ?
+            ORDER BY ts ASC
+            LIMIT ?`,
+        )
+        .all(cutoffIso, `%"anchor_id":"${anchorId}"%`, limit) as Array<{
+          id: string;
+          target_session: string;
+          caller_label: string | null;
+          payload_text: string;
+          ts: string;
+        }>;
+      return rows;
+    } catch {
+      return [];
+    }
+  }
+
+  /* Fix 15 C3 — mark a parked inject as replayed so the next resume
+   * window doesn't double-fire it. Rewrites decision to 'accepted'
+   * and amends reject_reason to record the replay context. */
+  markParkedInjectReplayed(
+    id: string,
+    replayedToSession: string,
+  ): void {
+    try {
+      this.db
+        .prepare(
+          `UPDATE cross_session_injection_log
+              SET decision = 'accepted',
+                  reject_reason = COALESCE(reject_reason, '') || ?
+            WHERE id = ?`,
+        )
+        .run(`;replayed_to=${replayedToSession}`, id);
+    } catch {
+      /* not fatal — replay already fired */
     }
   }
 

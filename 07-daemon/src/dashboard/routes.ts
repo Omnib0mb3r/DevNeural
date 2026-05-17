@@ -3999,6 +3999,12 @@ export async function registerDashboardRoutes(
             reason: 'bound-anchor-dormant',
           }),
           brainstorm_id: null,
+          /* Fix 15 C3 — persist the full text so smart-compact's
+           * resume hook can replay this inject when the anchor
+           * comes back live. Only stamped on this decision branch;
+           * other audit rows leave payload_text NULL to keep
+           * audit-log storage bounded. */
+          payload_text: body.text,
         });
       } catch {
         /* never let audit failures block the response */

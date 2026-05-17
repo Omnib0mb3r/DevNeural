@@ -685,6 +685,35 @@ export function fireSmartCompact(
               }
             });
           }
+          /* Fix 15 C3 — replay parked injects before the resume
+           * summary fires. Bounded to 3 entries per resume window so
+           * a stuck audit row can't trigger a self-amplifying replay
+           * loop. The new CC session uuid (if observable) is read
+           * from wait.new_jsonl so the audit rows can be amended to
+           * record where the replay actually landed. */
+          let replayedToSession: string | null = null;
+          if (wait?.ready && wait.new_jsonl) {
+            const base = wait.new_jsonl.split('/').pop() ?? '';
+            replayedToSession = base.replace(/\.jsonl$/, '') || null;
+          }
+          try {
+            const parked = db.findParkedInjectsForAnchor(anchorId, {
+              limit: 3,
+              sinceMs: 5 * 60 * 1000,
+            });
+            for (const row of parked) {
+              if (!row.payload_text) continue;
+              const r = opts.injector(target, row.payload_text, true);
+              if (r.ok) {
+                db.markParkedInjectReplayed(
+                  row.id,
+                  replayedToSession ?? target,
+                );
+              }
+            }
+          } catch {
+            /* replay is best-effort; never block the summary */
+          }
           const ship = opts.injector(target, summary, true);
           try {
             opts.onResumeComplete?.({ ship_ok: ship.ok, wait });
