@@ -46,9 +46,10 @@ const MODE_BTN: Record<SmartCompactMode, string> = {
 };
 
 const MODE_BLURB: Record<SmartCompactMode, string> = {
-  off: "fire is inert: no audit row, no PTY inject.",
-  shadow: "fire logs a shadow row but never injects into a worker.",
-  live: "per-anchor shadow gate decides; otherwise /clear + summary inject.",
+  off: "Off. Lex never auto-resets workers. Stuck workers stay stuck until you reset them yourself.",
+  shadow:
+    "Shadow. Lex records every worker it would have reset, but takes no action. Use this to watch the picks before turning it on.",
+  live: "Live. When a worker runs out of context, Lex resets it and pastes a summary so it picks up where it left off.",
 };
 
 export function SmartCompactPanel() {
@@ -89,10 +90,10 @@ export function SmartCompactPanel() {
       <header className="px-4 py-3 border-b border-border1 flex items-center justify-between">
         <div className="flex flex-col gap-0.5">
           <h2 className="text-sm font-emphasized text-txt1">
-            Smart compact mode
+            Auto-reset for stuck workers
           </h2>
           <p className="text-nano text-txt3">
-            Runtime kill-switch for the auto-/clear + summary pipeline
+            When a worker fills its context, Lex resets it and resumes with a summary so work continues.
           </p>
         </div>
         <span

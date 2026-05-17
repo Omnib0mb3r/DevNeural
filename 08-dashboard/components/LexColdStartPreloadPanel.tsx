@@ -226,10 +226,10 @@ export function LexColdStartPreloadPanel() {
       <header className="px-4 py-3 border-b border-border1 flex items-center justify-between">
         <div className="flex flex-col gap-0.5">
           <h2 className="text-sm font-emphasized text-txt1">
-            Lex cold-start preload
+            Carry context into fresh Lex sessions
           </h2>
           <p className="text-nano text-txt3">
-            Auto-injects sibling brainstorm context on fresh Lex SessionStart
+            When a new Lex chat opens, Lex preloads what you discussed in related earlier sessions so you do not start from zero.
           </p>
         </div>
         <span

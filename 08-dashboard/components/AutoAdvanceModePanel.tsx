@@ -54,10 +54,10 @@ const MODE_BTN: Record<AutoAdvanceMode, string> = {
 };
 
 const MODE_BLURB: Record<AutoAdvanceMode, string> = {
-  off: "loop dormant: no quiescence eval, no auto_advance_log rows.",
+  off: "Off. Workers stop after each task. You drive every next step.",
   shadow:
-    "loop logs decision='shadow' on every clean-idle-done turn but never injects.",
-  live: "loop fires crossSessionInject on every clean-idle-done turn; Lex still handles judgment cases.",
+    "Shadow. Lex records what it would have advanced to, but never sends the next task. Use this to watch the picks before turning it on.",
+  live: "Live. When a worker finishes a task cleanly, Lex picks the next item and sends it automatically. Anything that needs your input still stops for you.",
 };
 
 export function AutoAdvanceModePanel() {
@@ -98,10 +98,10 @@ export function AutoAdvanceModePanel() {
       <header className="px-4 py-3 border-b border-border1 flex items-center justify-between">
         <div className="flex flex-col gap-0.5">
           <h2 className="text-sm font-emphasized text-txt1">
-            Auto-advance supervisor
+            Auto-advance to the next task
           </h2>
           <p className="text-nano text-txt3">
-            Runtime kill-switch for the daemon&apos;s clean-idle-done backlog pump
+            When a worker finishes a task without questions, Lex sends it the next item from the project backlog.
           </p>
         </div>
         <span

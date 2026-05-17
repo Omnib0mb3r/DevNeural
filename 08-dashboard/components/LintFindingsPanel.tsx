@@ -117,25 +117,34 @@ export function LintFindingsPanel() {
   const rows: AuditFindingRow[] = q.data?.findings ?? [];
   return (
     <section className="rounded-panel bg-surface1 hairline overflow-hidden">
-      <div className="px-5 py-3 border-b border-border1 flex items-center gap-2">
-        <h2 className="font-display text-sm font-emphasized">Audit findings</h2>
-        <span className="text-nano text-txt3 ml-auto">{rows.length} open</span>
-        <button
-          type="button"
-          onClick={() => lintM.mutate()}
-          disabled={lintM.isPending}
-          className="text-xs font-mono rounded border border-border1 bg-surface2 px-2 py-0.5 disabled:opacity-50"
-        >
-          {lintM.isPending ? "linting…" : "lint now"}
-        </button>
-        <button
-          type="button"
-          onClick={() => selfM.mutate()}
-          disabled={selfM.isPending}
-          className="text-xs font-mono rounded border border-border1 bg-surface2 px-2 py-0.5 disabled:opacity-50"
-        >
-          {selfM.isPending ? "auditing…" : "self-audit"}
-        </button>
+      <div className="px-5 py-3 border-b border-border1 flex flex-col gap-1">
+        <div className="flex items-center gap-2">
+          <h2 className="font-display text-sm font-emphasized">
+            Wiki problems
+          </h2>
+          <span className="text-nano text-txt3 ml-auto">
+            {rows.length} open
+          </span>
+          <button
+            type="button"
+            onClick={() => lintM.mutate()}
+            disabled={lintM.isPending}
+            className="text-xs font-mono rounded border border-border1 bg-surface2 px-2 py-0.5 disabled:opacity-50"
+          >
+            {lintM.isPending ? "linting…" : "lint now"}
+          </button>
+          <button
+            type="button"
+            onClick={() => selfM.mutate()}
+            disabled={selfM.isPending}
+            className="text-xs font-mono rounded border border-border1 bg-surface2 px-2 py-0.5 disabled:opacity-50"
+          >
+            {selfM.isPending ? "auditing…" : "self-audit"}
+          </button>
+        </div>
+        <p className="text-nano text-txt3">
+          Issues Lex has noticed in your local wiki: broken links, stale pages, missing context. Click a row to see details.
+        </p>
       </div>
       {toast && (
         <div

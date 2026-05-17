@@ -13,9 +13,9 @@ import {
 } from "@/lib/daemon-client";
 
 const OPTIONS: Array<{ value: "on" | "off" | "auto"; label: string }> = [
-  { value: "auto", label: "auto (idle for 21d → pause)" },
-  { value: "off", label: "off (decay always runs)" },
-  { value: "on", label: "on (decay frozen)" },
+  { value: "auto", label: "Auto. Pause when the project is idle for 21 days." },
+  { value: "off", label: "Off. Wiki pages fade in importance over time." },
+  { value: "on", label: "On. Wiki page importance is frozen; nothing fades." },
 ];
 
 export function PauseModeToggle() {
@@ -32,10 +32,11 @@ export function PauseModeToggle() {
   });
   return (
     <section className="rounded-panel bg-surface1 hairline p-4 space-y-2">
-      <h2 className="font-display text-sm font-emphasized">Pause mode</h2>
+      <h2 className="font-display text-sm font-emphasized">
+        Pause the wiki when you step away
+      </h2>
       <p className="text-xs text-txt3">
-        controls weight decay on canonical wiki pages. runtime override
-        wins over DEVNEURAL_PAUSE_MODE.
+        Stops Lex from fading older wiki pages while you are not actively working on the project.
       </p>
       <div className="flex flex-col gap-1">
         {OPTIONS.map((o) => (
@@ -55,6 +56,9 @@ export function PauseModeToggle() {
       {setM.isError ? (
         <p className="text-xs text-rose-400">save failed</p>
       ) : null}
+      <div className="text-nano text-txt3 font-mono pt-1">
+        env: DEVNEURAL_PAUSE_MODE={current}
+      </div>
     </section>
   );
 }

@@ -108,7 +108,7 @@ export function VoiceDiagnosticsPanel(): React.ReactElement {
             Voice diagnostics
           </h2>
           <p className="text-nano text-txt3">
-            WS reconnects, mic / VAD / wake-word transitions, errors — live
+            Live log of voice events: connection drops, mic state, wake word, and errors. Use this when voice misbehaves.
           </p>
         </div>
         <div className="flex items-center gap-3 shrink-0">

@@ -63,13 +63,18 @@ export function SmartCompactAuditPanel() {
       data-testid="smart-compact-audit-panel"
       className="rounded-panel bg-surface1 hairline"
     >
-      <header className="px-4 py-3 border-b border-border1 flex items-center justify-between">
-        <h2 className="text-sm font-emphasized text-txt1">
-          Smart compact audit
-        </h2>
-        <span className="text-nano text-txt3 uppercase tracking-wider">
-          last 20
-        </span>
+      <header className="px-4 py-3 border-b border-border1 flex flex-col gap-0.5">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-emphasized text-txt1">
+            Auto-reset history
+          </h2>
+          <span className="text-nano text-txt3 uppercase tracking-wider">
+            last 20
+          </span>
+        </div>
+        <p className="text-nano text-txt3">
+          Every worker reset Lex has run or recorded. Expand a row to see the resume summary it pasted.
+        </p>
       </header>
       {q.isLoading ? (
         <div className="px-4 py-6 text-xs text-txt3">loading</div>
