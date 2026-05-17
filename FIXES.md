@@ -22,6 +22,9 @@ Status legend: ⏳ queued, 🔄 in progress, ✅ shipped, ❌ blocked.
 | 12 | Feedback memories baked into Lex system prompt | ✅ | 2eb63b7 | |
 | 13 | TTS speak on stop_reason=tool_use (pre-tool ack) | ✅ | 873a7c2 | |
 | 14 | Neural-network legend anchored to panel + mobile safe area | ✅ | a9b2595 | Wrapper now `100dvh`-based + mobile-tab-bar aware; legend flowed in flex column with `env(safe-area-inset-bottom)` pb. |
+| 15a | Cross-session-inject: anchor-resolved dispatch + auto-redirect | ✅ | 6c2f8c2 | migration 029, previous_session_id, redirect/dormant audit rows, resolveAnchorDispatch helper. |
+| 15b | Cross-session-inject: anchor_id-signed HMAC alternate | ✅ | aef80dc | verifyToken multi-subject, route accepts signed_anchor_id, /auth/cross-session-token gains anchor_id mode. |
+| 15c | Smart-compact: replay parked injects on resume | ✅ | 57c5304 | migration 030 payload_text col, findParkedInjectsForAnchor, fireSmartCompact replays max 3 before summary. |
 
 > **Note: no Fix 8.** The slot was skipped intentionally between
 > Fix 7 and Fix 9; the original Fix 8 placeholder did not earn its
