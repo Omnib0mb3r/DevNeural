@@ -51,19 +51,20 @@ const TITLE: Record<SupervisionMode, string> = {
   off: "Supervision disabled (kill-switch)",
 };
 
+/* Unified segmented control. All three modes share the same base
+ * style; the active mode is rendered with a single fill + accent
+ * border treatment regardless of which mode is active. Earlier
+ * builds gave each mode a different active style (off=dim,
+ * event=brand ring + inner dot, polling=plain fill), which made the
+ * selection state ambiguous and conflated the event chip's selection
+ * ring with its "live event just fired" pulse. */
 function modeClass(mode: SupervisionMode, current: SupervisionMode): string {
   const base =
-    "text-[11px] px-2 py-0.5 font-mono rounded-pill border transition";
-  if (mode !== current) {
-    return `${base} border-border1 bg-surface2 text-txt3 hover:bg-surface3`;
+    "text-[11px] px-2 py-0.5 font-mono transition shrink-0 disabled:cursor-not-allowed";
+  if (mode === current) {
+    return `${base} bg-brand/15 text-brandSoft`;
   }
-  if (mode === "off") {
-    return `${base} border-txt3/30 bg-surface3 text-txt3`;
-  }
-  if (mode === "event") {
-    return `${base} border-brand/40 bg-brand/10 text-brandSoft ring-1 ring-brand/30`;
-  }
-  return `${base} border-border1 bg-surface3 text-txt1`;
+  return `${base} bg-transparent text-txt3 hover:bg-surface2/40`;
 }
 
 export function SupervisionModeToggle({
@@ -111,31 +112,45 @@ export function SupervisionModeToggle({
       data-mode={mode}
       data-pending={pending ? "1" : "0"}
       data-dim={mode === "off" ? "1" : "0"}
-      className={`inline-flex items-center gap-1 ${mode === "off" ? "opacity-60" : ""}`}
+      className={`inline-flex items-center gap-1.5 min-w-0 max-w-full ${mode === "off" ? "opacity-60" : ""}`}
       title={error ? `error: ${error}` : TITLE[mode]}
     >
-      {MODES.map((m) => (
-        <button
-          key={m}
-          type="button"
-          data-testid={`supervision-mode-${m}`}
-          aria-pressed={m === mode}
-          aria-label={`set supervision mode ${m}`}
-          disabled={disabled || pending}
-          onClick={() => void handle(m)}
-          className={modeClass(m, mode)}
-          title={TITLE[m]}
-        >
-          {LABEL[m]}
-          {m === "event" && mode === "event" && (
-            <span
-              aria-hidden
-              data-testid="supervision-event-indicator"
-              className="ml-1 inline-block w-1.5 h-1.5 rounded-full bg-brand"
-            />
-          )}
-        </button>
-      ))}
+      <div
+        role="radiogroup"
+        aria-label="Supervision mode"
+        className="inline-flex rounded-pill border border-border1 overflow-hidden shrink min-w-0"
+      >
+        {MODES.map((m) => (
+          <button
+            key={m}
+            type="button"
+            data-testid={`supervision-mode-${m}`}
+            role="radio"
+            aria-pressed={m === mode}
+            aria-checked={m === mode}
+            aria-label={`set supervision mode ${m}`}
+            disabled={disabled || pending}
+            onClick={() => void handle(m)}
+            className={modeClass(m, mode)}
+            title={TITLE[m]}
+          >
+            {LABEL[m]}
+          </button>
+        ))}
+      </div>
+      {/* Adjacent live-event pulse. Renders only when event-mode is
+       * active. Kept OUTSIDE the segmented control so the chip's
+       * selection treatment is the single source of truth for "which
+       * mode is on" and this pulse is the single source of truth for
+       * "an event just fired". The two concepts no longer conflate
+       * in one glyph. */}
+      {mode === "event" && (
+        <span
+          aria-hidden
+          data-testid="supervision-event-indicator"
+          className="inline-block w-1.5 h-1.5 rounded-full bg-brand shrink-0"
+        />
+      )}
     </div>
   );
 }

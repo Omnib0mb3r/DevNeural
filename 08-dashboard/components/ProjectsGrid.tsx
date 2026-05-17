@@ -116,7 +116,7 @@ export function ProjectsGrid({ compact = false, limit }: Props = {}) {
             data-testid="projects-grid-tile"
             data-anchor-id={anchor?.anchor_id ?? ""}
             data-supervision-mode={anchor?.supervision_mode ?? ""}
-            className={`rounded-card bg-surface1 hairline lift p-4 cursor-pointer transition ${
+            className={`rounded-card bg-surface1 hairline lift p-4 cursor-pointer transition min-w-0 overflow-hidden ${
               dim ? "opacity-60" : ""
             }`}
           >
@@ -140,8 +140,8 @@ export function ProjectsGrid({ compact = false, limit }: Props = {}) {
               <span>{relTimeIso(p.last_seen)} ago</span>
             </div>
             {anchor && (
-              <div className="mt-3 pt-2 border-t border-border2 flex items-center justify-between gap-2">
-                <span className="text-nano text-txt3 uppercase tracking-wider">
+              <div className="mt-3 pt-2 border-t border-border2 flex items-center justify-between gap-2 min-w-0">
+                <span className="text-nano text-txt3 uppercase tracking-wider shrink-0">
                   supervision
                 </span>
                 <SupervisionModeToggle
