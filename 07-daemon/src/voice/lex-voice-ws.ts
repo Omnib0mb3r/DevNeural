@@ -184,11 +184,31 @@ function findJsonlBySessionId(sessionId: string): string | null {
 }
 
 /* One voice WS per PTY. Without this, a user with multiple dashboard
- * tabs open sees every utterance injected once per tab — same audio,
+ * tabs open sees every utterance injected once per tab, same audio,
  * same transcript, three injects, three Lex replies. We track the
  * active socket per bindKey and gracefully evict any previous one
  * whenever a fresh hello binds. */
 const activeByBindKey = new Map<string, ConnState>();
+
+/* Last tts-end emit timestamp (epoch ms). Stamped server-side every
+ * time the daemon finishes streaming TTS PCM to a client. Surfaced in
+ * /health.audio.last_tts_ack_ms so an external probe can see when the
+ * audio path last completed a round trip. 0 until first TTS finishes
+ * after process start. */
+let lastTtsEndMs = 0;
+
+export interface VoiceWsStats {
+  bound_count: number;
+  last_tts_ack_ms: number;
+}
+
+export function getVoiceWsStats(): VoiceWsStats {
+  let bound = 0;
+  for (const c of activeByBindKey.values()) {
+    if (!c.closed && c.bindKey) bound += 1;
+  }
+  return { bound_count: bound, last_tts_ack_ms: lastTtsEndMs };
+}
 
 /* Lex dashboard voice controls. Mirrors the spoken voice-command path
  * (mute / unmute / disable) over HTTP so Lex can mute itself or stop
@@ -856,6 +876,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     handle.pcm.on('data', (chunk: Buffer) => sendBinary(chunk));
     handle.pcm.on('end', () => {
       send({ t: 'tts-end' });
+      lastTtsEndMs = Date.now();
       state.ttsActive = null;
     });
     handle.pcm.on('error', (err: Error) => {

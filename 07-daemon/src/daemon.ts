@@ -24,6 +24,9 @@ import { VramMonitor } from './gpu/vram-monitor.js';
 import { createHeartbeatPoster } from './heartbeat/poster.js';
 import { cullRawChunks } from './reinforcement/raw-chunks-cull.js';
 import { purgeMeetingAudio } from './voice/meeting-audio-purge.js';
+import { whisperStatus } from './voice/whisper.js';
+import { piperStatus } from './voice/piper.js';
+import { getVoiceWsStats } from './voice/lex-voice-ws.js';
 import { embedOne, warmUp, getEmbedDim, getModelId, setEmbedderLogger, embedderStats } from './embedder/index.js';
 import { ensureWiki } from './wiki/scaffolding.js';
 import { runSeed, hasSeeded } from './corpus/seed.js';
@@ -745,17 +748,39 @@ async function main(): Promise<void> {
   });
 
   await registerDashboardRoutes(app, store, logger);
-  app.get('/health', async () => ({
-    ok: true,
-    pid: process.pid,
-    uptime_s: Math.round(process.uptime()),
-    phase: 'P3.2-reference-corpus',
-    raw_chunks: store.rawChunks.size(),
-    wiki_pages: store.wikiPages.size(),
-    llm: providerStatus(),
-    lint_queue: lintQueueStatus(),
-    embedder: embedderStats(),
-  }));
+  app.get('/health', async () => {
+    /* Audio block surfaces whether the daemon's STT/TTS workers are
+     * usable and whether any browser voice WS is currently bound. The
+     * top-level `ok` flag flips to false when a session is bound but
+     * the audio workers are dead, so an external probe (or the
+     * dashboard reconnect path) can detect a daemon-restart broke voice
+     * scenario without having to scrape four separate endpoints. */
+    const wsStats = getVoiceWsStats();
+    const wh = whisperStatus();
+    const pi = piperStatus();
+    const workerAlive = wh.ready && pi.configured;
+    const sessionBound = wsStats.bound_count > 0;
+    const ok = !(sessionBound && !workerAlive);
+    return {
+      ok,
+      pid: process.pid,
+      uptime_s: Math.round(process.uptime()),
+      phase: 'P3.2-reference-corpus',
+      raw_chunks: store.rawChunks.size(),
+      wiki_pages: store.wikiPages.size(),
+      llm: providerStatus(),
+      lint_queue: lintQueueStatus(),
+      embedder: embedderStats(),
+      audio: {
+        worker_alive: workerAlive,
+        whisper_ready: wh.ready,
+        piper_configured: pi.configured,
+        session_bound: sessionBound,
+        bound_count: wsStats.bound_count,
+        last_tts_ack_ms: wsStats.last_tts_ack_ms,
+      },
+    };
+  });
 
   app.get('/projects', async () => {
     const { listProjects } = await import('./identity/registry.js');
