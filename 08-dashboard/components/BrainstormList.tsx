@@ -43,14 +43,19 @@ export function BrainstormList({ initialKind = "brainstorm" }: BrainstormListPro
 
   return (
     <div className="flex flex-col gap-3 p-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-xl font-semibold">Brainstorms</h1>
-        <Link
-          href="/sessions/new"
-          className="rounded border border-border1 bg-surface2 px-3 py-1 text-sm font-mono"
-        >
-          + new session
-        </Link>
+      <div className="flex flex-col gap-1">
+        <div className="flex items-center justify-between">
+          <h1 className="text-xl font-semibold">Brainstorms</h1>
+          <Link
+            href="/sessions/new"
+            className="rounded border border-border1 bg-surface2 px-3 py-1 text-sm font-mono"
+          >
+            + new session
+          </Link>
+        </div>
+        <p className="text-xs text-txt3">
+          Voice and text sessions you have had with Lex. Filter by project, mode, or date to find one.
+        </p>
       </div>
       <FilterChips
         project={project}
@@ -99,9 +104,9 @@ function FilterChips(props: {
         aria-label="filter by mode"
       >
         <option value="">any mode</option>
-        <option value="conversation">conversation</option>
-        <option value="push-to-talk">push-to-talk</option>
-        <option value="notes">notes</option>
+        <option value="conversation">conversation (voice both ways)</option>
+        <option value="push-to-talk">push-to-talk (hold mic to speak)</option>
+        <option value="notes">notes (dictation, no reply)</option>
       </select>
       <input
         type="date"
