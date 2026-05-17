@@ -187,8 +187,16 @@ export function TopBar({ activeTab }: { activeTab: string }) {
              * Windows/Linux/ChromeOS, resolved client-side from
              * navigator.userAgentData.platform with the legacy
              * navigator.platform as fallback. */}
-            <kbd className="hidden sm:inline-flex items-center gap-1 px-1.5 h-5 rounded border border-border1 bg-surface2 text-[11px] font-mono text-txt2">
-              {modKey} K
+            {/* Hidden below the lg: breakpoint (1024px). Earlier
+             * builds gated this from sm: (640px) up, which collided
+             * with the voice slider readout the moment a user
+             * resized to a narrow-landscape or mobile-portrait
+             * width: the Ctrl+K chip and the slider's "0.70x"
+             * readout sat on the same row and overlapped each
+             * other. Mobile / narrow-landscape users do not have
+             * a physical Ctrl+K keyboard anyway. */}
+            <kbd className="hidden lg:inline-flex items-center gap-1 px-1.5 h-5 rounded border border-border1 bg-surface2 text-[11px] font-mono text-txt2">
+              {modKey}+K
             </kbd>
           </button>
           <button
