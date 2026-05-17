@@ -20,7 +20,7 @@ import {
 } from "@/lib/voice-wake-word";
 import { logWake } from "@/lib/wake-log";
 import { logVoice, computeReconnectBackoffMs } from "@/lib/voice-log";
-import { getVadModule } from "@/lib/voice-ort-config";
+import { getVadModule, resetVadModuleCache } from "@/lib/voice-ort-config";
 import { warmAudioContext } from "@/lib/voice-audio-warm";
 import { VoiceErrorPill } from "./VoiceErrorPill";
 
@@ -1327,6 +1327,16 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         /* ignore */
       }
       vadRef.current = null;
+      /* Disable + restart OOM fix: vad.destroy() terminates ORT's
+       * threaded-backend worker pool, but the singleton
+       * getVadModule cache still reports configured=true and would
+       * hand the next MicVAD.new a half-disposed env. Reset the
+       * cache so the next enable cycle re-imports + re-pins
+       * cleanly. Tab-switch remount (component unmount with
+       * enabled stays true) goes through a different path that
+       * never reaches this teardown, so the singleton warm-path
+       * stays intact for that case. */
+      resetVadModuleCache();
       try {
         captureProcRef.current?.disconnect();
       } catch {
@@ -2458,14 +2468,25 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
              * render in full so the operator can read the real
              * failure instead of guessing from a truncated suffix.
              * VoiceErrorPill drops the `truncate` class and wraps
-             * via whitespace-pre-wrap + break-words. The retry
-             * button still reloads the page to drop any leftover
-             * WASM memory; ORT memoises broken init state across
-             * imports so a hot retry in the same tab lands on the
-             * same dead state. */
+             * via whitespace-pre-wrap + break-words. Retry path
+             * does an in-place reset: clear errMsg, flip enabled
+             * off so the [enabled] cleanup runs (which now resets
+             * the VAD module singleton cache), then flip on after
+             * a microtask so a fresh init re-imports vad-web and
+             * re-pins ORT. The previous window.location.reload()
+             * shortcut leaked SAB-backed WebAssembly.Memory across
+             * the reload on Windows Chromium (Chromium accounts
+             * SAB commits per renderer process, not per document),
+             * so the post-reload init landed on a memory budget
+             * that already had the prior session's pages
+             * committed and OOM'd again. */
             <VoiceErrorPill
               message={errMsg}
-              onRetry={() => window.location.reload()}
+              onRetry={() => {
+                setErrMsg("");
+                setEnabled(false);
+                setTimeout(() => setEnabled(true), 0);
+              }}
             />
           )}
           {lastTurn && (

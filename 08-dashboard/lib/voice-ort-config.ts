@@ -148,6 +148,31 @@ export function resetVadModuleCacheForTests(): void {
   vadModuleConfigured = false;
 }
 
+/**
+ * Drop the cached vad-web module + the configured flag so the next
+ * `getVadModule()` call dynamically re-imports and re-runs
+ * `configureVadOrt` against a fresh ORT env. Used on the
+ * disable + restart path where MicVAD.destroy() terminates the
+ * threaded-backend's worker pool but leaves the singleton ORT env
+ * reporting "configured", so the next MicVAD.new lands on a dead
+ * pthread shim and ORT cascades into
+ * `RangeError: Out of memory` + `previous call to 'initWasm()'
+ * failed.` Resetting the cache rebuilds the backend cleanly at the
+ * cost of one fresh WASM init per enable cycle, which is acceptable
+ * because the disable path is rare in real usage (hands-busy
+ * interrupt, not a hot loop).
+ *
+ * Tab-switch remount keeps the cache warm: the cleanup that fires
+ * on enabled-stays-true component remount does NOT call
+ * MicVAD.destroy and does NOT need to call this; that path is what
+ * 393d4f5's singleton was originally designed for and still
+ * benefits from.
+ */
+export function resetVadModuleCache(): void {
+  vadModulePromise = null;
+  vadModuleConfigured = false;
+}
+
 export function isVadModuleConfigured(): boolean {
   return vadModuleConfigured;
 }
