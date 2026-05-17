@@ -54,6 +54,7 @@ import {
   parseWorkerStatusFooter,
   type WorkerStatus,
 } from '../dashboard/worker-status-footer.js';
+import { resolveCcJsonlPath } from './cc-project-slug.js';
 
 export type AutoAdvanceMode = 'off' | 'shadow' | 'live';
 
@@ -207,20 +208,13 @@ function defaultResolveJsonlPath(
   anchor: ProjectSessionRow,
 ): string | null {
   if (!anchor.current_session_id) return null;
-  /* CC layout: ~/.claude/projects/<slug>/<session_id>.jsonl. The
-   * slug is project_slug-style but the cold-start path resolves
-   * via project_session.cwd today, so we mirror that by reading
-   * the row's cwd and converting to the CC slug. Falls back to a
-   * direct $HOME-relative path; the resolver is best-effort and
-   * tests stub it out. */
-  const home = process.env.HOME ?? process.env.USERPROFILE ?? '';
-  if (!home) return null;
-  const slug = anchor.cwd
-    .replace(/^[a-z]:/i, '')
-    .replace(/[\\/]/g, '-')
-    .replace(/^-+/, '')
-    .toLowerCase();
-  return `${home.replace(/\\/g, '/')}/.claude/projects/c-${slug}/${anchor.current_session_id}.jsonl`;
+  /* CC layout: ~/.claude/projects/<slug>/<session_id>.jsonl. Use
+   * the shared rootToSlug + case-insensitive directory scan so a
+   * casing mismatch between the anchor row's cwd (which can land
+   * lowercase via the bridge presence file) and CC's on-disk
+   * directory (case-preserved from the cwd CC saw at spawn) does
+   * not produce `no-jsonl` skips every tick. */
+  return resolveCcJsonlPath(anchor.cwd, anchor.current_session_id);
 }
 
 interface QuiescenceCheck {
