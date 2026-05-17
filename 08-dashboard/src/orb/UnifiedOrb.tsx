@@ -453,7 +453,10 @@ export function UnifiedOrb() {
   );
 
   return (
-    <div className="relative h-full w-full overflow-hidden flex flex-col">
+    <div
+      className="relative h-full w-full overflow-hidden flex flex-col"
+      style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+    >
       {/* Controls bar */}
       <div className="absolute top-3 left-3 z-10 flex items-center gap-2 rounded-panel bg-surface1/80 hairline px-3 py-1.5 backdrop-blur-sm">
         <FilterChips filters={filters} onChange={setFilters} />
@@ -632,8 +635,8 @@ export function UnifiedOrb() {
         )}
       </div>
 
-      {/* Legend */}
-      <div className="absolute left-3 bottom-3 rounded-panel bg-surface1/80 hairline px-3 py-2 text-nano text-txt3 backdrop-blur-sm flex items-center gap-3 z-10">
+      {/* Legend — in flex flow so canvas reserves space and legend stays clipped to panel bottom on mobile */}
+      <div className="shrink-0 self-start mx-3 mb-3 rounded-panel bg-surface1/80 hairline px-3 py-2 text-nano text-txt3 backdrop-blur-sm flex items-center gap-x-3 gap-y-1 flex-wrap z-10">
         <LegendDot color="oklch(75% 0.17 60)" label="brainstorm" />
         <LegendDot color="oklch(64% 0.20 295)" label="wiki" />
         <LegendDot color="oklch(58% 0.04 260)" label="project" diamond />
