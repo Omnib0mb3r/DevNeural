@@ -21,6 +21,7 @@ Status legend: ⏳ queued, 🔄 in progress, ✅ shipped, ❌ blocked.
 | 11 | Dashboard Help page scaffold + content | ✅ | 927b88b, bfa0d1b, 488e5f6 | |
 | 12 | Feedback memories baked into Lex system prompt | ✅ | 2eb63b7 | |
 | 13 | TTS speak on stop_reason=tool_use (pre-tool ack) | ✅ | 873a7c2 | |
+| 14 | Neural-network legend anchored to panel + mobile safe area | ✅ | a9b2595 | Wrapper now `100dvh`-based + mobile-tab-bar aware; legend flowed in flex column with `env(safe-area-inset-bottom)` pb. |
 
 > **Note: no Fix 8.** The slot was skipped intentionally between
 > Fix 7 and Fix 9; the original Fix 8 placeholder did not earn its
