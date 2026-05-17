@@ -30,7 +30,7 @@ export function ReferenceList() {
       <div className="px-5 py-3 border-b border-border1 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <Icon name="Library" className="text-brandSoft" size={16} />
-          <h2 className="font-display text-sm font-emphasized">Reference corpus</h2>
+          <h2 className="font-display text-sm font-emphasized">Uploaded references</h2>
         </div>
         <span className="text-nano text-txt3">{docs.length} docs</span>
       </div>
