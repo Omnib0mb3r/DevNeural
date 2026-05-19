@@ -22,6 +22,12 @@ import { logWake } from "@/lib/wake-log";
 import { logVoice, computeReconnectBackoffMs } from "@/lib/voice-log";
 import { getVadModule, resetVadModuleCache } from "@/lib/voice-ort-config";
 import { warmAudioContext } from "@/lib/voice-audio-warm";
+import {
+  runWatchdogChecks,
+  postVoiceHealth,
+  type VoiceHealthEvent,
+  type WatchdogCheckKind,
+} from "@/lib/voice-watchdog";
 import { VoiceErrorPill } from "./VoiceErrorPill";
 
 /* Wake-word debug badge gating. The badge is dev-only: set
@@ -800,6 +806,21 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * barge-in / new tts-start bumps the gen; chunk handlers compare
    * against a captured value at receive-time. */
   const ttsGenRef = useRef<number>(0);
+  /* Voice-output watchdog state. The 10s probe loop reads these
+   * refs to decide whether the audio path is healthy and whether
+   * to fire a heal step. lastFrameTsMs is bumped on every binary
+   * PCM frame; lastBufferProgressTsMs is bumped on tts-start, on
+   * every scheduled BufferSource, and on every onended -- so a
+   * stalled audio clock surfaces as a gap in the progress
+   * timestamp even though the queue depth stays the same. */
+  const ttsActiveRef = useRef<boolean>(false);
+  const lastFrameTsMsRef = useRef<number | null>(null);
+  const lastBufferProgressTsMsRef = useRef<number | null>(null);
+  /* Banner gate. Flips to true after two consecutive heal attempts
+   * for the same failing-check set both fail to recover the path.
+   * Cleared by the in-banner reset click or by the watchdog seeing
+   * a clean tick on its own. */
+  const [voiceWatchdogDead, setVoiceWatchdogDead] = useState<boolean>(false);
   /* Timestamps + handles for the live utterance counter and the
    * server-side max-utterance abort. */
   const utteranceStartRef = useRef<number>(0);
@@ -877,6 +898,9 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     if (!streamFinishedRef.current) return;
     streamFinishedRef.current = false;
     speakingRef.current = false;
+    /* Watchdog: TTS request fully drained, the stall + frame-timeout
+     * checks should idle until the next tts-start. */
+    ttsActiveRef.current = false;
     setStatus((cur) => (cur === "speaking" ? "ready" : cur));
     /* Order matters: clear the gate flag BEFORE restarting VAD so a
      * fast-firing onSpeechStart does not bounce off a still-true
@@ -1068,6 +1092,10 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * the chunk so we don't schedule cancelled audio into a fresh reply. */
   function schedulePcmChunk(pcm: ArrayBuffer, gen: number): void {
     if (gen !== ttsGenRef.current) return;
+    /* Stamp the frame arrival even before we decide whether to
+     * schedule it. A late chunk from a barged-in stream still
+     * proves the WS audio path is alive end-to-end. */
+    lastFrameTsMsRef.current = Date.now();
     const ctx = audioCtxRef.current;
     if (!ctx) return;
     const int16 = new Int16Array(pcm);
@@ -1088,12 +1116,14 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     }
     src.start(playheadRef.current);
     playheadRef.current += float.length / rate;
+    lastBufferProgressTsMsRef.current = Date.now();
     /* Track so resetTtsPlayback can stop everything on barge-in. Drop
      * the entry on natural end so the array doesn't grow unbounded. */
     activeSourcesRef.current.push(src);
     src.onended = () => {
       const idx = activeSourcesRef.current.indexOf(src);
       if (idx >= 0) activeSourcesRef.current.splice(idx, 1);
+      lastBufferProgressTsMsRef.current = Date.now();
       /* Last scheduled buffer just left the speaker AND the server is
        * done streaming: only now is the mic gate safe to drop. */
       if (
@@ -1104,6 +1134,167 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       }
     };
   }
+
+  /* Full audio-sink reset. Closes the current AudioContext, warms a
+   * fresh one in the same window, and bumps the TTS generation so
+   * any in-flight PCM frames land in the new context (or get dropped
+   * by the gen guard if their parent reply was already cancelled).
+   * This is the heal-step-2 path of the watchdog AND the click
+   * handler for the "voice output dead" banner -- both must land
+   * here so the operator's manual reset matches the auto-heal path
+   * byte-for-byte. */
+  function resetVoiceAudio(): void {
+    const prev = audioCtxRef.current;
+    if (prev && prev.state !== "closed") {
+      try {
+        void prev.close();
+      } catch {
+        /* ignore: context may already be closed by a peer reset */
+      }
+    }
+    audioCtxRef.current = null;
+    /* Bumping the gen counter discards any PCM frames still in the
+     * WS receive buffer; they were destined for the old context's
+     * playhead and would scratch into the fresh context if scheduled. */
+    ttsGenRef.current += 1;
+    activeSourcesRef.current = [];
+    playheadRef.current = 0;
+    streamFinishedRef.current = false;
+    if (typeof window !== "undefined") {
+      const win = window as unknown as {
+        AudioContext?: typeof AudioContext;
+        webkitAudioContext?: typeof AudioContext;
+      };
+      audioCtxRef.current = warmAudioContext({
+        AudioContextCtor: win.AudioContext,
+        WebkitAudioContextCtor: win.webkitAudioContext,
+      });
+    }
+    /* Restart the stall clock from the moment the new sink came up
+     * so the watchdog's next probe does not immediately re-flag the
+     * buffer-stuck check against a zeroed timestamp. */
+    lastBufferProgressTsMsRef.current = Date.now();
+    logVoice(
+      "settings-reset-on-reconnect",
+      "voice watchdog reset audio sink",
+      {
+        prevState: prev?.state ?? null,
+        newState: audioCtxRef.current?.state ?? null,
+      },
+    );
+  }
+
+  /* Voice-output watchdog. Polls the audio path every 10s while voice
+   * is enabled, runs the pure-function check set, and either heals
+   * locally (resume -> close+warm+reattach) or flips the dead banner
+   * after two consecutive heal attempts both fail to clear the same
+   * set of failing checks. Telemetry batches per tick to
+   * /dashboard/voice-health so the operator gets a forensic trail
+   * even when the heal worked silently. */
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    let lastFailKinds: WatchdogCheckKind[] = [];
+    let lastHealAttempt = 0;
+    let consecutiveHealFailures = 0;
+    let nextHealStep: 1 | 2 = 1;
+    /* Fresh enable cycle: clear any stale banner so the user does
+     * not see a dead-voice banner from a previous session. */
+    setVoiceWatchdogDead(false);
+
+    function runHealStep(step: 1 | 2): void {
+      if (step === 1) {
+        const ctx = audioCtxRef.current;
+        if (ctx && ctx.state !== "running") {
+          try {
+            void ctx.resume().catch(() => undefined);
+          } catch {
+            /* resume can throw synchronously on a closed context */
+          }
+        }
+        lastBufferProgressTsMsRef.current = Date.now();
+      } else {
+        resetVoiceAudio();
+      }
+    }
+
+    const interval = setInterval(() => {
+      if (cancelled) return;
+      const now = Date.now();
+      const ctx = audioCtxRef.current;
+      const checks = runWatchdogChecks(
+        {
+          ctxState: ctx ? ctx.state : null,
+          ttsActive: ttsActiveRef.current,
+          lastFrameTsMs: lastFrameTsMsRef.current,
+          activeBufferCount: activeSourcesRef.current.length,
+          lastBufferProgressTsMs: lastBufferProgressTsMsRef.current,
+        },
+        now,
+      );
+      const fails = checks.filter((c) => !c.ok).map((c) => c.kind);
+      const events: VoiceHealthEvent[] = [];
+
+      if (fails.length === 0) {
+        if (lastFailKinds.length > 0) {
+          for (const k of lastFailKinds) {
+            events.push({
+              ts_ms: now,
+              check_kind: k,
+              status: "healed",
+              heal_attempt: lastHealAttempt,
+              recovered: 1,
+            });
+          }
+          lastFailKinds = [];
+          lastHealAttempt = 0;
+          consecutiveHealFailures = 0;
+          nextHealStep = 1;
+          setVoiceWatchdogDead(false);
+        }
+      } else {
+        const isRepeat = lastFailKinds.length > 0;
+        if (isRepeat) {
+          consecutiveHealFailures += 1;
+          for (const k of fails) {
+            events.push({
+              ts_ms: now,
+              check_kind: k,
+              status: "heal_failed",
+              heal_attempt: lastHealAttempt,
+              recovered: 0,
+            });
+          }
+          if (consecutiveHealFailures >= 2) {
+            setVoiceWatchdogDead(true);
+          }
+        } else {
+          for (const k of fails) {
+            events.push({
+              ts_ms: now,
+              check_kind: k,
+              status: "fail",
+              heal_attempt: 0,
+              recovered: 0,
+            });
+          }
+        }
+        if (consecutiveHealFailures < 2) {
+          runHealStep(nextHealStep);
+          lastHealAttempt = nextHealStep;
+          nextHealStep = 2;
+        }
+        lastFailKinds = fails;
+      }
+
+      void postVoiceHealth(events);
+    }, 10_000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [enabled]);
 
   /* Prewarm whisper-server as soon as the voice panel mounts so the
    * first utterance doesn't pay the 3-4s model-load cold start. The
@@ -1755,6 +1946,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
              * onended for THIS reply only finalises after this reply's
              * own tts-end has landed. */
             streamFinishedRef.current = false;
+            /* Watchdog gates: a TTS request is now in flight, and the
+             * buffer-progress clock restarts from this instant so the
+             * stall check has a fair baseline before any frames land. */
+            ttsActiveRef.current = true;
+            lastBufferProgressTsMsRef.current = Date.now();
             /* Stamp the moment audio actually started flowing so the
              * VAD barge-in handler can swallow self-echo within the
              * configured cooldown window. */
@@ -2696,9 +2892,35 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     setMicMuted,
     setSoftMuted,
   };
+  /* Dead-voice banner. The watchdog flips this true after two
+   * consecutive heal attempts both fail to clear a failing check.
+   * Mount via a body-level portal so the banner stays on top of
+   * any dashboard route the user happens to be on when voice dies,
+   * not just /lex. The click handler fires resetVoiceAudio (same
+   * path as heal-step-2) so manual reset is byte-for-byte
+   * equivalent to what the watchdog already tried. */
+  const watchdogBanner =
+    voiceWatchdogDead && typeof document !== "undefined"
+      ? createPortal(
+          <button
+            type="button"
+            onClick={() => {
+              resetVoiceAudio();
+              setVoiceWatchdogDead(false);
+            }}
+            className="fixed top-0 inset-x-0 z-[100] w-full bg-err/90 text-white text-sm font-emphasized px-4 py-2 hover:bg-err transition-colors shadow-lg cursor-pointer text-left"
+            aria-label="Voice output dead, click to reset"
+            title="Click to close and reopen the audio sink. Same path the watchdog already tried twice."
+          >
+            voice output dead, click to reset
+          </button>,
+          document.body,
+        )
+      : null;
   return (
     <VoiceCtx.Provider value={ctxValue}>
       {children}
+      {watchdogBanner}
       {mountEl ? createPortal(fullPanel, mountEl) : null}
     </VoiceCtx.Provider>
   );

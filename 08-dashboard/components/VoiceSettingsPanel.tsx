@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { emitVoiceSettingUpdate } from "@/lib/voice-settings-bus";
+import { fetchVoiceHealth, type VoiceHealthRow } from "@/lib/voice-watchdog";
 
 const BARGE_STORAGE_KEY = "lex-barge-cooldown-ms";
 const BARGE_MIN = 0;
@@ -70,6 +71,27 @@ export function VoiceSettingsPanel() {
     null,
   );
   const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /* Last 5 voice-output watchdog events, polled from
+   * /dashboard/voice-health every 10s. Surfaces here so the operator
+   * can see in-panel why TTS went silent (and whether the heal worked)
+   * instead of opening the daemon log. */
+  const [healthRows, setHealthRows] = useState<VoiceHealthRow[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    async function load(): Promise<void> {
+      const rows = await fetchVoiceHealth(5);
+      if (!cancelled) setHealthRows(rows);
+    }
+    void load();
+    const t = setInterval(() => {
+      void load();
+    }, 10_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, []);
 
   useEffect(() => {
     void fetch("/voice/piper-status", { credentials: "include" })
@@ -335,6 +357,56 @@ export function VoiceSettingsPanel() {
             guard entirely. 250 ms is the default and works for most laptop
             speaker setups; bump higher if echo is severe.
           </p>
+        </div>
+
+        <div className="space-y-2 pt-2 border-t border-border1">
+          <div className="flex items-center justify-between">
+            <span className="text-sm text-txt1 font-emphasized">
+              Voice output watchdog
+            </span>
+            <span className="text-nano font-mono text-txt3">
+              last 5 events
+            </span>
+          </div>
+          {healthRows.length === 0 ? (
+            <p className="text-nano text-txt3 leading-relaxed">
+              No watchdog events recorded. The dashboard probes the audio
+              path every 10 seconds while voice is enabled; rows appear here
+              only when a check fails or a self-heal runs.
+            </p>
+          ) : (
+            <ul className="space-y-1 text-nano font-mono">
+              {healthRows.map((row) => {
+                const ts = new Date(row.ts_ms);
+                const hh = String(ts.getHours()).padStart(2, "0");
+                const mm = String(ts.getMinutes()).padStart(2, "0");
+                const ss = String(ts.getSeconds()).padStart(2, "0");
+                const statusTone =
+                  row.recovered === 1
+                    ? "text-ok"
+                    : row.status === "heal_failed"
+                      ? "text-err"
+                      : "text-attn";
+                return (
+                  <li
+                    key={row.id}
+                    className="flex items-center gap-2 tabular-nums"
+                  >
+                    <span className="text-txt3 w-20">
+                      {hh}:{mm}:{ss}
+                    </span>
+                    <span className="text-txt2 w-28 truncate">
+                      {row.check_kind}
+                    </span>
+                    <span className={`${statusTone} w-24`}>{row.status}</span>
+                    <span className="text-txt3">
+                      heal {row.heal_attempt} {row.recovered === 1 ? "ok" : ""}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
         </div>
       </div>
     </section>

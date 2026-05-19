@@ -697,6 +697,56 @@ export class IndexDb {
       .run(status, detail ?? null, id);
   }
 
+  // ── voice_health_log ──────────────────────────────────────────
+  /* Dashboard-side voice-output watchdog telemetry. The dashboard
+   * batches rows on every 10s probe iteration that contains either
+   * a failed check or the outcome of a heal attempt. Successful
+   * idle ticks are not shipped. heal_attempt=0 means "check failed,
+   * no heal yet"; 1 or 2 names the Nth heal attempt's outcome.
+   * recovered=1 means the immediately-following check confirmed
+   * the heal worked. */
+  insertVoiceHealthRow(row: {
+    ts_ms: number;
+    check_kind: string;
+    status: string;
+    heal_attempt: number;
+    recovered: number;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO voice_health_log
+           (ts_ms, check_kind, status, heal_attempt, recovered)
+         VALUES (@ts_ms, @check_kind, @status, @heal_attempt, @recovered)`,
+      )
+      .run(row);
+  }
+
+  listVoiceHealthRows(limit = 5): Array<{
+    id: number;
+    ts_ms: number;
+    check_kind: string;
+    status: string;
+    heal_attempt: number;
+    recovered: number;
+  }> {
+    const cap = Math.min(Math.max(Math.floor(limit), 1), 200);
+    return this.db
+      .prepare(
+        `SELECT id, ts_ms, check_kind, status, heal_attempt, recovered
+         FROM voice_health_log
+         ORDER BY ts_ms DESC
+         LIMIT ?`,
+      )
+      .all(cap) as Array<{
+        id: number;
+        ts_ms: number;
+        check_kind: string;
+        status: string;
+        heal_attempt: number;
+        recovered: number;
+      }>;
+  }
+
   // ── wiki_drafts (BF-7) ─────────────────────────────────────────
   /* Insert a pending wiki draft produced by the session-end auto-
    * distillation. brainstorm_id is the voice-session FK (column name

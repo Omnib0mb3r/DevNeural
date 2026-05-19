@@ -423,6 +423,57 @@ export async function registerDashboardRoutes(
     }
   });
 
+  /* Voice-output watchdog telemetry sink + tail. The dashboard's
+   * 10s probe ships a batch of rows on each iteration that produced
+   * an interesting event (failed check or heal attempt). The GET
+   * surfaces the trailing N rows so the Voice settings panel can
+   * render the last 5 events without round-tripping through the
+   * full diagnostics endpoint. */
+  app.post('/dashboard/voice-health', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      events?: Array<{
+        ts_ms?: number;
+        check_kind?: string;
+        status?: string;
+        heal_attempt?: number;
+        recovered?: number | boolean;
+      }>;
+    };
+    const events = Array.isArray(body.events) ? body.events : [];
+    let written = 0;
+    for (const ev of events) {
+      const ts = Number(ev?.ts_ms);
+      const kind = typeof ev?.check_kind === 'string' ? ev.check_kind : '';
+      const status = typeof ev?.status === 'string' ? ev.status : '';
+      if (!Number.isFinite(ts) || !kind || !status) continue;
+      const healAttempt = Number.isFinite(Number(ev?.heal_attempt))
+        ? Math.max(0, Math.min(9, Number(ev.heal_attempt)))
+        : 0;
+      const recovered = ev?.recovered === true || Number(ev?.recovered) === 1 ? 1 : 0;
+      try {
+        store.db.insertVoiceHealthRow({
+          ts_ms: ts,
+          check_kind: kind.slice(0, 64),
+          status: status.slice(0, 32),
+          heal_attempt: healAttempt,
+          recovered,
+        });
+        written += 1;
+      } catch (err) {
+        log(`voice-health insert failed: ${(err as Error).message}`);
+      }
+    }
+    reply.code(200);
+    return { ok: true, written };
+  });
+
+  app.get('/dashboard/voice-health', async (req) => {
+    const q = req.query as { limit?: string };
+    const limit = Math.min(Math.max(Number(q.limit ?? '5') || 5, 1), 200);
+    const rows = store.db.listVoiceHealthRows(limit);
+    return { ok: true, events: rows };
+  });
+
   // ── Wiki graph for the orb ───────────────────────────────────────
   app.get('/graph', async () => buildGraph());
 
