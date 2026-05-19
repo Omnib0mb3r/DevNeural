@@ -3086,12 +3086,18 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
       <span className="text-[11px] font-emphasized text-txt2 px-1 shrink-0">
         Voice
       </span>
-      {/* Status pill. Hidden on xs (below sm breakpoint) to keep the
-       * narrow-viewport pill compact; the tooltip on the root still
-       * carries the same info. */}
+      {/* Status pill. Fixed width so the surrounding TopBar / pill
+       * row does not reflow when the label flips between short
+       * ("off", "ready") and long ("transcribing", "muted (voice)")
+       * states. 7rem comfortably fits the longest possible label
+       * ("muted (voice)" = 13 chars uppercase monospace with
+       * tracking-wider) plus a small slack. Always rendered so the
+       * mobile-row layout has the same fixed footprint as desktop;
+       * truncate is left as a safety net for any future label
+       * additions that overshoot. */}
       <span
         data-testid="voice-pill-status"
-        className={`hidden sm:inline-flex text-nano font-mono uppercase tracking-wider truncate shrink-0 ${finalStatusTone}`}
+        className={`inline-block w-[7rem] text-nano font-mono uppercase tracking-wider truncate shrink-0 text-left whitespace-nowrap ${finalStatusTone}`}
       >
         {statusLabel}
       </span>
