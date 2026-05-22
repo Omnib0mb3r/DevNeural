@@ -39,7 +39,10 @@ import {
   setLexSessionStatus,
   closeTranscriptRef,
 } from '../lex/lex-session-store.js';
-import { runSessionEndPipeline } from '../lex/session-end-pipeline.js';
+import {
+  runSessionEndPipeline,
+  runDistillationFlush,
+} from '../lex/session-end-pipeline.js';
 
 interface PtyHandle {
   ptyId: string;
@@ -606,14 +609,37 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
        * worker CC session exits, detach it from any brainstorm that
        * had bound it via attachWorkerSession. The brainstorm itself
        * stays alive (the durable brain); only the worker tool went
-       * away. */
+       * away.
+       *
+       * Plan section F amendment: worker detach fires
+       * runDistillationFlush so the brainstorm's last_summary +
+       * thread-doc are fresh by the time the next worker attaches.
+       * Without this, a fresh /worker/clear-handoff would pull a
+       * stale summary and the new worker would start from outdated
+       * context. */
       if (handle.sessionId) {
         try {
           const owning = getBrainstormStore().db.getBrainstormByAttachedWorker(
             handle.sessionId,
           );
           if (owning) {
+            const detachingSessionId = handle.sessionId;
+            const detachingMode = owning.mode;
             detachWorkerSession(owning.id);
+            void runDistillationFlush(
+              getBrainstormStore(),
+              {
+                brainstormId: owning.id,
+                claudeSessionId: detachingSessionId,
+                mode: detachingMode,
+                reason: 'worker-detach',
+              },
+              (msg) => console.log(msg),
+            ).catch((err) =>
+              console.log(
+                `[pty-host] worker-detach flush failed: ${(err as Error).message}`,
+              ),
+            );
           }
         } catch {
           /* observability only */

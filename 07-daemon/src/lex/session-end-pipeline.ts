@@ -160,7 +160,36 @@ export async function runSessionEndPipeline(
   let primaryRan = false;
   const result = await withSessionEndLock<SessionEndResult>(sessionKey, async () => {
     primaryRan = true;
-    return runOrderedPipeline(store, input, log);
+    return runOrderedPipeline(store, input, log, true);
+  });
+  return { ...result, was_primary_runner: primaryRan };
+}
+
+/* Brainstorm-as-durable-primary-entity (2026-05-22, plan section F
+ * amendment). Steps 1-7 of the ordered pipeline with NO teardown:
+ * GPU drain, audio finalise, ingest force-flush, BF-7 distillation,
+ * rolling summary refresh, distilled_at stamp, thread-doc. Leaves
+ * status / ended_ms untouched so the brainstorm stays alive.
+ *
+ * Triggers per plan section F:
+ *   - worker CC detaches from a brainstorm
+ *   - periodic chunking in a long-running direct-llm brainstorm
+ *   - voice WS close on a direct-llm brainstorm
+ *
+ * The next attached CC session inherits an up-to-date last_summary
+ * + thread-doc, which is what lex-cold-start-preamble and
+ * /worker/clear-handoff already inject into a fresh SessionStart. */
+export async function runDistillationFlush(
+  store: Store,
+  input: SessionEndInput,
+  log: (msg: string) => void = () => undefined,
+): Promise<SessionEndResult> {
+  const sessionKey =
+    input.claudeSessionId ?? `brainstorm:${input.brainstormId}`;
+  let primaryRan = false;
+  const result = await withSessionEndLock<SessionEndResult>(sessionKey, async () => {
+    primaryRan = true;
+    return runOrderedPipeline(store, input, log, false);
   });
   return { ...result, was_primary_runner: primaryRan };
 }
@@ -169,6 +198,13 @@ async function runOrderedPipeline(
   store: Store,
   input: SessionEndInput,
   log: (msg: string) => void,
+  /* When true, runs the full session-end pipeline including the
+   * terminal status='ended' + ended_ms flip in step 3. When false,
+   * runs only the distillation flush (steps 1-7 minus the teardown);
+   * brainstorm row stays in its current status so a worker detach
+   * or periodic chunking does not prematurely archive a still-live
+   * brainstorm. See plan section F amendment. */
+  markEnded: boolean,
 ): Promise<SessionEndResult> {
   const out: SessionEndResult = {
     ingest_triggered: false,
@@ -189,21 +225,35 @@ async function runOrderedPipeline(
    * downstream steps that strictly require a CC session bail
    * gracefully below. */
   if (!input.claudeSessionId) {
-    try {
-      const existing = store.db.getBrainstorm(input.brainstormId);
-      if (existing && existing.status !== 'ended') {
-        store.db.updateBrainstorm(input.brainstormId, {
-          status: 'ended',
-          ended_ms: Date.now(),
-          lifecycle_state: 'ended',
-        });
+    /* direct-llm path: no CC session, so the steps that need a
+     * project id / raw_chunks / transcripts.jsonl tail cannot run.
+     * If this is a terminal end, flip status='ended'; if it is a
+     * distillation flush, leave the row alone so the brainstorm
+     * continues. Future work can build a direct-llm-specific
+     * distillation pass over brainstorm_chunks; for now the flush
+     * is a no-op on direct-llm brainstorms and the terminal end
+     * just marks the row. */
+    if (markEnded) {
+      try {
+        const existing = store.db.getBrainstorm(input.brainstormId);
+        if (existing && existing.status !== 'ended') {
+          store.db.updateBrainstorm(input.brainstormId, {
+            status: 'ended',
+            ended_ms: Date.now(),
+            lifecycle_state: 'ended',
+          });
+          log(
+            `[session-end] brainstorm=${input.brainstormId} direct-llm; row marked ended (no CC pipeline steps run)`,
+          );
+        }
+      } catch (err) {
         log(
-          `[session-end] brainstorm=${input.brainstormId} direct-llm; row marked ended (no CC pipeline steps run)`,
+          `[session-end] direct-llm row update failed: ${(err as Error).message}`,
         );
       }
-    } catch (err) {
+    } else {
       log(
-        `[session-end] direct-llm row update failed: ${(err as Error).message}`,
+        `[distillation-flush] brainstorm=${input.brainstormId} direct-llm; no CC session, nothing to flush`,
       );
     }
     return out;
@@ -237,19 +287,23 @@ async function runOrderedPipeline(
     log(`[session-end] gpu drain failed: ${(err as Error).message}`);
   }
 
-  /* Step 3 (ordered flush): persist the final transcript and update
-   * brainstorm_sessions ended_ms / status='ended'. The pipeline
-   * takes ownership of these fields; idempotent on repeat calls. */
-  try {
-    const existing = store.db.getBrainstorm(input.brainstormId);
-    if (existing && existing.status !== 'ended') {
-      store.db.updateBrainstorm(input.brainstormId, {
-        status: 'ended',
-        ended_ms: existing.ended_ms ?? Date.now(),
-      });
+  /* Step 3 (ordered flush): persist the final transcript and, when
+   * this is a terminal end, update brainstorm_sessions ended_ms /
+   * status='ended'. Distillation-flush callers (worker detach,
+   * periodic chunking, voice WS close on direct-llm) skip this so
+   * the brainstorm stays alive. */
+  if (markEnded) {
+    try {
+      const existing = store.db.getBrainstorm(input.brainstormId);
+      if (existing && existing.status !== 'ended') {
+        store.db.updateBrainstorm(input.brainstormId, {
+          status: 'ended',
+          ended_ms: existing.ended_ms ?? Date.now(),
+        });
+      }
+    } catch (err) {
+      log(`[session-end] ended_ms update failed: ${(err as Error).message}`);
     }
-  } catch (err) {
-    log(`[session-end] ended_ms update failed: ${(err as Error).message}`);
   }
 
   /* Step 3a (Wave 2 day 2 / BF-11 / A4): finalise the per-session

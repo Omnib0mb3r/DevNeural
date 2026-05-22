@@ -80,7 +80,10 @@ import {
 import { firePanic } from '../dashboard/panic-routes.js';
 import { getStore } from '../lex/brainstorm-store.js';
 import { checkToolGate, notifyLargeFsRead, LARGE_FS_READ_LINE_THRESHOLD } from '../lex/tool-gate.js';
-import { runSessionEndPipeline } from '../lex/session-end-pipeline.js';
+import {
+  runSessionEndPipeline,
+  runDistillationFlush,
+} from '../lex/session-end-pipeline.js';
 import { appendUtterance as appendSessionAudio } from './audio-bundle.js';
 import { selectTtsContent } from './select-tts-content.js';
 
@@ -1798,23 +1801,43 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     if (state.sessionEndFired) return;
     state.sessionEndFired = true;
     try {
-      const handle = state.bindKey
-        ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
-        : null;
-      const claudeSessionId =
-        handle?.sessionId ?? state.watchSessionId ?? null;
-      const ptyId = handle?.ptyId ?? null;
-      const bs =
-        (claudeSessionId && getBrainstormByClaudeSessionId(claudeSessionId)) ||
-        (ptyId && getBrainstormByPty(ptyId)) ||
-        null;
+      /* Resolve the brainstorm. Direct-llm sockets reach the
+       * brainstorm via state.brainstormId without ever touching a
+       * PTY; legacy cc-pty sockets reach it via the bound PTY +
+       * jsonl session id. */
+      let bs = state.brainstormId ? getBrainstorm(state.brainstormId) : null;
+      let claudeSessionId: string | null = null;
+      if (!bs) {
+        const handle = state.bindKey
+          ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
+          : null;
+        claudeSessionId = handle?.sessionId ?? state.watchSessionId ?? null;
+        const ptyId = handle?.ptyId ?? null;
+        bs =
+          (claudeSessionId && getBrainstormByClaudeSessionId(claudeSessionId)) ||
+          (ptyId && getBrainstormByPty(ptyId)) ||
+          null;
+      }
       if (!bs) {
         /* Voice WS without a brainstorm row (read-only TTS bind, or
          * a session that ended before the row was created). Nothing
          * to summarise; skip silently. */
         return;
       }
-      await runSessionEndPipeline(
+      /* Plan section F amendment (2026-05-22): triggers table.
+       *
+       *   ws-close + direct-llm -> runDistillationFlush (brainstorm
+       *     stays alive across voice disconnects; next attached
+       *     worker / next voice resume gets fresh last_summary)
+       *   voice end-session     -> runSessionEndPipeline (terminal)
+       *   compaction-restart    -> runSessionEndPipeline (legacy)
+       *   ws-close + cc-pty     -> runSessionEndPipeline (legacy
+       *     teardown; cc-pty brainstorms still tear down on ws
+       *     close to preserve existing behavior). */
+      const isDirectLlm = (bs.runtime_mode ?? 'cc-pty') === 'direct-llm';
+      const flushOnly = reason === 'ws-close' && isDirectLlm;
+      const runner = flushOnly ? runDistillationFlush : runSessionEndPipeline;
+      await runner(
         getBrainstormStore(),
         {
           brainstormId: bs.id,
@@ -1824,6 +1847,13 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         },
         (msg) => console.log(msg),
       );
+      if (flushOnly) {
+        /* Re-arm so a subsequent voice end-session / explicit UI end
+         * can still fire the terminal pipeline on the same in-memory
+         * state. Without resetting the latch, a voice disconnect
+         * followed by an explicit end command would no-op. */
+        state.sessionEndFired = false;
+      }
     } catch (err) {
       console.log(
         `[voice-ws] session-end pipeline failed: ${(err as Error).message}`,
