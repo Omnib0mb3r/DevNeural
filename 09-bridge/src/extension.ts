@@ -330,20 +330,27 @@ async function findTargetTerminalAsync(): Promise<vscode.Terminal | undefined> {
     if (await isClaudeTerminal(t)) return t;
   }
 
-  // 3. Single-terminal auto-bind. Per user direction (2026-05-21),
-  // the bridge must never prompt for a terminal pick. When exactly
-  // one terminal is open in this VS Code window, treat it as the
-  // implied Claude terminal -- the user already declared the
-  // brainstorm <-> CC session binding via the Lex supervises
-  // dropdown, so there is no ambiguity to resolve.
-  if (terminals.length === 1) {
-    const only = terminals[0];
-    if (only) {
-      channel.appendLine(
-        `[auto-bind] single terminal "${only.name}" claimed as target without name/pid match`,
-      );
-      return only;
-    }
+  // 3. Aggressive last-resort auto-bind. Per user direction
+  // (2026-05-21), the bridge must never prompt for a terminal pick
+  // and the cost of an occasional wrong-terminal pick is acceptable
+  // ("we can afford the mistake"). When no other resolution path
+  // succeeds, pick the most recently active terminal in this window
+  // (or, if none is active, the most recently created one). The
+  // user declared the brainstorm <-> CC session binding via the
+  // Lex supervises dropdown; the bridge honors that intent rather
+  // than blocking on disambiguation.
+  if (active) {
+    channel.appendLine(
+      `[auto-bind] no name/pid match; defaulting to active terminal "${active.name}"`,
+    );
+    return active;
+  }
+  const fallback = terminals[terminals.length - 1];
+  if (fallback) {
+    channel.appendLine(
+      `[auto-bind] no name/pid match and no active terminal; defaulting to most recent "${fallback.name}"`,
+    );
+    return fallback;
   }
   return undefined;
 }
