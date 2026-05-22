@@ -143,7 +143,16 @@ interface ConnState {
   compaction: CompactionSupervisorState;
 }
 
-const MIC_BUF_MAX = 4 * 1024 * 1024; // 4 MB ~= 2 minutes of 16k mono pcm
+/* 2026-05-22: lifted from 4 MB to 64 MB. The old 4 MB ceiling was a
+ * floor on how long the user could keep talking before STT refused
+ * the buffer; combined with the dashboard's 30s utterance cap that
+ * dropped audio, long-form utterances were not survivable. 64 MB =
+ * roughly 33 min of 16k mono int16, comfortably above the new
+ * dashboard MAX_UTTERANCE_MS of 30 min, with headroom for the
+ * defensive sample ceiling on the client. fastifyWebsocket's default
+ * frame limit (100 MB) still bounds individual WS frames so a single
+ * pathological message cannot blow past this. */
+const MIC_BUF_MAX = 64 * 1024 * 1024;
 
 const SESSION_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

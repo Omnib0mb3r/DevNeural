@@ -259,15 +259,22 @@ function vadThresholds(sensitivity: number): {
 /* Cap on a single utterance. After this many milliseconds of
  * continuous speech we force an utterance-end so the user gets a
  * response even if they're still mid-sentence. Also protects the
- * server from runaway buffers. 30s matches typical "long thought"
- * windows; the user can keep talking after Lex starts responding via
- * barge-in. */
-const MAX_UTTERANCE_MS = 30_000;
+ * server from runaway buffers.
+ *
+ * 2026-05-22: lifted from 30s to 30 min. The old 30s cap silently
+ * dropped the parallel capture buffer on fire, which truncated any
+ * long-form utterance the user was still actively producing. The
+ * new ceiling is a runaway-protection floor only; the cap-fire path
+ * now ships captureBufRef through flushParallelCapture so audio is
+ * preserved even when the cap trips. */
+const MAX_UTTERANCE_MS = 30 * 60_000;
 
-/* Hard ceiling on the mic buffer in samples (16k Hz mono int16). 30s
- * = 30 * 16000 = 480k samples = 960KB; well below the server cap of
- * 4MB. Used as a defensive abort if VAD never fires speech-end. */
-const MAX_UTTERANCE_SAMPLES = 30 * 16000;
+/* Hard ceiling on the mic buffer in samples (16k Hz mono int16).
+ * 30 min * 60s * 16000 = ~28.8M samples = ~57.6MB. Above the legacy
+ * 4MB server cap; the WS frame cap was lifted in concert with the
+ * MAX_UTTERANCE_MS change. Used as a defensive abort if VAD never
+ * fires speech-end. */
+const MAX_UTTERANCE_SAMPLES = 30 * 60 * 16000;
 
 /* Voice enable/mute toggles are intentionally NOT persisted across
  * page loads. A page refresh is treated as an explicit reset: voice
@@ -2264,19 +2271,28 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
               /* Hard cap: if VAD never fires speech-end (user keeps
                * talking through pauses too short to trip the threshold),
                * finalize at MAX_UTTERANCE_MS so Lex actually gets a
-               * chance to respond. */
+               * chance to respond.
+               *
+               * 2026-05-22: cap path now ships the parallel capture
+               * buffer via flushParallelCapture so a long-form
+               * utterance is delivered to STT even when the cap
+               * trips. The legacy behavior dropped audio and forced
+               * the user to repeat themselves; we trust STT for long
+               * audio instead. */
               utteranceCapRef.current = setTimeout(() => {
                 if (vadInstance && typeof vadInstance.pause === "function") {
                   vadInstance.pause();
                   vadListenerOpenRef.current = false;
                   probWindowRef.current = [];
-                  /* Pulling buffered audio from the VAD: package
-                   * doesn't expose mid-utterance audio, so we drop
-                   * the cap-fired utterance and let the user try
-                   * again. We DO still send utterance-end so the
-                   * server doesn't think we're hanging. */
-                  sendJson({ t: "utterance-end" });
-                  setStatus("transcribing");
+                  const shipped = flushParallelCapture();
+                  if (!shipped) {
+                    /* No buffered audio (parallel capture was off or
+                     * empty). Send utterance-end so the server does
+                     * not think we are hanging, even though the cap
+                     * fire produced nothing transcribable. */
+                    sendJson({ t: "utterance-end" });
+                    setStatus("transcribing");
+                  }
                   /* Resume VAD listening after a moment. */
                   setTimeout(() => {
                     try {
