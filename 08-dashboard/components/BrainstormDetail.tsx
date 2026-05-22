@@ -22,6 +22,7 @@ import {
   patchLexAnchor,
   type AudioCue,
   type BrainstormChunkRow,
+  type WorkerExpectationRow,
 } from "@/lib/daemon-client";
 import { SupervisesPicker } from "./SupervisesPicker";
 
@@ -102,6 +103,13 @@ export function BrainstormDetail({ id }: { id: string }) {
         <p className="text-xs text-txt3">no audio retained for this session.</p>
       )}
       <WorkerAttachmentSection brainstormId={id} bs={bs} />
+      <ExpectationsSection
+        expectations={detail.data.open_expectations ?? []}
+      />
+      <DeferralsSection
+        items={artifacts.data?.artifacts ?? []}
+        loading={artifacts.isLoading}
+      />
       <SupervisesSection brainstormId={id} />
       {bs.last_summary ? (
         <section>
@@ -291,6 +299,128 @@ function BrainstormTranscript(props: {
             </li>
           ))}
         </ol>
+      )}
+    </section>
+  );
+}
+
+/* Brainstorm-as-durable-primary-entity (2026-05-22, plan section N).
+ * Surfaces open lex_worker_expectation rows. Each row shows what
+ * Lex told the worker to accomplish, the last evaluation's
+ * alignment score (0..1, colour-coded), and the drift summary +
+ * suggested correction when the supervisor judged the worker has
+ * drifted. Read-only; manual close / cancel buttons can land in a
+ * follow-up. */
+function ExpectationsSection(props: { expectations: WorkerExpectationRow[] }) {
+  if (props.expectations.length === 0) {
+    return (
+      <section>
+        <h2 className="text-sm font-semibold">Expectations</h2>
+        <p className="text-xs text-txt3">
+          No open expectations. Lex records one whenever it dispatches a
+          concrete task to the worker; the 90s tick evaluates alignment.
+        </p>
+      </section>
+    );
+  }
+  return (
+    <section>
+      <h2 className="text-sm font-semibold">Expectations</h2>
+      <ul className="flex flex-col gap-2">
+        {props.expectations.map((e) => {
+          const score = e.last_alignment_score;
+          const scoreTone =
+            score === null
+              ? "text-txt3"
+              : score >= 0.85
+                ? "text-ok"
+                : score >= 0.5
+                  ? "text-attn"
+                  : "text-rose-400";
+          return (
+            <li
+              key={e.id}
+              className="rounded border border-border1 bg-surface1 p-2 text-xs"
+            >
+              <p className="font-semibold">{e.expected_outcome}</p>
+              <p className="mt-1 flex flex-wrap gap-3 font-mono text-nano text-txt3">
+                <span>anchor={e.anchor_id.slice(0, 8)}</span>
+                <span>
+                  created={new Date(e.created_at).toISOString().slice(0, 16).replace("T", " ")}
+                </span>
+                <span className={scoreTone}>
+                  alignment={score === null ? "unknown" : score.toFixed(2)}
+                </span>
+              </p>
+              {e.last_drift_summary ? (
+                <p className="mt-1 text-rose-400">
+                  drift: {e.last_drift_summary}
+                </p>
+              ) : null}
+              {e.last_suggested_correction ? (
+                <p className="mt-1 text-txt2">
+                  suggested: {e.last_suggested_correction}
+                </p>
+              ) : null}
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
+/* Plan section N: render artifacts whose kind/title imply a deferral
+ * (auto-created by lex/deferral-detector.ts on regex+LLM gate hit).
+ * Filters the brainstorm's artifact list for reminder-class entries
+ * that the deferral detector emitted; matches on the "deferral"
+ * marker stamped on the underlying reminder's tags + the artifact's
+ * preview. Pure filter; no extra fetch. */
+function DeferralsSection(props: {
+  items: { id: string; kind: string; title: string; preview: string }[];
+  loading: boolean;
+}) {
+  const deferrals = props.items.filter(
+    (a) =>
+      a.kind === "reminder" &&
+      (a.preview ?? "").toLowerCase().includes("deferral"),
+  );
+  const fallback = props.items.filter(
+    (a) =>
+      a.kind === "reminder" &&
+      /\b(later|phase\s*2|defer|future|down the road|some\s?day)\b/i.test(
+        a.title ?? "",
+      ),
+  );
+  const merged =
+    deferrals.length > 0
+      ? deferrals
+      : fallback.slice(0, 10);
+  return (
+    <section>
+      <h2 className="text-sm font-semibold">Deferrals</h2>
+      <p className="text-nano text-txt3 mb-1">
+        Reminders auto-created when Lex or you deferred a concrete task in
+        conversation (plan section M).
+      </p>
+      {props.loading ? (
+        <p className="text-xs text-txt3">loading…</p>
+      ) : merged.length === 0 ? (
+        <p className="text-xs text-txt3">none captured.</p>
+      ) : (
+        <ul className="flex flex-col gap-2">
+          {merged.map((a) => (
+            <li
+              key={a.id}
+              className="rounded border border-border1 bg-surface1 p-2 text-xs"
+            >
+              <p className="font-semibold">{a.title}</p>
+              {a.preview ? (
+                <p className="text-txt3">{a.preview}</p>
+              ) : null}
+            </li>
+          ))}
+        </ul>
       )}
     </section>
   );

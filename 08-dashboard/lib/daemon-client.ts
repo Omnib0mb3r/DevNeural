@@ -708,10 +708,37 @@ export const listBrainstormsApi = (opts: BrainstormFilter = {}) => {
     `/brainstorms${q ? `?${q}` : ""}`,
   );
 };
+/* Brainstorm-as-durable-primary-entity (2026-05-22, plan section L
+ * + N). Open lex_worker_expectation rows joined into the brainstorm
+ * detail response. */
+export interface WorkerExpectationRow {
+  id: string;
+  brainstorm_id: string;
+  anchor_id: string;
+  expected_outcome: string;
+  expected_files: string;
+  expected_duration_ms: number | null;
+  created_at: string;
+  closed_at: string | null;
+  closed_reason:
+    | "completed"
+    | "drifted"
+    | "superseded"
+    | "cancelled"
+    | null;
+  last_evaluated_at: string | null;
+  last_alignment_score: number | null;
+  last_drift_summary: string | null;
+  last_suggested_correction: string | null;
+}
+
 export const getBrainstormApi = (id: string) =>
-  request<{ ok: boolean; brainstorm: BrainstormDecorated; error?: string }>(
-    `/brainstorms/${encodeURIComponent(id)}`,
-  );
+  request<{
+    ok: boolean;
+    brainstorm: BrainstormDecorated;
+    open_expectations?: WorkerExpectationRow[];
+    error?: string;
+  }>(`/brainstorms/${encodeURIComponent(id)}`);
 
 /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B). */
 export const createStandaloneBrainstormApi = (body: {

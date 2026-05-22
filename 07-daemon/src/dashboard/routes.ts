@@ -3415,7 +3415,26 @@ export async function registerDashboardRoutes(
       reply.code(404);
       return { ok: false, error: 'not found' };
     }
-    return { ok: true, brainstorm: decorateBrainstorm(row) };
+    /* Brainstorm-as-durable-primary-entity (2026-05-22, plan section
+     * N). BrainstormDetail surfaces the brainstorm's open
+     * expectations so the operator can see what Lex has told the
+     * worker to accomplish, the last evaluation's alignment score,
+     * and whether drift was detected. Best-effort lookup; legacy
+     * daemons without migration 034 return [] silently. */
+    let open_expectations: import('../store/index-db.js').WorkerExpectationRow[] = [];
+    try {
+      open_expectations = store.db.listOpenWorkerExpectations({
+        brainstormId: id,
+        limit: 50,
+      });
+    } catch {
+      /* observational */
+    }
+    return {
+      ok: true,
+      brainstorm: decorateBrainstorm(row),
+      open_expectations,
+    };
   });
 
   /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
