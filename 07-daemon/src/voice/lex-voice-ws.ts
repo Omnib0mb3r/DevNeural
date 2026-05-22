@@ -1341,7 +1341,23 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * block, never from harness cwd lists". */
     let snapshotBlock = '';
     try {
-      snapshotBlock = buildVoiceSnapshot() + '\n\n';
+      /* Three-tier memory + docs index (2026-05-22): pass the active
+       * brainstorm cwd so buildVoiceSnapshot can locate the Claude
+       * Code per-project MEMORY.md and emit memory_index + docs_index
+       * sections in the live_state block. Resolution chain: bound
+       * PTY -> brainstorm row -> cwd; falls back to the watch session
+       * id when the PTY handle is gone. */
+      const liveHandle = state.bindKey
+        ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
+        : null;
+      const watchSidForCwd = liveHandle?.sessionId ?? state.watchSessionId ?? null;
+      const bsForCwd =
+        (watchSidForCwd && getBrainstormByClaudeSessionId(watchSidForCwd)) ||
+        (liveHandle?.ptyId && getBrainstormByPty(liveHandle.ptyId)) ||
+        null;
+      snapshotBlock =
+        buildVoiceSnapshot({ activeBrainstormCwd: bsForCwd?.cwd ?? null }) +
+        '\n\n';
     } catch {
       /* observability only; fall back to no snapshot rather than
        * blocking the turn */
