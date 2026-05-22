@@ -22,7 +22,6 @@
  * unresolved draft conflicts). Only surfaced when present; count and
  * worst-severity label only, never full detail (that blows context).
  */
-import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { listPtys } from '../dashboard/pty-host.js';
@@ -30,60 +29,12 @@ import { listBrainstorms, getStore } from './brainstorm-store.js';
 import { listReminders } from '../dashboard/reminders.js';
 import { decodeBridgeMarker } from '../dashboard/bridge-presence.js';
 import { resolveCcProjectDir } from './cc-project-slug.js';
+import {
+  DEFAULT_DOCS_INDEX_PATH,
+  loadIndexBullets,
+  renderIndexSection,
+} from './docs-index.js';
 import type { ProjectSessionRow } from '../store/index-db.js';
-
-/* Three-tier memory + docs index (2026-05-22). Each per-turn voice
- * snapshot now carries a memory_index and docs_index section so Lex
- * never forgets which memories and docs exist as context decays over
- * a long session. Source files are MEMORY.md (in the brainstorm
- * cwd's Claude Code project memory dir) and docs/INDEX.md (this
- * repo). Each section is capped to MAX_INDEX_ENTRIES bullets; longer
- * lists truncate with a "+ N more (see INDEX.md)" footer to keep the
- * per-turn payload bounded. */
-const REPO_ROOT = (
-  process.env.DEVNEURAL_REPO_ROOT ?? 'C:/dev/Projects/DevNeural'
-).replace(/\\/g, '/');
-const DEFAULT_DOCS_INDEX_PATH = path.posix.join(REPO_ROOT, 'docs', 'INDEX.md');
-const MAX_INDEX_ENTRIES = 80;
-
-/* Pull every `- [...]` bullet from a MEMORY.md / INDEX.md file. Tolerates
- * blank lines, headings, and leading paragraphs; we only care about the
- * bullet rows. Returns an empty array on a missing or unreadable file
- * so callers can render a "(none)" placeholder without crashing the
- * snapshot. */
-function loadIndexBullets(file: string): string[] {
-  let raw: string;
-  try {
-    raw = fs.readFileSync(file, 'utf-8');
-  } catch {
-    return [];
-  }
-  const out: string[] = [];
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith('- [')) out.push(trimmed);
-  }
-  return out;
-}
-
-function renderIndexSection(
-  header: string,
-  bullets: string[],
-  sourceLabel: string,
-): string[] {
-  const lines: string[] = [header];
-  if (bullets.length === 0) {
-    lines.push('  (none)');
-    return lines;
-  }
-  const capped = bullets.slice(0, MAX_INDEX_ENTRIES);
-  for (const b of capped) lines.push(`  ${b}`);
-  if (bullets.length > MAX_INDEX_ENTRIES) {
-    const more = bullets.length - MAX_INDEX_ENTRIES;
-    lines.push(`  + ${more} more (see ${sourceLabel})`);
-  }
-  return lines;
-}
 
 /* Resolve the active brainstorm's MEMORY.md by mapping the brainstorm
  * cwd to the Claude Code per-project memory directory (under

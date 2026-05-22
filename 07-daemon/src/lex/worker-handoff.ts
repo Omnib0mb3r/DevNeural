@@ -37,6 +37,11 @@ import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import type { IndexDb } from '../store/index-db.js';
 import { WORKER_STATUS_FOOTER_TEMPLATE } from '../dashboard/worker-status-footer.js';
+import {
+  DEFAULT_DOCS_INDEX_PATH,
+  loadIndexBullets,
+  renderIndexSection,
+} from './docs-index.js';
 
 export interface BacklogEntry {
   id: string;
@@ -66,6 +71,12 @@ export interface WorkerHandoffSections {
     id: string;
     finding: string;
   }>;
+  /** Three-tier docs index (2026-05-22): table of contents for
+   * docs/. Same shape as the live_state docs_index block injected on
+   * voice turns; worker SessionStart gets the doc catalog every time
+   * the worker resumes so it never forgets which reference material
+   * exists. Memory index does NOT apply on the worker side. */
+  docs_index: string[];
 }
 
 export interface WorkerHandoffResult {
@@ -99,6 +110,9 @@ export interface BuildWorkerHandoffOptions {
   blockerLimit?: number;
   /** Cap on in-flight files surfaced in the git-state section. */
   inFlightLimit?: number;
+  /** Three-tier docs index (2026-05-22): override the docs/INDEX.md
+   * path for tests. Defaults to <repo>/docs/INDEX.md. */
+  docsIndexPath?: string;
 }
 
 const DEFAULT_NEXT_UP_LIMIT = 3;
@@ -268,6 +282,30 @@ function renderBlock(sections: WorkerHandoffSections): string {
       lines.push(`- ${b.id}: ${trimTitle(b.finding, 200)}`);
     }
   }
+
+  /* Three-tier docs index (2026-05-22): same shape and source file
+   * as the live_state docs_index block voice gets every turn. Read
+   * live on each handoff render so a newly-added doc lands without
+   * a daemon restart. The header phrasing differs slightly from the
+   * voice block so the worker reads it as a starting catalog rather
+   * than a per-turn refresher. */
+  if (sections.docs_index.length > 0) {
+    lines.push('');
+    lines.push('## Docs index');
+    lines.push(
+      'Reference material under docs/. Read the full file with the Read tool when a topic is relevant; do not re-derive from code if a doc already covers it.',
+    );
+    const block = renderIndexSection(
+      '',
+      sections.docs_index,
+      'docs/INDEX.md',
+    );
+    /* renderIndexSection prefixes its first line with the header
+     * argument; we already emitted our own `## Docs index` heading
+     * just above, so drop the empty header line it emits. */
+    for (const l of block.slice(1)) lines.push(l);
+  }
+
   /* Phase 1 of the autonomous supervisor: every worker SessionStart
    * additionalContext carries the status footer protocol reminder so
    * the worker emits a machine-parsable footer on every terminal
@@ -293,6 +331,7 @@ export function buildWorkerHandoff(
     active_task: null,
     next_up: [],
     open_blockers: [],
+    docs_index: [],
   };
   if (!cwd) {
     return { ok: true, block: '', sections: emptySections, reason: 'no-cwd' };
@@ -324,11 +363,13 @@ export function buildWorkerHandoff(
   const inFlightLimit = opts.inFlightLimit ?? DEFAULT_IN_FLIGHT_LIMIT;
 
   const entries = parseBacklog(readBacklog(backlogPath));
+  const docsIndexPath = opts.docsIndexPath ?? DEFAULT_DOCS_INDEX_PATH;
   const sections: WorkerHandoffSections = {
     where_left_off: buildGitState(cwd, runGit, inFlightLimit),
     active_task: selectActiveTask(entries),
     next_up: selectNextUp(entries, nextUpLimit),
     open_blockers: selectBlockers(opts.db, blockerLimit),
+    docs_index: loadIndexBullets(docsIndexPath),
   };
   return {
     ok: true,
