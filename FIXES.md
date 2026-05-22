@@ -20,7 +20,7 @@ Status legend: ⏳ queued, 🔄 in progress, ✅ shipped, ❌ blocked.
 | 10 | Wake-word audit + standby/listen + voice-commands.md | ✅ | ec614a6, a06c838 | |
 | 11 | Dashboard Help page scaffold + content | ✅ | 927b88b, bfa0d1b, 488e5f6 | |
 | 12 | Feedback memories baked into Lex system prompt | ✅ | 2eb63b7 | |
-| 13 | TTS speak on stop_reason=tool_use (pre-tool ack) | ✅ | 873a7c2 | |
+| 13 | TTS speak on stop_reason=tool_use (pre-tool ack) | ✅ | 873a7c2 | Smoke verified live 2026-05-17 ~10:07 EDT (iPad client). |
 | 14 | Neural-network legend anchored to panel + mobile safe area | ✅ | a9b2595 | Wrapper now `100dvh`-based + mobile-tab-bar aware; legend flowed in flex column with `env(safe-area-inset-bottom)` pb. |
 | 15a | Cross-session-inject: anchor-resolved dispatch + auto-redirect | ✅ | 6c2f8c2 | migration 029, previous_session_id, redirect/dormant audit rows, resolveAnchorDispatch helper. |
 | 15b | Cross-session-inject: anchor_id-signed HMAC alternate | ✅ | aef80dc | verifyToken multi-subject, route accepts signed_anchor_id, /auth/cross-session-token gains anchor_id mode. |
@@ -30,6 +30,8 @@ Status legend: ⏳ queued, 🔄 in progress, ✅ shipped, ❌ blocked.
 | 16c | deck-hook anchor-keyed state + race-safety | ✅ | stream-deck 77db4c2 | bounded retry on daemon lookup, pid+nanos TMP suffix for concurrent hooks, AnchorId/RecordedSessionId in payload. |
 | 16d | one-shot migration of legacy uuid-keyed state files | ✅ | stream-deck 505c43d | mtime>60s guard for Race 3, marker file gate at `.migrated-fix16`, content-idempotent. |
 | 16e | virtual deck source change | ⏭ skipped | — | Per amendment 2 conditional: virtual deck reads `/sessions` endpoint, not state files; layout change is transparent. No commit needed. |
+| 17 | TTS barge-in regression (watchdog desync) | ✅ | d6f094a | resetTtsPlayback now clears ttsActiveRef and stamps lastBufferProgressTsMsRef so the c2335c5 watchdog stops misreading post-barge-in as buffer_stuck. Dashboard React, no rebuild needed. |
+| 18 | Cross-session-inject deliverability gate | ✅ | f9ce914 | Presence payload gains has_terminal_for_uuid; filename gains __<bridge-id> so multi-window same-cwd does not clobber. Bridge halts offset on [skip]. Daemon resolveDeliverableBridgeForSession returns deliverable / legacy-grace / no_terminal / not_claimed. crossSessionInject short-circuits with decision='no_deliverable_bridge' when no bridge has a terminal. Migration 032 widens decision CHECK. Absorbs cold-start-blind bug. Rebuild + restart required for daemon + bridge VSIX. |
 
 > **Note: no Fix 8.** The slot was skipped intentionally between
 > Fix 7 and Fix 9; the original Fix 8 placeholder did not earn its
