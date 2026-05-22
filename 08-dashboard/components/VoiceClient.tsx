@@ -885,6 +885,15 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     micGatedRef.current = false;
     setMicGated(false);
     streamFinishedRef.current = false;
+    /* Watchdog teardown: the c2335c5 watchdog reads ttsActiveRef +
+     * lastBufferProgressTsMsRef on its poll. Without clearing them
+     * here, barge-in leaves ttsActive=true with zero active sources
+     * and a stale progress timestamp, which the watchdog misreads as
+     * a stuck buffer and self-heals (resetVoiceAudio) mid-utterance.
+     * Bump the progress clock too so a heal poll mid-fade does not
+     * see a fossil timestamp. */
+    ttsActiveRef.current = false;
+    lastBufferProgressTsMsRef.current = Date.now();
   }
 
   /* Called when both halves of the playback contract are complete:
