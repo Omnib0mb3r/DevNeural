@@ -329,6 +329,22 @@ async function findTargetTerminalAsync(): Promise<vscode.Terminal | undefined> {
     if (!t) continue;
     if (await isClaudeTerminal(t)) return t;
   }
+
+  // 3. Single-terminal auto-bind. Per user direction (2026-05-21),
+  // the bridge must never prompt for a terminal pick. When exactly
+  // one terminal is open in this VS Code window, treat it as the
+  // implied Claude terminal -- the user already declared the
+  // brainstorm <-> CC session binding via the Lex supervises
+  // dropdown, so there is no ambiguity to resolve.
+  if (terminals.length === 1) {
+    const only = terminals[0];
+    if (only) {
+      channel.appendLine(
+        `[auto-bind] single terminal "${only.name}" claimed as target without name/pid match`,
+      );
+      return only;
+    }
+  }
   return undefined;
 }
 
@@ -341,38 +357,17 @@ async function findTargetTerminalAsync(): Promise<vscode.Terminal | undefined> {
  * satisfies neither. Removed; see %LOCALAPPDATA%\\stream-deck\\
  * virtual-input\\<sessionId>.in for the current path. */
 
-/* Throttle the "no terminal" notice. Without this the user sees a
- * popup every time the daemon writes another prompt to the bridge
- * inbox, even though the warning content never changes. The first
- * occurrence shows an actionable info message (with "Pick Terminal"
- * button) so the user can fix the mapping. Subsequent occurrences
- * within 5 minutes go to the status bar only (auto-hide). */
-let lastNoTerminalNoticeMs = 0;
-let firstNoticeShown = false;
+/* "no terminal" notice. The bridge used to surface a popup with a
+ * "Pick Terminal" action button on first occurrence and a transient
+ * status-bar message thereafter. Per user direction (2026-05-21),
+ * the bridge must never prompt the user to pick a terminal -- the
+ * Lex supervises dropdown is the source of truth for which CC
+ * session a brainstorm controls, and the bridge is expected to
+ * resolve the target terminal automatically. When resolution
+ * genuinely fails, log to the output channel only. No UI. */
 function noticeNoTerminal(): void {
-  const now = Date.now();
-  if (now - lastNoTerminalNoticeMs < 5 * 60_000) return;
-  lastNoTerminalNoticeMs = now;
-  if (!firstNoticeShown) {
-    firstNoticeShown = true;
-    void vscode.window
-      .showInformationMessage(
-        'DevNeural Bridge: no Claude terminal mapped in this window. Map one to receive prompts here.',
-        'Pick Terminal',
-        'Dismiss',
-      )
-      .then((choice) => {
-        if (choice === 'Pick Terminal') {
-          void vscode.commands.executeCommand(
-            'devneural.bridge.openClaudeTerminal',
-          );
-        }
-      });
-    return;
-  }
-  vscode.window.setStatusBarMessage(
-    'DevNeural Bridge: no terminal mapped; prompt skipped.',
-    3000,
+  channel.appendLine(
+    '[skip] no claude terminal resolvable in this window; no UI prompt -- waiting for onDidOpenTerminal or a single-terminal workspace auto-bind',
   );
 }
 
