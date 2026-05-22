@@ -76,6 +76,19 @@ export interface BrainstormSessionRow {
    * LexThumbs can attach the version without recomputing. NULL on
    * legacy rows + non-Lex rows. */
   prompt_version?: string | null;
+  /* Brainstorm-as-durable-primary-entity (2026-05-22, migration 033).
+   * `runtime_mode` distinguishes legacy Lex-runs-as-CC-PTY brainstorms
+   * from the new direct-LLM path that lets a brainstorm exist without
+   * any Claude Code session backing it. `lifecycle_state` tracks the
+   * brainstorm's current state independent of PTY existence.
+   * `attached_worker_session_id` is the CC session UUID of the worker
+   * currently bound (distinct from claude_session_id, which legacy
+   * cc-pty brainstorms used for the Lex CC). Optional on the TS type
+   * so legacy code paths that pre-date the migration keep compiling;
+   * SQLite supplies defaults (cc-pty / idle) on read. */
+  runtime_mode?: 'cc-pty' | 'direct-llm' | 'detached';
+  lifecycle_state?: 'idle' | 'attached' | 'speaking' | 'ended';
+  attached_worker_session_id?: string | null;
 }
 
 /* lex_feedback row. Inline-thumbs writes here keyed on the system-
