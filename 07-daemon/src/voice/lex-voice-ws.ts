@@ -98,8 +98,12 @@ interface ConnState {
   /* PCM frames buffered between utterance-start and utterance-end. */
   micBuf: Buffer[];
   micBufBytes: number;
-  /* In-flight TTS handle so barge-in can cancel mid-stream. */
-  ttsActive: { cancel: () => void } | null;
+  /* In-flight TTS handle so barge-in can cancel mid-stream.
+   * `cancelled` is set by killActiveTts so the pcm 'end' handler can
+   * suppress its own tts-end emit (the client already received an
+   * earlier tts-cancel and a trailing tts-end would race against
+   * the next reply's tts-start). */
+  ttsActive: { cancel: () => void; cancelled: boolean } | null;
   /* Cursor into the bound session's jsonl for incremental tail reads. */
   jsonlOffset: number;
   jsonlPath: string | null;
@@ -932,10 +936,25 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       send({ t: 'error', code: 'tts', message: (err as Error).message });
       return;
     }
-    state.ttsActive = { cancel: handle.cancel };
+    const ttsCtx = { cancel: handle.cancel, cancelled: false };
+    state.ttsActive = ttsCtx;
     send({ t: 'tts-start', rate: handle.sampleRate });
-    handle.pcm.on('data', (chunk: Buffer) => sendBinary(chunk));
+    handle.pcm.on('data', (chunk: Buffer) => {
+      /* Drop binary frames that arrived after a forced cancel. The
+       * piper child has been killed but stdout can still flush a
+       * tail chunk before its FD closes; without this guard a
+       * post-cancel chunk would leak into the next reply's audio
+       * stream on the client. */
+      if (ttsCtx.cancelled) return;
+      sendBinary(chunk);
+    });
     handle.pcm.on('end', () => {
+      /* Cancelled streams emit their own tts-cancel via
+       * killActiveTts; do not double-emit a tts-end after. */
+      if (ttsCtx.cancelled) {
+        if (state.ttsActive === ttsCtx) state.ttsActive = null;
+        return;
+      }
       send({ t: 'tts-end' });
       lastTtsEndMs = Date.now();
       state.ttsActive = null;
@@ -948,10 +967,54 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * normally), still mark TTS finished so the next utterance can
      * proceed. */
     void handle.done.then(() => {
-      if (state.ttsActive?.cancel === handle.cancel) {
+      if (state.ttsActive === ttsCtx) {
         state.ttsActive = null;
       }
     });
+  }
+
+  /* Daemon-enforced barge-in. Wave 4 (2026-05-22): client-side VAD
+   * teardown alone was unreliable (commit d6f094a fixed one wedge
+   * but observation showed TTS still bleeding through on intermittent
+   * race conditions). The voice WS is the floor: utterance-start
+   * unconditionally calls this so no race between dashboard heal
+   * loops and incoming PCM can leave Lex talking over the user.
+   *
+   * Steps, in order:
+   *   1. Stop piper streaming (kill child process). The 'end' handler
+   *      sees `cancelled=true` and stays silent; the 'data' handler
+   *      drops any tail chunks already in the kernel pipe buffer.
+   *   2. Send a tts-cancel frame so the client's audio engine bumps
+   *      its generation counter and discards already-scheduled
+   *      AudioBufferSourceNodes plus any binary chunks in flight.
+   *   3. Send Ctrl+C to the bound Claude Code PTY so the worker
+   *      aborts whatever assistant turn it was mid-generation on.
+   *      Idempotent on idle workers.
+   *
+   * Per user direction: "No state check, no gating - utterance-
+   * start always kills." */
+  function killActiveTts(reason: 'utterance-start' | 'barge-in'): void {
+    const ctx = state.ttsActive;
+    if (ctx) {
+      ctx.cancelled = true;
+      try {
+        ctx.cancel();
+      } catch {
+        /* ignore; cancel is best-effort */
+      }
+      state.ttsActive = null;
+      send({ t: 'tts-cancel', reason });
+    }
+    if (state.bindKey) {
+      const handle = getPty(state.bindKey) || getPtyBySession(state.bindKey);
+      if (handle && !handle.exited) {
+        try {
+          handle.pty.write('\x03');
+        } catch {
+          /* ignore */
+        }
+      }
+    }
   }
 
   /* Voice-command dispatch shared by the whisper-transcript path
@@ -1291,14 +1354,13 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         }
         break;
       case 'utterance-start':
+        /* Daemon-enforced barge-in floor (2026-05-22). Capture
+         * whether TTS was active BEFORE the kill so the AEC-bleed
+         * gate downstream still sees the truth. */
+        state.utteranceStartedDuringTts = state.ttsActive !== null;
+        killActiveTts('utterance-start');
         state.micBuf = [];
         state.micBufBytes = 0;
-        /* Path-1 of the wake-during-TTS work. Stamp whether this
-         * utterance began inside the daemon's TTS stream so
-         * handleUtteranceEnd can run dispatch but suppress the
-         * inject for a non-wake transcript (likely AEC bleed
-         * coming back through whisper). */
-        state.utteranceStartedDuringTts = state.ttsActive !== null;
         break;
       case 'utterance-end':
         void handleUtteranceEnd();
@@ -1325,22 +1387,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         break;
       }
       case 'barge-in':
-        if (state.ttsActive) {
-          state.ttsActive.cancel();
-          state.ttsActive = null;
-          send({ t: 'tts-end' });
-        }
-        /* Send Ctrl+C to the PTY so Claude Code aborts its in-flight
-         * generation. Without this, the next injected user transcript
-         * gets queued behind the old turn and Lex finishes the prior
-         * response before answering the interrupt. */
-        if (state.bindKey) {
-          const bargeHandle =
-            getPty(state.bindKey) || getPtyBySession(state.bindKey);
-          if (bargeHandle && !bargeHandle.exited) {
-            bargeHandle.pty.write('\x03');
-          }
-        }
+        /* Legacy explicit barge frame. Kept for client backwards
+         * compat. utterance-start already does the same kill on
+         * its path; this is idempotent when ttsActive has already
+         * been nulled. */
+        killActiveTts('barge-in');
         break;
       case 'finalize-notes': {
         /* Notes-mode "stop" finalize. The user is ending a dictation

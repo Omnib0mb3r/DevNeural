@@ -2000,6 +2000,22 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             }
             break;
           }
+          case "tts-cancel": {
+            /* Daemon-enforced barge-in floor (2026-05-22). The voice
+             * WS killed an in-flight TTS stream because a client
+             * utterance-start (or legacy barge-in) frame landed. The
+             * daemon already stopped piper, dropped tail PCM frames,
+             * and sent a Ctrl+C to the bound worker; the client now
+             * just has to tear down playback. resetTtsPlayback bumps
+             * ttsGenRef so any chunks still in flight on the
+             * WebSocket get discarded, stops every active
+             * AudioBufferSourceNode, drops the mic gate, and clears
+             * ttsActiveRef so the watchdog stops reading a stale
+             * playing state. Idempotent if barge-in already triggered
+             * the same teardown locally. */
+            resetTtsPlayback();
+            break;
+          }
           case "session-end":
             /* Server-side intent match on the transcript flagged the
              * spoken "lex end session" command. Tear down the same
@@ -2229,7 +2245,18 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                * lex-voice-ws.ts). The barge-in path below still
                * cancels the in-flight TTS playback so the user is
                * heard immediately. */
-              if (speakingRef.current) {
+              /* Hardened barge trigger (2026-05-22): trip on EITHER
+               * speakingRef (set when first PCM chunk arrives) OR
+               * ttsActiveRef (set on tts-start, earlier in the
+               * pipeline). The gap between the two flags is where
+               * the old code could miss a barge: tts-start has
+               * fired daemon-side, the mic is gated, the user
+               * begins speaking, but speakingRef has not flipped
+               * yet because no PCM chunk has landed locally. The
+               * daemon-side floor (utterance-start unconditionally
+               * kills TTS) covers the worst case; this client-side
+               * harden keeps the visual + audio teardown tight. */
+              if (speakingRef.current || ttsActiveRef.current) {
                 /* Self-echo guard: Lex's own audio bleeds into the mic
                  * (laptop speakers, AirPods leak, etc.) and trips VAD
                  * milliseconds after tts-start. Swallow VAD events
@@ -2240,7 +2267,10 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                 if (sinceStart < bargeCooldownRef.current) {
                   return;
                 }
-                /* Barge-in: stop Lex, start a fresh utterance. */
+                /* Barge-in: stop Lex, start a fresh utterance. The
+                 * explicit barge-in frame is kept for daemon-side
+                 * audit clarity, but the daemon will also kill on
+                 * the trailing utterance-start regardless. */
                 sendJson({ t: "barge-in" });
                 resetTtsPlayback();
               }
