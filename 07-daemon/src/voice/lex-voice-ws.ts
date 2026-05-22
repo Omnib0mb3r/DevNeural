@@ -56,6 +56,7 @@ import {
   getBrainstormByClaudeSessionId,
   getBrainstormByPty,
   getStore as getBrainstormStore,
+  getBrainstorm,
 } from '../lex/brainstorm-store.js';
 import { processAssistantTurn } from '../lex/artifact-parser.js';
 import { fireForLexTurn as fireAttentionForLexTurn } from '../dashboard/lex-attention.js';
@@ -67,7 +68,10 @@ import {
 } from '../lex/compaction-supervisor.js';
 import { spawnLexSession } from '../lex/spawn-lex-session.js';
 import { buildLexSpawnPrompt } from '../lex/spawn-prompt.js';
+import { buildLexSystemPromptVersioned } from '../lex/system-prompt.js';
 import { buildVoiceSnapshot } from '../lex/snapshot-context.js';
+import { callVoiceChat } from '../llm/voice-chat.js';
+import { randomUUID } from 'node:crypto';
 import {
   matchVoiceCommand,
   ALL_VOICE_COMMAND_KINDS,
@@ -171,6 +175,15 @@ interface ConnState {
     started_at_ms: number;
     cancelled_at_ms: number;
   }>;
+  /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
+   * Set when a hello frame carries a brainstorm_id and the resolved
+   * brainstorm has runtime_mode='direct-llm'. Drives the dispatch
+   * branch in handleUtteranceEnd: direct-llm calls ollama through
+   * callVoiceChat and persists chunks itself instead of injecting
+   * into a PTY and watching the worker's jsonl. cc-pty (legacy) and
+   * null (no brainstorm bind) both keep the original behaviour. */
+  brainstormId: string | null;
+  runtimeMode: 'cc-pty' | 'direct-llm' | null;
 }
 
 /* 2026-05-22: lifted from 4 MB to 64 MB. The old 4 MB ceiling was a
@@ -359,6 +372,8 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     currentTtsText: null,
     currentTtsStartedAtMs: 0,
     partialChain: [],
+    brainstormId: null,
+    runtimeMode: null,
   };
 
   function send(msg: Record<string, unknown>): void {
@@ -496,6 +511,84 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       jsonl_bound: Boolean(state.jsonlPath),
     });
     if (state.jsonlPath) startJsonlWatch();
+  }
+
+  /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
+   *
+   * Bind the socket to a brainstorm by id, then split based on
+   * runtime_mode:
+   *
+   * - 'direct-llm': no PTY, no jsonl watcher. The socket carries
+   *   brainstormId only; handleUtteranceEnd runs the direct-llm
+   *   branch and persists chunks straight into brainstorm_chunks.
+   * - 'cc-pty' or 'detached' or unknown: fall through to the
+   *   legacy bind() path using the brainstorm's claude_session_id
+   *   so the existing PTY + jsonl plumbing keeps working unchanged.
+   *
+   * Sends 'hello-ack' on success; 'error' code 'no-brainstorm' when
+   * the id does not resolve, code 'brainstorm-ended' when the row
+   * is already terminal. */
+  function bindByBrainstorm(brainstormId: string): void {
+    const row = getBrainstorm(brainstormId);
+    if (!row) {
+      send({
+        t: 'error',
+        code: 'no-brainstorm',
+        message: `brainstorm "${brainstormId}" not found`,
+      });
+      return;
+    }
+    if (row.status === 'ended') {
+      send({
+        t: 'error',
+        code: 'brainstorm-ended',
+        message: 'brainstorm is ended; create a new one to continue',
+      });
+      return;
+    }
+    state.brainstormId = brainstormId;
+    /* 'detached' is a transitional schema value; treat it as cc-pty
+     * at the voice WS level so the legacy path picks it up. Voice WS
+     * only diverges on the explicit 'direct-llm' value. */
+    state.runtimeMode = row.runtime_mode === 'direct-llm' ? 'direct-llm' : 'cc-pty';
+    if (state.runtimeMode === 'direct-llm') {
+      /* Standalone brainstorm: no PTY, no jsonl. The voice WS is the
+       * sole runtime for this brainstorm; chunks land directly into
+       * the DB and TTS streams from the LLM reply. */
+      state.bindKey = `brainstorm:${brainstormId}`;
+      const prior = activeByBindKey.get(state.bindKey);
+      if (prior && prior !== state) {
+        prior.closed = true;
+        try {
+          prior.ws.send(
+            JSON.stringify({
+              t: 'evicted',
+              reason:
+                'another tab opened the voice panel for this brainstorm',
+            }),
+          );
+        } catch {
+          /* socket already gone */
+        }
+        try {
+          prior.ws.close();
+        } catch {
+          /* ignore */
+        }
+      }
+      activeByBindKey.set(state.bindKey, state);
+      send({
+        t: 'hello-ack',
+        brainstorm_id: brainstormId,
+        runtime_mode: 'direct-llm',
+        voice_rate: piperStatus().rate,
+      });
+      return;
+    }
+    /* Legacy cc-pty: delegate to the existing session_id-keyed
+     * resolver so all the PTY + jsonl bookkeeping stays in one
+     * place. */
+    bind(row.claude_session_id ?? row.pty_id ?? undefined);
   }
 
   function startJsonlWatch(): void {
@@ -1016,6 +1109,129 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     });
   }
 
+  /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
+   *
+   * Direct-llm utterance handler. Runs when the WS is bound to a
+   * brainstorm with runtime_mode='direct-llm' (no Lex PTY backing
+   * it). Three steps:
+   *
+   *   1. Persist the user transcript as a brainstorm_chunks row so
+   *      the chunk count + retrieval indices stay in sync with
+   *      legacy cc-pty brainstorms.
+   *   2. Assemble the LLM conversation: system prompt (current Lex
+   *      version), live_state snapshot, last_summary (when present),
+   *      replay the recent assistant/user history, append the new
+   *      user message. Call callVoiceChat (ollama, local-only) and
+   *      take the reply text.
+   *   3. Persist the assistant reply as a brainstorm_chunks row, hand
+   *      the text to speak() so piper streams TTS through the same
+   *      pipeline cc-pty uses. lifecycle_state flips through
+   *      speaking -> idle so the dashboard sees the state machine. */
+  async function handleDirectLlmUtterance(userText: string): Promise<void> {
+    const bsId = state.brainstormId;
+    if (!bsId) return;
+    const bs = getBrainstorm(bsId);
+    if (!bs) {
+      send({
+        t: 'error',
+        code: 'no-brainstorm',
+        message: 'brainstorm row disappeared mid-turn',
+      });
+      return;
+    }
+    const store = getStore();
+    /* Step 1: persist the user turn. */
+    try {
+      const userTurnId = randomUUID();
+      const turnIdx = store.db.nextTurnIndex(bsId);
+      store.db.insertBrainstormChunk({
+        id: userTurnId,
+        brainstorm_id: bsId,
+        turn_index: turnIdx,
+        role: 'user',
+        mode: state.mode,
+        text: userText,
+        model_id: 'voice-direct-llm',
+      });
+    } catch (err) {
+      console.log(
+        `[voice-ws] direct-llm user chunk insert failed: ${(err as Error).message}`,
+      );
+    }
+    /* Step 2: assemble messages + call LLM. */
+    store.db.updateBrainstorm(bsId, { lifecycle_state: 'speaking' });
+    try {
+      const sysVersion = buildLexSystemPromptVersioned({ mode: state.mode });
+      const snapshot = buildVoiceSnapshot({ activeBrainstormCwd: bs.cwd ?? null });
+      /* Replay the last N user/assistant pairs into the chat history
+       * so qwen carries multi-turn context. The chunks table already
+       * has the freshly-inserted user turn; pull the prior N before
+       * it to avoid duplicating the latest message. */
+      const HISTORY_TURNS = 16;
+      const prior = store.db.listBrainstormChunks(bsId, HISTORY_TURNS + 1, {
+        order: 'desc',
+      });
+      /* Drop the latest entry (the user turn we just inserted) and
+       * reverse so messages are oldest-first for the LLM. */
+      const historyAsc = prior.slice(1).reverse();
+      const messages: Array<{
+        role: 'system' | 'user' | 'assistant';
+        content: string;
+      }> = [
+        { role: 'system', content: sysVersion.prompt },
+        { role: 'system', content: snapshot },
+      ];
+      if (bs.last_summary) {
+        messages.push({
+          role: 'system',
+          content: `# Prior session summary\n${bs.last_summary}`,
+        });
+      }
+      for (const c of historyAsc) {
+        messages.push({
+          role: c.role === 'lex' ? 'assistant' : 'user',
+          content: c.text,
+        });
+      }
+      messages.push({ role: 'user', content: userText });
+      const reply = await callVoiceChat(messages);
+      /* Step 3: persist the assistant turn + speak it. */
+      try {
+        const replyTurnId = randomUUID();
+        const turnIdx = store.db.nextTurnIndex(bsId);
+        store.db.insertBrainstormChunk({
+          id: replyTurnId,
+          brainstorm_id: bsId,
+          turn_index: turnIdx,
+          role: 'lex',
+          mode: state.mode,
+          text: reply.text,
+          model_id: reply.modelId,
+        });
+      } catch (err) {
+        console.log(
+          `[voice-ws] direct-llm assistant chunk insert failed: ${(err as Error).message}`,
+        );
+      }
+      if (state.mode !== 'notes') {
+        await speak(reply.text);
+      }
+      send({ t: 'injected' });
+    } catch (err) {
+      send({
+        t: 'error',
+        code: 'direct-llm',
+        message: (err as Error).message,
+      });
+    } finally {
+      const post = store.db.getBrainstorm(bsId);
+      const nextLifecycle = post?.attached_worker_session_id
+        ? 'attached'
+        : 'idle';
+      store.db.updateBrainstorm(bsId, { lifecycle_state: nextLifecycle });
+    }
+  }
+
   /* Daemon-enforced barge-in. Wave 4 (2026-05-22): client-side VAD
    * teardown alone was unreliable (commit d6f094a fixed one wedge
    * but observation showed TTS still bleeding through on intermittent
@@ -1318,6 +1534,15 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       state.utteranceStartedDuringTts = false;
       return;
     }
+    /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
+     * Direct-llm branch: no PTY, no jsonl watch. Build the system
+     * prompt + brainstorm chunks history, call ollama, stream the
+     * reply through piper, persist user + assistant chunks. The
+     * legacy cc-pty path below stays untouched. */
+    if (state.runtimeMode === 'direct-llm' && state.brainstormId) {
+      void handleDirectLlmUtterance(result.text);
+      return;
+    }
     if (!state.bindKey) {
       send({ t: 'error', code: 'no-bind', message: 'not bound to a Lex PTY' });
       return;
@@ -1458,7 +1683,18 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         ) {
           state.mode = msg.mode;
         }
-        bind(typeof msg.session_id === 'string' ? msg.session_id : undefined);
+        /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
+         * Prefer brainstorm_id-keyed bind so a standalone direct-llm
+         * brainstorm (no Lex PTY) can attach. Falls through to the
+         * legacy session_id/pty_id resolver when no brainstorm_id is
+         * supplied OR the resolved brainstorm is runtime_mode=
+         * 'cc-pty'. The two paths share the same socket from this
+         * point on; handleUtteranceEnd branches on state.runtimeMode. */
+        if (typeof msg.brainstorm_id === 'string' && msg.brainstorm_id) {
+          bindByBrainstorm(msg.brainstorm_id);
+        } else {
+          bind(typeof msg.session_id === 'string' ? msg.session_id : undefined);
+        }
         break;
       case 'set-mode':
         if (
