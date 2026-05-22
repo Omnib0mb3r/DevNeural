@@ -561,6 +561,12 @@ export interface LexAnchor {
    * unbound. Cross-session inject falls back to the bound project's
    * current_session_id when target_session is omitted. */
   supervises_project_anchor_id?: string | null;
+  /* Brainstorm-as-durable-primary-entity (2026-05-22 reconcile).
+   * Surface the bound brainstorm's runtime_mode so the resume
+   * button can branch direct-llm (voice-connect-by-brainstorm-id)
+   * vs cc-pty (kill-then-spawn-with-resume). Undefined on legacy
+   * anchors that pre-date migration 033; treat as cc-pty. */
+  runtime_mode?: "cc-pty" | "direct-llm" | "detached";
 }
 export interface LexAnchorTranscriptRef {
   id: number;

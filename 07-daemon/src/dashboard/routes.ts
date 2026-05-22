@@ -944,6 +944,20 @@ export async function registerDashboardRoutes(
       const live = Boolean(
         row.current_pty_id && liveSet.has(row.current_pty_id),
       );
+      /* Brainstorm-as-durable-primary-entity (2026-05-22 reconcile).
+       * Surface the bound brainstorm's runtime_mode so LexSessionList's
+       * resume button can branch: cc-pty does the existing kill-then-
+       * spawn dance; direct-llm just voice-connects via brainstorm_id
+       * with no PTY churn. The lookup is best-effort: legacy anchors
+       * 1:1 with brainstorm rows by id; absent row returns undefined
+       * which the dashboard treats as cc-pty (default). */
+      let runtime_mode: 'cc-pty' | 'direct-llm' | 'detached' | undefined;
+      try {
+        const bs = store.db.getBrainstorm(row.id);
+        if (bs && bs.runtime_mode) runtime_mode = bs.runtime_mode;
+      } catch {
+        /* observational */
+      }
       return {
         id: row.id,
         title: row.title,
@@ -961,6 +975,7 @@ export async function registerDashboardRoutes(
          * '(no project)' on every refetch tick because
          * row.supervises_project_anchor_id was undefined. */
         supervises_project_anchor_id: row.supervises_project_anchor_id ?? null,
+        runtime_mode,
       };
     });
     return { ok: true, anchors: out };

@@ -379,24 +379,45 @@ export function LexSessionList({
                         <button
                           type="button"
                           onClick={() => {
+                            /* Brainstorm-as-durable-primary-entity
+                             * (2026-05-22 reconcile #2). For direct-
+                             * llm rows, "resume" is just voice
+                             * connect by brainstorm_id; do NOT kill
+                             * any PTY, do NOT flip the current
+                             * brainstorm to status=ended, do NOT
+                             * spawn a new CC. Navigate the URL so
+                             * the global VoiceClient's hello picks
+                             * up ?brainstorm=<id> on its next open.
+                             * cc-pty rows keep the existing kill-
+                             * then-spawn dance via openLexAnchor. */
+                            if (row.runtime_mode === "direct-llm") {
+                              const url = new URL(window.location.href);
+                              url.searchParams.set("brainstorm", row.id);
+                              window.location.href = url.toString();
+                              return;
+                            }
                             setPendingRowId(row.id);
                             openM.mutate(row.id);
                           }}
                           disabled={openM.isPending}
                           className="text-nano px-2 py-1 rounded-pill bg-brand/10 hairline ring-1 ring-brand/30 text-brandSoft hover:bg-brand/20 disabled:opacity-40 disabled:cursor-not-allowed"
                           title={
-                            isLive
-                              ? "Bind to the live PTY for this anchor"
-                              : row.transcript_count > 0
-                                ? "Spawn a fresh CC session under this anchor; Lex will Read every prior transcript before responding"
-                                : "Spawn a fresh CC session under this anchor (no prior transcripts to load)"
+                            row.runtime_mode === "direct-llm"
+                              ? "Voice-connect to this brainstorm (no PTY spawn)"
+                              : isLive
+                                ? "Bind to the live PTY for this anchor"
+                                : row.transcript_count > 0
+                                  ? "Spawn a fresh CC session under this anchor; Lex will Read every prior transcript before responding"
+                                  : "Spawn a fresh CC session under this anchor (no prior transcripts to load)"
                           }
                         >
                           {pendingRowId === row.id
                             ? "opening…"
-                            : isLive
-                              ? "switch to"
-                              : "open"}
+                            : row.runtime_mode === "direct-llm"
+                              ? "connect"
+                              : isLive
+                                ? "switch to"
+                                : "open"}
                         </button>
                       )}
                     </div>

@@ -24,6 +24,7 @@ import type {
 } from '../store/index-db.js';
 import {
   WorkerEventGate,
+  getSharedWorkerEventGate,
   resolveLexTargetSession,
   routeWorkerEvent,
   type RouteResult,
@@ -217,7 +218,11 @@ export function startWorkerEventListener(
   const root = (deps.jsonlRoot ?? DEFAULT_JSONL_ROOT).replace(/\\/g, '/');
   const log = deps.log ?? (() => undefined);
   const state = deps.state ?? new Map();
-  const gate = deps.gate ?? new WorkerEventGate();
+  /* Brainstorm-as-durable-primary-entity (2026-05-22, plan section L
+   * reconcile). Use the shared module-level gate so the expectation-
+   * supervisor's expectation_drift events share the same per-anchor
+   * 12/hour cap. Tests still inject their own gate via deps.gate. */
+  const gate = deps.gate ?? getSharedWorkerEventGate();
   const inject = deps.inject ?? buildInject(deps.db);
   const onKillSwitch = deps.onKillSwitch ?? bindKillSwitch(deps.db);
   const resolveTarget =

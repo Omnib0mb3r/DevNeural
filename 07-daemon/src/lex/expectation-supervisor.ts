@@ -27,6 +27,10 @@ import * as fs from 'node:fs';
 import { getStore } from './brainstorm-store.js';
 import { resolveCcProjectDir } from './cc-project-slug.js';
 import { fireForStall } from '../dashboard/lex-attention.js';
+import {
+  getSharedWorkerEventGate,
+  type WorkerEvent,
+} from '../dashboard/worker-event-router.js';
 import { callVoiceChat } from '../llm/voice-chat.js';
 import type { WorkerExpectationRow } from '../store/index-db.js';
 
@@ -190,20 +194,32 @@ export async function runExpectationTick(): Promise<{
         db.closeWorkerExpectation(row.id, 'completed');
       }
     } else {
-      /* Drift: fire lex-attention and leave the row open. Lex will
-       * see the suggested_correction via the BrainstormDetail
-       * surface (or future per-turn injection); the supervisor
-       * does NOT auto-inject corrections itself. */
-      try {
-        fireForStall({
-          brainstorm_id: row.brainstorm_id,
-          anchor_id: row.anchor_id,
-          reason: `worker drift: ${result.drift_summary.slice(0, 160)}`,
-        });
-      } catch {
-        /* notification path is best-effort */
+      /* Plan section L reconcile (2026-05-22): drift events route
+       * through the shared WorkerEventGate so they share the
+       * per-anchor 12/hour cap with permission_denied / test_failure
+       * / commit / idle. Without this, a misbehaving evaluator on a
+       * tight tick could spam corrections past the rate limit and
+       * blow up the worker's context. */
+      const event: WorkerEvent = {
+        type: 'expectation_drift',
+        anchor_id: row.anchor_id,
+        worker_session_id: row.anchor_id,
+        timestamp: new Date().toISOString(),
+        snippet: (result.drift_summary || '').slice(0, 2_000),
+      };
+      const verdict = getSharedWorkerEventGate().evaluate(event, Date.now());
+      if (verdict.decision === 'accept') {
+        try {
+          fireForStall({
+            brainstorm_id: row.brainstorm_id,
+            anchor_id: row.anchor_id,
+            reason: `worker drift: ${result.drift_summary.slice(0, 160)}`,
+          });
+        } catch {
+          /* notification path is best-effort */
+        }
+        driftFired += 1;
       }
-      driftFired += 1;
     }
   }
   return { evaluated, drift_fired: driftFired };

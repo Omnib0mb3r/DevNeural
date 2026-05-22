@@ -26,7 +26,14 @@ export type WorkerEventType =
   | 'pending_prompt'
   | 'test_failure'
   | 'commit'
-  | 'bridge_disconnect';
+  | 'bridge_disconnect'
+  /* Brainstorm-as-durable-primary-entity (2026-05-22, plan section L
+   * reconcile). The expectation supervisor emits this when the LLM
+   * judges the worker's recent activity is NOT aligned with the
+   * expected outcome. Routing through WorkerEventGate keeps the
+   * per-anchor 12/hour cap honest so a misbehaving evaluator cannot
+   * spam Lex with corrections. */
+  | 'expectation_drift';
 
 export interface WorkerEvent {
   type: WorkerEventType;
@@ -173,6 +180,22 @@ export class WorkerEventGate {
       this.window.delete(anchorId);
     }
   }
+}
+
+/* Brainstorm-as-durable-primary-entity (2026-05-22, plan section L
+ * reconcile). Shared module-level WorkerEventGate so the legacy
+ * worker-event-listener + the new expectation-supervisor share one
+ * per-anchor rate-limit window. Without this, the supervisor's
+ * expectation_drift fires would bypass the listener's 12/hour cap
+ * and could spam corrections. Tests can replace via
+ * setSharedWorkerEventGate. */
+let sharedGate: WorkerEventGate | null = null;
+export function getSharedWorkerEventGate(): WorkerEventGate {
+  if (!sharedGate) sharedGate = new WorkerEventGate();
+  return sharedGate;
+}
+export function setSharedWorkerEventGate(gate: WorkerEventGate | null): void {
+  sharedGate = gate;
 }
 
 /* ── Payload assembly ──────────────────────────────────────────────── */

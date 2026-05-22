@@ -71,6 +71,7 @@ import { buildLexSpawnPrompt } from '../lex/spawn-prompt.js';
 import { buildLexSystemPromptVersioned } from '../lex/system-prompt.js';
 import { buildVoiceSnapshot } from '../lex/snapshot-context.js';
 import { callVoiceChat } from '../llm/voice-chat.js';
+import { detectDeferral } from '../lex/deferral-detector.js';
 import { randomUUID } from 'node:crypto';
 import {
   matchVoiceCommand,
@@ -1220,6 +1221,22 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         await speak(reply.text);
       }
       send({ t: 'injected' });
+      /* Plan section M (2026-05-22): scan both the user's turn and
+       * Lex's reply for a deferral phrase. On regex+LLM gate hit,
+       * auto-create a reminder + a deferrals artifact ref on the
+       * brainstorm so the user never has to manually capture
+       * "phase 2", "future date", "later", etc. Fire-and-forget:
+       * detection failures never block voice. */
+      void detectDeferral({
+        brainstormId: bsId,
+        turnText: userText,
+        source: 'user',
+      }).catch(() => undefined);
+      void detectDeferral({
+        brainstormId: bsId,
+        turnText: reply.text,
+        source: 'lex-assistant',
+      }).catch(() => undefined);
     } catch (err) {
       send({
         t: 'error',
