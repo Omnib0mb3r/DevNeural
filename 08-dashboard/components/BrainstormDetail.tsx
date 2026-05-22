@@ -43,9 +43,18 @@ export function BrainstormDetail({ id }: { id: string }) {
    * transcript alongside the audio. Skips if the row is still
    * mid-ingest (turn_count=0); refetches on the same cadence as the
    * detail row so a live session updates as turns land. */
+  /* Fetch newest-N. Brainstorms can exceed 2000 turns; without
+   * order=desc the UI only ever sees turns 0..499 and recent Lex
+   * replies vanish. Display layer reverses to chronological. */
   const chunks = useQuery({
     queryKey: ["brainstorm-chunks", id],
-    queryFn: () => getBrainstormChunksApi(id, 500),
+    queryFn: async () => {
+      const r = await getBrainstormChunksApi(id, 500, { order: "desc" });
+      if (r.ok) {
+        return { ...r, chunks: [...r.chunks].reverse() };
+      }
+      return r;
+    },
     refetchInterval: 10_000,
   });
 

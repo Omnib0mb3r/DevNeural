@@ -893,12 +893,18 @@ export class IndexDb {
     return r.n;
   }
 
-  listBrainstormChunks(brainstormId: string, limit = 1000): BrainstormChunkRow[] {
+  listBrainstormChunks(
+    brainstormId: string,
+    limit = 1000,
+    opts: { order?: 'asc' | 'desc'; offset?: number } = {},
+  ): BrainstormChunkRow[] {
+    const order = opts.order === 'desc' ? 'DESC' : 'ASC';
+    const offset = Math.max(0, opts.offset ?? 0);
     return this.db
       .prepare(
-        `SELECT * FROM brainstorm_chunks WHERE brainstorm_id = ? ORDER BY turn_index ASC LIMIT ?`,
+        `SELECT * FROM brainstorm_chunks WHERE brainstorm_id = ? ORDER BY turn_index ${order} LIMIT ? OFFSET ?`,
       )
-      .all(brainstormId, limit) as BrainstormChunkRow[];
+      .all(brainstormId, limit, offset) as BrainstormChunkRow[];
   }
 
   /* Wave 2 day 3 backfill_review_queue helpers. Insert is the band

@@ -3408,15 +3408,17 @@ export async function registerDashboardRoutes(
    * text + metadata. */
   app.get('/brainstorms/:id/chunks', async (req, reply) => {
     const id = (req.params as { id: string }).id;
-    const q = req.query as { limit?: string };
+    const q = req.query as { limit?: string; offset?: string; order?: string };
     const limit = Math.min(1000, Math.max(1, Number(q.limit ?? 200) || 200));
+    const offset = Math.max(0, Number(q.offset ?? 0) || 0);
+    const order: 'asc' | 'desc' = q.order === 'desc' ? 'desc' : 'asc';
     const row = store.db.getBrainstorm(id);
     if (!row) {
       reply.code(404);
       return { ok: false, error: 'not found' };
     }
-    const chunks = store.db.listBrainstormChunks(id, limit);
-    return { ok: true, chunks };
+    const chunks = store.db.listBrainstormChunks(id, limit, { order, offset });
+    return { ok: true, chunks, total: row.turn_count };
   });
 
   app.get('/brainstorms/:id/cues', async (req, reply) => {

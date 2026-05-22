@@ -731,10 +731,18 @@ export interface BrainstormChunkRow {
   no_decay: number;
   created_at: string;
 }
-export const getBrainstormChunksApi = (id: string, limit = 200) =>
-  request<{ ok: boolean; chunks: BrainstormChunkRow[] }>(
-    `/brainstorms/${encodeURIComponent(id)}/chunks?limit=${limit}`,
+export const getBrainstormChunksApi = (
+  id: string,
+  limit = 200,
+  opts: { order?: 'asc' | 'desc'; offset?: number } = {},
+) => {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (opts.order) params.set('order', opts.order);
+  if (typeof opts.offset === 'number') params.set('offset', String(opts.offset));
+  return request<{ ok: boolean; chunks: BrainstormChunkRow[]; total?: number }>(
+    `/brainstorms/${encodeURIComponent(id)}/chunks?${params.toString()}`,
   );
+};
 
 /* Wave 2 day 3 step 13. Borderline-band candidates from
  * `npm run backfill-brainstorms` await one-click link / reject. */
