@@ -145,6 +145,32 @@ interface ConnState {
    * end_turn record in the same jsonl tail cannot re-fire the
    * restart while distillation is still running. */
   compaction: CompactionSupervisorState;
+  /* N-deep barge integration (2026-05-22). Captures the markdown-
+   * cleaned text passed to piper for the in-flight TTS so a
+   * killActiveTts call can record what Lex was MEANT to say. Cleared
+   * on natural tts-end so the next reply does not inherit a stale
+   * intended-text. */
+  currentTtsText: string | null;
+  /* Wall-clock instant the current TTS handle started streaming.
+   * Subtracted from the cancel timestamp so the partial-chain entry
+   * carries an "interrupted Xms into delivery" hint the LLM uses to
+   * weave the resumed reply. */
+  currentTtsStartedAtMs: number;
+  /* Unresolved interrupted-reply chain. Each entry is one assistant
+   * turn that was synthesized but cancelled before piper finished
+   * shipping it. Appended on killActiveTts when ttsActive was non-
+   * null; cleared the next time handleUtteranceEnd successfully
+   * injects a user transcript. The chain is in-memory only; a daemon
+   * restart between cancel and the next inject loses the [voice-
+   * context] block, which is acceptable given the narrow window and
+   * the worker's own jsonl still carrying the assistant turn text.
+   * Survives /compact and /clear in the worker because it lives on
+   * the WS state, not in the worker's context. */
+  partialChain: Array<{
+    intended_text: string;
+    started_at_ms: number;
+    cancelled_at_ms: number;
+  }>;
 }
 
 /* 2026-05-22: lifted from 4 MB to 64 MB. The old 4 MB ceiling was a
@@ -330,6 +356,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     lastVoiceCmdMs: {},
     utteranceStartedDuringTts: false,
     compaction: { compactedAt: 0 },
+    currentTtsText: null,
+    currentTtsStartedAtMs: 0,
+    partialChain: [],
   };
 
   function send(msg: Record<string, unknown>): void {
@@ -938,6 +967,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
     const ttsCtx = { cancel: handle.cancel, cancelled: false };
     state.ttsActive = ttsCtx;
+    /* N-deep barge integration (2026-05-22): capture the cleaned
+     * text so killActiveTts can record what Lex INTENDED to say if
+     * the user barges before piper finishes shipping it. */
+    state.currentTtsText = clean;
+    state.currentTtsStartedAtMs = Date.now();
     send({ t: 'tts-start', rate: handle.sampleRate });
     handle.pcm.on('data', (chunk: Buffer) => {
       /* Drop binary frames that arrived after a forced cancel. The
@@ -958,6 +992,15 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       send({ t: 'tts-end' });
       lastTtsEndMs = Date.now();
       state.ttsActive = null;
+      /* N-deep barge integration: natural completion means Lex
+       * finished the assistant turn the user heard in full. Reset
+       * the intended-text capture so the next reply does not
+       * inherit a stale value. The partialChain is NOT cleared
+       * here; it is cleared at the next successful user inject so a
+       * partial that landed BEFORE this complete reply still gets
+       * carried forward into the conversation context. */
+      state.currentTtsText = null;
+      state.currentTtsStartedAtMs = 0;
     });
     handle.pcm.on('error', (err: Error) => {
       send({ t: 'error', code: 'tts-stream', message: err.message });
@@ -1004,6 +1047,21 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       }
       state.ttsActive = null;
       send({ t: 'tts-cancel', reason });
+      /* N-deep barge integration: record the unresolved partial so
+       * the next inject can prepend a [voice-context] block. We
+       * stash the cleaned text passed to piper (what Lex INTENDED
+       * to say) plus the wall-clock cancel offset; the system
+       * prompt rule tells Lex to weave the interrupted thread(s)
+       * into the next reply rather than restarting cold. */
+      if (state.currentTtsText) {
+        state.partialChain.push({
+          intended_text: state.currentTtsText,
+          started_at_ms: state.currentTtsStartedAtMs,
+          cancelled_at_ms: Date.now(),
+        });
+      }
+      state.currentTtsText = null;
+      state.currentTtsStartedAtMs = 0;
     }
     if (state.bindKey) {
       const handle = getPty(state.bindKey) || getPtyBySession(state.bindKey);
@@ -1098,6 +1156,37 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       typeof v === 'string' &&
       (ALL_VOICE_COMMAND_KINDS as ReadonlyArray<string>).includes(v)
     );
+  }
+
+  /* N-deep barge integration (2026-05-22): render the unresolved
+   * partial chain as a [voice-context] block that prepends the next
+   * user inject. Lex's system prompt has the matching rule
+   * ("integrate interrupted threads with the latest input as one
+   * cohesive natural response"); this block hands Lex the receipts
+   * so it can do the integration deterministically. */
+  function renderPartialChain(): string {
+    if (state.partialChain.length === 0) return '';
+    const lines: string[] = [];
+    lines.push('[voice-context: interrupted-replies]');
+    lines.push(
+      'Your prior reply(ies) were cut off mid-delivery by the user. ' +
+        'Per the partial-integration rule, weave the interrupted thread(s) ' +
+        'with the latest user input into one cohesive natural response. ' +
+        'Do not restart the prior reply from scratch and do not repeat ' +
+        'fragments the user already heard.',
+    );
+    for (let i = 0; i < state.partialChain.length; i++) {
+      const e = state.partialChain[i]!;
+      const delayMs = Math.max(0, e.cancelled_at_ms - e.started_at_ms);
+      lines.push('');
+      lines.push(
+        `Interrupted reply ${i + 1} (cut off ~${delayMs}ms into delivery):`,
+      );
+      lines.push(`Intended text: ${JSON.stringify(e.intended_text)}`);
+    }
+    lines.push('');
+    lines.push('[end voice-context]');
+    return lines.join('\n');
   }
 
   async function handleUtteranceEnd(): Promise<void> {
@@ -1288,15 +1377,27 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       });
       return;
     }
+    /* N-deep barge integration: emit the unresolved partial chain
+     * as a [voice-context] block ahead of the user's transcript so
+     * Lex sees what was interrupted and can weave it into the next
+     * reply per the system-prompt rule. */
+    let partialChainBlock = '';
+    if (state.partialChain.length > 0) {
+      partialChainBlock = renderPartialChain() + '\n\n';
+    }
     const ir = ptyInject(
       state.bindKey,
-      snapshotBlock + gateNote + voiceTag + result.text,
+      snapshotBlock + gateNote + partialChainBlock + voiceTag + result.text,
       true,
     );
     if (!ir.ok) {
       send({ t: 'error', code: 'inject', message: ir.error });
       return;
     }
+    /* Consume the partial chain only after a successful inject. If
+     * inject fails, the chain stays so the retry path on the next
+     * utterance still carries the partials. */
+    state.partialChain = [];
     send({ t: 'injected' });
     state.awaitingResponseSince = Date.now();
     startJsonlWatch();
