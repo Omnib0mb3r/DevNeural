@@ -530,6 +530,12 @@ export interface BrainstormSessionRow {
   artifacts_json: string;
   last_summary: string | null;
   last_summary_ms: number | null;
+  /* Brainstorm-as-durable-primary-entity (2026-05-22, migration 033).
+   * Optional on the type so legacy daemons that have not run
+   * migration 033 yet still parse. */
+  runtime_mode?: "cc-pty" | "direct-llm" | "detached";
+  lifecycle_state?: "idle" | "attached" | "speaking" | "ended";
+  attached_worker_session_id?: string | null;
 }
 /* lexSessions / lexSession / patchLexSession retired in step 6;
  * past-sessions list now goes through lexAnchors below.
@@ -699,6 +705,34 @@ export const listBrainstormsApi = (opts: BrainstormFilter = {}) => {
 export const getBrainstormApi = (id: string) =>
   request<{ ok: boolean; brainstorm: BrainstormDecorated; error?: string }>(
     `/brainstorms/${encodeURIComponent(id)}`,
+  );
+
+/* Brainstorm-as-durable-primary-entity (2026-05-22, Path B). */
+export const createStandaloneBrainstormApi = (body: {
+  user_label?: string;
+  mode?: "conversation" | "notes" | "push-to-talk";
+}) =>
+  request<{ ok: boolean; brainstorm: BrainstormDecorated; error?: string }>(
+    "/brainstorms/standalone",
+    {
+      method: "POST",
+      body,
+    },
+  );
+
+export const attachBrainstormWorkerApi = (id: string, ccSessionId: string) =>
+  request<{ ok: boolean; brainstorm: BrainstormDecorated; error?: string }>(
+    `/brainstorms/${encodeURIComponent(id)}/attach-worker`,
+    {
+      method: "POST",
+      body: { cc_session_id: ccSessionId },
+    },
+  );
+
+export const detachBrainstormWorkerApi = (id: string) =>
+  request<{ ok: boolean; brainstorm: BrainstormDecorated; error?: string }>(
+    `/brainstorms/${encodeURIComponent(id)}/detach-worker`,
+    { method: "POST" },
   );
 
 export interface AudioCue {

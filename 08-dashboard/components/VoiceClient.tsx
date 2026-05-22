@@ -1670,9 +1670,21 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           const wasReconnect = reconnectAttempts > 0;
           reconnectAttempts = 0;
           logVoice("ws-open", "voice ws connected", { reconnect: wasReconnect });
+          /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
+           * If the URL carries ?brainstorm=<id>, prefer it over the
+           * legacy lexPty session id. The daemon's bindByBrainstorm
+           * resolves runtime_mode and either runs the direct-llm
+           * path or falls through to legacy bind() via the brainstorm's
+           * claude_session_id. */
+          const brainstormIdFromUrl =
+            typeof window !== "undefined"
+              ? new URL(window.location.href).searchParams.get("brainstorm")
+              : null;
           sendJson({
             t: "hello",
-            session_id: sessionId ?? undefined,
+            ...(brainstormIdFromUrl
+              ? { brainstorm_id: brainstormIdFromUrl }
+              : { session_id: sessionId ?? undefined }),
             mode: modeRef.current,
           });
           if (wasReconnect) {

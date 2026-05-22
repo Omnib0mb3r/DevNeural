@@ -7,10 +7,13 @@
  * when audio was retained. Cues are loaded lazily from the cues_url
  * so a session without audio doesn't pay the second fetch.
  */
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { AudioPlayer } from "./AudioPlayer";
 import {
+  attachBrainstormWorkerApi,
+  detachBrainstormWorkerApi,
   getBrainstormApi,
   getBrainstormCuesApi,
   getBrainstormChunksApi,
@@ -98,6 +101,7 @@ export function BrainstormDetail({ id }: { id: string }) {
       ) : (
         <p className="text-xs text-txt3">no audio retained for this session.</p>
       )}
+      <WorkerAttachmentSection brainstormId={id} bs={bs} />
       <SupervisesSection brainstormId={id} />
       {bs.last_summary ? (
         <section>
@@ -114,6 +118,93 @@ export function BrainstormDetail({ id }: { id: string }) {
         loading={artifacts.isLoading}
       />
     </div>
+  );
+}
+
+/* Brainstorm-as-durable-primary-entity (2026-05-22, Path B + section
+ * I). The brainstorm IS the god; CC sessions are tools it attaches.
+ * This section surfaces the worker CC binding so the user can:
+ *   - see whether a worker is currently bound (attached_worker_
+ *     session_id non-null + lifecycle_state='attached')
+ *   - manually attach a worker by pasting its cc_session_id
+ *   - detach the worker (runDistillationFlush will fire daemon-side
+ *     so the next attach inherits fresh last_summary)
+ *
+ * The legacy SupervisesSection below stays for the cross-session-
+ * inject project-anchor binding (a different concept). */
+function WorkerAttachmentSection({
+  brainstormId,
+  bs,
+}: {
+  brainstormId: string;
+  bs: {
+    attached_worker_session_id?: string | null;
+    lifecycle_state?: string;
+    runtime_mode?: string;
+  };
+}) {
+  const qc = useQueryClient();
+  const [input, setInput] = useState("");
+  const attach = useMutation({
+    mutationFn: (cc: string) => attachBrainstormWorkerApi(brainstormId, cc),
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: ["brainstorm", brainstormId] });
+      void qc.invalidateQueries({ queryKey: ["brainstorms"] });
+    },
+    onSuccess: (resp) => {
+      if (resp.ok) setInput("");
+    },
+  });
+  const detach = useMutation({
+    mutationFn: () => detachBrainstormWorkerApi(brainstormId),
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: ["brainstorm", brainstormId] });
+      void qc.invalidateQueries({ queryKey: ["brainstorms"] });
+    },
+  });
+  const attached = bs.attached_worker_session_id ?? null;
+  return (
+    <section data-testid="brainstorm-detail-worker">
+      <h2 className="text-sm font-semibold">Worker CC</h2>
+      <p className="text-nano text-txt3 mb-1">
+        The brainstorm is the durable Lex brain. A worker CC session is
+        the tool side: it implements, tests, and commits while the
+        brainstorm drives. Detach fires a distillation flush so the
+        next attach picks up fresh context. runtime={bs.runtime_mode ?? "cc-pty"} ·
+        state={bs.lifecycle_state ?? "idle"}
+      </p>
+      {attached ? (
+        <div className="flex items-center gap-2 text-xs">
+          <span className="font-mono text-txt2">{attached}</span>
+          <button
+            type="button"
+            onClick={() => detach.mutate()}
+            disabled={detach.isPending}
+            className="rounded border border-border1 bg-surface2 px-2 py-1 font-mono text-nano hover:border-rose-400 disabled:opacity-50"
+          >
+            {detach.isPending ? "detaching…" : "detach"}
+          </button>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2 text-xs">
+          <input
+            value={input}
+            onChange={(e) => setInput(e.target.value.trim())}
+            placeholder="cc_session_id (uuid)"
+            className="flex-1 rounded border border-border1 bg-surface2 px-2 py-1 font-mono"
+            aria-label="worker cc_session_id"
+          />
+          <button
+            type="button"
+            onClick={() => input && attach.mutate(input)}
+            disabled={!input || attach.isPending}
+            className="rounded border border-border1 bg-surface2 px-2 py-1 font-mono text-nano hover:border-brandSoft disabled:opacity-50"
+          >
+            {attach.isPending ? "attaching…" : "attach"}
+          </button>
+        </div>
+      )}
+    </section>
   );
 }
 
