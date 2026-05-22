@@ -49,6 +49,20 @@ function makeDbStub(): IndexDbType {
   } as unknown as IndexDbType;
 }
 
+/* Bug 3e (2026-05-22): the bridge fallback now consults the
+ * presence-file-based deliverability resolver before queueing a
+ * marker. These tests don't run a real presence directory, so we
+ * stub the dep to a deliverable verdict; the bridge-fallback tests
+ * here are about the CR nudge mechanics, not about the deliverability
+ * gate (covered separately). */
+function stubDeliverable(): NonNullable<CrossSessionInjectDeps['resolveDeliverableBridge']> {
+  return () => ({
+    verdict: 'deliverable',
+    selected: null,
+    claimingRecords: [],
+  });
+}
+
 /* Synchronous scheduler that captures the deferred callback so the
  * test can drive it on demand. Lets us assert the primary inject
  * happens first and only fires the nudge after we deliberately tick
@@ -164,6 +178,7 @@ describe('crossSessionInject auto-CR nudge', () => {
         queueSessionSuggestion,
         scheduleCommit: scheduler.schedule,
         commitDelayMs: 850,
+        resolveDeliverableBridge: stubDeliverable(),
       },
     );
 
@@ -203,6 +218,7 @@ describe('crossSessionInject auto-CR nudge', () => {
         queueSessionPrompt,
         queueSessionSuggestion,
         scheduleCommit: scheduler.schedule,
+        resolveDeliverableBridge: stubDeliverable(),
       },
     );
 

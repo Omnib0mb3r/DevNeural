@@ -46,6 +46,10 @@ export interface BridgePresenceFile {
   cc_session_ids?: string[];
   cc_session_id?: string;
   updated_at?: string;
+  /* Bug 3d (2026-05-22): per-UUID deliverability flag emitted by
+   * bridges >= 2026-05-22. Absent on older bridges; consumers must
+   * treat absence as "unknown" (migration grace) rather than false. */
+  has_terminal_for_uuid?: Record<string, boolean>;
 }
 
 export interface BridgePresenceRecord {
@@ -54,6 +58,12 @@ export interface BridgePresenceRecord {
   ccSessionIds: string[];
   fileMtimeMs: number;
   updatedAtMs: number;
+  /* Bug 3d (2026-05-22): null on old bridges (no field shipped),
+   * empty record on new bridges that explicitly reported no
+   * deliverability. The distinction matters: null => migration grace
+   * applies, {} => bridge said "I have NO terminal for any UUID I'm
+   * claiming." */
+  hasTerminalForUuid: Record<string, boolean> | null;
 }
 
 export interface ReconcileResult {
@@ -160,12 +170,22 @@ export function readPresenceDir(
     const updatedAtMs = parsed.updated_at
       ? Date.parse(parsed.updated_at)
       : stat.mtimeMs;
+    let hasTerminalForUuid: Record<string, boolean> | null = null;
+    if (parsed.has_terminal_for_uuid && typeof parsed.has_terminal_for_uuid === 'object') {
+      hasTerminalForUuid = {};
+      for (const [k, v] of Object.entries(parsed.has_terminal_for_uuid)) {
+        if (typeof k === 'string' && typeof v === 'boolean') {
+          hasTerminalForUuid[k] = v;
+        }
+      }
+    }
     out.push({
       bridgeId,
       cwd: normalizeCwd(cwd),
       ccSessionIds,
       fileMtimeMs: stat.mtimeMs,
       updatedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : stat.mtimeMs,
+      hasTerminalForUuid,
     });
   }
   return out;
@@ -324,6 +344,82 @@ export function startBridgePresenceLoop(
   return {
     stop: () => clearInterval(timer),
   };
+}
+
+/* Bug 3d/3e (2026-05-22). Resolve whether the bridge fleet has a
+ * deliverable terminal for `ccSessionId` right now. Used by
+ * crossSessionInject to gate the bridge fallback so a marker is
+ * never written into a queue file with no terminal-owning bridge to
+ * consume it.
+ *
+ * Verdict semantics:
+ *   - 'deliverable'           — at least one fresh presence record
+ *                               flags has_terminal_for_uuid[uuid]=true
+ *   - 'legacy-grace'          — at least one fresh record CLAIMS the
+ *                               uuid (cc_session_ids), but none ship
+ *                               the deliverability field. Migration
+ *                               window: assume deliverable so older
+ *                               bridges keep working. Logged at
+ *                               caller so the soak can spot stuck
+ *                               legacy fleets.
+ *   - 'no_terminal'           — uuid is claimed by at least one
+ *                               record, but every flagged record
+ *                               reports has_terminal_for_uuid=false.
+ *                               This is the actual sinkhole the bug
+ *                               describes; caller should refuse to
+ *                               queue.
+ *   - 'not_claimed'           — no presence record claims the uuid.
+ *                               No bridge is even pretending to own
+ *                               this worker; structured failure. */
+export type DeliverabilityVerdict =
+  | 'deliverable'
+  | 'legacy-grace'
+  | 'no_terminal'
+  | 'not_claimed';
+
+export interface DeliverabilityResult {
+  verdict: DeliverabilityVerdict;
+  /* The bridge record selected as the route target when
+   * verdict='deliverable' or 'legacy-grace'. Most-recently-updated
+   * record wins ties. Null for the negative verdicts. */
+  selected: BridgePresenceRecord | null;
+  /* Every fresh record that claimed the uuid, in updatedAt-desc
+   * order. Useful for logging which bridges saw which UUID. */
+  claimingRecords: BridgePresenceRecord[];
+}
+
+export function resolveDeliverableBridgeForSession(
+  ccSessionId: string,
+  opts: ReconcileOptions = {},
+): DeliverabilityResult {
+  const dir = opts.presenceDir ?? defaultPresenceDir();
+  const fresh = opts.freshMs ?? DEFAULT_BRIDGE_TIMEOUT_MS;
+  const now = (opts.now ?? Date.now)();
+  const records = readPresenceDir(dir, now, fresh);
+  const claiming = records
+    .filter((r) => r.ccSessionIds.includes(ccSessionId))
+    .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+  if (claiming.length === 0) {
+    return { verdict: 'not_claimed', selected: null, claimingRecords: [] };
+  }
+  /* Prefer the most-recent record whose flag explicitly says true. */
+  const flaggedTrue = claiming.find(
+    (r) => r.hasTerminalForUuid?.[ccSessionId] === true,
+  );
+  if (flaggedTrue) {
+    return { verdict: 'deliverable', selected: flaggedTrue, claimingRecords: claiming };
+  }
+  /* If any claiming record ships the field, the fleet has opted in
+   * to the new contract; an all-false fleet means no terminal owns
+   * the uuid. Refuse delivery. */
+  const anyHasField = claiming.some((r) => r.hasTerminalForUuid !== null);
+  if (anyHasField) {
+    return { verdict: 'no_terminal', selected: null, claimingRecords: claiming };
+  }
+  /* Migration grace: every claiming record is an old bridge with no
+   * deliverability field. Treat the most-recent record as deliverable
+   * so the legacy fleet keeps working through the transition window. */
+  return { verdict: 'legacy-grace', selected: claiming[0]!, claimingRecords: claiming };
 }
 
 /* Convenience: returns the encoded marker decoded into its parts so

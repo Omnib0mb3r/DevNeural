@@ -23,7 +23,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { execFile } from 'node:child_process';
-import { writePresenceFiles, presenceFilename } from './presence.js';
+import { writePresenceFiles, presenceFilename, legacyPresenceFilename } from './presence.js';
 import { cwdToSlug } from './slug.js';
 import { CcSessionLatch } from './cc-session-latch.js';
 import { buildBridgePayload } from './bridge-payload.js';
@@ -378,10 +378,12 @@ function noticeNoTerminal(): void {
   );
 }
 
-async function handleMessage(message: BridgeMessage): Promise<void> {
+type DeliveryOutcome = 'delivered' | 'dropped' | 'retry';
+
+async function handleMessage(message: BridgeMessage): Promise<DeliveryOutcome> {
   if (!message.text) {
     channel.appendLine('[skip] message has no text');
-    return;
+    return 'dropped';
   }
 
   let terminal: vscode.Terminal | undefined;
@@ -389,14 +391,23 @@ async function handleMessage(message: BridgeMessage): Promise<void> {
     terminal = await findTargetTerminalAsync();
   } catch (err) {
     channel.appendLine(`[error] terminal resolution failed: ${(err as Error).message}`);
-    return;
+    /* Resolution itself crashed (wmic/Get-CimInstance error). Treat
+     * as retry so a transient process-snapshot failure does not eat
+     * the marker; the next tick re-attempts. */
+    return 'retry';
   }
   if (!terminal) {
     channel.appendLine(
       '[skip] no terminal in this window; another bridge instance is expected to handle it',
     );
     noticeNoTerminal();
-    return;
+    /* Bug 3c (2026-05-22): do NOT advance the offset when no terminal
+     * is resolvable in this window. Another bridge instance is
+     * expected to deliver, and if none does the marker ages out into
+     * the >90s skip-stale path on its own (line ~642). Advancing here
+     * would have caused the silent-drop bug documented in
+     * docs/bugs/2026-05-22-worker-discovery-both-launch-paths.md. */
+    return 'retry';
   }
   try {
     const commit = message.commit !== false; // default true
@@ -454,8 +465,13 @@ async function handleMessage(message: BridgeMessage): Promise<void> {
         `[send] payload shipped (len=${wrapped.length}); safety-net Enter scheduled +120ms`,
       );
     }
+    return 'delivered';
   } catch (err) {
     channel.appendLine(`[error] sendText failed: ${(err as Error).message}`);
+    /* sendText raised after we identified a terminal. The PTY write
+     * may have partially landed; advancing the offset avoids an
+     * infinite retry that re-pastes a fragment. Drop the marker. */
+    return 'dropped';
   }
 }
 
@@ -572,21 +588,65 @@ function shouldHandleSession(sessionId: string): boolean {
  * without serialization a slow terminal lookup on one message could
  * let a later tick read the same file again before the prior batch's
  * handleMessage calls had run, and prompts could land out of order.
- * We chain handleMessage promises against a single tail promise per
- * file so deliveries stay strictly in queue order. */
-const inflightByFile = new Map<string, Promise<void>>();
+ *
+ * Bug 3c (2026-05-22): the chain now threads each handleMessage's
+ * DeliveryOutcome back through the file's offset advance. A 'retry'
+ * outcome (no terminal in this window right now) HALTS offset
+ * advancement for the file until either the message ages out into
+ * skip-stale at the >90s gate OR another tick succeeds. Without the
+ * gate the offset advanced unconditionally and silently dropped any
+ * marker that landed during a no-terminal window. */
+interface FileChainState {
+  tail: Promise<void>;
+  /* Highest contiguous byte offset that has been ACKed by a delivery
+   * outcome ('delivered' or 'dropped'). saveOffsetsDebounced reads
+   * lastOffsets which is committed from this value when the chain
+   * advances. */
+  committedOffset: number;
+  /* True while the chain is paused on a 'retry' outcome. processFile
+   * will not enqueue further messages from beyond this point until
+   * the retry resolves on a later tick. */
+  halted: boolean;
+}
+const fileChain = new Map<string, FileChainState>();
 
-function enqueueDelivery(file: string, message: BridgeMessage): void {
-  const tail = inflightByFile.get(file) ?? Promise.resolve();
-  const next = tail
+function getFileChain(file: string, initialOffset: number): FileChainState {
+  let state = fileChain.get(file);
+  if (!state) {
+    state = { tail: Promise.resolve(), committedOffset: initialOffset, halted: false };
+    fileChain.set(file, state);
+  }
+  return state;
+}
+
+function enqueueDelivery(
+  file: string,
+  message: BridgeMessage,
+  byteSize: number,
+  startOffset: number,
+): void {
+  const state = getFileChain(file, startOffset);
+  state.tail = state.tail
     .catch(() => undefined)
-    .then(() => handleMessage(message))
-    .catch((err) => {
-      channel.appendLine(
-        `[deliver-error] ${(err as Error)?.message ?? String(err)}`,
-      );
+    .then(async () => {
+      let outcome: DeliveryOutcome = 'dropped';
+      try {
+        outcome = await handleMessage(message);
+      } catch (err) {
+        channel.appendLine(
+          `[deliver-error] ${(err as Error)?.message ?? String(err)}`,
+        );
+        outcome = 'dropped';
+      }
+      if (outcome === 'retry') {
+        state.halted = true;
+        return;
+      }
+      state.committedOffset = startOffset + byteSize;
+      state.halted = false;
+      lastOffsets.set(file, state.committedOffset);
+      saveOffsetsDebounced();
     });
-  inflightByFile.set(file, next);
 }
 
 function processFile(file: string): void {
@@ -606,8 +666,17 @@ function processFile(file: string): void {
   if (stat.size < lastOffset) {
     // File was truncated; restart from beginning
     lastOffsets.set(file, 0);
+    fileChain.delete(file);
     return processFile(file);
   }
+
+  /* Honour a prior 'retry' halt: another tick is going to ack the
+   * outstanding marker before we read past it. processFile bails so
+   * we do not double-enqueue the same line on every tick. The chain
+   * itself will lift the halt once handleMessage resolves with
+   * 'delivered' or 'dropped'. */
+  const state = fileChain.get(file);
+  if (state?.halted) return;
 
   const fd = fs.openSync(file, 'r');
   try {
@@ -616,7 +685,7 @@ function processFile(file: string): void {
     fs.readSync(fd, buf, 0, length, lastOffset);
     const text = buf.toString('utf-8');
     const lines = text.split('\n');
-    let consumed = 0;
+    let cursorOffset = lastOffset;
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i] ?? '';
       const isLast = i === lines.length - 1;
@@ -628,9 +697,19 @@ function processFile(file: string): void {
       // by 1 byte and the next tick treats the unchanged file as
       // truncated, replaying every message every 750ms.
       if (isLast && line === '' && text.endsWith('\n')) break;
-      consumed += Buffer.byteLength(line, 'utf-8') + 1;
+      const byteSize = Buffer.byteLength(line, 'utf-8') + 1;
+      const startOffset = cursorOffset;
+      cursorOffset += byteSize;
       const trimmed = line.trim();
-      if (!trimmed) continue;
+      if (!trimmed) {
+        /* Blank line: not a real marker. Commit its byte size as a
+         * dropped no-op so the offset still advances past it. */
+        const blankState = getFileChain(file, startOffset);
+        blankState.committedOffset = startOffset + byteSize;
+        lastOffsets.set(file, blankState.committedOffset);
+        saveOffsetsDebounced();
+        continue;
+      }
       try {
         const message = JSON.parse(trimmed) as BridgeMessage;
         // Drop stale messages so a queue that piled up while the bridge
@@ -643,18 +722,33 @@ function processFile(file: string): void {
           channel.appendLine(
             `[skip-stale] queued_at=${message.queued_at} age=${Math.round((Date.now() - queuedMs) / 1000)}s text=${(message.text ?? '').slice(0, 60)}`,
           );
+          /* Stale drop: commit through the chain so a retry ahead of
+           * us in the same tick is not jumped over. The chain's tail
+           * is sequential, so appending a no-op resolver preserves
+           * the in-order semantics. */
+          const stale = getFileChain(file, startOffset);
+          stale.tail = stale.tail.catch(() => undefined).then(() => {
+            stale.committedOffset = startOffset + byteSize;
+            stale.halted = false;
+            lastOffsets.set(file, stale.committedOffset);
+            saveOffsetsDebounced();
+          });
           continue;
         }
-        enqueueDelivery(file, message);
+        enqueueDelivery(file, message, byteSize, startOffset);
       } catch (err) {
         channel.appendLine(
           `[parse-error] ${(err as Error).message}: ${trimmed.slice(0, 200)}`,
         );
+        const parseState = getFileChain(file, startOffset);
+        parseState.tail = parseState.tail.catch(() => undefined).then(() => {
+          parseState.committedOffset = startOffset + byteSize;
+          parseState.halted = false;
+          lastOffsets.set(file, parseState.committedOffset);
+          saveOffsetsDebounced();
+        });
       }
     }
-    const nextOffset = Math.min(lastOffset + consumed, stat.size);
-    lastOffsets.set(file, nextOffset);
-    saveOffsetsDebounced();
   } finally {
     fs.closeSync(fd);
   }
@@ -763,7 +857,50 @@ function writePresence(): void {
       const slug = cwdToSlug(cwd).toLowerCase();
       return daemonActiveSessions.get(slug);
     },
+    /* Bug 3b (2026-05-22): per-UUID deliverability flag. Honest
+     * answer to "does THIS bridge own a terminal that can receive a
+     * marker for this UUID right now?" Used by the daemon to route
+     * /lex/inject-cross-session away from windows that latched the
+     * UUID but have no terminal (e.g. the user opened a second VS
+     * Code window, latched first, then closed it to keep the worker
+     * in window 2).
+     *
+     * Best-effort sync: walks vscode.window.terminals and consults
+     * the existing claudeTerminalCache. A terminal whose process
+     * tree contains a claude.exe (via isClaudeTerminal cache) is
+     * accepted as the owner of whichever UUID the latch resolves
+     * for this cwd. A cold cache returns false here AND fires a
+     * background isClaudeTerminal() so the next tick has a real
+     * answer; the daemon's migration grace treats a flagless or
+     * false-from-cold-cache record as deliverable for one tick. */
+    hasTerminalForUuidLookup: (_cwd, _uuid) => hasClaudeTerminalInThisWindow(),
   });
+}
+
+/* See hasTerminalForUuidLookup wire-up in writePresence. Sync probe:
+ *   - any terminal in this window whose claudeTerminalCache says true
+ *     => true (deliverable)
+ *   - all terminals say false => false (definitely not deliverable)
+ *   - some uncached terminals => warm them async, return whether any
+ *     already-cached terminal said true (the cold-start tick yields a
+ *     conservative false; daemon's migration grace covers one tick) */
+function hasClaudeTerminalInThisWindow(): boolean {
+  const terminals = vscode.window.terminals;
+  if (terminals.length === 0) return false;
+  let anyTrue = false;
+  for (const t of terminals) {
+    const cached = readClaudeCache(t);
+    if (cached === true) {
+      anyTrue = true;
+      continue;
+    }
+    if (cached === undefined) {
+      /* Fire-and-forget; isClaudeTerminal writes back into the cache
+       * so the next presence tick gets a real answer. */
+      void isClaudeTerminal(t).catch(() => undefined);
+    }
+  }
+  return anyTrue;
 }
 
 function clearPresence(): void {
@@ -771,13 +908,23 @@ function clearPresence(): void {
   if (folders.length === 0) return;
   const dir = getPresenceDir();
   if (!fs.existsSync(dir)) return;
+  if (!presenceContext) return;
+  const bridgeId = getBridgeId(presenceContext);
   for (const folder of folders) {
     const cwd = folder.uri.fsPath.replace(/\\/g, '/');
-    const file = path.posix.join(dir, `${presenceFilename(cwd)}.json`);
-    try {
-      fs.unlinkSync(file);
-    } catch {
-      /* ignore */
+    /* Scrub this bridge's per-bridge-id file plus the legacy
+     * cwd-only file (pre-2026-05-22). Both are removed on deactivate
+     * so a stale presence does not survive a window close. */
+    const candidates = [
+      path.posix.join(dir, `${presenceFilename(cwd, bridgeId)}.json`),
+      path.posix.join(dir, `${legacyPresenceFilename(cwd)}.json`),
+    ];
+    for (const file of candidates) {
+      try {
+        fs.unlinkSync(file);
+      } catch {
+        /* ignore */
+      }
     }
   }
 }

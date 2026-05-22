@@ -33,6 +33,10 @@ import { randomUUID } from 'node:crypto';
 import { getAuthSecret } from '../dashboard/auth-secret.js';
 import { ptyInject, listPtys } from '../dashboard/pty-host.js';
 import { queueSessionPrompt, queueSessionSuggestion } from '../dashboard/sessions.js';
+import {
+  resolveDeliverableBridgeForSession,
+  type DeliverabilityResult,
+} from '../dashboard/bridge-presence.js';
 import type { IndexDb } from '../store/index-db.js';
 
 /* Allowlist env var. Comma-separated name/id prefixes. Empty = allow all. */
@@ -119,7 +123,14 @@ export interface InjectResult {
     | 'rejected_pty'
     | 'redirected'
     | 'dispatched_dead_session'
-    | 'rejected_anchor_dormant';
+    | 'rejected_anchor_dormant'
+    /* Bug 3e (2026-05-22). Daemon refuses to queue a bridge marker
+     * when no fresh presence file claims the target uuid AT ALL
+     * (verdict='not_claimed') or claims it without owning a terminal
+     * (verdict='no_terminal'). Returned so callers (Lex) react to a
+     * real failure instead of treating a queue-file-write as
+     * delivery. */
+    | 'no_deliverable_bridge';
   /** When 'accepted', which transport delivered the prompt. */
   transport?: 'pty' | 'bridge';
   error?: string;
@@ -129,6 +140,11 @@ export interface InjectResult {
   dispatched_to?: string;
   /** Fix 15 — anchor id resolved for this dispatch, when known. */
   anchor_id?: string;
+  /** Bug 3e — for delivery-failed verdicts, the reason classifier
+   * from resolveDeliverableBridgeForSession. Helps Lex distinguish
+   * "no bridge even claims this uuid" (worker never opened a window)
+   * from "bridge claims but has no terminal" (window closed). */
+  deliverability_verdict?: 'not_claimed' | 'no_terminal';
 }
 
 /**
@@ -150,6 +166,11 @@ export interface CrossSessionInjectDeps {
    * default sits in the middle of the bracketed-paste settle
    * window observed on the bridge VSIX path (~750-1000ms). */
   commitDelayMs?: number;
+  /** Bug 3e (2026-05-22): bridge deliverability gate. Default reads
+   * the live `.bridge-presence` directory via
+   * resolveDeliverableBridgeForSession. Tests stub this so the
+   * inject path can be exercised without a real presence dir. */
+  resolveDeliverableBridge?: (ccSessionId: string) => DeliverabilityResult;
 }
 
 const DEFAULT_COMMIT_DELAY_MS = 850;
@@ -196,6 +217,9 @@ export function crossSessionInject(
     deps?.queueSessionSuggestion ?? queueSessionSuggestion;
   const scheduleCommit = deps?.scheduleCommit ?? defaultScheduleCommit;
   const commitDelayMs = deps?.commitDelayMs ?? DEFAULT_COMMIT_DELAY_MS;
+  const resolveDeliverableBridge =
+    deps?.resolveDeliverableBridge ??
+    ((ccSessionId: string) => resolveDeliverableBridgeForSession(ccSessionId));
 
   function audit(
     decision: InjectResult['decision'],
@@ -286,7 +310,32 @@ export function crossSessionInject(
   /* 4. Bridge fallback. queueSessionPrompt requires a session-id (not
    * a ptyId), so we only attempt this when target_session looks like
    * a UUID prefix or full UUID — the same shape sessions.ts resolves
-   * via .claude jsonl scan. */
+   * via .claude jsonl scan.
+   *
+   * Bug 3e (2026-05-22): before writing the marker, confirm at least
+   * one fresh bridge presence record reports has_terminal_for_uuid
+   * for the target. Without this gate the marker lands in a sinkhole
+   * (no bridge owns a terminal) and the audit row reports 'accepted'
+   * for what is in fact a silent drop. Migration grace (verdict =
+   * 'legacy-grace') keeps older bridges working through the rollout
+   * window. */
+  const deliverability = resolveDeliverableBridge(target_session);
+  if (
+    deliverability.verdict === 'not_claimed' ||
+    deliverability.verdict === 'no_terminal'
+  ) {
+    const reason =
+      deliverability.verdict === 'not_claimed'
+        ? `no fresh bridge presence claims "${target_session}"`
+        : `bridge presence claims "${target_session}" but no terminal owns it`;
+    audit('no_deliverable_bridge', reason);
+    return {
+      ok: false,
+      decision: 'no_deliverable_bridge',
+      error: reason,
+      deliverability_verdict: deliverability.verdict,
+    };
+  }
   const bridgeResult = commit
     ? queueSessionPromptFn(target_session, text)
     : queueSessionSuggestionFn(target_session, text);

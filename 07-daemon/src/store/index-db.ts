@@ -2179,7 +2179,8 @@ export class IndexDb {
       | 'shadow'
       | 'redirected'
       | 'dispatched_dead_session'
-      | 'rejected_anchor_dormant';
+      | 'rejected_anchor_dormant'
+      | 'no_deliverable_bridge';
     reject_reason?: string | null;
     brainstorm_id?: string | null;
     /* Fix 15 C3 — full inject text, populated only when the audit
