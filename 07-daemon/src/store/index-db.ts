@@ -1520,6 +1520,13 @@ export class IndexDb {
 
   // ── brainstorm sessions ────────────────────────────────────────
   insertBrainstorm(row: BrainstormSessionRow): void {
+    /* Migration 033 columns (runtime_mode, lifecycle_state,
+     * attached_worker_session_id) are NOT enumerated here so legacy
+     * spawnLex inserts keep their SQLite-defaulted values
+     * (cc-pty / idle / null). Standalone brainstorms set those
+     * explicitly via the followup updateBrainstorm call inside
+     * createStandaloneBrainstorm so the same INSERT path serves both
+     * legacy and direct-llm without diverging schemas. */
     this.db
       .prepare(
         `INSERT OR REPLACE INTO brainstorm_sessions

@@ -81,6 +81,9 @@ import {
   setStore as setBrainstormStore,
   reapAllActive as reapAllActiveBrainstorms,
   reapOrphansAgainstLivePtys,
+  createStandaloneBrainstorm,
+  attachWorkerSession,
+  detachWorkerSession,
 } from '../lex/brainstorm-store.js';
 import {
   ensureServer as ensureWhisper,
@@ -3396,6 +3399,69 @@ export async function registerDashboardRoutes(
     if (!row) {
       reply.code(404);
       return { ok: false, error: 'not found' };
+    }
+    return { ok: true, brainstorm: decorateBrainstorm(row) };
+  });
+
+  /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
+   *
+   * Create a standalone brainstorm: no Lex PTY backing it, no Claude
+   * Code session bound. Voice WS connects by brainstorm_id and runs
+   * the direct-llm path on every turn. user_label is optional;
+   * defaults to null and the dashboard / Stream Deck pickers will
+   * fall back to derived_label once Lex has spoken a few turns. */
+  app.post('/brainstorms/standalone', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      user_label?: string;
+      mode?: string;
+      cwd?: string;
+    };
+    const userLabel =
+      typeof body.user_label === 'string' && body.user_label.trim()
+        ? body.user_label.trim()
+        : null;
+    const mode =
+      body.mode === 'notes' || body.mode === 'push-to-talk'
+        ? body.mode
+        : 'conversation';
+    const cwd =
+      typeof body.cwd === 'string' && body.cwd.trim() ? body.cwd : undefined;
+    let row;
+    try {
+      row = createStandaloneBrainstorm({ userLabel, mode, cwd });
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, error: (err as Error).message };
+    }
+    return { ok: true, brainstorm: decorateBrainstorm(row) };
+  });
+
+  /* Attach a worker CC session UUID to a brainstorm so the worker
+   * SessionStart preamble pulls the brainstorm's accumulated context
+   * on its next /clear and Lex's cross-session inject targets the
+   * right worker without manual ?target_session= plumbing. */
+  app.post('/brainstorms/:id/attach-worker', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { cc_session_id?: string };
+    const cc = (body.cc_session_id ?? '').trim();
+    if (!cc) {
+      reply.code(400);
+      return { ok: false, error: 'cc_session_id required' };
+    }
+    const row = attachWorkerSession(id, cc);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'brainstorm not found' };
+    }
+    return { ok: true, brainstorm: decorateBrainstorm(row) };
+  });
+
+  app.post('/brainstorms/:id/detach-worker', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = detachWorkerSession(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'brainstorm not found' };
     }
     return { ok: true, brainstorm: decorateBrainstorm(row) };
   });

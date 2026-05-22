@@ -117,6 +117,92 @@ export function registerBrainstorm(opts: {
   return row;
 }
 
+/* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
+ *
+ * Create a standalone brainstorm that does NOT depend on a Claude
+ * Code PTY backing it. Lex runs as a direct LLM consumer in the
+ * voice WS path; the brainstorm row is the durable Lex brain and
+ * survives between worker CC sessions, restarts, and /clear.
+ *
+ * cwd defaults to <repo>/brainstorm so the existing isBrainstormCwd
+ * convention keeps recognising the row as a Lex spawn for chunks,
+ * audit-finding lookups, and the chokidar transcript watcher's
+ * brainstorm-aware paths. Caller can override (e.g. tests). */
+export function createStandaloneBrainstorm(opts: {
+  cwd?: string;
+  mode?: string;
+  userLabel?: string | null;
+  startedMs?: number;
+}): BrainstormSessionRow {
+  const id = randomUUID();
+  const cwd = (
+    opts.cwd ??
+    process.env.DEVNEURAL_STANDALONE_BRAINSTORM_CWD ??
+    'C:/dev/Projects/DevNeural/brainstorm'
+  ).replace(/\\/g, '/');
+  const row: BrainstormSessionRow = {
+    id,
+    claude_session_id: null,
+    pty_id: null,
+    cwd,
+    user_label: opts.userLabel ?? null,
+    derived_label: null,
+    mode: opts.mode ?? 'conversation',
+    status: 'active',
+    started_ms: opts.startedMs ?? Date.now(),
+    ended_ms: null,
+    turn_count: 0,
+    topic_tags_json: '[]',
+    artifacts_json: JSON.stringify(emptyArtifacts()),
+    last_summary: null,
+    last_summary_ms: null,
+  };
+  db().insertBrainstorm(row);
+  /* Set the migration 033 columns explicitly so the dashboard sees
+   * 'direct-llm' / 'idle' immediately rather than the SQLite default
+   * 'cc-pty' that legacy spawnLex inserts inherit. */
+  db().updateBrainstorm(id, {
+    runtime_mode: 'direct-llm',
+    lifecycle_state: 'idle',
+  });
+  return db().getBrainstorm(id) ?? row;
+}
+
+/* Bind a worker CC session to a brainstorm. Records the worker's
+ * cc_session_id in attached_worker_session_id and flips
+ * lifecycle_state to 'attached' (unless the brainstorm is already
+ * 'speaking', in which case lifecycle_state stays so voice flows
+ * are not interrupted). Returns the updated row, or null when the
+ * brainstorm id is unknown. */
+export function attachWorkerSession(
+  brainstormId: string,
+  ccSessionId: string,
+): BrainstormSessionRow | null {
+  const existing = db().getBrainstorm(brainstormId);
+  if (!existing) return null;
+  const nextLifecycle =
+    existing.lifecycle_state === 'speaking' ? 'speaking' : 'attached';
+  return db().updateBrainstorm(brainstormId, {
+    attached_worker_session_id: ccSessionId,
+    lifecycle_state: nextLifecycle,
+  });
+}
+
+/* Detach the worker CC session from a brainstorm. Flips
+ * lifecycle_state back to 'idle' unless mid-utterance. */
+export function detachWorkerSession(
+  brainstormId: string,
+): BrainstormSessionRow | null {
+  const existing = db().getBrainstorm(brainstormId);
+  if (!existing) return null;
+  const nextLifecycle =
+    existing.lifecycle_state === 'speaking' ? 'speaking' : 'idle';
+  return db().updateBrainstorm(brainstormId, {
+    attached_worker_session_id: null,
+    lifecycle_state: nextLifecycle,
+  });
+}
+
 /* Pre-bind a row to a freshly-spawned PTY before claude has written
  * its first jsonl. Used by the switch-to flow so the dashboard
  * stops showing the previous (now-dead) PTY id immediately. The
