@@ -64,6 +64,7 @@ import {
 import { startBridgePresenceLoop } from './dashboard/bridge-presence.js';
 import { startDistillationBackfillScheduler } from './lex/distillation-scheduler.js';
 import { startWorkerEventListener } from './dashboard/worker-event-listener.js';
+import { startExpectationSupervisor } from './lex/expectation-supervisor.js';
 import {
   startDashboardSupervisor,
   type DashboardSupervisorHandle,
@@ -202,6 +203,16 @@ async function main(): Promise<void> {
     log: (msg) => logger(msg),
   });
   void workerEventListener;
+
+  /* Brainstorm-as-durable-primary-entity (2026-05-22, plan section L).
+   * Active polling-with-expectations supervisor. Ticks every 90s
+   * (DEVNEURAL_EXPECTATION_TICK_MS override), walks open
+   * lex_worker_expectation rows, asks the LLM whether the worker's
+   * recent jsonl tail aligns with the expected outcome, and on
+   * drift fires lex-attention so the operator sees a push and Lex
+   * sees the correction text on its next voice turn. */
+  const expectationSupervisor = startExpectationSupervisor();
+  void expectationSupervisor;
 
   /* External heartbeat poster (Wave 2 day 1 step 5).
    * No-op when DEVNEURAL_HEARTBEAT_URL is unset; the poster logs

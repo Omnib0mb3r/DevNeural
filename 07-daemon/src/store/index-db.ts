@@ -91,6 +91,27 @@ export interface BrainstormSessionRow {
   attached_worker_session_id?: string | null;
 }
 
+/* Brainstorm-as-durable-primary-entity (2026-05-22, migration 034).
+ * lex_worker_expectation row. Open while closed_at IS NULL; the
+ * expectation-supervisor evaluates it every 90s and either flips to
+ * 'completed' / 'drifted' / 'superseded' / 'cancelled' once the
+ * worker's recent activity has resolved one way or the other. */
+export interface WorkerExpectationRow {
+  id: string;
+  brainstorm_id: string;
+  anchor_id: string;
+  expected_outcome: string;
+  expected_files: string;
+  expected_duration_ms: number | null;
+  created_at: string;
+  closed_at: string | null;
+  closed_reason: 'completed' | 'drifted' | 'superseded' | 'cancelled' | null;
+  last_evaluated_at: string | null;
+  last_alignment_score: number | null;
+  last_drift_summary: string | null;
+  last_suggested_correction: string | null;
+}
+
 /* lex_feedback row. Inline-thumbs writes here keyed on the system-
  * prompt version so the prompt-tuning loop can aggregate up-rate
  * per revision over weeks. */
@@ -1610,6 +1631,113 @@ export class IndexDb {
         )
         .get(ptyId) as BrainstormSessionRow | undefined) ?? null
     );
+  }
+
+  /* Brainstorm-as-durable-primary-entity (2026-05-22, migration 034).
+   * lex_worker_expectation row helpers. Drives the active polling-
+   * with-expectations supervisor: Lex records what it told the
+   * worker to do, the 90s tick reads the worker's jsonl tail and
+   * asks the LLM "does this align?", and on drift fires lex-attention. */
+  insertWorkerExpectation(row: {
+    id: string;
+    brainstorm_id: string;
+    anchor_id: string;
+    expected_outcome: string;
+    expected_files?: string[];
+    expected_duration_ms?: number | null;
+  }): void {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO lex_worker_expectation
+             (id, brainstorm_id, anchor_id, expected_outcome,
+              expected_files, expected_duration_ms)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          row.id,
+          row.brainstorm_id,
+          row.anchor_id,
+          row.expected_outcome,
+          JSON.stringify(row.expected_files ?? []),
+          row.expected_duration_ms ?? null,
+        );
+    } catch {
+      /* table missing pre-migration 034; never crash the caller */
+    }
+  }
+
+  listOpenWorkerExpectations(
+    opts: { brainstormId?: string; limit?: number } = {},
+  ): WorkerExpectationRow[] {
+    const limit = opts.limit ?? 50;
+    try {
+      if (opts.brainstormId) {
+        return this.db
+          .prepare(
+            `SELECT * FROM lex_worker_expectation
+              WHERE closed_at IS NULL AND brainstorm_id = ?
+              ORDER BY created_at DESC LIMIT ?`,
+          )
+          .all(opts.brainstormId, limit) as WorkerExpectationRow[];
+      }
+      return this.db
+        .prepare(
+          `SELECT * FROM lex_worker_expectation
+            WHERE closed_at IS NULL
+            ORDER BY created_at ASC LIMIT ?`,
+        )
+        .all(limit) as WorkerExpectationRow[];
+    } catch {
+      return [];
+    }
+  }
+
+  updateWorkerExpectationEvaluation(
+    id: string,
+    patch: {
+      alignment_score: number | null;
+      drift_summary: string | null;
+      suggested_correction: string | null;
+    },
+  ): void {
+    try {
+      this.db
+        .prepare(
+          `UPDATE lex_worker_expectation
+             SET last_evaluated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 last_alignment_score = ?,
+                 last_drift_summary = ?,
+                 last_suggested_correction = ?
+           WHERE id = ?`,
+        )
+        .run(
+          patch.alignment_score,
+          patch.drift_summary,
+          patch.suggested_correction,
+          id,
+        );
+    } catch {
+      /* observability only */
+    }
+  }
+
+  closeWorkerExpectation(
+    id: string,
+    reason: 'completed' | 'drifted' | 'superseded' | 'cancelled',
+  ): void {
+    try {
+      this.db
+        .prepare(
+          `UPDATE lex_worker_expectation
+             SET closed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 closed_reason = ?
+           WHERE id = ? AND closed_at IS NULL`,
+        )
+        .run(reason, id);
+    } catch {
+      /* observability only */
+    }
   }
 
   /* Brainstorm-as-durable-primary-entity (2026-05-22, migration 033).
