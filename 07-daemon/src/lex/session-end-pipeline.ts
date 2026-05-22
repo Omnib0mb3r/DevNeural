@@ -180,10 +180,32 @@ async function runOrderedPipeline(
     was_primary_runner: true,
     thread_doc_written: false,
   };
+  /* Brainstorm-as-durable-primary-entity (2026-05-22): direct-llm
+   * brainstorms have no CC session id and no raw_chunks rows; the
+   * old early-out skipped the entire pipeline which meant the
+   * brainstorm row never flipped status='ended' on a voice
+   * "end session" command. Run step 3 (flip status + ended_ms +
+   * lifecycle_state='ended') regardless of CC session presence; the
+   * downstream steps that strictly require a CC session bail
+   * gracefully below. */
   if (!input.claudeSessionId) {
-    log(
-      `[session-end] brainstorm=${input.brainstormId} no claude session id; skipping pipeline`,
-    );
+    try {
+      const existing = store.db.getBrainstorm(input.brainstormId);
+      if (existing && existing.status !== 'ended') {
+        store.db.updateBrainstorm(input.brainstormId, {
+          status: 'ended',
+          ended_ms: Date.now(),
+          lifecycle_state: 'ended',
+        });
+        log(
+          `[session-end] brainstorm=${input.brainstormId} direct-llm; row marked ended (no CC pipeline steps run)`,
+        );
+      }
+    } catch (err) {
+      log(
+        `[session-end] direct-llm row update failed: ${(err as Error).message}`,
+      );
+    }
     return out;
   }
   const projectId = store.db.projectIdBySession(input.claudeSessionId);

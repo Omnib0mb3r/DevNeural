@@ -33,6 +33,7 @@ import {
   registerBrainstorm,
   reapOrphansAgainstLivePtys,
   getBrainstorm,
+  detachWorkerSession,
 } from '../lex/brainstorm-store.js';
 import {
   setLexSessionStatus,
@@ -552,7 +553,13 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
       const bs = handle.brainstormId
         ? getBrainstorm(handle.brainstormId)
         : getBrainstormByPty(handle.ptyId);
-      if (bs && bs.status === 'active') {
+      /* Brainstorm-as-durable-primary-entity (2026-05-22): direct-
+       * llm brainstorms have no Lex PTY backing them; a PTY exit on
+       * the daemon NEVER corresponds to "Lex stopped". Only fire the
+       * session-end pipeline when runtime_mode is cc-pty (legacy) or
+       * unset (pre-migration rows default to cc-pty via SQLite). */
+      const runtimeMode = bs?.runtime_mode ?? 'cc-pty';
+      if (bs && bs.status === 'active' && runtimeMode === 'cc-pty') {
         void runSessionEndPipeline(
           getBrainstormStore(),
           {
@@ -594,6 +601,23 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
       }
       if (handle.sessionId) {
         closeTranscriptRef(handle.sessionId);
+      }
+      /* Brainstorm-as-durable-primary-entity (2026-05-22): when a
+       * worker CC session exits, detach it from any brainstorm that
+       * had bound it via attachWorkerSession. The brainstorm itself
+       * stays alive (the durable brain); only the worker tool went
+       * away. */
+      if (handle.sessionId) {
+        try {
+          const owning = getBrainstormStore().db.getBrainstormByAttachedWorker(
+            handle.sessionId,
+          );
+          if (owning) {
+            detachWorkerSession(owning.id);
+          }
+        } catch {
+          /* observability only */
+        }
       }
     } catch {
       /* observability only */
