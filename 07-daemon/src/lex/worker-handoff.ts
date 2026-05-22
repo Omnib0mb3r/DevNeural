@@ -77,6 +77,21 @@ export interface WorkerHandoffSections {
    * the worker resumes so it never forgets which reference material
    * exists. Memory index does NOT apply on the worker side. */
   docs_index: string[];
+  /** Brainstorm-as-durable-primary-entity (2026-05-22): present when
+   * the worker's cc_session_id matched a brainstorm row's
+   * attached_worker_session_id. The brainstorm IS the durable Lex
+   * brain; this block hands the worker the conversation thread Lex
+   * has been driving so /clear or a fresh spawn does not lose
+   * continuity. Null when no brainstorm has claimed this worker. */
+  brainstorm_context: {
+    brainstorm_id: string;
+    user_label: string | null;
+    last_summary: string | null;
+    recent_chunks: Array<{
+      role: 'user' | 'lex' | 'tool';
+      text: string;
+    }>;
+  } | null;
 }
 
 export interface WorkerHandoffResult {
@@ -93,6 +108,17 @@ export interface BuildWorkerHandoffOptions {
    * audit_findings query. Pass null to skip the project-anchor gate
    * (tests that exercise the rendering path directly). */
   db: IndexDb | null;
+  /** Brainstorm-as-durable-primary-entity (2026-05-22): the new CC
+   * session id the worker is starting under. When provided AND the
+   * db carries a brainstorm row with this attached_worker_session_id,
+   * the rendered block gains a ## Brainstorm context section pulling
+   * the brainstorm's last_summary plus its most recent chunks so the
+   * worker resumes the thread the brainstorm has been driving. Null
+   * skips the lookup. */
+  workerSessionId?: string;
+  /** Test seam: cap on the number of recent brainstorm chunks
+   * replayed in the brainstorm-context section. */
+  brainstormChunkLimit?: number;
   /** Path to the backlog queue JSON. Defaults to the env override or
    * c:/tmp/lex-backlog-queue.json. */
   backlogPath?: string;
@@ -283,6 +309,40 @@ function renderBlock(sections: WorkerHandoffSections): string {
     }
   }
 
+  /* Brainstorm-as-durable-primary-entity (2026-05-22): when a
+   * brainstorm has bound this worker via attachWorkerSession, the
+   * worker resumes the thread Lex has been driving. Last summary +
+   * the last few user/assistant turns lets the worker pick up
+   * without re-discovering state. The block is intentionally short
+   * so a /clear + handoff cycle does not blow context budget; full
+   * history lives in brainstorm_chunks and the worker can ask Lex
+   * to recall older turns via cross-session inject. */
+  if (sections.brainstorm_context) {
+    const bc = sections.brainstorm_context;
+    lines.push('');
+    lines.push('## Brainstorm context');
+    lines.push(
+      'The brainstorm bound to this worker is the durable Lex brain. Your role is the tool side: implement, test, commit. The summary + recent turns below capture what Lex has been working through so you can resume the thread without re-discovery.',
+    );
+    lines.push('');
+    lines.push(`- brainstorm_id: ${bc.brainstorm_id}`);
+    if (bc.user_label) lines.push(`- label: ${bc.user_label}`);
+    if (bc.last_summary) {
+      lines.push('');
+      lines.push('### Last summary');
+      lines.push(bc.last_summary);
+    }
+    if (bc.recent_chunks.length > 0) {
+      lines.push('');
+      lines.push('### Recent turns (oldest first)');
+      for (const c of bc.recent_chunks) {
+        const speaker =
+          c.role === 'lex' ? 'Lex' : c.role === 'tool' ? 'Tool' : 'User';
+        lines.push(`- ${speaker}: ${trimTitle(c.text, 280)}`);
+      }
+    }
+  }
+
   /* Three-tier docs index (2026-05-22): same shape and source file
    * as the live_state docs_index block voice gets every turn. Read
    * live on each handoff render so a newly-added doc lands without
@@ -332,6 +392,7 @@ export function buildWorkerHandoff(
     next_up: [],
     open_blockers: [],
     docs_index: [],
+    brainstorm_context: null,
   };
   if (!cwd) {
     return { ok: true, block: '', sections: emptySections, reason: 'no-cwd' };
@@ -364,12 +425,39 @@ export function buildWorkerHandoff(
 
   const entries = parseBacklog(readBacklog(backlogPath));
   const docsIndexPath = opts.docsIndexPath ?? DEFAULT_DOCS_INDEX_PATH;
+  const chunkLimit = opts.brainstormChunkLimit ?? 6;
+  /* Brainstorm-context lookup: the worker IS this brainstorm's tool;
+   * dump the brainstorm's accumulated thread into the worker's first
+   * turn so /clear and fresh spawns do not lose continuity. */
+  let brainstormContext: WorkerHandoffSections['brainstorm_context'] = null;
+  if (opts.db && opts.workerSessionId) {
+    try {
+      const bs = opts.db.getBrainstormByAttachedWorker(opts.workerSessionId);
+      if (bs) {
+        const chunks = opts.db.listBrainstormChunks(bs.id, chunkLimit, {
+          order: 'desc',
+        });
+        brainstormContext = {
+          brainstorm_id: bs.id,
+          user_label: bs.user_label ?? bs.derived_label ?? null,
+          last_summary: bs.last_summary ?? null,
+          recent_chunks: chunks.reverse().map((c) => ({
+            role: c.role,
+            text: c.text,
+          })),
+        };
+      }
+    } catch {
+      /* observational; never block the handoff on a missing column */
+    }
+  }
   const sections: WorkerHandoffSections = {
     where_left_off: buildGitState(cwd, runGit, inFlightLimit),
     active_task: selectActiveTask(entries),
     next_up: selectNextUp(entries, nextUpLimit),
     open_blockers: selectBlockers(opts.db, blockerLimit),
     docs_index: loadIndexBullets(docsIndexPath),
+    brainstorm_context: brainstormContext,
   };
   return {
     ok: true,

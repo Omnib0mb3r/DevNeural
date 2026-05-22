@@ -1612,6 +1612,27 @@ export class IndexDb {
     );
   }
 
+  /* Brainstorm-as-durable-primary-entity (2026-05-22, migration 033).
+   * Resolve the brainstorm that has bound `ccSessionId` as its worker
+   * via attachWorkerSession. Used by the worker SessionStart handoff
+   * so a fresh CC session picks up the brainstorm's accumulated
+   * context on its first turn. Returns the most-recently-started row
+   * when more than one brainstorm has somehow latched the same
+   * worker (should be unique in practice). */
+  getBrainstormByAttachedWorker(
+    ccSessionId: string,
+  ): BrainstormSessionRow | null {
+    return (
+      (this.db
+        .prepare(
+          `SELECT * FROM brainstorm_sessions
+            WHERE attached_worker_session_id = ?
+            ORDER BY started_ms DESC LIMIT 1`,
+        )
+        .get(ccSessionId) as BrainstormSessionRow | undefined) ?? null
+    );
+  }
+
   listBrainstorms(opts: { status?: 'active' | 'ended'; limit?: number } = {}):
     BrainstormSessionRow[] {
     const limit = opts.limit ?? 50;

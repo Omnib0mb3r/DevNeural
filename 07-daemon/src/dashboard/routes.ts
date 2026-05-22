@@ -4266,7 +4266,11 @@ export async function registerDashboardRoutes(
       return { ok: false, error: 'cwd required' };
     }
     const { buildWorkerHandoff } = await import('../lex/worker-handoff.js');
-    const result = buildWorkerHandoff({ cwd: body.cwd, db: store.db });
+    const result = buildWorkerHandoff({
+      cwd: body.cwd,
+      db: store.db,
+      workerSessionId: typeof body.session_id === 'string' ? body.session_id : undefined,
+    });
     return result;
   });
 
