@@ -338,7 +338,37 @@ export async function maybePushNotification(
   opts: { mode?: 'auto' | 'force' } = {},
 ): Promise<void> {
   const mode = opts.mode ?? 'auto';
-  if (mode === 'auto' && n.severity === 'info') return;
+  /* Fix 21 (2026-05-24): respect the Fix 9 notify_class taxonomy.
+   *
+   * Policy (operator, 2026-05-24): push + bell fire ONLY for
+   *   - critical / action-required items (notify_class='followup')
+   *   - end-of-session reports          (notify_class='report')
+   *   - signals worth a phone buzz       (notify_class='signal' + severity>=warn)
+   * Everything else (conversation, idle ticks, info-level signals)
+   * stays silent.
+   *
+   * Mapping:
+   *   conversation -> skip (activity-rail only, like the bell filter)
+   *   report       -> push (end-of-session / handover artifact)
+   *   followup     -> push (action-required, e.g. lex-attention)
+   *   signal       -> severity gate; warn / alert push, info skip
+   *
+   * Legacy rows without notify_class default to 'conversation' so
+   * an un-tagged emit cannot leak to phone push, matching the bell
+   * filter's default (notifications.ts:passesSurfaceFilter line
+   * 207). */
+  const cls = n.notify_class ?? 'conversation';
+  if (cls === 'conversation') return;
+  if (cls === 'signal' && n.severity === 'info') return;
+  /* report + followup always push (mode='force' or 'auto'). The
+   * legacy severity-info gate only applies to 'signal' above, so
+   * an info-level report (e.g. session-end summary) still ships. */
+  if (mode === 'auto' && cls !== 'signal' && cls !== 'followup' && cls !== 'report') {
+    /* Defensive default: an unknown class lands here only if a new
+     * NotifyClass value is added without updating this gate.
+     * Suppress rather than leak. */
+    if (n.severity === 'info') return;
+  }
   const result = await sendPushToAll({
     title: n.title,
     ...(n.body ? { body: n.body } : {}),

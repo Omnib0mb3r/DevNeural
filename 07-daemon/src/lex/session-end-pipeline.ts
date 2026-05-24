@@ -163,6 +163,39 @@ export async function runSessionEndPipeline(
     primaryRan = true;
     return runOrderedPipeline(store, input, log, true);
   });
+  /* Fix 21 (2026-05-24): end-of-session report. Fires only for the
+   * primary runner (concurrent funnel paths that wait on the lock
+   * do not double-emit). notify_class='report' bypasses the
+   * conversation skip in maybePushNotification, so bell + phone
+   * push both surface the wrap regardless of severity. */
+  if (primaryRan) {
+    try {
+      const row = store.db.getBrainstorm(input.brainstormId);
+      const label =
+        row?.user_label ?? row?.derived_label ?? input.brainstormId.slice(0, 8);
+      const { emitNotification } = await import('../dashboard/notifications.js');
+      const bodyParts: string[] = [];
+      if (result.drafts_created > 0) {
+        bodyParts.push(
+          `${result.drafts_created} wiki draft${result.drafts_created === 1 ? '' : 's'}`,
+        );
+      } else {
+        bodyParts.push('no drafts created');
+      }
+      if (result.thread_doc_written) bodyParts.push('thread doc written');
+      if (result.summary_embedded) bodyParts.push('summary embedded');
+      emitNotification({
+        severity: 'info',
+        source: 'session-end',
+        notify_class: 'report',
+        title: `Session ended: ${label}`,
+        body: bodyParts.join(', '),
+        link: `/brainstorms/${encodeURIComponent(input.brainstormId)}`,
+      });
+    } catch (err) {
+      log(`[session-end] report emit failed: ${(err as Error).message}`);
+    }
+  }
   return { ...result, was_primary_runner: primaryRan };
 }
 
