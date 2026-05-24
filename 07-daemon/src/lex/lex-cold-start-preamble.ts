@@ -33,6 +33,7 @@ import {
   type PreloadResult,
 } from './sibling-distillation-preload.js';
 import { extractLastTurnPairs } from './sibling-index.js';
+import { findLatestHandover } from './handover-writer.js';
 import * as fs from 'node:fs';
 
 export interface ColdStartPreloadInput {
@@ -71,6 +72,13 @@ export interface ColdStartPreloadInput {
   anchorPairsPerRef?: number;
   /** Test seam: filesystem read for transcript_path jsonls. */
   readTranscript?: (p: string) => string | null;
+  /** Phase 4 of LEX-STANDALONE-SUPERVISION: prefer the freshest
+   * HANDOVER doc when its on-disk mtime is newer than the row's
+   * last_summary_ms. Injected for tests; production uses
+   * handover-writer.findLatestHandover + fs.statSync. Return null
+   * for "no handover doc found"; the preload falls back to
+   * last_summary_ms in that case. */
+  findHandover?: (brainstormId: string) => { mtimeMs: number; filePath: string } | null;
 }
 
 export interface ColdStartPreloadSummary {
@@ -91,6 +99,13 @@ export interface ColdStartPreloadSummary {
    * reason rides here so the header pill can render "context:
    * failed (no-label)". null on success. */
   failure_reason: string | null;
+  /** Phase 4 of LEX-STANDALONE-SUPERVISION: count of siblings whose
+   * freshest source was a HANDOVER-*.md doc rather than the row's
+   * last_summary_ms column. Surfaces in the preload event log so
+   * the dashboard panel can show "context: 2 siblings (1 handover)".
+   * Always 0 when findHandover is not wired or no handover docs
+   * exist for the surfaced rows. */
+  handover_sourced_count?: number;
 }
 
 const TOP_N_DEFAULT = 2;
@@ -214,10 +229,31 @@ export async function preloadColdStartSiblings(
 
   let maxDistilledMs: number | null = null;
   let turns = 0;
+  let handoverSourced = 0;
+  /* Phase 4 of LEX-STANDALONE-SUPERVISION (2026-05-24): prefer the
+   * freshest HANDOVER doc when its mtime beats the row's
+   * last_summary_ms. The cold + day-cap grooming passes write the
+   * handover; mid-session freshness lives there even when the row's
+   * last_summary column has not been refreshed yet. Defaults to
+   * findLatestHandover + fs.statSync; tests inject the lookup. */
+  const findHandover = input.findHandover ?? defaultFindHandover;
   for (const row of surfaced) {
-    if (row.last_summary_ms && row.last_summary_ms > 0) {
-      if (maxDistilledMs === null || row.last_summary_ms > maxDistilledMs) {
-        maxDistilledMs = row.last_summary_ms;
+    const summaryMs =
+      row.last_summary_ms && row.last_summary_ms > 0 ? row.last_summary_ms : 0;
+    let effectiveMs = summaryMs;
+    try {
+      const ho = findHandover(row.id);
+      if (ho && ho.mtimeMs > effectiveMs) {
+        effectiveMs = ho.mtimeMs;
+        handoverSourced += 1;
+      }
+    } catch {
+      /* observational; missing handover dir or stat failure must not
+       * block the preload */
+    }
+    if (effectiveMs > 0) {
+      if (maxDistilledMs === null || effectiveMs > maxDistilledMs) {
+        maxDistilledMs = effectiveMs;
       }
     }
     try {
@@ -228,7 +264,21 @@ export async function preloadColdStartSiblings(
   }
   out.last_distilled_ms = maxDistilledMs;
   out.recent_turns_appended = turns;
+  out.handover_sourced_count = handoverSourced;
   return out;
+}
+
+function defaultFindHandover(
+  brainstormId: string,
+): { mtimeMs: number; filePath: string } | null {
+  const latest = findLatestHandover(brainstormId);
+  if (!latest) return null;
+  try {
+    const stat = fs.statSync(latest.filePath);
+    return { mtimeMs: stat.mtimeMs, filePath: latest.filePath };
+  } catch {
+    return null;
+  }
 }
 
 /* Format the first-turn preamble Lex prints verbatim on its first
