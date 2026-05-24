@@ -751,6 +751,34 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     if (!isPreToolAck && state.pendingUserUtterances.length > 0) {
       flushPendingUtterances();
     }
+    /* Phase 3 of LEX-STANDALONE-SUPERVISION (2026-05-24): flip
+     * lifecycle_state back to idle (or attached when a worker is
+     * bound) on the matching end_turn record so the idle-watcher
+     * starts counting silence again. Pre-tool acks stay in speaking
+     * because Lex is still mid-turn. Best-effort lookup; the row may
+     * have been archived by an unrelated path. */
+    if (!isPreToolAck) {
+      try {
+        const handle = state.bindKey
+          ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
+          : null;
+        const bs =
+          (handle?.sessionId && getBrainstormByClaudeSessionId(handle.sessionId)) ||
+          (handle?.ptyId && getBrainstormByPty(handle.ptyId)) ||
+          null;
+        if (bs && bs.lifecycle_state === 'speaking') {
+          const post = getStore().db.getBrainstorm(bs.id);
+          const nextLifecycle = post?.attached_worker_session_id
+            ? 'attached'
+            : 'idle';
+          getStore().db.updateBrainstorm(bs.id, {
+            lifecycle_state: nextLifecycle,
+          });
+        }
+      } catch {
+        /* observational */
+      }
+    }
     /* Always tell the client the response text, regardless of mode.
      * The panel renders it on screen. Notes-only mode skips the TTS
      * synth so Lex stays silent (the user is dictating, doesn't want
@@ -1181,8 +1209,14 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         `[voice-ws] direct-llm user chunk insert failed: ${(err as Error).message}`,
       );
     }
-    /* Step 2: assemble messages + call LLM. */
-    store.db.updateBrainstorm(bsId, { lifecycle_state: 'speaking' });
+    /* Step 2: assemble messages + call LLM. Stamps last_user_utterance
+     * _at (Phase 3 of LEX-STANDALONE-SUPERVISION) so the idle-watcher
+     * resets the silence baseline on every user turn. Combined with
+     * lifecycle_state='speaking' the row is fully marked active. */
+    store.db.updateBrainstorm(bsId, {
+      lifecycle_state: 'speaking',
+      last_user_utterance_at: new Date().toISOString(),
+    });
     try {
       const sysVersion = buildLexSystemPromptVersioned({ mode: state.mode });
       const snapshot = buildVoiceSnapshot({ activeBrainstormCwd: bs.cwd ?? null });
@@ -1828,6 +1862,29 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     state.partialChain = [];
     send({ t: 'injected' });
     state.awaitingResponseSince = Date.now();
+    /* Phase 3 of LEX-STANDALONE-SUPERVISION (2026-05-24): stamp the
+     * brainstorm row so the idle-watcher resets its silence baseline
+     * and the row reflects "speaking" lifecycle. Best-effort lookup
+     * via the bound handle's session id; direct-llm path stamps in
+     * handleDirectLlmUtterance. handleJsonlLine flips lifecycle_state
+     * back to idle/attached on the matching end_turn record. */
+    try {
+      const handle = state.bindKey
+        ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
+        : null;
+      const bs =
+        (handle?.sessionId && getBrainstormByClaudeSessionId(handle.sessionId)) ||
+        (handle?.ptyId && getBrainstormByPty(handle.ptyId)) ||
+        null;
+      if (bs) {
+        getStore().db.updateBrainstorm(bs.id, {
+          lifecycle_state: 'speaking',
+          last_user_utterance_at: new Date().toISOString(),
+        });
+      }
+    } catch {
+      /* observational; never block the turn */
+    }
     startJsonlWatch();
   }
 
