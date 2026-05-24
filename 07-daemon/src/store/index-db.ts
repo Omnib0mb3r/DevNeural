@@ -89,6 +89,22 @@ export interface BrainstormSessionRow {
   runtime_mode?: 'cc-pty' | 'direct-llm' | 'detached';
   lifecycle_state?: 'idle' | 'attached' | 'speaking' | 'ended';
   attached_worker_session_id?: string | null;
+  /* Lex standalone supervision (2026-05-24, migration 035).
+   * See docs/spec/LEX-STANDALONE-SUPERVISION.md.
+   *
+   * last_user_utterance_at  ISO timestamp of the most recent user
+   *                         turn in this brainstorm. Voice WS updates
+   *                         it per turn; idle-watcher subtracts it
+   *                         from now() to decide which grooming
+   *                         threshold (5/20/60 min, 6h) to fire.
+   * last_grooming_pass_at   ISO timestamp of the most recent
+   *                         completed grooming pass.
+   * last_grooming_kind      Which pass kind ran most recently.
+   *                         Surfaces in the dashboard idle-activity
+   *                         panel. */
+  last_user_utterance_at?: string | null;
+  last_grooming_pass_at?: string | null;
+  last_grooming_kind?: 'light' | 'mid' | 'cold' | 'day-cap' | null;
 }
 
 /* Brainstorm-as-durable-primary-entity (2026-05-22, migration 034).
