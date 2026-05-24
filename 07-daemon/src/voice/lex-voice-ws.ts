@@ -179,6 +179,16 @@ interface ConnState {
     started_at_ms: number;
     cancelled_at_ms: number;
   }>;
+  /* Fix 20 (2026-05-23) mid-tool-use utterance queue.
+   * When the user speaks while Lex is mid-turn (e.g. mid-tool-use)
+   * with NO active TTS, the new utterance is deferred instead of
+   * injected. handleUtteranceEnd pushes the cleaned transcript here;
+   * handleJsonlLine flushes the queue as one combined inject the
+   * instant awaitingResponseSince clears (i.e. Lex's end_turn lands).
+   * That preserves Lex's in-flight tool sequence while still letting
+   * the user "stack" follow-on context that gets delivered cleanly
+   * at the next natural turn boundary. */
+  pendingUserUtterances: string[];
   /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
    * Set when a hello frame carries a brainstorm_id and the resolved
    * brainstorm has runtime_mode='direct-llm'. Drives the dispatch
@@ -376,6 +386,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     currentTtsText: null,
     currentTtsStartedAtMs: 0,
     partialChain: [],
+    pendingUserUtterances: [],
     brainstormId: null,
     runtimeMode: null,
   };
@@ -732,6 +743,13 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * jsonl line cannot double-speak. */
     for (const h of decision.new_hashes) spokenSegmentHashes.add(h);
     if (!isPreToolAck) state.awaitingResponseSince = 0;
+    /* Fix 20 (2026-05-23): flush any utterances queued during
+     * Lex's mid-turn-no-tts window the instant the end_turn lands.
+     * Pre-tool acks are intentionally NOT a flush point — they're
+     * mid-tool-use markers, not turn boundaries. */
+    if (!isPreToolAck && state.pendingUserUtterances.length > 0) {
+      flushPendingUtterances();
+    }
     /* Always tell the client the response text, regardless of mode.
      * The panel renders it on screen. Notes-only mode skips the TTS
      * synth so Lex stays silent (the user is dictating, doesn't want
@@ -1259,7 +1277,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * unconditionally calls this so no race between dashboard heal
    * loops and incoming PCM can leave Lex talking over the user.
    *
-   * Steps, in order:
+   * Steps, in order, ALL gated on ttsActive being non-null:
    *   1. Stop piper streaming (kill child process). The 'end' handler
    *      sees `cancelled=true` and stays silent; the 'data' handler
    *      drops any tail chunks already in the kernel pipe buffer.
@@ -1268,10 +1286,22 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    *      AudioBufferSourceNodes plus any binary chunks in flight.
    *   3. Send Ctrl+C to the bound Claude Code PTY so the worker
    *      aborts whatever assistant turn it was mid-generation on.
-   *      Idempotent on idle workers.
    *
-   * Per user direction: "No state check, no gating - utterance-
-   * start always kills." */
+   * Fix 20 (2026-05-23): step 3 used to be unconditional. The prior
+   * "No state check, no gating - utterance-start always kills"
+   * directive was revised because it killed Lex mid-tool-use whenever
+   * the user spoke while Lex was reasoning silently (no TTS in
+   * flight). Repro from FIXES.md row 20: user dispatched a worker
+   * task, then spoke again to add context; the second utterance
+   * fired a PTY Ctrl+C against Lex's still-running tool sequence
+   * and Lex lost mid-flight state.
+   *
+   * New rule: PTY Ctrl+C only fires when TTS was actually playing.
+   * Mid-reasoning, mid-tool-use, or idle: no abort. The mid-tool-use
+   * utterance is instead queued via state.pendingUserUtterances in
+   * handleUtteranceEnd and dispatched at the next natural turn
+   * boundary (when handleJsonlLine clears awaitingResponseSince on
+   * the end_turn record). */
   function killActiveTts(reason: 'utterance-start' | 'barge-in'): void {
     const ctx = state.ttsActive;
     if (ctx) {
@@ -1298,17 +1328,63 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       }
       state.currentTtsText = null;
       state.currentTtsStartedAtMs = 0;
-    }
-    if (state.bindKey) {
-      const handle = getPty(state.bindKey) || getPtyBySession(state.bindKey);
-      if (handle && !handle.exited) {
-        try {
-          handle.pty.write('\x03');
-        } catch {
-          /* ignore */
+      /* Step 3, gated: only abort the PTY turn when TTS was actually
+       * in flight. The user is interrupting Lex's spoken reply; the
+       * worker should drop the rest of the turn. When TTS is null
+       * we DO NOT abort because the user may be stacking follow-on
+       * context onto an in-flight reasoning/tool sequence (handled
+       * in handleUtteranceEnd via pendingUserUtterances). */
+      if (state.bindKey) {
+        const handle = getPty(state.bindKey) || getPtyBySession(state.bindKey);
+        if (handle && !handle.exited) {
+          try {
+            handle.pty.write('\x03');
+          } catch {
+            /* ignore */
+          }
         }
       }
     }
+  }
+
+  /* Fix 20 (2026-05-23): flush queued mid-turn-no-tts utterances at
+   * the next natural turn boundary. Called from handleJsonlLine when
+   * Lex's end_turn record lands (i.e. awaitingResponseSince has just
+   * been cleared) AND pendingUserUtterances has at least one entry.
+   *
+   * Construction is intentionally minimal compared to the live
+   * handleUtteranceEnd path: snapshot/gate/partial-chain are skipped
+   * because (a) the queued utterances arrived close in time so the
+   * original turn's snapshot is still fresh and (b) the queue
+   * marker itself tells Lex that these are deferred follow-ons, not
+   * the start of a new conversation. Voice tag is preserved so Lex's
+   * conversational voice contract still applies. */
+  function flushPendingUtterances(): void {
+    if (state.pendingUserUtterances.length === 0) return;
+    if (!state.bindKey) return;
+    const queued = state.pendingUserUtterances.slice();
+    state.pendingUserUtterances = [];
+    const header =
+      queued.length === 1
+        ? '[voice-context: queued-mid-turn-utterance] The user spoke this while you were mid-turn; it was held until your turn boundary.\n\n'
+        : `[voice-context: queued-mid-turn-utterances (${queued.length})] The user spoke these follow-on utterances while you were mid-turn. They were held until your turn boundary; treat as one combined message:\n\n${queued.map((t, i) => `${i + 1}. ${t}`).join('\n')}\n\n`;
+    const body =
+      queued.length === 1 ? `${header}${queued[0]}` : header;
+    const voiceTag =
+      state.mode === 'notes'
+        ? '[voice mode: notes, silent reply, capture as artifact] '
+        : '[voice mode] ';
+    const ir = ptyInject(state.bindKey, body + voiceTag, true);
+    if (!ir.ok) {
+      send({ t: 'error', code: 'inject', message: `flush-mid-turn-queue: ${ir.error}` });
+      state.pendingUserUtterances = queued.concat(state.pendingUserUtterances);
+      return;
+    }
+    console.log(
+      `[voice-ws] mid-turn-no-tts queue flush count=${queued.length}`,
+    );
+    send({ t: 'injected', source: 'mid-turn-queue-flush', count: queued.length });
+    state.awaitingResponseSince = Date.now();
   }
 
   /* Voice-command dispatch shared by the whisper-transcript path
@@ -1635,6 +1711,26 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         code: 'cc-feedback-prompt-active',
         message:
           'Claude Code system prompt is open in the terminal. Voice injection paused; answer the prompt in the terminal or wait for it to dismiss.',
+      });
+      return;
+    }
+    /* Fix 20 (2026-05-23): mid-turn-no-tts utterance queueing.
+     * If Lex is mid-turn (awaitingResponseSince > 0) and no TTS is
+     * playing, the user is stacking follow-on context onto an
+     * in-flight reasoning / tool sequence. Don't inject mid-stream;
+     * push into the pending queue and let handleJsonlLine flush it
+     * the moment Lex's end_turn lands. The TTS-active case is a
+     * "barge over Lex's reply" and is already handled by
+     * killActiveTts (PTY Ctrl+C + tts-cancel + partialChain). */
+    if (state.awaitingResponseSince > 0 && !state.ttsActive) {
+      state.pendingUserUtterances.push(result.text);
+      console.log(
+        `[voice-ws] mid-turn-no-tts queue push depth=${state.pendingUserUtterances.length} text=${JSON.stringify(result.text.slice(0, 80))}`,
+      );
+      send({
+        t: 'queued-mid-turn',
+        text: result.text,
+        queue_depth: state.pendingUserUtterances.length,
       });
       return;
     }
