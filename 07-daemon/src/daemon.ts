@@ -447,6 +447,80 @@ async function main(): Promise<void> {
     );
   }
 
+  /* Phase 5 wire-up of docs/spec/LEX-STANDALONE-SUPERVISION.md.
+   * Boots the idle-watcher with the production grooming deps so
+   * standalone brainstorms get light/mid/cold/day-cap passes on
+   * the spec-defined cadence (5/20/60 min, 6h).
+   *
+   * Generator: createLlmDistillationGenerator against the active
+   * provider (ollama by default). Honors BF-4 = no anthropic for
+   * brainstorm content.
+   *
+   * writeHandover: real disk writer at <DATA_ROOT>/brainstorms/<id>/.
+   *
+   * runFinalDistillation: the day-cap pass flips lifecycle_state=
+   * ended via grooming.ts step 3, then delegates here. We re-enter
+   * runSessionEndPipeline so day-cap, voice "end session", PTY exit,
+   * and admin redistill all share the same code path per spec
+   * section D. markEnded=true is the default behavior of
+   * runSessionEndPipeline; grooming's status flip is idempotent
+   * because the canonical pipeline only updates ended_ms when it
+   * was previously null.
+   *
+   * Cadence configurable via DEVNEURAL_IDLE_WATCHER_INTERVAL_MS;
+   * default 60s per startIdleWatcher.DEFAULT_IDLE_WATCHER_INTERVAL_
+   * MS. Set to 0 to disable (e.g. on dev boxes where the LLM is
+   * cold). */
+  try {
+    const idleIntervalRaw = Number(
+      process.env.DEVNEURAL_IDLE_WATCHER_INTERVAL_MS ?? NaN,
+    );
+    if (idleIntervalRaw === 0) {
+      logger('idle-watcher: disabled via DEVNEURAL_IDLE_WATCHER_INTERVAL_MS=0');
+    } else {
+      const { startIdleWatcher } = await import('./lex/idle-watcher.js');
+      const { createLlmDistillationGenerator } = await import(
+        './lex/distillation-generator.js'
+      );
+      const { writeHandover } = await import('./lex/handover-writer.js');
+      const { runSessionEndPipeline } = await import(
+        './lex/session-end-pipeline.js'
+      );
+      const generator = createLlmDistillationGenerator({
+        db: store.db,
+        log: logger,
+      });
+      startIdleWatcher({
+        db: store.db,
+        generator,
+        writeHandover,
+        runFinalDistillation: async (brainstormId: string) => {
+          const row = store.db.getBrainstorm(brainstormId);
+          if (!row) return;
+          await runSessionEndPipeline(
+            store,
+            {
+              brainstormId,
+              claudeSessionId: row.claude_session_id ?? null,
+              mode: row.mode ?? 'conversation',
+              reason: 'idle-watcher-day-cap',
+            },
+            logger,
+          );
+        },
+        log: logger,
+        intervalMs: Number.isFinite(idleIntervalRaw)
+          ? idleIntervalRaw
+          : undefined,
+      });
+      logger(
+        `idle-watcher: started intervalMs=${Number.isFinite(idleIntervalRaw) ? idleIntervalRaw : 'default(60000)'}`,
+      );
+    }
+  } catch (err) {
+    logger(`idle-watcher bootstrap failed: ${(err as Error).message}`);
+  }
+
   /* Smart-compact scheduler. Walks every live project_session anchor,
    * runs evaluateSmartCompact, and fires the resulting fire/wrap
    * through fireSmartCompact. Global toggle
