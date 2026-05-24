@@ -74,7 +74,7 @@ Claude Code session(s)
               └──────────────────────────────────────┘
 ```
 
-Every component talks to the daemon over HTTP/WS on `:3747`. The daemon owns SQLite, the vector store, the wiki, the Claude PTYs, the voice loop, and the hook fan-in.
+Most components talk to the daemon over HTTP/WS on `:3747`. The exception is the hook path: `hook-runner` writes observations to disk (`<dataRoot>/projects/<id>/observations.jsonl`) and best-effort pokes the daemon via OS signal (`SIGUSR1` on POSIX). The disk-write is the contract; the signal is a latency optimization. The daemon still owns SQLite, the vector store, the wiki, the Claude PTYs, the voice loop, and the hook fan-in.
 
 ---
 
@@ -96,7 +96,9 @@ Without semantics: a junk drawer of insights nobody can find. Without logic: a v
 
 Claude Code hooks are registered for: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`, `Notification`. All four route through `07-daemon/scripts/silent-shim/bin/silent-shim.exe` so they never flash a console window on Windows. The shim wraps the actual hook script (`07-daemon/dist/capture/hooks/hook-runner.js`).
 
-`hook-runner.js` writes one observation per event into `<dataRoot>/projects/<id>/observations.jsonl` and emits a `SIGUSR1` to the running daemon every N events so the auto-ingest signal coalescer can fire near-instant.
+`hook-runner.js` writes one observation per event into `<dataRoot>/projects/<id>/observations.jsonl`. Every `DEVNEURAL_HOOK_SIGNAL_EVERY` events (default in `hook-runner.ts`) it best-effort emits a `SIGUSR1` to the running daemon so the auto-ingest signal coalescer fires near-instant.
+
+The signal path is best-effort by design. On Windows, cross-process named signals are not supported by Node; the `process.kill(pid, 'SIGUSR1')` call is wrapped in `try/catch` and silently no-ops when the kernel rejects it. When the signal fails to land, the periodic auto-ingest interval (5 min default, section 5.1) is the workhorse. Treat real-time ingest as a Linux/macOS-only optimization until a portable IPC replacement lands.
 
 ### 3.2 Transcript watcher
 
@@ -119,6 +121,8 @@ Why: a 20-line assistant turn (intro text + tool_use + tool_result + final text)
 Backstops:
 - 8000-char merged-text cap forces a flush mid-turn for runaway monologues
 - Across-batch turn split: when the watcher polls mid-turn, the two halves end up adjacent (rare, acceptable)
+
+**Known limitation:** both backstops produce two adjacent vectors with no foreign-key link between them. At search time the second half can surface without the first if cosine only matches the tail content. Rare in practice (most turns are <8000 chars and most watcher cycles flush turn boundaries cleanly) but the fragmentation is real and the spec calls it out so a future change can address it (proposed: link-back metadata `prev_chunk_id` / `next_chunk_id` on flush boundaries).
 
 Per-line side effects (transcripts.jsonl append, observations, reinforcement signals, dashboard phase) STAY per-line. Only the vector chunk emission moved to per-turn.
 
@@ -144,7 +148,7 @@ Both needed. Neither sufficient alone.
 - `<dataRoot>/chroma/collections/<name>/.meta.jsonl` — one JSON line per vector
 - `<dataRoot>/chroma/collections/<name>/.head.json` — collection header
 
-Two collections: `raw_chunks` and `wiki_pages`. Both 384-dim (MiniLM-L6-v2 via `@xenova/transformers`).
+Three collections: `raw_chunks`, `wiki_pages`, and `reference_chunks`. All 384-dim (MiniLM-L6-v2 via `@xenova/transformers`). `reference_chunks` holds embedded chunks of uploaded docs (PDF, manuals, audio/video transcripts) processed by `07-daemon/src/reference/`; metadata mirrors into the `reference_chunks_meta` SQLite table and the chunks surface in retrieval under the `reference` source class (section 8.2).
 
 Search is dot-product on normalized vectors. `search(query, {topK, filter, minScore})` allows metadata filters such as `project_id`, `session_id`. Filtering happens in-memory after the cosine scan.
 
@@ -217,7 +221,11 @@ Pass-2 input ≤8K tokens, output ≤2K tokens.
 
 ### 5.4 Cross-project verifier
 
-When an existing page first gains evidence from a NEW project (`fm.projects.length` goes 1 → 2), a cheap LLM verification call asks "given the existing trigger+insight+pattern, does this new evidence describe the SAME recurring pattern, or just share vocabulary?" Strict JSON `{"same_pattern": boolean}`. Failing closed sets `flag_for_review: true` so unrelated patterns don't silently fuse. Commit `d9e80da`.
+When an applied page update would push `fm.projects.length` to `>= 3` distinct project slugs (the domain-distance gate; see CP-1 in `docs/spec/PHASE-TWO-IMPLEMENTATION.md` Q-4 verifications) AND the update carries new evidence, a cheap LLM verification call asks "given the existing trigger+insight+pattern, does this new evidence describe the SAME recurring pattern, or just share vocabulary?" Strict JSON `{"same_pattern": boolean}`.
+
+**Order of operations** (`07-daemon/src/wiki/ingest.ts` around line 380): Pass 2 produces a `page_updates` entry. The verifier runs on the in-memory `updated` object BEFORE the page is rewritten to disk. If the verifier rejects, `flag_for_review: true` is set on the in-memory object and a log line is appended; the disk write then captures the flag. Verifier exceptions are logged and the update is allowed (open-fail on verifier outage; the flag would have been the only outcome anyway).
+
+Voice-session-derived pages (those with non-empty `source_brainstorms` or `source_meetings`) skip the verifier entirely and are flagged for human review via the lint loop instead (BF-4 + CP-3). The verifier is an outbound LLM call and voice content stays local-only.
 
 ### 5.5 Brainstorm-source weight bump
 
@@ -225,7 +233,7 @@ When `writeNewPendingPage()` detects the source project's cwd matches `isBrainst
 
 ### 5.6 Side effects after a successful ingest
 
-1. Page written to `wiki/pending/` or `wiki/canonical/`
+1. Page written to `wiki/pending/` or `wiki/pages/` (canonical)
 2. Embedded into `wiki_pages` collection (title + summary + pattern slice)
 3. Upserted into `wiki_pages_meta` SQLite
 4. `commitWiki("ingest <source>")` git-commits the wiki dir
@@ -277,7 +285,7 @@ Lint NEVER auto-applies destructive changes to `human_edited: true` pages. Only 
 `07-daemon/src/reinforcement/index.ts`:
 
 - **Hit:** Curator injects a wiki page at UserPromptSubmit. Transcript watcher's next assistant reply gets cosine-matched against the page's summary. If cosine >= 0.65, `hits += 1` and `weight += (1 - weight) * 0.05`. Pending pages with a hit are promoted to canonical immediately.
-- **Correction:** User's next message is regex-matched against `\bno\b`, `\bactually\b`, `\bwrong\b`, `\bnot what i\b`, etc. On match, `corrections += 1` and `weight -= weight * 0.10`. Page is blacklisted from re-injection in this session. Pages with `corrections >= 3` AND `weight < 0.15` move to archive.
+- **Correction:** User's next message is regex-matched against a tightened set of correction patterns in `07-daemon/src/reinforcement/index.ts` (`CORRECTION_PATTERNS`). Patterns require either sentence-initial position (`^\s*no[,.\s—-]`, `^\s*actually[,.\s]`) or explicit corrective phrase shapes (`that's (wrong|incorrect|not (right|what|true))`, `not what i (asked|wanted|meant|said)`, `you got (it|this|that) wrong`, `revert that`, `undo that`, `do it the other way`, `stop doing that`). Bare-word matches (`\bno\b`, `\bactually\b`, `\bwrong\b`, `\binstead\b`) were retired because they produced catastrophic false positives on natural English ("no problem", "actually that's a great point", "use X instead of Y") and one false positive blacklists the page for the rest of the session. On match, `corrections += 1` and `weight -= weight * 0.10`. Page is blacklisted from re-injection in this session. Pages with `corrections >= 3` AND `weight < 0.15` move to archive.
 - **Raw-hit:** When a raw_chunk (not a wiki page) was the curator's pick and the assistant reply matches it, the chunk is queued for a wiki ingest pass so the pattern can crystallize into a page.
 
 ### 7.2 Decay scheduler
@@ -364,6 +372,12 @@ Lex is the always-available coworker that lives on top of every active worker se
 Voice mode is set on `hello` and changeable mid-session via `set-mode`.
 
 ### 10.3 Voice loop
+
+A brainstorm row has a `runtime_mode` column (`cc-pty`, `direct-llm`, or `detached`; default `cc-pty`). The voice WS dispatches on this column at `hello` time:
+
+- **`cc-pty`** (default): The classic path. The daemon owns a Lex PTY hosting a `claude` CLI; voice WS injects transcript text into the PTY stdin and watches the Lex jsonl for the matching assistant turn. PTY output drives TTS.
+- **`direct-llm`**: No PTY, no jsonl watcher. `voice/lex-voice-ws.ts` calls `callVoiceChat()` (`07-daemon/src/llm/voice-chat.ts`) directly against the local ollama provider. User chunks and assistant chunks are persisted to `raw_chunks` by the voice WS itself, tagged with `model_id: 'voice-direct-llm'` so retrieval can distinguish them. Anthropic is hard-blocked here (BF-4) because brainstorm content must stay local.
+- **`detached`**: Worker session attached to a brainstorm row without a live voice loop (used by `/08-dashboard` worker attach/detach routes).
 
 `07-daemon/src/voice/lex-voice-ws.ts`. WebSocket protocol:
 
@@ -467,7 +481,9 @@ The mode tag is the durable marker that this chunk came from a meeting recording
 
 ### 12.1 Dashboard
 
-`08-dashboard/`. Next.js 15 + Tailwind v4 + Tanstack Query. PIN auth on first launch. Statically exported to `out/`; the daemon serves the build at `:3747`. PWA-installable on phones.
+`08-dashboard/`. Next.js 15 + Tailwind v4 + Tanstack Query. Statically exported to `out/`; the daemon serves the build at `:3747`. PWA-installable on phones.
+
+**Auth model:** none at the HTTP layer. The earlier PIN concept was removed (the file `07-daemon/src/dashboard/auth-secret.ts` retains only an HMAC secret used for internal cross-process token signing, not for first-access auth). The sole trust boundary is host-binding: by default the daemon binds `0.0.0.0` so a Tailscale-connected device on the user's tailnet can reach it, with the implicit assumption that the tailnet ACL is the gate. Override with `DEVNEURAL_BIND=127.0.0.1` to lock down to loopback. Operator owns the trade-off; see section 15.
 
 Major surfaces:
 - `/sessions` — live + recent CC sessions, terminal mirror, prompt injection (via 09-bridge or daemon-PTY), Stream Deck rail, pending-prompt resolver
@@ -548,23 +564,25 @@ Wiki has its own off-site git push (`startWikiPushInterval` at `daemon.ts:600`),
 DevNeural is a **personal** second brain on a **personal** machine accessed over **Tailscale** (private mesh, WireGuard-encrypted by default). Threats considered:
 - Local disk loss → daily backup pipeline + weekly off-site rotation
 - Accidental secret capture in transcripts → `secret-scrub.ts` regex defense at watcher boundary
-- Browser session hijack → PIN auth on dashboard, Tailscale ACLs limit who can reach `:3747` at all
+- Browser-side prompt injection of cookies / cross-session tokens → HMAC-derived per-request tokens from the secret in `auth-secret.ts`
 - LLM exfiltration of secrets via assistant output → user's global `CLAUDE.md` rules, plus `secret-scrub` on captured assistant output before storage
 
 Threats NOT in scope (by design, single-user personal install):
 - Multi-tenant access control, OAuth, JWT — overkill for a personal Tailnet
 - HTTPS cert validation beyond what Tailscale Serve provides — Tailscale traffic is encrypted regardless of HTTP/HTTPS layer
-- Malicious-actor models on the local network — assumed not present on a personal Tailnet
+- Malicious-actor models on the local network — assumed not present. **Caveat:** the daemon binds `0.0.0.0` by default (so Tailscale can reach it). On any network where untrusted hosts share the LAN, the operator must set `DEVNEURAL_BIND=127.0.0.1` and rely on Tailscale Serve for remote access. The spec does not enforce this; it is an operator responsibility.
+- Tailscale node-sharing with external users — sharing one node grants that user the same unauthenticated dashboard access the operator has. If shares happen, operator must layer auth (e.g. front the daemon with `caddy` + basic auth or move to a future PIN/passkey iteration).
 
 ### 15.2 Defense layers
 
 | Layer | What | Where |
 |---|---|---|
-| Capture-side scrub | Regex match against API-key shapes, env var assignments, JWTs | `07-daemon/src/capture/secret-scrub.ts` |
+| Capture-side scrub | Regex match against API-key shapes, env var assignments, JWTs (transcript-watcher boundary only; voice-transcript scrubbing is not currently wired) | `07-daemon/src/capture/secret-scrub.ts` |
 | LLM-behavior scrub | User's `~/.claude/CLAUDE.md` global rules forbid printing secrets | User-managed |
-| Dashboard auth | PIN auth on first launch; cookie-bound session | `07-daemon/src/dashboard/auth.ts` |
-| Network | Tailscale WireGuard encrypted transport | OS-level |
-| Backup | Atomic SQLite capture; manifest checksums; OneDrive at-rest encryption | `scripts/backup.ps1` + cloud provider |
+| HTTP host-binding | `0.0.0.0` by default for Tailscale reachability; override `DEVNEURAL_BIND=127.0.0.1` for loopback-only | `07-daemon/src/daemon.ts` listen call |
+| Internal HMAC | Secret-signed tokens for cross-session prompt-injection flow | `07-daemon/src/dashboard/auth-secret.ts` |
+| Network | Tailscale WireGuard encrypted transport (when used) | OS-level |
+| Backup | Atomic SQLite capture; manifest checksums; cloud-provider-held-key at-rest encryption when using OneDrive (not zero-knowledge) | `scripts/backup.ps1` + cloud provider |
 | Wiki content | DEVNEURAL.md rule 7.6 forbids LLM from writing secrets/confidential client work | LLM system prompt |
 
 ---
@@ -577,6 +595,7 @@ Daemon reads at start. All optional.
 |---|---|---|
 | `DEVNEURAL_DATA_ROOT` | `C:/dev/data/skill-connections` | Where wiki, vector store, SQLite, session-state live |
 | `DEVNEURAL_PORT` | `3747` | Daemon HTTP/WS bind port |
+| `DEVNEURAL_BIND` | `0.0.0.0` | Daemon HTTP/WS bind address. Default exposes the daemon on every local interface (intentional, for Tailscale). Set to `127.0.0.1` to lock to loopback. |
 | `DEVNEURAL_LLM_PROVIDER` | `ollama` | `ollama`, `anthropic`, or `none` |
 | `DEVNEURAL_AUTO_INGEST_INTERVAL_MS` | `300000` (5 min) | Periodic wiki auto-ingest cadence |
 | `DEVNEURAL_AUTO_INGEST_MIN` | `600` | Minimum bytes of new transcript before periodic ingest fires |
