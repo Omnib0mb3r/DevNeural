@@ -3500,6 +3500,49 @@ export async function registerDashboardRoutes(
     return { ok: true, brainstorm: decorateBrainstorm(row) };
   });
 
+  /* Admin redistill (Fix 2026-05-24): re-run the distillation flush
+   * (steps 1-7 of the session-end pipeline minus the status flip) on
+   * an existing brainstorm row. Used to retro-fill last_summary for
+   * sessions that ended before the cc-pty last_summary write landed,
+   * per docs/bugs/2026-05-24-cold-start-preload-stale-distillation.md.
+   *
+   * markEnded=false so an already-ended brainstorm stays ended and a
+   * still-live one is not prematurely archived. Best-effort; reports
+   * the SessionEndResult so the caller can see drafts_created,
+   * summary_written, and skip reasons. */
+  app.post('/brainstorms/:id/redistill', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.getBrainstorm(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'brainstorm not found' };
+    }
+    const { runDistillationFlush } = await import(
+      '../lex/session-end-pipeline.js'
+    );
+    try {
+      const result = await runDistillationFlush(
+        store,
+        {
+          brainstormId: id,
+          claudeSessionId: row.claude_session_id ?? null,
+          mode: row.mode ?? 'conversation',
+          reason: 'admin-redistill',
+        },
+        log,
+      );
+      const refreshed = store.db.getBrainstorm(id);
+      return {
+        ok: true,
+        result,
+        brainstorm: refreshed ? decorateBrainstorm(refreshed) : null,
+      };
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, error: (err as Error).message };
+    }
+  });
+
   /* Wave 3 fixup (bug: 2026-05-10-brainstorm-picker-and-transcripts).
    * Return the brainstorm_chunks rows for a session so the dashboard can
    * render the text transcript alongside the audio player. limit is

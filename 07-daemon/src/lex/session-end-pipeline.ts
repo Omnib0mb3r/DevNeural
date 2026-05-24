@@ -49,6 +49,7 @@ import { updateSummary, readSummary } from '../curation/session-summarizer.js';
 import { listProjects } from '../identity/registry.js';
 import { withSessionEndLock } from './session-end-lock.js';
 import { distillBrainstorm } from './brainstorm-distillation.js';
+import { createLlmDistillationGenerator } from './distillation-generator.js';
 import { gpuQueue } from '../gpu/queue.js';
 import {
   finalize as finalizeAudioBundle,
@@ -225,44 +226,18 @@ async function runOrderedPipeline(
    * downstream steps that strictly require a CC session bail
    * gracefully below. */
   if (!input.claudeSessionId) {
-    /* direct-llm path: no CC session, so the steps that need a
-     * project id / raw_chunks / transcripts.jsonl tail cannot run.
-     * If this is a terminal end, flip status='ended'; if it is a
-     * distillation flush, leave the row alone so the brainstorm
-     * continues. Future work can build a direct-llm-specific
-     * distillation pass over brainstorm_chunks; for now the flush
-     * is a no-op on direct-llm brainstorms and the terminal end
-     * just marks the row. */
-    if (markEnded) {
-      try {
-        const existing = store.db.getBrainstorm(input.brainstormId);
-        if (existing && existing.status !== 'ended') {
-          store.db.updateBrainstorm(input.brainstormId, {
-            status: 'ended',
-            ended_ms: Date.now(),
-            lifecycle_state: 'ended',
-          });
-          log(
-            `[session-end] brainstorm=${input.brainstormId} direct-llm; row marked ended (no CC pipeline steps run)`,
-          );
-        }
-      } catch (err) {
-        log(
-          `[session-end] direct-llm row update failed: ${(err as Error).message}`,
-        );
-      }
-    } else {
-      log(
-        `[distillation-flush] brainstorm=${input.brainstormId} direct-llm; no CC session, nothing to flush`,
-      );
-    }
+    log(
+      `[session-end] brainstorm=${input.brainstormId} direct-llm; using brainstorm_chunks fallback`,
+    );
+    await runBrainstormChunksFallback(store, input, log, markEnded, out);
     return out;
   }
   const projectId = store.db.projectIdBySession(input.claudeSessionId);
   if (!projectId) {
     log(
-      `[session-end] brainstorm=${input.brainstormId} session=${input.claudeSessionId} no raw chunks; skipping pipeline`,
+      `[session-end] brainstorm=${input.brainstormId} session=${input.claudeSessionId} no raw chunks; using brainstorm_chunks fallback`,
     );
+    await runBrainstormChunksFallback(store, input, log, markEnded, out);
     return out;
   }
   const project = listProjects().find((p) => p.id === projectId);
@@ -465,6 +440,54 @@ async function runOrderedPipeline(
     log(`[session-end] distilled_at update failed: ${(err as Error).message}`);
   }
 
+  /* Step 7a (Fix 2026-05-24): Lex-side last_summary write.
+   *
+   * Additive append. The canonical pipeline above wrote a
+   * brainstorm-summary chunk into raw_chunks (step 6) but never
+   * touched brainstorm_sessions.last_summary, the column the
+   * cold-start sibling preload (sibling-distillation-preload.ts:85)
+   * reads to render the spawn-time preamble. Result: every cc-pty
+   * brainstorm with a registered project_session kept last_summary
+   * NULL forever, the preload fell back to the most recent older
+   * sibling that did have a value, and the preamble pinned to a
+   * stale distillation timestamp despite newer ended sessions.
+   * Bug: docs/bugs/2026-05-24-cold-start-preload-stale-distillation.md.
+   *
+   * Runs the same LLM generator + updateBrainstorm pair that the
+   * brainstorm_chunks fallback path below uses, so cc-pty and
+   * direct-llm/no-project-session brainstorms produce equivalent
+   * last_summary values via the same code path. Lex chunks land
+   * via lex-voice-ws.ts:823 (assistant-text) and brainstorm-jsonl-
+   * ingestor.ts on Lex's own claude_session_id regardless of
+   * attached_worker_session_id, so this generator has source
+   * material whether or not a worker is bound.
+   *
+   * Best-effort: any failure (no provider, BF-4 anthropic block,
+   * no chunks, validation throw) logs and leaves last_summary as
+   * NULL rather than blocking teardown. */
+  try {
+    const generator = createLlmDistillationGenerator({ db: store.db, log });
+    const refreshed = store.db.getBrainstorm(input.brainstormId);
+    if (refreshed) {
+      const lexSummary = await generator(refreshed);
+      if (lexSummary && lexSummary.trim().length > 0) {
+        store.db.updateBrainstorm(input.brainstormId, {
+          last_summary: lexSummary,
+          last_summary_ms: Date.now(),
+        });
+        log(
+          `[session-end] last_summary written chars=${lexSummary.length}`,
+        );
+      } else {
+        log(`[session-end] last_summary generator returned empty`);
+      }
+    }
+  } catch (err) {
+    log(
+      `[session-end] last_summary generation failed: ${(err as Error).message}`,
+    );
+  }
+
   /* Step 8: release lock. Handled automatically by withSessionEndLock's
    * finally branch on return. */
 
@@ -518,4 +541,162 @@ function recentTranscriptText(
   return chunks
     .map((c) => `${c.role === 'user' ? 'USER' : 'LEX'}: ${c.text}`)
     .join('\n\n');
+}
+
+/* brainstorm_chunks-backed session-end pipeline.
+ *
+ * Runs when the brainstorm row exists but the CC-session/project_session
+ * coupling needed by the canonical pipeline is missing. Covers two cases:
+ *   1. direct-llm brainstorms (no claude_session_id at all)
+ *   2. cc-pty brainstorms whose CC session never registered a
+ *      project_session row, so raw_chunks_meta stays empty
+ *
+ * Source of truth for both: brainstorm_chunks (populated by the
+ * brainstorm-jsonl-ingestor regardless of project indexing). Steps:
+ *   - terminal end? flip status='ended' + ended_ms + lifecycle_state
+ *   - distillBrainstorm against the chunks transcript -> wiki_drafts
+ *   - LLM summary via createLlmDistillationGenerator -> last_summary
+ *   - setBrainstormDistilledAt
+ *   - writeThreadDoc so the next Lex spawn has a pointer doc
+ *
+ * Skips raw_chunks-dependent steps (force-ingest, brainstorm-summary
+ * embed, gpu drain, audio finalise) because they all assume
+ * project_id + transcripts.jsonl + session_id keying that does not
+ * exist for brainstorm anchors. */
+async function runBrainstormChunksFallback(
+  store: Store,
+  input: SessionEndInput,
+  log: (msg: string) => void,
+  markEnded: boolean,
+  out: SessionEndResult,
+): Promise<void> {
+  const existing = store.db.getBrainstorm(input.brainstormId);
+  if (!existing) {
+    log(`[chunks-fallback] brainstorm=${input.brainstormId} row missing; nothing to do`);
+    return;
+  }
+
+  if (markEnded && existing.status !== 'ended') {
+    try {
+      store.db.updateBrainstorm(input.brainstormId, {
+        status: 'ended',
+        ended_ms: existing.ended_ms ?? Date.now(),
+        lifecycle_state: 'ended',
+      });
+      log(
+        `[chunks-fallback] brainstorm=${input.brainstormId} status='ended' flipped`,
+      );
+    } catch (err) {
+      log(
+        `[chunks-fallback] status flip failed: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  const chunks = store.db.listBrainstormChunks(input.brainstormId, 200);
+  if (chunks.length === 0) {
+    log(
+      `[chunks-fallback] brainstorm=${input.brainstormId} no brainstorm_chunks; skipping distill + summary`,
+    );
+    return;
+  }
+  const transcript = chunks
+    .map((c) => {
+      const role =
+        c.role === 'lex' ? 'LEX' : c.role === 'user' ? 'USER' : 'TOOL';
+      return `${role}: ${c.text}`;
+    })
+    .join('\n');
+
+  const kind = store.db.brainstormKind(input.brainstormId);
+  if (kind === 'meeting') {
+    out.drafts_skipped_reason = 'kind_meeting';
+    log(
+      `[chunks-fallback] distillation skipped: kind=meeting (BF-15)`,
+    );
+  } else {
+    try {
+      const distill = await distillBrainstorm(
+        store,
+        input.brainstormId,
+        transcript,
+        log,
+      );
+      out.drafts_created = distill.drafts_created;
+      if (distill.skipped_reason) {
+        out.drafts_skipped_reason = distill.skipped_reason;
+      }
+    } catch (err) {
+      log(
+        `[chunks-fallback] distillation failed: ${(err as Error).message}`,
+      );
+      out.drafts_skipped_reason = 'distillation_threw';
+    }
+  }
+
+  try {
+    const generator = createLlmDistillationGenerator({ db: store.db, log });
+    const refreshed = store.db.getBrainstorm(input.brainstormId);
+    if (refreshed) {
+      const summary = await generator(refreshed);
+      if (summary && summary.trim().length > 0) {
+        store.db.updateBrainstorm(input.brainstormId, {
+          last_summary: summary,
+          last_summary_ms: Date.now(),
+        });
+        out.summary_written = true;
+        log(
+          `[chunks-fallback] last_summary written chars=${summary.length}`,
+        );
+      } else {
+        log(`[chunks-fallback] summary generator returned empty`);
+      }
+    }
+  } catch (err) {
+    log(
+      `[chunks-fallback] summary generation failed: ${(err as Error).message}`,
+    );
+  }
+
+  try {
+    store.db.setBrainstormDistilledAt(
+      input.brainstormId,
+      new Date().toISOString(),
+    );
+  } catch (err) {
+    log(
+      `[chunks-fallback] distilled_at update failed: ${(err as Error).message}`,
+    );
+  }
+
+  try {
+    const row = store.db.getBrainstorm(input.brainstormId);
+    if (row) {
+      const docResult = await writeThreadDoc(
+        {
+          brainstormId: input.brainstormId,
+          mode: input.mode,
+          userLabel: row.user_label ?? null,
+          derivedLabel: row.derived_label ?? null,
+          summaryText: row.last_summary ?? null,
+          transcriptText: transcript.slice(0, 4000),
+          turnCount: row.turn_count ?? 0,
+          startedMs: row.started_ms ?? Date.now(),
+          endedMs: row.ended_ms ?? null,
+        },
+        log,
+      );
+      out.thread_doc_written = docResult.generated;
+      if (docResult.filePath) out.thread_doc_path = docResult.filePath;
+      if (docResult.generated) {
+        log(
+          `[chunks-fallback] thread doc written: ${docResult.filePath} (llm=${docResult.usedLlm})`,
+        );
+      }
+    }
+  } catch (err) {
+    log(
+      `[chunks-fallback] thread doc failed: ${(err as Error).message}`,
+    );
+  }
 }
