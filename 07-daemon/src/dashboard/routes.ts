@@ -4664,6 +4664,22 @@ export async function registerDashboardRoutes(
     };
   });
 
+  /* Lex standalone idle activity (Phase 5 of LSS).
+   *
+   * Surface for the "Standalone brainstorm idle activity" dashboard
+   * panel. Walks every brainstorm row whose lifecycle_state is
+   * 'idle' or 'attached', returns silence + pending grooming pass +
+   * last grooming kind/time so the panel can render one card per
+   * row. Pure read; no side effects. */
+  app.get('/lex/idle-activity', async () => {
+    const { listIdleActivity } = await import('../lex/idle-watcher.js');
+    return {
+      ok: true,
+      rows: listIdleActivity(store.db),
+      generated_at: new Date().toISOString(),
+    };
+  });
+
   /* Auto-advance supervisor toggle (autonomous supervisor phase 4).
    *
    * Three-state runtime kill-switch backing the auto-advance loop.

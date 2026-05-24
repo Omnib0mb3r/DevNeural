@@ -1738,6 +1738,29 @@ export const coldStartPreloadEvents = (
   >(`/lex/cold-start-preload/events${qs ? `?${qs}` : ""}`);
 };
 
+/* Phase 5 of LEX-STANDALONE-SUPERVISION: idle activity panel. The
+ * daemon exposes one row per brainstorm whose lifecycle_state is
+ * 'idle' or 'attached' with silence + pending grooming pass. */
+export type IdleActivityGroomingKind = 'light' | 'mid' | 'cold' | 'day-cap';
+
+export interface IdleActivityRow {
+  brainstormId: string;
+  user_label: string | null;
+  lifecycle_state: 'idle' | 'attached';
+  runtime_mode: 'cc-pty' | 'direct-llm' | 'detached' | null;
+  last_user_utterance_at: string | null;
+  last_grooming_pass_at: string | null;
+  last_grooming_kind: IdleActivityGroomingKind | null;
+  silence_ms: number;
+  baseline_ms: number;
+  pending_pass: IdleActivityGroomingKind | null;
+}
+
+export const idleActivity = () =>
+  request<{ ok: boolean; rows: IdleActivityRow[]; generated_at: string }>(
+    '/lex/idle-activity',
+  );
+
 export const uploadReference = (file: File, opts: { project_id?: string; tags?: string[] } = {}) => {
   const fd = new FormData();
   fd.append("file", file);

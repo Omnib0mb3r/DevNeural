@@ -8,6 +8,7 @@ import { SmartCompactPanel } from "@/components/SmartCompactPanel";
 import { LexColdStartPreloadPanel } from "@/components/LexColdStartPreloadPanel";
 import { AutoAdvanceModePanel } from "@/components/AutoAdvanceModePanel";
 import { VoiceDiagnosticsPanel } from "@/components/VoiceDiagnosticsPanel";
+import { StandaloneIdleActivityPanel } from "@/components/StandaloneIdleActivityPanel";
 
 export default function SystemPage() {
   return (
@@ -17,6 +18,7 @@ export default function SystemPage() {
         <SystemPanel />
         <PauseModeToggle />
         <VoiceDiagnosticsPanel />
+        <StandaloneIdleActivityPanel />
         <LexColdStartPreloadPanel />
         <PanicAuditPanel />
         <SmartCompactPanel />
