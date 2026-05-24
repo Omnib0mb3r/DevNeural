@@ -4,6 +4,9 @@
 
 | Date | Bug | Status | Severity |
 |------|-----|--------|----------|
+| 2026-05-22 | [Lex cannot see worker on cold start](./2026-05-22-lex-blind-to-worker-on-cold-start.md) | open | high |
+| 2026-05-22 | [TTS does not stop when user speaks (barge-in regression)](./2026-05-22-tts-bargein-regression.md) | open | high |
+| 2026-05-22 | [Worker discovery fails for VS-Code-launched claude](./2026-05-22-worker-discovery-both-launch-paths.md) | open | high |
 
 ## Recently closed
 

@@ -22,6 +22,15 @@ Last updated: 2026-05-13.
   - Cross-thread retrieval: bounded targeted retrieval across a thread so per-turn cost stays constant regardless of thread length.
 - Why: brainstorms are core artifact; arbitrary-length threads must stay cheap to load.
 
+### Supervision tunables in settings UI
+- All supervision rate limits and thresholds today are env-tunable or hard-coded; not in the dashboard. Surface in the settings page (likely a new `SupervisionSettingsPanel`):
+  - WorkerEventGate per-anchor hourly cap (today ~20/10min)
+  - Worker stall thresholds (`DEVNEURAL_STALL_TOOL_MS` default 5min, `DEVNEURAL_STALL_USER_MS` default 3min, stall cooldown)
+  - Expectation supervisor tick interval (default 90s, new from PLAN-brainstorm-without-cc.md section L)
+  - Auto-advance mode (off/shadow/live), Cold-start preload mode (off/shadow/live), Smart-compact mode (off/shadow/live) — toggles exist, just need to be on the settings page alongside everything else
+- Write-through via existing `/runtime-config/:key`. Daemon reads runtime_config first, falls back to env, then defaults.
+- Why: hard-coded limits are invisible; runtime control matters when supervision is misbehaving and a daemon restart isn't desired.
+
 ### DevNeural docs refresh
 - Comprehensive punch list from the supervision memory:
   - Text-input mode TTS suppression rationale.
