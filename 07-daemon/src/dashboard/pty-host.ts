@@ -750,7 +750,40 @@ export function isAwaitingSystemPrompt(ptyIdOrSession: string): boolean {
  * sees the line as committed (same as pressing Enter). commit=false
  * pastes without committing so the user can review/edit (parity with
  * the existing bridge "suggest" path).
+ *
+ * Fix 19 (2026-05-23): the prior implementation wrote the body, then
+ * scheduled the trailing \r 80ms later via setTimeout. On a busy
+ * event loop the second pty.write occasionally raced ahead of the
+ * first call's kernel flush, so the trailing \r landed inside the
+ * bracketed-paste envelope and Claude Code's TUI treated it as part
+ * of the pasted text instead of as Enter. Symptom: "[Pasted text #N]"
+ * stayed in the terminal input field, worker never processed the
+ * turn until the user manually pressed Enter. Same class of bug
+ * that 09-bridge/src/bridge-payload.ts buildBridgePayload already
+ * fixed on the bridge VSIX side.
+ *
+ * The fix has two layers:
+ *  1. Atomic body+\r in one pty.write call when commit=true. The
+ *     kernel writes the full byte sequence as a single ordered slab
+ *     so the bracketed-paste close (\x1b[201~) is guaranteed to
+ *     precede the \r.
+ *  2. A second bare \r nudge ~1s later, fire-and-forget. Safety net
+ *     for environments where the atomic write still drops the CR
+ *     (observed historically on the bridge VSIX bracketed-paste path
+ *     and documented as a durable user rule in FIXES.md row 19).
+ *     Idempotent on workers that already committed.
  */
+export const PTY_INJECT_COMMIT_NUDGE_MS = 1000;
+
+/* Pure helper for the primary write payload. Extracted so the
+ * Fix 19 regression test can pin the atomic body+\r contract
+ * without standing up a real PTY. commit=true returns body+\r in
+ * one string for a single ordered pty.write; commit=false returns
+ * body alone so the user can review/edit before submitting. */
+export function buildPtyInjectPayload(text: string, commit: boolean): string {
+  return commit ? `${text}\r` : text;
+}
+
 export function ptyInject(
   ptyIdOrSession: string,
   text: string,
@@ -761,16 +794,23 @@ export function ptyInject(
   if (!handle) return { ok: false, error: 'pty not found' };
   if (handle.exited) return { ok: false, error: 'pty has exited' };
   try {
-    handle.lastCommandSent = text.slice(0, 4096);
+    const payload = buildPtyInjectPayload(text, commit);
+    handle.lastCommandSent = payload.slice(0, 4096);
     handle.lastCommandAt = Date.now();
-    handle.pty.write(text);
+    handle.pty.write(payload);
     if (commit) {
-      /* Brief gap mirrors the bridge's 80ms paste-then-Enter delay so
-       * bracketed-paste-mode terminators are fully delivered before
-       * the carriage return commits. */
-      setTimeout(() => {
-        if (!handle!.exited) handle!.pty.write('\r');
-      }, 80);
+      const t = setTimeout(() => {
+        if (!handle!.exited) {
+          try {
+            handle!.pty.write('\r');
+          } catch {
+            /* nudge is fire-and-forget */
+          }
+        }
+      }, PTY_INJECT_COMMIT_NUDGE_MS);
+      if (typeof (t as { unref?: () => void }).unref === 'function') {
+        (t as { unref: () => void }).unref();
+      }
     }
     handle.lastActivity = Date.now();
     return { ok: true };
