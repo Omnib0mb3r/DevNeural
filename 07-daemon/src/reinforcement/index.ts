@@ -48,16 +48,30 @@ const DECAY_PER_SESSION = 0.995;
 const ARCHIVE_FLOOR = 0.15;
 const PENDING_TTL_MS = 10 * 60 * 1000; // 10 min — stale pending discarded
 
+/* Correction signal patterns.
+ *
+ * Earlier version used bare-word regexes (`\bno\b`, `\bactually\b`,
+ * `\bwrong\b`, `\binstead\b`) which produced catastrophic false
+ * positives on natural English ("no problem", "actually that's a
+ * great point", "wrong file fixed", "use X instead of Y"). Every
+ * false positive blacklists the injected page for the rest of the
+ * session and decays its weight, poisoning the reinforcement signal.
+ *
+ * Tightened set requires either sentence-initial position (where
+ * "No," and "Actually," carry corrective intent) or an explicit
+ * corrective phrase shape ("that's not right", "not what I asked"
+ * etc.). Bare `wrong`/`incorrect`/`instead` are removed because the
+ * verb/object context, not the word, is what carries the signal. */
 const CORRECTION_PATTERNS = [
-  /\bno\b/i,
-  /\bactually\b/i,
-  /\bwrong\b/i,
-  /\bincorrect\b/i,
-  /\bnot what i\b/i,
-  /\bthat['’]s not\b/i,
-  /\binstead\b/i,
-  /\brevert\b/i,
-  /\bundo\b/i,
+  /^\s*no[,.\s—-]/i,
+  /^\s*actually[,.\s]/i,
+  /\bthat['’]s (wrong|incorrect|not (right|what|true))\b/i,
+  /\bthat['’]s not what\b/i,
+  /\bnot what i (asked|wanted|meant|said)\b/i,
+  /\byou (got|have) (it|this|that) (wrong|backwards)\b/i,
+  /\b(revert|undo) (that|the|this|those)\b/i,
+  /\bdo (it|that) (the )?other way\b/i,
+  /\bstop (doing|using) (that|this)\b/i,
 ];
 
 /* `kind: 'wiki'` is the original path: a wiki page was injected, on a
