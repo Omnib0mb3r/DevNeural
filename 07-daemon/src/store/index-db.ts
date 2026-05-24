@@ -1777,21 +1777,31 @@ export class IndexDb {
     );
   }
 
-  listBrainstorms(opts: { status?: 'active' | 'ended'; limit?: number } = {}):
-    BrainstormSessionRow[] {
+  listBrainstorms(opts: {
+    status?: 'active' | 'ended';
+    /* Lex standalone supervision (Phase 2): the idle-watcher pulls
+     * rows by lifecycle_state ('idle' or 'attached'). Additive: when
+     * unset, behaves exactly like before. */
+    lifecycle_state?: 'idle' | 'attached' | 'speaking' | 'ended';
+    limit?: number;
+  } = {}): BrainstormSessionRow[] {
     const limit = opts.limit ?? 50;
+    const where: string[] = [];
+    const params: Array<string | number> = [];
     if (opts.status) {
-      return this.db
-        .prepare(
-          `SELECT * FROM brainstorm_sessions WHERE status = ? ORDER BY started_ms DESC LIMIT ?`,
-        )
-        .all(opts.status, limit) as BrainstormSessionRow[];
+      where.push('status = ?');
+      params.push(opts.status);
     }
-    return this.db
-      .prepare(
-        `SELECT * FROM brainstorm_sessions ORDER BY started_ms DESC LIMIT ?`,
-      )
-      .all(limit) as BrainstormSessionRow[];
+    if (opts.lifecycle_state) {
+      where.push('lifecycle_state = ?');
+      params.push(opts.lifecycle_state);
+    }
+    const sql =
+      `SELECT * FROM brainstorm_sessions` +
+      (where.length > 0 ? ` WHERE ${where.join(' AND ')}` : '') +
+      ` ORDER BY started_ms DESC LIMIT ?`;
+    params.push(limit);
+    return this.db.prepare(sql).all(...params) as BrainstormSessionRow[];
   }
 
   /* ── lex_session ────────────────────────────────────────────────
