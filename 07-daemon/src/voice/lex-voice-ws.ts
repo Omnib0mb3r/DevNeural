@@ -78,6 +78,7 @@ import {
   ALL_VOICE_COMMAND_KINDS,
   type VoiceCommandKind,
 } from './lex-voice-commands.js';
+import { runHoldUp } from './lex-voice-hold-up.js';
 import { firePanic } from '../dashboard/panic-routes.js';
 import { getStore } from '../lex/brainstorm-store.js';
 import { checkToolGate, notifyLargeFsRead, LARGE_FS_READ_LINE_THRESHOLD } from '../lex/tool-gate.js';
@@ -1460,6 +1461,60 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         send({ t: 'voice-disable', reason: 'voice-command' });
         return true;
       }
+      case 'hold_up': {
+        /* Fix 2026-05-24: hard abort of Lex's current activity.
+         * Cancels TTS, sends ^C to the Lex PTY (which makes Claude
+         * Code's tool sequencer drop the in-flight tool_use plan and
+         * thereby drops any cross-session inject Lex was about to
+         * POST), re-opens the mic, and speaks a one-sentence recap +
+         * "what is up?" so the user can redirect. The worker is
+         * deliberately untouched: no PTY write, no bridge queue
+         * write, no /lex/inject-cross-session POST. Already-delivered
+         * injects to the worker are NOT clawed back. */
+        const ctx = state.ttsActive;
+        const intended = state.currentTtsText;
+        runHoldUp({
+          cancelTts: () => {
+            if (ctx) {
+              ctx.cancelled = true;
+              try {
+                ctx.cancel();
+              } catch {
+                /* TTS cancel is best-effort */
+              }
+              state.ttsActive = null;
+              if (state.currentTtsText) {
+                state.partialChain.push({
+                  intended_text: state.currentTtsText,
+                  started_at_ms: state.currentTtsStartedAtMs,
+                  cancelled_at_ms: Date.now(),
+                });
+              }
+            }
+            state.currentTtsText = null;
+            state.currentTtsStartedAtMs = 0;
+          },
+          ctrlCLexPty: () => {
+            if (state.bindKey) {
+              const handle =
+                getPty(state.bindKey) || getPtyBySession(state.bindKey);
+              if (handle && !handle.exited) {
+                try {
+                  handle.pty.write('\x03');
+                } catch {
+                  /* ignore */
+                }
+              }
+            }
+          },
+          sendFrame: send,
+          speak: (text) => {
+            void speak(text);
+          },
+          intendedText: intended,
+        });
+        return true;
+      }
     }
   }
 
@@ -1723,6 +1778,22 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * "barge over Lex's reply" and is already handled by
      * killActiveTts (PTY Ctrl+C + tts-cancel + partialChain). */
     if (state.awaitingResponseSince > 0 && !state.ttsActive) {
+      /* Addendum 2026-05-24: belt-and-suspenders voice-command
+       * punch-through. matchVoiceCommand already ran at the top of
+       * handleUtteranceEnd, but re-check at the queue's edge so any
+       * future refactor that lands command text here cannot silently
+       * swallow it. lex panic / end_session / mute / unmute /
+       * disable / hold_up MUST interrupt mid-tool-use; queueing them
+       * would defer the interrupt to the next turn boundary, which
+       * defeats the wake-word contract. */
+      const lateCmd = matchVoiceCommand(result.text);
+      if (lateCmd) {
+        console.log(
+          `[voice-ws] mid-turn-queue: lex command "${lateCmd.kind}" punches through, dispatching synchronously`,
+        );
+        dispatchVoiceCommand(lateCmd.kind, 'transcript');
+        return;
+      }
       state.pendingUserUtterances.push(result.text);
       console.log(
         `[voice-ws] mid-turn-no-tts queue push depth=${state.pendingUserUtterances.length} text=${JSON.stringify(result.text.slice(0, 80))}`,

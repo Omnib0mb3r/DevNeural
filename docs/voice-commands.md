@@ -19,6 +19,7 @@ The voice state machine has three independent axes:
 |----------------|--------------------|-------------------------------------|
 | TTS playback   | `mute` / `unmute`  | Halt or resume Lex's spoken reply.  |
 | STT capture    | `standby` / `listen` | Pause or rearm microphone capture. |
+| Hard abort     | `hold_up`          | Cancel Lex's current TTS + pending tool calls without touching the worker. |
 | Session life   | `disable`, `end_session`, `panic` | Terminal commands (see below). |
 
 The axes do not interact. Muting TTS does not affect the mic; putting
@@ -113,6 +114,40 @@ Inverse: `standby` family above.
 
 State transition: `muted=true -> false`. Logged with kind=`listen`.
 
+### hold_up
+
+Phrasings: `lex hold up`, `lex holdup`
+
+Effect: hard abort of Lex's current activity. Distinct from `mute`
+(TTS-only) and `standby` (mic-only). Steps, in order:
+
+1. Cut TTS mid-sentence immediately.
+2. Send `^C` (`\x03`) to the Lex PTY so Claude Code's tool sequencer
+   drops the in-flight tool_use plan. This is the mechanism that
+   drops any cross-session inject to the worker that Lex had queued
+   but not yet POSTed to `/lex/inject-cross-session`. Already-
+   delivered injects are NOT clawed back.
+3. Leave the worker completely alone. The runtime has no callback
+   that can touch worker PTYs, the bridge `.in` queue, or the
+   cross-session-inject endpoint; the worker continues unaffected.
+4. Re-open the mic by sending a `voice-listen` frame so a soft
+   standby state does not silently swallow the user's follow-up.
+5. Speak a one-sentence recap of what Lex was doing (`I was saying
+   "..."` when TTS was in flight, or `I was thinking through your
+   last request` otherwise), then ask `what is up?`.
+6. Wait for the user to redirect. Hold-up itself never injects.
+
+Use this when Lex is doing the wrong thing mid-turn and you want to
+stop everything Lex-side without losing what the worker has already
+received. `lex shut up` is wrong for this because it only stops TTS;
+Lex keeps executing tool calls in the background.
+
+Inverse: none. The next user utterance is the resumption.
+
+State transition: `ttsActive=*` -> null, `partialChain` gets one
+appended entry if TTS was in flight (so Lex's next reply can weave
+in what got cut). Logged with kind=`hold_up`.
+
 ### disable
 
 Phrasings: `lex disable`
@@ -136,19 +171,41 @@ overlapping phrasings resolve deterministically:
 ```
 1. panic         (lex emergency stop)
 2. end_session   (lex end session)
-3. mute          (lex mute / shut up / be quiet / stop talking)
-4. standby       (lex stand by / pause listening / hold on)
-5. listen        (lex listen / resume listening / i'm back)
-6. unmute        (lex unmute / resume / come back / ...)
-7. disable       (lex disable)
+3. hold_up       (lex hold up / lex holdup)
+4. mute          (lex mute / shut up / be quiet / stop talking)
+5. standby       (lex stand by / pause listening / hold on)
+6. listen        (lex listen / resume listening / i'm back)
+7. unmute        (lex unmute / resume / come back / ...)
+8. disable       (lex disable)
 ```
 
 Notes:
+- `hold_up` before `mute` so the matcher cannot mistake `lex hold up`
+  for the mute family and before `standby` so `lex hold up` never
+  gets absorbed by the `hold on` standby pattern when whisper drops
+  a phoneme. The `hold\s*up` shape never overlaps `hold\s+on`.
 - `mute` before `disable` so `lex stop talking` lands on mute rather
   than tripping a substring of `lex stop`.
 - `standby` and `listen` before `unmute` so the qualified
   `lex resume listening` lands on listen and bare `lex resume` lands
   on unmute.
+
+## Punch-through (Addendum 2026-05-24)
+
+Every command listed above MUST interrupt Lex regardless of state:
+TTS playing, mid-tool-use, mid-reasoning, or idle. The voice WS
+enforces this with two `matchVoiceCommand` checks inside
+`handleUtteranceEnd`:
+
+1. At the top of the function, before any inject or queue logic.
+2. At the mid-turn-no-tts queue site, immediately before
+   `state.pendingUserUtterances.push`. Belt-and-suspenders so any
+   future refactor cannot silently swallow a command into the queue.
+
+Non-command utterances follow their normal path: dispatch into the
+worker (TTS not playing + Lex idle), queue for next turn boundary
+(mid-tool-use no TTS), or trigger the partial-chain barge handler
+(TTS active).
 
 ## Observability
 

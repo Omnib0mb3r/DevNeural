@@ -29,7 +29,8 @@ export type VoiceCommandKind =
   | "panic"
   | "end_session"
   | "standby"
-  | "listen";
+  | "listen"
+  | "hold_up";
 
 const LEX_PREFIX = String.raw`\blex\s+`;
 
@@ -51,6 +52,10 @@ const LISTEN_RE = new RegExp(
   LEX_PREFIX + String.raw`(?:listen|resume\s+listening|i\s+m\s+back)\b`,
 );
 const DISABLE_RE = new RegExp(LEX_PREFIX + String.raw`disable\b`);
+/* Hold-up = hard abort of Lex's current activity (TTS + pending tool
+ * calls) without touching the worker. Mirrors the daemon-side regex
+ * in 07-daemon/src/voice/lex-voice-commands.ts. */
+const HOLD_UP_RE = new RegExp(LEX_PREFIX + String.raw`(?:hold\s*up|holdup)\b`);
 
 function normalize(text: string): string {
   return text
@@ -66,6 +71,10 @@ export function matchWakeWord(text: string): VoiceCommandKind | null {
   if (!norm) return null;
   if (PANIC_RE.test(norm)) return "panic";
   if (END_SESSION_RE.test(norm)) return "end_session";
+  /* hold_up before mute so "lex hold up" cannot be misread as part of
+   * the mute family, and before standby so it never gets absorbed by
+   * the "hold on" standby pattern when whisper drops a phoneme. */
+  if (HOLD_UP_RE.test(norm)) return "hold_up";
   if (MUTE_RE.test(norm)) return "mute";
   /* STANDBY + LISTEN before UNMUTE so qualified "resume listening"
    * lands on listen and bare "lex resume" lands on unmute. */

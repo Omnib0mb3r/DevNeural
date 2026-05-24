@@ -47,7 +47,8 @@ export type VoiceCommandKind =
   | 'panic'
   | 'end_session'
   | 'standby'
-  | 'listen';
+  | 'listen'
+  | 'hold_up';
 
 export type VoiceCommand = { kind: VoiceCommandKind };
 
@@ -59,6 +60,7 @@ export const ALL_VOICE_COMMAND_KINDS: ReadonlyArray<VoiceCommandKind> = [
   'end_session',
   'standby',
   'listen',
+  'hold_up',
 ];
 
 const LEX_PREFIX = String.raw`\blex\s+`;
@@ -89,6 +91,11 @@ const LISTEN_RE = new RegExp(
   LEX_PREFIX + String.raw`(?:listen|resume\s+listening|i\s+m\s+back)\b`,
 );
 const DISABLE_RE = new RegExp(LEX_PREFIX + String.raw`disable\b`);
+/* Hold-up = hard abort of Lex's current activity (TTS + pending tool
+ * calls) without touching the worker. Distinct from mute ("shut up")
+ * which only stops TTS. Distinct from standby ("hold on") which only
+ * pauses the mic. Matches "lex hold up" and "lex holdup". */
+const HOLD_UP_RE = new RegExp(LEX_PREFIX + String.raw`(?:hold\s*up|holdup)\b`);
 
 function normalize(text: string): string {
   return text
@@ -104,6 +111,11 @@ export function matchVoiceCommand(text: string): VoiceCommand | null {
   if (!norm) return null;
   if (PANIC_RE.test(norm)) return { kind: 'panic' };
   if (END_SESSION_RE.test(norm)) return { kind: 'end_session' };
+  /* hold_up before mute so "lex hold up" cannot be misread as part of
+   * the mute family, and before standby so "lex hold up" never gets
+   * absorbed by the "hold on" standby pattern when whisper drops a
+   * phoneme. The 'hold\s*up' shape never overlaps 'hold\s+on'. */
+  if (HOLD_UP_RE.test(norm)) return { kind: 'hold_up' };
   if (MUTE_RE.test(norm)) return { kind: 'mute' };
   /* Order: STANDBY + LISTEN before UNMUTE so the qualified
    * "resume listening" lands on listen, not on the unmute synonym

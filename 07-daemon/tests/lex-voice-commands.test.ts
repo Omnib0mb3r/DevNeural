@@ -176,6 +176,51 @@ describe('matchVoiceCommand', () => {
     });
   });
 
+  describe('hold_up family (Fix 2026-05-24)', () => {
+    it('matches "lex hold up"', () => {
+      expect(matchVoiceCommand('lex hold up')).toEqual({ kind: 'hold_up' });
+    });
+
+    it('matches "lex holdup" (one word)', () => {
+      expect(matchVoiceCommand('lex holdup')).toEqual({ kind: 'hold_up' });
+    });
+
+    it('matches in mid-utterance prose', () => {
+      expect(matchVoiceCommand('okay lex hold up wait a second')).toEqual({
+        kind: 'hold_up',
+      });
+      expect(matchVoiceCommand('Lex, hold up please.')).toEqual({
+        kind: 'hold_up',
+      });
+    });
+
+    it('matches with casing and punctuation', () => {
+      expect(matchVoiceCommand('LEX HOLD UP!')).toEqual({ kind: 'hold_up' });
+    });
+
+    it('does NOT confuse "lex hold on" (standby) with hold_up', () => {
+      expect(matchVoiceCommand('lex hold on')).toEqual({ kind: 'standby' });
+    });
+
+    it('does NOT match the mute family ("lex shut up" stays mute)', () => {
+      expect(matchVoiceCommand('lex shut up')).toEqual({ kind: 'mute' });
+    });
+
+    it('does NOT match bare "hold up" without the lex prefix', () => {
+      expect(matchVoiceCommand('hold up')).toBeNull();
+      expect(matchVoiceCommand('please hold up a second')).toBeNull();
+    });
+
+    it('matches before mute when both phrases appear', () => {
+      /* Precedence: hold_up is listed ahead of mute in the matcher.
+       * The text contains "lex hold up" first so hold_up wins; mute
+       * never gets a chance. */
+      expect(matchVoiceCommand('lex hold up and lex shut up')).toEqual({
+        kind: 'hold_up',
+      });
+    });
+  });
+
   describe('disable', () => {
     it('matches "lex disable"', () => {
       expect(matchVoiceCommand('lex disable')).toEqual({ kind: 'disable' });

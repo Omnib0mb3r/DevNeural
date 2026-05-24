@@ -94,6 +94,22 @@ describe("matchWakeWord", () => {
     expect(matchWakeWord("lex end session")).toBe("end_session");
   });
 
+  it("matches the hold_up family (Fix 2026-05-24)", () => {
+    expect(matchWakeWord("lex hold up")).toBe("hold_up");
+    expect(matchWakeWord("lex holdup")).toBe("hold_up");
+    expect(matchWakeWord("okay lex hold up wait")).toBe("hold_up");
+    expect(matchWakeWord("LEX HOLD UP!")).toBe("hold_up");
+  });
+
+  it("does NOT confuse 'lex hold on' (standby) with hold_up", () => {
+    expect(matchWakeWord("lex hold on")).toBe("standby");
+    expect(matchWakeWord("lex hold up")).toBe("hold_up");
+  });
+
+  it("does NOT match bare 'hold up' without the lex prefix", () => {
+    expect(matchWakeWord("hold up")).toBeNull();
+  });
+
   it("requires the lex prefix on every command", () => {
     expect(matchWakeWord("emergency stop")).toBeNull();
     expect(matchWakeWord("shut up")).toBeNull();
