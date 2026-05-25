@@ -1,21 +1,34 @@
 /**
- * LLM-backed generator for the sibling distillation pipeline.
+ * LLM-backed distillation generators.
  *
- * Plugs into preloadSiblingDistillations + runDistillationBackfill via
- * the existing DistillationGenerator shape. Reads the brainstorm's
- * chunk transcript, prompts the active LLM provider for a one-sentence
- * plain-prose summary, returns the trimmed text (or null on
- * skip / failure).
+ * Two factories:
  *
- * Respects BF-4: never sends brainstorm content out to the anthropic
- * provider. Local-only (ollama) by design. The shipped
- * brainstorm-distillation pipeline already enforces this on the
- * wiki-draft path; mirror the gate here so a wired backfill cannot
- * leak content if env flips DEVNEURAL_LLM_PROVIDER=anthropic mid-run.
+ * 1. createLlmDistillationGenerator (anchor-flat, legacy).
+ *    Plugs into preloadSiblingDistillations + runDistillationBackfill
+ *    + idle-watcher via the DistillationGenerator shape. Reads the
+ *    brainstorm's full chunk transcript (ordered by turn_index, anchor
+ *    -wide), prompts for a structured Markdown summary, returns the
+ *    trimmed text or null. Anchor-flat semantics: the summary
+ *    describes the entire brainstorm, not a single CC session.
+ *
+ * 2. createPerSessionDistillationGenerator (Stage 2 of
+ *    LEX-AUTONOMY-PAYLOAD-SPEC).
+ *    Takes ({brainstorm_id, cc_session_id, ...}), reads chunks
+ *    scoped to that pair via listBrainstormChunksForSession, prompts
+ *    with PER_SESSION_SYSTEM_BLOCK (per-session semantics distinct
+ *    from the rolling aggregate), and returns {summary, provenance}
+ *    so callers can land source_chunk_count, source_session_ids,
+ *    coverage_score on lex_transcript_ref. Returns null on every
+ *    skip path (no provider, BF-4 blocked, no scoped chunks, empty
+ *    LLM reply, validation throw) - the session-end pipeline logs
+ *    the structured skip reason rather than synthesising a summary.
+ *
+ * Respects BF-4 on both paths: never sends brainstorm content out to
+ * the anthropic provider. Local-only (ollama) by design.
  *
  * Pure module aside from the provider call: db reads are injected and
- * the provider is swappable so the scheduler tests can drive the
- * pipeline with a stub.
+ * the provider is swappable so tests can drive the pipeline with a
+ * stub.
  */
 import type {
   BrainstormSessionRow,
@@ -145,5 +158,166 @@ export function createLlmDistillationGenerator(
       );
       return null;
     }
+  };
+}
+
+/* Stage 2 of LEX-AUTONOMY-PAYLOAD-SPEC. Per-CC-session system block.
+ * Distinct artifact from the anchor-flat rolling aggregate: this
+ * summary describes ONE Lex/CC session, with full awareness that
+ * other sessions on the same anchor exist and that the rolling
+ * aggregate is composed downstream from N of these per-session
+ * artifacts. Wording emphasises self-containment, single-session
+ * vocabulary, and ends with a "session boundary" marker that the
+ * rolling aggregate's separator pass can lean on. */
+export const PER_SESSION_SYSTEM_BLOCK = {
+  text:
+    'Summarize ONE Claude Code session of an ongoing Lex brainstorm ' +
+    'so a downstream rolling aggregate can stitch this with other ' +
+    'per-session summaries from the same anchor. This artifact is ' +
+    'about THIS session only - do not generalise to the anchor, do ' +
+    'not reference earlier sessions, do not pre-empt the aggregate. ' +
+    'The user is a brainstormer-first; their work must never decay ' +
+    'to lossy one-liners. Output structured Markdown with the ' +
+    "following bolded sections in this order, each on its own line:\n\n" +
+    '**Session topic**: one sentence on what THIS session worked on.\n\n' +
+    '**Threads**: 2-5 bullets, the concrete threads this session ' +
+    'kept circling back to. Be specific (named files, components, ' +
+    'protocols), not generic.\n\n' +
+    '**Decisions this session**: 2-5 bullets, concrete decisions ' +
+    'made or commits landed DURING this session. Empty bullet ' +
+    'allowed when no decisions were made; do not invent. Do not ' +
+    'restate decisions from earlier sessions.\n\n' +
+    '**Planted markers**: 1-3 bullets, forward-looking notes the ' +
+    'user wanted to revisit later. Empty allowed.\n\n' +
+    '**Open at session end**: 1-3 bullets, unresolved questions or ' +
+    'blockers as of the moment this session closed. Empty allowed.\n\n' +
+    '**Recent turns** (verbatim, last 5-10): each bullet is ' +
+    "ROLE: <text>, trimmed to ~200 chars, in chronological order. " +
+    'Use USER / LEX / TOOL.\n\n' +
+    'Total target: two short paragraphs of structured content plus ' +
+    'the recent-turns block. No fences, no preamble, no commentary ' +
+    'about the summary itself. Skip pleasantries. Be specific.',
+  cache: true,
+};
+
+export interface PerSessionGeneratorInput {
+  brainstorm_id: string;
+  cc_session_id: string;
+  /** Total chunks the session produced (denominator for coverage_
+   * score). Caller computes via countBrainstormChunksForSession so
+   * the generator stays pure / does not duplicate the count query. */
+  totalChunksInSession: number;
+}
+
+export interface PerSessionGeneratorOutput {
+  summary: string;
+  /** Provenance fields the caller writes onto lex_transcript_ref. */
+  source_chunk_count: number;
+  source_session_ids: string;
+  coverage_score: number;
+}
+
+export type PerSessionDistillationGenerator = (
+  input: PerSessionGeneratorInput,
+) => Promise<PerSessionGeneratorOutput | null>;
+
+export function createPerSessionDistillationGenerator(
+  opts: CreateGeneratorOptions,
+): PerSessionDistillationGenerator {
+  const log = opts.log ?? (() => undefined);
+  const maxTranscriptBytes = opts.maxTranscriptBytes ?? 8000;
+  const maxTokens = opts.maxTokens ?? 600;
+  const chunkLimit = opts.chunkLimit ?? 50;
+  return async (input) => {
+    const tag = `${input.brainstorm_id.slice(0, 8)}/${input.cc_session_id.slice(0, 8)}`;
+    const provider = opts.provider ?? pickProvider();
+    if (!provider) {
+      log(`[per-session-distill] no provider; skip ${tag}`);
+      return null;
+    }
+    if (!provider.isConfigured()) {
+      log(
+        `[per-session-distill] provider ${provider.name} not configured; skip ${tag}`,
+      );
+      return null;
+    }
+    /* BF-4 mirror: brainstorm chunks never leave the host. */
+    if (provider.name === 'anthropic') {
+      log(
+        `[per-session-distill] BF-4 skip ${tag}: anthropic provider blocked for brainstorm content`,
+      );
+      return null;
+    }
+    /* Pull the newest chunkLimit chunks scoped to this CC session.
+     * DESC fetch + reverse so the LLM sees them oldest-first; the
+     * tail of a long session is what matters most for distillation
+     * but the model still expects chronological prompt order. */
+    const fetched = opts.db.listBrainstormChunksForSession(
+      input.brainstorm_id,
+      input.cc_session_id,
+      chunkLimit,
+      'desc',
+    );
+    if (fetched.length === 0) {
+      /* Structured skip signal. NULL cc_session_id chunks land here
+       * as well (since they would not match the scoped WHERE) but
+       * the session-end pipeline only calls this generator with a
+       * non-null cc_session_id; the explicit NULL-skip path lives
+       * upstream so the structured log reason is unambiguous. */
+      log(
+        `[per-session-distill] no_session_scoped_chunks ${tag}; skip`,
+      );
+      return null;
+    }
+    const ordered = fetched.slice().reverse();
+    const transcript = ordered
+      .map((c) => {
+        const role =
+          c.role === 'lex' ? 'LEX' : c.role === 'user' ? 'USER' : 'TOOL';
+        return `${role}: ${c.text}`;
+      })
+      .join('\n')
+      .slice(0, maxTranscriptBytes);
+    if (transcript.length === 0) {
+      log(`[per-session-distill] empty_transcript ${tag}; skip`);
+      return null;
+    }
+    let text: string;
+    try {
+      const result = await provider.call('distillation', {
+        systemBlocks: [PER_SESSION_SYSTEM_BLOCK],
+        user: transcript,
+        maxTokens,
+        temperature: 0.2,
+      });
+      text = result.text
+        .trim()
+        .replace(/^["'`]+|["'`]+$/g, '')
+        .replace(/^```\w*\n?|```$/g, '')
+        .trim();
+    } catch (err) {
+      log(
+        `[per-session-distill] provider call failed for ${tag}: ${(err as Error).message}`,
+      );
+      return null;
+    }
+    if (!text) {
+      log(`[per-session-distill] empty_llm_reply ${tag}; skip`);
+      return null;
+    }
+    /* coverage_score = chunks shipped to LLM / total chunks in
+     * session. Total is the denominator the caller computed BEFORE
+     * the prompt was built (cheap COUNT scoped to the same pair).
+     * Guard against div-by-zero (shouldn't happen since fetched
+     * .length > 0 implies total > 0, but be explicit) and clamp into
+     * the [0,1] range the CHECK constraint enforces. */
+    const denom = Math.max(input.totalChunksInSession, fetched.length);
+    const coverage = denom > 0 ? Math.min(1, fetched.length / denom) : 0;
+    return {
+      summary: text,
+      source_chunk_count: fetched.length,
+      source_session_ids: JSON.stringify([input.cc_session_id]),
+      coverage_score: Math.max(0, coverage),
+    };
   };
 }
