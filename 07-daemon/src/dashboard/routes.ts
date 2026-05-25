@@ -1267,6 +1267,47 @@ export async function registerDashboardRoutes(
       reply.code(404);
       return { ok: false, error: 'anchor not found' };
     }
+    /* Dashboard "End" button must behave identically to the spoken
+     * "Lex end session" voice command: both fire the full session-end
+     * pipeline (distillation, ref_summary write, last_summary refresh,
+     * RAG embed, thread-doc) on the active transcript before the PTY
+     * is killed. Prior behaviour skipped the pipeline entirely, which
+     * left ended sessions with NULL ref_summary and broke smoke step
+     * 3.1/3.2/3.3. */
+    try {
+      const refs = listTranscriptRefs(id);
+      const active = refs.find((r) => !r.ended_ms);
+      if (active) {
+        const bs = getBrainstorm(id);
+        const { runSessionEndPipeline } = await import('../lex/session-end-pipeline.js');
+        const mode = (bs?.mode ?? 'conversation') as
+          | 'conversation'
+          | 'notes'
+          | 'push-to-talk'
+          | string;
+        log(
+          `[lex-anchor] /end: firing session-end pipeline anchor=${id} cc=${active.cc_session_id} reason=dashboard-end-button`,
+        );
+        await runSessionEndPipeline(
+          store,
+          {
+            brainstormId: id,
+            claudeSessionId: active.cc_session_id,
+            mode,
+            reason: 'dashboard-end-button',
+          },
+          (msg) => log(msg),
+        );
+      } else {
+        log(
+          `[lex-anchor] /end: no active transcript for anchor=${id}; skipping pipeline`,
+        );
+      }
+    } catch (err) {
+      log(
+        `[lex-anchor] /end: pipeline failed for ${id}: ${(err as Error).message}`,
+      );
+    }
     if (row.current_pty_id) {
       try {
         ptyKill(row.current_pty_id);

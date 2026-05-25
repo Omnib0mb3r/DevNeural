@@ -1505,6 +1505,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         return true;
       }
       case 'end_session': {
+        console.log(
+          `[voice-ws] voice-cmd matched kind=end_session source=${source} bindKey=${state.bindKey ?? 'null'} watchSessionId=${state.watchSessionId ?? 'null'} brainstormId=${state.brainstormId ?? 'null'}`,
+        );
         send({ t: 'session-end', reason: 'voice-command' });
         void fireSessionEndPipeline('voice-command');
         return true;
@@ -2092,8 +2095,16 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * double-summary or a redundant force-ingest. Best-effort: failures
    * are logged not thrown so teardown always proceeds. */
   async function fireSessionEndPipeline(reason: string): Promise<void> {
-    if (state.sessionEndFired) return;
+    if (state.sessionEndFired) {
+      console.log(
+        `[voice-ws] session-end pipeline: latch already fired reason=${reason}`,
+      );
+      return;
+    }
     state.sessionEndFired = true;
+    console.log(
+      `[voice-ws] session-end pipeline entered reason=${reason} bindKey=${state.bindKey ?? 'null'} watchSessionId=${state.watchSessionId ?? 'null'} brainstormId=${state.brainstormId ?? 'null'}`,
+    );
     try {
       /* Resolve the brainstorm. Direct-llm sockets reach the
        * brainstorm via state.brainstormId without ever touching a
@@ -2116,6 +2127,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         /* Voice WS without a brainstorm row (read-only TTS bind, or
          * a session that ended before the row was created). Nothing
          * to summarise; skip silently. */
+        console.log(
+          `[voice-ws] session-end pipeline: brainstorm row not resolved (handle=${state.bindKey ?? 'null'} watch=${state.watchSessionId ?? 'null'} bsId=${state.brainstormId ?? 'null'} reason=${reason}); skipping`,
+        );
         return;
       }
       /* Plan section F amendment (2026-05-22): triggers table.
