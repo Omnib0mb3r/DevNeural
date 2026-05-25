@@ -344,6 +344,20 @@ export interface LexTranscriptRefRow {
   started_ms: number;
   ended_ms: number | null;
   ordering: number;
+  /* Stage 0 of LEX-AUTONOMY-PAYLOAD-SPEC: per-CC-session
+   * distillation artifact. Written once at session-end via the new
+   * generator API; NULL until then. Immutable in content, but the
+   * write is a deterministic-overwrite on retry (the spec rejects
+   * the "draft inconsistency" semantics, idempotent overwrite is
+   * the contract). */
+  ref_summary: string | null;
+  ref_summary_ms: number | null;
+  /* Stage 2 provenance: how much of the session went into the
+   * artifact + which ids it covers + coverage fraction. See
+   * migration 038. NULL whenever ref_summary itself is NULL. */
+  source_chunk_count: number | null;
+  source_session_ids: string | null;
+  coverage_score: number | null;
 }
 
 /* project_session row. Durable per-project anchor identity, daemon-
@@ -1910,8 +1924,22 @@ export class IndexDb {
 
   /* ── lex_transcript_ref ────────────────────────────────────────── */
   insertLexTranscriptRef(
-    row: Omit<LexTranscriptRefRow, 'id'>,
+    row: Omit<
+      LexTranscriptRefRow,
+      | 'id'
+      | 'ref_summary'
+      | 'ref_summary_ms'
+      | 'source_chunk_count'
+      | 'source_session_ids'
+      | 'coverage_score'
+    >,
   ): LexTranscriptRefRow {
+    /* Insert lands the ref row with NULL distillation columns. The
+     * Stage 2 session-end writer fills ref_summary / ref_summary_ms /
+     * provenance via updateLexTranscriptRef once distillation
+     * completes. Decoupling the insert from the summary write keeps
+     * the ref row creation cheap on bind and the summary work
+     * deferrable. */
     const r = this.db
       .prepare(
         `INSERT INTO lex_transcript_ref
@@ -1926,25 +1954,63 @@ export class IndexDb {
         row.ended_ms,
         row.ordering,
       );
-    return { id: Number(r.lastInsertRowid), ...row };
+    return {
+      id: Number(r.lastInsertRowid),
+      ...row,
+      ref_summary: null,
+      ref_summary_ms: null,
+      source_chunk_count: null,
+      source_session_ids: null,
+      coverage_score: null,
+    };
   }
 
   updateLexTranscriptRef(
     id: number,
-    patch: Partial<Pick<LexTranscriptRefRow, 'ended_ms'>>,
+    patch: Partial<
+      Pick<
+        LexTranscriptRefRow,
+        | 'ended_ms'
+        | 'ref_summary'
+        | 'ref_summary_ms'
+        | 'source_chunk_count'
+        | 'source_session_ids'
+        | 'coverage_score'
+      >
+    >,
   ): void {
     const sets: string[] = [];
-    const params: Array<number | null> = [];
+    const params: Array<string | number | null> = [];
     for (const [k, v] of Object.entries(patch)) {
       if (v === undefined) continue;
       sets.push(`${k} = ?`);
-      params.push(v as number | null);
+      params.push(v as string | number | null);
     }
     if (sets.length === 0) return;
     params.push(id);
     this.db
       .prepare(`UPDATE lex_transcript_ref SET ${sets.join(', ')} WHERE id = ?`)
       .run(...params);
+  }
+
+  /* Stage 2 lookup: most recent ref_summary rows for an anchor's
+   * Lex sessions, newest-first by ref_summary_ms. Returns at most
+   * `limit` rows. Used by the rolling aggregate writer to compose
+   * brainstorm_sessions.last_summary from the N newest per-session
+   * artifacts. Filters out rows whose ref_summary is NULL so the
+   * caller does not have to. */
+  listRecentRefSummariesForLexSession(
+    lexSessionId: string,
+    limit: number,
+  ): LexTranscriptRefRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM lex_transcript_ref
+           WHERE lex_session_id = ? AND ref_summary IS NOT NULL
+           ORDER BY ref_summary_ms DESC, id DESC
+           LIMIT ?`,
+      )
+      .all(lexSessionId, Math.max(0, Math.floor(limit))) as LexTranscriptRefRow[];
   }
 
   listLexTranscriptRefs(lexSessionId: string): LexTranscriptRefRow[] {
