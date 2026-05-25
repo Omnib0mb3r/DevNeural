@@ -1561,6 +1561,17 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           },
           intendedText: intended,
         });
+        /* Fix 29 (2026-05-25): runHoldUp's Ctrl+C aborts the Lex
+         * PTY mid-turn, so no end_turn jsonl record lands to clear
+         * awaitingResponseSince at line 746. Without these resets
+         * the next utterance hits the mid-turn-no-tts gate, queues
+         * into pendingUserUtterances, and never injects (the flush
+         * point is gated on the same end_turn that never arrives).
+         * Clear the mid-turn state inline so the next user
+         * utterance routes through the normal inject path. */
+        state.awaitingResponseSince = 0;
+        state.pendingUserUtterances = [];
+        spokenSegmentHashes.clear();
         return true;
       }
     }

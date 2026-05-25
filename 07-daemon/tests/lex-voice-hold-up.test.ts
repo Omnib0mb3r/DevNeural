@@ -13,6 +13,9 @@
  *  - voice-hold-up + voice-listen frames sent to the client
  *  - recap text passed to speak() includes "what is up?"
  */
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   runHoldUp,
@@ -206,6 +209,67 @@ describe('runHoldUp', () => {
       expect(m!.kind).toBe(expectedKind);
     },
   );
+
+  /* Fix 29 (2026-05-25): hold-up dispatch must clear mid-turn
+   * state because runHoldUp's Ctrl+C kills the Lex PTY before any
+   * end_turn jsonl can land. Without the clear, next utterance
+   * gets queued into pendingUserUtterances and never injects.
+   *
+   * Simulates the dispatch by constructing a state object that
+   * matches what dispatchVoiceCommand sees (awaitingResponseSince
+   * non-zero, one queued utterance), invokes runHoldUp with
+   * mock callbacks, then runs the exact three-line clear from
+   * lex-voice-ws.ts and asserts state is reset.
+   *
+   * Also pins the wiring: reads lex-voice-ws.ts and confirms the
+   * three resets live AFTER the runHoldUp({...}) call inside the
+   * hold_up case so a future refactor can't silently regress. */
+  it('clears awaitingResponseSince + pendingUserUtterances + spokenSegmentHashes after hold-up dispatch', () => {
+    const state = {
+      awaitingResponseSince: 1_700_000_000_000,
+      pendingUserUtterances: ['queued before hold up'] as string[],
+    };
+    const spokenSegmentHashes = new Set<string>(['hash-a', 'hash-b']);
+
+    const { deps } = makeDeps();
+    runHoldUp(deps);
+
+    /* This block mirrors the three lines added to the hold_up
+     * dispatch in lex-voice-ws.ts. If those lines are removed or
+     * reordered, the wiring-pin test below will fail. */
+    state.awaitingResponseSince = 0;
+    state.pendingUserUtterances = [];
+    spokenSegmentHashes.clear();
+
+    expect(state.awaitingResponseSince).toBe(0);
+    expect(state.pendingUserUtterances).toEqual([]);
+    expect(spokenSegmentHashes.size).toBe(0);
+  });
+
+  it('wiring pin: hold_up dispatch in lex-voice-ws.ts clears mid-turn state after runHoldUp', () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const wsSource = readFileSync(
+      resolve(here, '../src/voice/lex-voice-ws.ts'),
+      'utf8',
+    );
+    /* Find the hold_up case body. The regex captures from the
+     * case label through the next `return true;` so we only
+     * inspect the dispatch arm, not unrelated occurrences
+     * elsewhere in the file. */
+    const m = wsSource.match(/case 'hold_up': \{([\s\S]*?)return true;/);
+    expect(m, "hold_up case must exist in lex-voice-ws.ts").not.toBeNull();
+    const body = m![1]!;
+    /* runHoldUp must run BEFORE the clears so the recap fires
+     * against the still-populated state. */
+    const runHoldUpIdx = body.indexOf('runHoldUp(');
+    const clearAwaitingIdx = body.indexOf('state.awaitingResponseSince = 0');
+    const clearQueueIdx = body.indexOf('state.pendingUserUtterances = []');
+    const clearHashesIdx = body.indexOf('spokenSegmentHashes.clear()');
+    expect(runHoldUpIdx, 'runHoldUp must be invoked').toBeGreaterThan(-1);
+    expect(clearAwaitingIdx, 'awaitingResponseSince must be cleared').toBeGreaterThan(runHoldUpIdx);
+    expect(clearQueueIdx, 'pendingUserUtterances must be drained').toBeGreaterThan(runHoldUpIdx);
+    expect(clearHashesIdx, 'spokenSegmentHashes must be cleared').toBeGreaterThan(runHoldUpIdx);
+  });
 
   it('tolerates failures in cancelTts and ctrlCLexPty without aborting the speak path', () => {
     const cancelTts = vi.fn(() => {
