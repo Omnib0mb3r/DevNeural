@@ -2668,7 +2668,25 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       logVoice("engine-disable", "voice engine effect cleanup");
       teardown();
     };
-  }, [enabled, sessionId, mode]);
+    /* Fix 31 (2026-05-25): depend on lexPty.ptyId, NOT sessionId.
+     * sessionId is Claude Code's cc-session-id, which is null at PTY
+     * spawn time and populates a few seconds later when Claude Code
+     * emits SessionStart. When that resolution races with the user's
+     * first voice utterance, the dep tuple change tore down WS #1
+     * (with its awaitingResponseSince stamped from the inject) and
+     * opened WS #2 (fresh state, awaiting=0). The assistant turn then
+     * landed in the jsonl past WS #2's bind-time EOF stamp, but
+     * handleJsonlLine's awaiting-gate dropped it because WS #2 never
+     * saw an inject. Result: silent first turn, spoken turn 2 onward.
+     *
+     * ptyId is the true PTY identity. It does NOT change when
+     * Claude Code resolves its cc-session-id; it only changes when
+     * the user switches brainstorms or Lex respawns from outside
+     * the daemon (smart-compact restart is handled in-daemon at
+     * lex-voice-ws.ts:1053 with no client visibility). So this dep
+     * captures every WS-replacement-worthy event and ignores the
+     * spurious sessionId-resolve case. */
+  }, [enabled, lexPty?.ptyId ?? null, mode]);
 
   function pttDown(): void {
     setPttHolding(true);

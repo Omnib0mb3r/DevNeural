@@ -527,6 +527,32 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       jsonl_bound: Boolean(state.jsonlPath),
     });
     if (state.jsonlPath) startJsonlWatch();
+    /* Fix 31 (2026-05-25): migrate awaitingResponseSince from the
+     * brainstorm row when binding to an in-flight turn. The race:
+     * a prior WS for the same brainstorm fired ptyInject and set
+     * awaiting on its ConnState + flipped the brainstorm row's
+     * lifecycle_state to 'speaking' (handleUtteranceEnd:1900-1910).
+     * That socket then closed before the assistant turn landed
+     * (client reconnect on sessionId resolve, smart-compact restart,
+     * eviction, or daemon restart). The new ConnState bound here
+     * has awaiting=0 by default, so handleJsonlLine's gate at line
+     * 762 (!awaiting && !readOnly) drops the assistant turn when it
+     * arrives in the jsonl. The brainstorm row is the source of
+     * truth for "in-flight"; inherit it. lifecycle_state flips back
+     * to idle/attached on the matching end_turn at line 822, so
+     * this only stamps awaiting when a turn truly is in flight. */
+    try {
+      const bs =
+        (handle.sessionId && getBrainstormByClaudeSessionId(handle.sessionId)) ||
+        getBrainstormByPty(handle.ptyId) ||
+        null;
+      if (bs && bs.lifecycle_state === 'speaking') {
+        state.awaitingResponseSince = Date.now();
+        if (!state.watchTimer) startJsonlWatch();
+      }
+    } catch {
+      /* best-effort migration; never block bind() */
+    }
   }
 
   /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
@@ -632,24 +658,15 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   function pollJsonl(): void {
     if (!state.jsonlPath && state.watchSessionId) {
       /* Late jsonl creation: the file may not have existed at bind
-       * time but was created on first user/assistant turn.
-       *
-       * Fix 30 (2026-05-25): start at offset 0, not EOF. By the time
-       * pollJsonl late-resolves the file, Claude Code has already
-       * written the user record AND begun streaming the assistant
-       * turn (handleUtteranceEnd:1913 starts the watcher AFTER the
-       * inject; first tick is ~250ms later; short turns finish
-       * inside that window). Stamping EOF here lands the offset
-       * past the assistant text and the watcher never speaks it,
-       * giving the well-known "turn 1 text-only, turn 2+ spoken"
-       * symptom. The existing awaitingResponseSince > 0 gate at
-       * line 717 + rec.type !== 'assistant' filter at line 710 +
-       * spokenSegmentHashes dedupe at line 745 already prevent any
-       * pre-bind content from being spoken, so reading from 0 only
-       * admits the assistant turn that started AFTER the inject.
-       * Same shape as the 2026-05-14 compaction-restart fix at
-       * line 1055 (offset = 0 there too); that fix never propagated
-       * to this fresh-bind path. */
+       * time but was created on first user/assistant turn. Offset
+       * stamps to 0 (not EOF) so any assistant text already on disk
+       * when we late-resolve is still read. Safety: the
+       * `awaitingResponseSince > 0` gate + the
+       * `rec.type !== 'assistant'` filter + the spokenSegmentHashes
+       * dedupe in handleJsonlLine filter out any pre-bind content;
+       * reading from 0 only admits content that landed AFTER the
+       * matching inject. Same shape as the 2026-05-14 compaction-
+       * restart bind at line 1055. */
       const jsonl = findJsonlBySessionId(state.watchSessionId);
       if (jsonl) {
         state.jsonlPath = jsonl;
@@ -658,8 +675,8 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
     if (!state.jsonlPath) {
       /* Re-resolve the jsonl path if the PTY just bound a session_id.
-       * Same Fix 30 reasoning: offset = 0, not EOF, so turn 1's
-       * already-written assistant text is read on the first tick. */
+       * Offset = 0 for the same reason as the watchSessionId branch
+       * above: the handleJsonlLine gates filter what plays. */
       const handle = state.bindKey
         ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
         : undefined;

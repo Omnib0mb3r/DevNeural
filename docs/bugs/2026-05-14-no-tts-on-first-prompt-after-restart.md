@@ -3,6 +3,7 @@
 **Reported:** 2026-05-14 (brainstorm session "DevNeural Testing")
 **Severity:** medium
 **Component:** voice client (TTS on cold restart) / Lex cold-start path
+**Status:** closed 2026-05-25 (original cold-restart variant + 2026-05-24 fresh-spawn recurrence both addressed; see Fix 31)
 
 ## Symptom
 
@@ -62,3 +63,43 @@ Daemon's pollJsonl reads state.jsonlPath on every 250ms tick so the existing wat
 ## Open items
 
 - Hold for one cold-restart smoke-pass before marking closed.
+
+---
+
+## Recurrence: fresh-session spawn (2026-05-24)
+
+**Reported:** 2026-05-24 (brainstorm session, voice mode)
+**Status:** closed 2026-05-25 (Fix 31)
+
+### Symptom (recurrence)
+
+On every freshly started Lex session (not a compaction restart, a brand-new spawn), the first user prompt produces a text reply in the mirror but no TTS. The second prompt onward speaks normally. Identical user-visible behavior to the original cold-restart bug, different trigger path.
+
+### Difference from original
+
+Original repro required driving Lex past the compaction threshold so the cold-restart compaction path ran. This recurrence happens on a clean fresh spawn with no prior session involved, so the spawnRestart closure fix (37165b8 successor) does not cover it. The WS/jsonl state on first spawn is already "fresh"; the missing piece is parallel to the rebind-on-cold-restart path.
+
+### Root cause (verified 2026-05-25 via daemon.log probes)
+
+Two-layer race. Cause and fix are structural, not field-symmetry as initially suspected.
+
+**Layer 1 (client trigger).** `08-dashboard/components/VoiceClient.tsx:2671` declared the voice-engine effect with deps `[enabled, sessionId, mode]`. `sessionId` is Claude Code's cc-session-id, exposed via the 3-second `/pty-list` poll. At voice-engine startup on a fresh PTY, `lexPty.sessionId` is `null` (PTY exists but Claude Code has not yet emitted its SessionStart record). The effect runs with `sessionId=null`, opens WS #1, sends hello with `session_id=undefined`. The daemon's `bind()` falls back to PTY-cwd discovery, binds successfully (`bindKey = ptyId`). User speaks. `handleUtteranceEnd` injects into the PTY and stamps `state.awaitingResponseSince`. Claude Code processes the inject, emits SessionStart with its new cc-session-id, and begins writing the assistant turn into its jsonl. ~1.5-3 seconds later the dashboard's `/pty-list` poll returns the now-populated `sessionId`, React state updates, effect deps change, effect re-runs. Cleanup tears down WS #1. WS #2 opens with `session_id=<resolved>`. The fresh `ConnState` has `awaitingResponseSince=0` (default).
+
+**Layer 2 (daemon gate).** WS #2's `bind()` resolves the jsonl via the session-id branch at `lex-voice-ws.ts:419` and stamps `jsonlOffset = fs.statSync(jsonl).size` (EOF at bind time). The assistant turn lands in the jsonl past that offset within ~2 seconds. `pollJsonl` reads the new bytes and calls `handleJsonlLine`. At line 762 the gate `if (!readOnly && !state.awaitingResponseSince) return;` drops the assistant record because WS #2 never saw an inject and therefore never stamped awaiting. Silent first turn.
+
+Probe trace (`daemon.log` 21:43:37–21:44:01) confirmed the sequence verbatim: WS #1 hello with `session_id=undef`, fallback bind to `bindKey=ptyId`, inject + awaiting stamped, then WS #2 hello at 21:43:57 with the resolved cc-session-id, EOF offset stamped, and `handleJsonlLine GATE drop: type=assistant awaiting=0` at 21:44:01.
+
+### Fix (commit pending)
+
+Two layers, both committed atomically.
+
+**Layer 1 — daemon, the structural invariant.** `bind()` in `07-daemon/src/voice/lex-voice-ws.ts` now migrates `awaitingResponseSince` from the brainstorm row. After the bind resolves a handle, look up the brainstorm via `handle.sessionId` or `handle.ptyId`. If `lifecycle_state === 'speaking'` there is a turn in flight that the previous WS owner left behind, so stamp `state.awaitingResponseSince = Date.now()` and ensure the jsonl watcher is running. The brainstorm row is the authoritative source for "is a turn in flight?" — set on every inject at `handleUtteranceEnd:1900-1910` and cleared at the matching end_turn in `handleJsonlLine:818-822`. Inheriting from that row makes the gate at line 762 correct for any WS replacement cause: sessionId resolve, smart-compact restart, daemon restart, multi-tab eviction.
+
+**Layer 2 — client, identity correctness.** Change the voice-engine effect deps in `08-dashboard/components/VoiceClient.tsx:2671` from `[enabled, sessionId, mode]` to `[enabled, lexPty?.ptyId ?? null, mode]`. `ptyId` is the true PTY identity; it does not change when Claude Code resolves its cc-session-id. The dep tuple now only changes when the PTY itself changes (brainstorm switch, manual Lex restart) — events that genuinely justify a WS replacement. The smart-compact restart path swaps `bindKey` and `jsonlPath` in-daemon at `lex-voice-ws.ts:1053` without changing `ptyId` visible to the client (the daemon spawns a new PTY but the supervisor handles the swap), so this dep also avoids redundant churn on that path.
+
+Together: Layer 2 prevents the spurious WS replacement on cold-spawn sessionId resolve; Layer 1 keeps the daemon correct for any future cause of WS replacement during an in-flight turn.
+
+### Verification
+
+Real-hardware test 2026-05-25 (post-rebuild, post-restart): fresh brainstorm spawn, voice toggled on, first utterance spoken, first reply spoken aloud. Daemon test suite 863/863 green. Probes stripped before commit.
+
