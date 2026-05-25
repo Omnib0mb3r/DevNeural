@@ -2469,6 +2469,22 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           vadRef.current = vad;
           vad.start();
         } catch (err) {
+          /* Fix 2026-05-25: mic-init OOM recurrence on mobile Safari.
+           * Clear the cached vadModulePromise + vadModuleConfigured
+           * singletons BEFORE surfacing the error so the next Retry
+           * boots a fresh ORT env rather than landing on a poisoned
+           * backend ("previous call to initWasm() failed"). Extends
+           * the 2026-05-16 disable-path reset to the error path.
+           * logVoice lands the failure in the ring buffer + Voice
+           * diagnostics panel; setErrMsg only fires a UI toast and
+           * was invisible to operator + audit. */
+          resetVadModuleCache();
+          logVoice(
+            "vad-error",
+            (err as Error).message,
+            undefined,
+            "error",
+          );
           setStatus("error");
           setErrMsg(`mic init failed: ${(err as Error).message}`);
         }
@@ -2561,6 +2577,19 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           } as { destroy: () => void };
           setStatus("ready");
         } catch (err) {
+          /* Fix 2026-05-25: same reset + log path as the VAD mic-init
+           * catch above. Push-to-talk mode does not hit the wasm OOM
+           * path (no ORT modules) but the cached vadModule state can
+           * still be poisoned from an earlier conversation-mode init
+           * attempt; resetting on every error keeps the next Retry
+           * deterministic regardless of which mode tripped first. */
+          resetVadModuleCache();
+          logVoice(
+            "vad-error",
+            (err as Error).message,
+            undefined,
+            "error",
+          );
           setStatus("error");
           setErrMsg(`mic init failed: ${(err as Error).message}`);
         }
