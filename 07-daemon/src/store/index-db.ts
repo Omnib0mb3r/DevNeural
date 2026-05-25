@@ -982,6 +982,48 @@ export class IndexDb {
       .all(brainstormId, limit, offset) as BrainstormChunkRow[];
   }
 
+  /* Stage 2 of LEX-AUTONOMY-PAYLOAD-SPEC. Per-CC-session chunk fetch
+   * scoped to (brainstorm_id, cc_session_id). Defaults to DESC so
+   * the caller pulls the newest `limit` chunks first (the tail of a
+   * long session matters more than the head for distillation);
+   * caller reverses for chronological prompt assembly.
+   *
+   * Returns [] when no chunks for that pair exist. Importantly does
+   * NOT fall back to anchor-flat reads when cc_session_id is NULL
+   * or when the (brainstorm_id, cc_session_id) pair has no rows;
+   * the per-session distillation pipeline relies on this to detect
+   * "no scoped chunks" and log a structured skip reason rather than
+   * silently producing an anchor-wide summary mislabelled as
+   * per-session. */
+  listBrainstormChunksForSession(
+    brainstormId: string,
+    ccSessionId: string,
+    limit: number = 1000,
+    order: 'asc' | 'desc' = 'desc',
+  ): BrainstormChunkRow[] {
+    const sql =
+      `SELECT * FROM brainstorm_chunks
+         WHERE brainstorm_id = ? AND cc_session_id = ?
+         ORDER BY turn_index ${order === 'asc' ? 'ASC' : 'DESC'}
+         LIMIT ?`;
+    return this.db
+      .prepare(sql)
+      .all(brainstormId, ccSessionId, Math.max(0, Math.floor(limit))) as BrainstormChunkRow[];
+  }
+
+  countBrainstormChunksForSession(
+    brainstormId: string,
+    ccSessionId: string,
+  ): number {
+    const r = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM brainstorm_chunks
+           WHERE brainstorm_id = ? AND cc_session_id = ?`,
+      )
+      .get(brainstormId, ccSessionId) as { n: number } | undefined;
+    return r?.n ?? 0;
+  }
+
   /* Wave 2 day 3 backfill_review_queue helpers. Insert is the band
    * classifier's write path; the list helper drives /brainstorms/
    * backfill-review; the update helper handles one-click link / reject
