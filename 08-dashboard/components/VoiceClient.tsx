@@ -225,7 +225,7 @@ const MIC_GAIN_DEFAULT = 1.0;
  * requires a voice-off / voice-on cycle to take effect. */
 const VAD_REDEMPTION_STORAGE_KEY = "lex-vad-redemption-ms";
 const VAD_REDEMPTION_MIN = 200;
-const VAD_REDEMPTION_MAX = 3000;
+const VAD_REDEMPTION_MAX = 6000;
 const VAD_REDEMPTION_DEFAULT = 768;
 const SILERO_FRAME_MS = 32;
 
@@ -1602,6 +1602,20 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         clearTimeout(utteranceCapRef.current);
         utteranceCapRef.current = null;
       }
+      /* Fix 22 (2026-05-24): AudioContext close moved OUT of teardown.
+       * teardown runs on every effect cleanup (sessionId change, mode
+       * change, !enabled). Closing the ctx on sessionId change tore
+       * down the audio sink right before the new brainstorm's first
+       * tts-start tried to use it; tts-start refuses to lazy-create
+       * per voice-audio-warm.ts (autoplay policy), so the first reply
+       * was silenced and only the ~10s watchdog heal (resetVoiceAudio)
+       * re-warmed it for subsequent turns. The AudioContext is owned
+       * by the page (VoiceClient mounts once at app root, comment at
+       * line 287-294), not by the WS or the brainstorm session, so it
+       * must survive any teardown that is not a real voice-off. */
+    }
+
+    function closeAudioCtxOnDisable(): void {
       const ctx = audioCtxRef.current;
       if (ctx && ctx.state !== "closed") {
         try {
@@ -1615,6 +1629,10 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
 
     if (!enabled) {
       teardown();
+      /* Fix 22: ctx close only on real voice-off. The user-gesture
+       * warm path in toggleEnabled() re-creates the ctx on the next
+       * "Start voice" click. */
+      closeAudioCtxOnDisable();
       setStatus("idle");
       return;
     }
