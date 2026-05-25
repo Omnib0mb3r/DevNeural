@@ -1,13 +1,23 @@
 /**
  * Smart compact routes (SMART-COMPACT.md "Mechanics" + "Audit").
  *
- *   POST /lex/smart-compact/evaluate    {anchor_id}
- *     -> {action, reason, ctx_pct, summary?, shadow}
+ * v2 - Lex-authored resume prompts. The daemon no longer builds the
+ * resume summary. Lex composes the prompt at fire time using live
+ * conversation context and posts it as opts.summary on
+ * /lex/smart-compact/fire. The daemon is transport + audit log only
+ * for the summary inject. The wrap path stays daemon-authored
+ * (WRAP_AND_COMMIT_PROMPT).
  *
- *   POST /lex/smart-compact/fire        {anchor_id, reason, caller?, summary?}
- *     -> writes audit row; if not shadow and the anchor has a current
- *        PTY, injects /clear then the summary; if action='wrap' injects
- *        the wrap-and-commit prompt instead.
+ *   POST /lex/smart-compact/evaluate    {anchor_id}
+ *     -> {action, reason, ctx_pct, shadow}  // no summary
+ *
+ *   POST /lex/smart-compact/fire        {anchor_id, reason, action,
+ *                                        caller?, summary}
+ *     -> 400 when action='fire' and summary is missing/empty.
+ *        Otherwise writes audit row; if not shadow and the anchor
+ *        has a current PTY, injects /clear then the caller-supplied
+ *        summary. action='wrap' injects WRAP_AND_COMMIT_PROMPT and
+ *        does NOT require summary.
  *
  *   GET  /lex/smart-compact/recent      ?limit=20
  *     -> {ok, rows: SmartCompactLogRow[]}
@@ -20,7 +30,6 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
-import * as path from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import type { IndexDb, SmartCompactLogRow } from '../store/index-db.js';
 import {
@@ -32,10 +41,6 @@ import {
   type EvalReason,
   type Phase,
 } from '../lex/smart-compact.js';
-import {
-  buildSixSectionResume,
-  type FailedAttemptsExtractor,
-} from '../lex/six-section-resume.js';
 import {
   awaitNewSessionReady,
   capturePreClearJsonlSet,
@@ -69,7 +74,6 @@ export interface EvaluateResult {
   reason: EvalReason;
   ctx_pct: number | null;
   shadow: boolean;
-  summary?: string;
   jsonl_path: string | null;
   anchor_id: string;
 }
@@ -131,282 +135,6 @@ function deriveLastCommit(cwd: string): number | null {
   }
 }
 
-function recentCommits(cwd: string, n: number = 10): string[] {
-  if (!cwd || !fs.existsSync(cwd)) return [];
-  try {
-    const out = execFileSync(
-      'git',
-      ['-C', cwd, 'log', `-${n}`, '--oneline'],
-      { encoding: 'utf-8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] },
-    );
-    return out
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
-/* Six-section "Files in flight" feeder. `git status --short` returns
- * one line per dirty path, prefixed with a two-char status code. The
- * builder treats each line as a discrete entry; the caller does not
- * need to parse the codes for the resume to be useful. */
-function diffStatShort(cwd: string): string[] {
-  if (!cwd || !fs.existsSync(cwd)) return [];
-  try {
-    const out = execFileSync(
-      'git',
-      ['-C', cwd, 'status', '--short'],
-      { encoding: 'utf-8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] },
-    );
-    return out
-      .split('\n')
-      .map((l) => l.replace(/\s+$/, ''))
-      .filter((l) => l.length > 0);
-  } catch {
-    return [];
-  }
-}
-
-/* Six-section "Files in flight" feeder: scan the recent jsonl tail
- * for tool_use entries whose name is Read, Edit, or Write, and pull
- * the `path` / `file_path` argument out of input. Newest last. Caller
- * (six-section-resume.ts) dedupes and caps to the most recent 8. */
-function recentToolPathsFromJsonl(jsonlPath: string | null): string[] {
-  if (!jsonlPath || !fs.existsSync(jsonlPath)) return [];
-  try {
-    const stat = fs.statSync(jsonlPath);
-    const tailLen = Math.min(stat.size, 64 * 1024);
-    const start = stat.size - tailLen;
-    const fd = fs.openSync(jsonlPath, 'r');
-    try {
-      const buf = Buffer.alloc(tailLen);
-      fs.readSync(fd, buf, 0, tailLen, start);
-      const text = buf.toString('utf-8');
-      const lines = text.split('\n').filter((l) => l.trim());
-      const out: string[] = [];
-      for (const line of lines) {
-        try {
-          const rec = JSON.parse(line) as {
-            message?: {
-              content?: Array<{
-                type?: string;
-                name?: string;
-                input?: { file_path?: unknown; path?: unknown };
-              }>;
-            };
-          };
-          for (const c of rec.message?.content ?? []) {
-            if (c?.type !== 'tool_use') continue;
-            const n = c.name;
-            if (n !== 'Read' && n !== 'Edit' && n !== 'Write') continue;
-            const p =
-              (typeof c.input?.file_path === 'string' && c.input.file_path) ||
-              (typeof c.input?.path === 'string' && c.input.path) ||
-              '';
-            if (p) out.push(p);
-          }
-        } catch {
-          continue;
-        }
-      }
-      return out;
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch {
-    return [];
-  }
-}
-
-/* Six-section "Next step" feeder. Workers writing an away-summary
- * conventionally end with a "Next:" prefix on the last paragraph. We
- * scan the tail jsonl for the most recent assistant message that
- * contains a "Next:" line and return the text after the prefix. */
-function nextStepFromAwaySummary(jsonlPath: string | null): string {
-  if (!jsonlPath || !fs.existsSync(jsonlPath)) return '';
-  const turns = recentAssistantTurnsFromJsonl(jsonlPath);
-  for (let i = turns.length - 1; i >= 0; i--) {
-    const t = turns[i] ?? '';
-    const match = t.match(/(?:^|\n)\s*Next:\s*([^\n]+)/i);
-    if (match && match[1]) {
-      return match[1].trim();
-    }
-  }
-  return '';
-}
-
-/* Six-section "Failed attempts" feeder: pull the most recent N assistant
- * turn texts so the LLM extractor has something to scan. Cap to the
- * last 6 turns to keep the extractor prompt short. */
-function recentAssistantTurnsFromJsonl(
-  jsonlPath: string | null,
-  maxTurns: number = 6,
-): string[] {
-  if (!jsonlPath || !fs.existsSync(jsonlPath)) return [];
-  try {
-    const stat = fs.statSync(jsonlPath);
-    const tailLen = Math.min(stat.size, 128 * 1024);
-    const start = stat.size - tailLen;
-    const fd = fs.openSync(jsonlPath, 'r');
-    try {
-      const buf = Buffer.alloc(tailLen);
-      fs.readSync(fd, buf, 0, tailLen, start);
-      const text = buf.toString('utf-8');
-      const lines = text.split('\n').filter((l) => l.trim());
-      const out: string[] = [];
-      for (const line of lines) {
-        try {
-          const rec = JSON.parse(line) as {
-            type?: string;
-            message?: { content?: unknown };
-          };
-          if (rec.type !== 'assistant') continue;
-          const content = rec.message?.content;
-          if (typeof content === 'string') {
-            out.push(content);
-          } else if (Array.isArray(content)) {
-            const texts: string[] = [];
-            for (const c of content) {
-              const block = c as { type?: string; text?: string };
-              if (block?.type === 'text' && typeof block.text === 'string') {
-                texts.push(block.text);
-              }
-            }
-            if (texts.length > 0) out.push(texts.join('\n'));
-          }
-        } catch {
-          continue;
-        }
-      }
-      return out.slice(-maxTurns);
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch {
-    return [];
-  }
-}
-
-function jsonlTailSummary(jsonlPath: string | null): string {
-  if (!jsonlPath || !fs.existsSync(jsonlPath)) return '';
-  try {
-    const stat = fs.statSync(jsonlPath);
-    const tailLen = Math.min(stat.size, 8 * 1024);
-    const start = stat.size - tailLen;
-    const fd = fs.openSync(jsonlPath, 'r');
-    try {
-      const buf = Buffer.alloc(tailLen);
-      fs.readSync(fd, buf, 0, tailLen, start);
-      const text = buf.toString('utf-8');
-      const lines = text.split('\n').filter((l) => l.trim());
-      for (let i = lines.length - 1; i >= 0; i--) {
-        try {
-          const rec = JSON.parse(lines[i]!) as {
-            type?: string;
-            message?: { content?: unknown };
-          };
-          if (rec.type === 'assistant' || rec.type === 'user') {
-            const content =
-              typeof rec.message?.content === 'string'
-                ? rec.message.content
-                : JSON.stringify(rec.message?.content ?? '');
-            return content.slice(0, 240);
-          }
-        } catch {
-          continue;
-        }
-      }
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch {
-    /* ignore */
-  }
-  return '';
-}
-
-export interface BuildSummaryOptions {
-  recentCommits?: (cwd: string) => string[];
-  diffStatShort?: (cwd: string) => string[];
-  lastActionSummary?: (jsonlPath: string | null) => string;
-  recentToolPaths?: (jsonlPath: string | null) => string[];
-  nextStepFromAwaySummary?: (jsonlPath: string | null) => string;
-  recentAssistantTurns?: (jsonlPath: string | null) => string[];
-  /** Pluggable failed-attempts extractor. The route wires the LLM-
-   * driven implementation from six-section-resume-extractors.ts;
-   * tests pass a deterministic fake. When omitted the failed-
-   * attempts section is dropped with reason='no-extractor'. */
-  extractFailedAttempts?: FailedAttemptsExtractor;
-}
-
-export async function buildAnchorSummary(
-  db: IndexDb,
-  anchorId: string,
-  opts: BuildSummaryOptions = {},
-): Promise<{ summary: string; jsonlPath: string | null; dropped: string[] } | null> {
-  const anchor = db.getProjectSession(anchorId);
-  if (!anchor) return null;
-  const jsonlPath = jsonlForAnchor(db, anchorId);
-  const commits = (opts.recentCommits ?? recentCommits)(anchor.cwd);
-  const diff = (opts.diffStatShort ?? diffStatShort)(anchor.cwd);
-  const lastAction = (opts.lastActionSummary ?? jsonlTailSummary)(jsonlPath);
-  const findings = (() => {
-    try {
-      return db.listAuditFindings({
-        status: 'open',
-        limit: 50,
-      }).length;
-    } catch {
-      return 0;
-    }
-  })();
-  const activeWork = pickActiveWork(anchor.cwd);
-  const recentToolPaths = (opts.recentToolPaths ?? recentToolPathsFromJsonl)(jsonlPath);
-  const nextStep = (opts.nextStepFromAwaySummary ?? nextStepFromAwaySummary)(jsonlPath);
-  const recentTurns = (opts.recentAssistantTurns ?? recentAssistantTurnsFromJsonl)(jsonlPath);
-  const built = await buildSixSectionResume(
-    {
-      projectName: anchor.title?.trim() || anchor.project_slug,
-      activeWork,
-      lastActionSummary: lastAction,
-      diffStatShort: diff,
-      recentToolPaths,
-      recentCommits: commits,
-      nextStepFromAwaySummary: nextStep,
-      openAuditFindings: findings,
-      jsonlPath: jsonlPath ?? '',
-      recentAssistantTurns: recentTurns,
-    },
-    {
-      ...(opts.extractFailedAttempts
-        ? { extractFailedAttempts: opts.extractFailedAttempts }
-        : {}),
-    },
-  );
-  return { jsonlPath, summary: built.text, dropped: built.dropped };
-}
-
-function pickActiveWork(cwd: string): string {
-  /* Best-effort: read first heading of TODO.md if present, else the
-   * one-line summary from docs/spec/ROADMAP-or-first-spec. Falls back
-   * to a generic line. */
-  const todo = path.posix.join(cwd.replace(/\\/g, '/'), 'TODO.md');
-  if (fs.existsSync(todo)) {
-    try {
-      const head = fs
-        .readFileSync(todo, 'utf-8')
-        .split('\n')
-        .find((l) => l.trim() && !l.trim().startsWith('#'));
-      if (head) return head.trim().slice(0, 240);
-    } catch {
-      /* fall through */
-    }
-  }
-  return 'see TODO.md / docs/spec for current focus';
-}
-
 export async function evaluateSmartCompact(
   db: IndexDb,
   anchorId: string,
@@ -459,18 +187,12 @@ export async function evaluateSmartCompact(
     phase,
   });
   const shadow = isShadow(db, anchorId);
-  let summary: string | undefined;
-  if (verdict.action === 'fire' || verdict.action === 'wrap') {
-    const built = await buildAnchorSummary(db, anchorId);
-    summary = built?.summary;
-  }
   return {
     ok: true,
     action: verdict.action,
     reason: verdict.reason,
     ctx_pct: ctxPct,
     shadow,
-    summary,
     jsonl_path: jsonlPath,
     anchor_id: anchorId,
   };
@@ -804,6 +526,23 @@ export function registerSmartCompactRoutes(
     if (!body.anchor_id || !body.reason || !body.action) {
       reply.code(400);
       return { ok: false, error: 'anchor_id, reason, action required' };
+    }
+    /* v2 - Lex-authored resume prompt. The daemon no longer builds the
+     * summary. action='fire' requires a non-empty caller-supplied
+     * summary; rejecting up-front prevents an empty inject pasting a
+     * blank line into the freshly-cleared worker. action='wrap' uses
+     * the daemon-authored WRAP_AND_COMMIT_PROMPT and does not take a
+     * caller summary. */
+    if (body.action === 'fire') {
+      const s = typeof body.summary === 'string' ? body.summary.trim() : '';
+      if (!s) {
+        reply.code(400);
+        return {
+          ok: false,
+          error:
+            "summary is required and must be non-empty when action='fire' (v2: Lex-authored)",
+        };
+      }
     }
     /* Build the event-driven readiness gate for the resume summary
      * paste. Skipped for action='wrap' since wrap does a single

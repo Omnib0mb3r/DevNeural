@@ -7,6 +7,7 @@
  * shadow gating skips inject.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import Fastify from 'fastify';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -18,6 +19,7 @@ import {
   fireSmartCompact,
   parseSmartCompactValue,
   recentSmartCompacts,
+  registerSmartCompactRoutes,
   smartCompactMode,
   SMART_COMPACT_CONFIG_KEY,
 } from '../src/dashboard/smart-compact-routes.js';
@@ -118,7 +120,7 @@ describe('evaluateSmartCompact', () => {
     expect(r.ctx_pct).toBeNull();
   });
 
-  it('passes through explicit ctx_pct and phase to the evaluator', async () => {
+  it('passes through explicit ctx_pct and phase to the evaluator and does NOT return a summary (v2 Lex-authored)', async () => {
     seedAnchor({ id: 'a' });
     const r = await evaluateSmartCompact(db, 'a', {
       ctxPct: 60,
@@ -128,8 +130,9 @@ describe('evaluateSmartCompact', () => {
     });
     expect(r.action).toBe('fire');
     expect(r.reason).toBe('window-open');
-    expect(typeof r.summary).toBe('string');
-    expect(r.summary).toMatch(/Context refreshed/);
+    /* v2 contract: daemon no longer builds the summary; Lex authors
+     * it at fire time and posts it on opts.summary. */
+    expect((r as { summary?: unknown }).summary).toBeUndefined();
   });
 
   it('returns shadow=true while attempt count is under threshold', async () => {
@@ -417,5 +420,118 @@ describe('smart-compact three-state runtime toggle', () => {
     expect(r.action).toBe('fire');
     /* /clear + summary injects on the resolved pty. */
     expect(injector).toHaveBeenCalled();
+  });
+});
+
+describe('POST /lex/smart-compact/fire validation (v2 - Lex-authored summary)', () => {
+  async function buildApp(): Promise<{
+    app: ReturnType<typeof Fastify>;
+    injector: ReturnType<typeof vi.fn>;
+  }> {
+    const app = Fastify({ logger: false });
+    const injector = vi.fn(() => ({ ok: true as const }));
+    registerSmartCompactRoutes(app, db, injector, () => undefined);
+    await app.ready();
+    return { app, injector };
+  }
+
+  it("rejects fire with 400 when summary is missing (action='fire')", async () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    const { app, injector } = await buildApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/fire',
+        payload: {
+          anchor_id: 'a',
+          reason: 'window-open',
+          action: 'fire',
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      const body = res.json() as { ok: boolean; error: string };
+      expect(body.ok).toBe(false);
+      expect(body.error).toMatch(/summary is required/i);
+      expect(injector).not.toHaveBeenCalled();
+      /* No audit row written when the route short-circuits. */
+      expect(recentSmartCompacts(db).length).toBe(0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejects fire when summary is whitespace-only', async () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    const { app, injector } = await buildApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/fire',
+        payload: {
+          anchor_id: 'a',
+          reason: 'window-open',
+          action: 'fire',
+          summary: '   \n  \t  ',
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(injector).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("accepts fire when summary is a non-empty string (action='fire')", async () => {
+    /* cwd left empty so the route's awaitSessionReady gate is skipped
+     * and fireSmartCompact runs the legacy back-to-back inline path
+     * (/clear + summary synchronously). The event-driven async path
+     * is exercised in smart-compact-parked-replay.test.ts. */
+    seedAnchor({ id: 'a', cwd: '', pty: 'pty-A' });
+    const { app, injector } = await buildApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/fire',
+        payload: {
+          anchor_id: 'a',
+          reason: 'window-open',
+          action: 'fire',
+          summary: 'Lex-authored resume prompt here.',
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { ok: boolean; action: string };
+      expect(body.action).toBe('fire');
+      /* injector receives /clear, then the summary string verbatim. */
+      const calls = injector.mock.calls.map((c) => c[1]);
+      expect(calls[0]).toBe('/clear');
+      expect(calls).toContain('Lex-authored resume prompt here.');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("does NOT require summary when action='wrap' (daemon-authored prompt)", async () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    const { app, injector } = await buildApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/fire',
+        payload: {
+          anchor_id: 'a',
+          reason: 'forced-no-stop',
+          action: 'wrap',
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { action: string };
+      expect(body.action).toBe('wrap');
+      const calls = injector.mock.calls;
+      expect(calls.length).toBe(1);
+      expect(calls[0]![1]).toMatch(/Wrap your current work/);
+    } finally {
+      await app.close();
+    }
   });
 });

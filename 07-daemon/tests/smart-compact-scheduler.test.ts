@@ -3,9 +3,10 @@
  *
  * Drives runSmartCompactTick with stub evaluator + injector against a
  * tmp DB seeded with live anchors. Asserts: evaluator is called per
- * live anchor, fire/wrap drive fireSmartCompact (audit row lands),
- * action='wait' is recorded without an inject, hard-ceiling routes
- * through to fire path, errors do not abort the loop.
+ * live anchor, action='wrap' drives fireSmartCompact (audit row
+ * lands), action='wait' is recorded without an inject, action='fire'
+ * is deferred to Lex (v2 - daemon no longer authors resume prompts),
+ * errors do not abort the loop.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
@@ -91,7 +92,7 @@ describe('runSmartCompactTick', () => {
     expect(r.waited.sort()).toEqual(['a', 'b', 'c']);
   });
 
-  it('routes action=fire through fireSmartCompact (audit row lands)', async () => {
+  it("defers action='fire' to Lex (no inject, no audit row) - v2 Lex-authored summary", async () => {
     seedLive('a');
     const evaluator = vi.fn(() => ({
       ok: true as const,
@@ -99,18 +100,18 @@ describe('runSmartCompactTick', () => {
       reason: 'window-open' as const,
       ctx_pct: 60,
       shadow: false,
-      summary: 'resume me',
       jsonl_path: null,
       anchor_id: 'a',
     }));
     const injector = vi.fn(() => ({ ok: true }));
     const r = await runSmartCompactTick({ db, injector, evaluator });
-    expect(r.fired).toEqual(['a']);
-    expect(injector).toHaveBeenCalled();
-    const row = recentSmartCompacts(db)[0]!;
-    expect(row.action).toBe('fire');
-    expect(row.caller).toBe('scheduler');
-    expect(row.pre_ctx_pct).toBe(60);
+    /* Scheduler no longer authors the resume prompt. action='fire' is
+     * deferred to Lex; the scheduler logs and skips so the worker
+     * never receives a /clear followed by a blank inject. */
+    expect(r.fired).toEqual([]);
+    expect(r.deferredFire).toEqual(['a']);
+    expect(injector).not.toHaveBeenCalled();
+    expect(recentSmartCompacts(db).length).toBe(0);
   });
 
   it('routes action=wrap into the wrap path (no /clear)', async () => {
@@ -121,7 +122,6 @@ describe('runSmartCompactTick', () => {
       reason: 'forced-no-stop' as const,
       ctx_pct: 75,
       shadow: false,
-      summary: 'unused for wrap',
       jsonl_path: null,
       anchor_id: 'a',
     }));
@@ -133,7 +133,7 @@ describe('runSmartCompactTick', () => {
     expect(text).toMatch(/Wrap your current work/);
   });
 
-  it('hard-ceiling reason -> fire path', async () => {
+  it("hard-ceiling reason -> still deferred to Lex (v2 - daemon doesn't author)", async () => {
     seedLive('a');
     const evaluator = vi.fn(() => ({
       ok: true as const,
@@ -141,17 +141,17 @@ describe('runSmartCompactTick', () => {
       reason: 'hard-ceiling' as const,
       ctx_pct: 92,
       shadow: false,
-      summary: 'forced',
       jsonl_path: null,
       anchor_id: 'a',
     }));
-    const r = await runSmartCompactTick({
-      db,
-      injector: vi.fn(() => ({ ok: true })),
-      evaluator,
-    });
-    expect(r.fired).toEqual(['a']);
-    expect(recentSmartCompacts(db)[0]!.reason).toBe('hard-ceiling');
+    const injector = vi.fn(() => ({ ok: true }));
+    const r = await runSmartCompactTick({ db, injector, evaluator });
+    /* Even at hard ceiling the daemon does not invent a summary. Lex
+     * must observe the same verdict on its next poll and post the
+     * resume prompt. */
+    expect(r.deferredFire).toEqual(['a']);
+    expect(injector).not.toHaveBeenCalled();
+    expect(recentSmartCompacts(db).length).toBe(0);
   });
 
   it('continues past an evaluator throw on one anchor', async () => {

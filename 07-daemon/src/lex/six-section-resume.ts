@@ -1,6 +1,14 @@
 /**
  * Six-section resume builder.
  *
+ * v2 status: caller-side optional helper. The daemon no longer wires
+ * this into smart-compact evaluate/fire — Lex authors the resume
+ * prompt directly from its live conversation context and posts it as
+ * opts.summary on /lex/smart-compact/fire. This module stays
+ * available for any caller (Lex itself, a future external tool) that
+ * wants a structured six-section scaffold instead of free-form prose,
+ * but it is no longer the default resume path.
+ *
  * Replaces the legacy single-paragraph `assembleSummary` in
  * `lex/smart-compact.ts`. Outputs a structured resume prompt with up
  * to six labelled sections:

@@ -563,9 +563,14 @@ async function main(): Promise<void> {
         ctxProvider,
         log: (m) => logger(m),
       });
-      if (r.fired.length || r.wrapped.length || r.errors.length) {
+      if (
+        r.fired.length ||
+        r.wrapped.length ||
+        r.deferredFire.length ||
+        r.errors.length
+      ) {
         logger(
-          `[smart-compact] evaluated=${r.evaluated} fired=${r.fired.length} wrapped=${r.wrapped.length} waited=${r.waited.length} errors=${r.errors.length}`,
+          `[smart-compact] evaluated=${r.evaluated} fired=${r.fired.length} wrapped=${r.wrapped.length} deferred=${r.deferredFire.length} waited=${r.waited.length} errors=${r.errors.length}`,
         );
       }
     } catch (err) {
