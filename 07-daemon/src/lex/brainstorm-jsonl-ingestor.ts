@@ -76,8 +76,25 @@ export interface BrainstormJsonlIngestorTickResult {
 /* Persistent per-process offset map. Tests inject a fresh instance
  * via _resetOffsetsForTests; production callers reuse the module
  * default so daemon hot paths do not re-walk multi-MB jsonls every
- * tick. */
+ * tick.
+ *
+ * Fix 2026-05-25 (jsonl-repoint-drain-loss): key is now
+ * `${row.id}:${claude_session_id}` rather than `row.id` alone. The
+ * brainstorm row's claude_session_id is a mutable pointer; when
+ * bindBrainstormSessionId repoints it (after /clear or --resume
+ * rejection), the old key remains in the map but is no longer
+ * referenced and the new key starts at offset 0. Without the
+ * composite key, a repointed row's next tick would seek into the
+ * new jsonl at the OLD jsonl's tail offset, either silently
+ * returning empty (new file shorter than old offset) or skipping
+ * into the middle of the new session's content (new file longer).
+ * Old keys are not actively cleaned up; they cost nothing and the
+ * map is in-process only (rebuilt on daemon restart). */
 const offsets = new Map<string, number>();
+
+function offsetKey(rowId: string, claudeSessionId: string): string {
+  return `${rowId}:${claudeSessionId}`;
+}
 
 export function _resetBrainstormOffsetsForTests(): void {
   offsets.clear();
@@ -187,7 +204,14 @@ export function runBrainstormJsonlIngestTick(
     scanned += 1;
     const jsonl = resolve(row);
     if (!jsonl) continue;
-    const offset = offsets.get(row.id) ?? 0;
+    /* Composite (rowId, claude_session_id) key per the 2026-05-25
+     * repoint-drain-loss fix. claude_session_id is non-null here
+     * because defaultResolveJsonlPath returns null without it; the
+     * empty-string fallback exists only for tests that inject a
+     * custom resolver and may leave the field blank. */
+    const ccKey = row.claude_session_id ?? '';
+    const key = offsetKey(row.id, ccKey);
+    const offset = offsets.get(key) ?? 0;
     const slice = readSince(jsonl, offset);
     if (!slice) continue;
     /* Walk lines. The slice may end mid-line if the cap fired or the
@@ -242,7 +266,7 @@ export function runBrainstormJsonlIngestTick(
       text.slice(0, lastComplete),
       'utf-8',
     );
-    offsets.set(row.id, offset + completedBytes);
+    offsets.set(key, offset + completedBytes);
   }
   if (deps.log && (inserted > 0 || errors.length > 0)) {
     deps.log(

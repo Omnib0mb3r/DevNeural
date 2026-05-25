@@ -15,6 +15,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Store } from '../store/index.js';
 import type { BrainstormSessionRow } from '../store/index-db.js';
+import { runBrainstormJsonlIngestTick } from './brainstorm-jsonl-ingestor.js';
 
 let _store: Store | null = null;
 
@@ -236,6 +237,33 @@ export function bindBrainstormSessionId(
   ptyId: string,
   claudeSessionId: string,
 ): BrainstormSessionRow | null {
+  /* Fix 2026-05-25 (jsonl-repoint-drain-loss). Before flipping
+   * claude_session_id to the new value, run one synchronous
+   * ingestor tick against the row in its CURRENT state. That
+   * drains any unread turns from the OLD jsonl into
+   * brainstorm_chunks with the correct OLD cc_session_id stamped
+   * per line. Without this drain, turns appended between the last
+   * cron-cadence tick and the repoint were never seen by the
+   * ingestor and never landed in brainstorm_chunks. Scoped to the
+   * single row by passing listActiveBrainstorms; cheap because we
+   * only walk the bytes since this row's last offset, not the
+   * whole jsonl. Best-effort: an ingestor throw must not block the
+   * pointer flip (PTY discovery is the higher-priority signal). */
+  try {
+    const existing = db().getBrainstorm(brainstormId);
+    if (
+      existing &&
+      existing.claude_session_id &&
+      existing.claude_session_id !== claudeSessionId
+    ) {
+      runBrainstormJsonlIngestTick({
+        db: db(),
+        listActiveBrainstorms: () => [existing],
+      });
+    }
+  } catch {
+    /* Drain is additive; never block the bind on its failure. */
+  }
   return db().updateBrainstorm(brainstormId, {
     pty_id: ptyId,
     claude_session_id: claudeSessionId,

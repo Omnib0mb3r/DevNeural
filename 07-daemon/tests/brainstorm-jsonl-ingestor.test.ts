@@ -145,7 +145,12 @@ describe('runBrainstormJsonlIngestTick', () => {
       'utf-8',
     );
     runBrainstormJsonlIngestTick(deps());
-    const firstOffset = _peekBrainstormOffsetsForTests().get(BS_ID);
+    /* Fix 2026-05-25: offsets map is keyed by
+     * `${rowId}:${claude_session_id}` (composite) so a jsonl
+     * repoint starts at offset 0 cleanly. */
+    const firstOffset = _peekBrainstormOffsetsForTests().get(
+      `${BS_ID}:${CC_SESSION}`,
+    );
     expect(firstOffset).toBeGreaterThan(0);
     /* Append a second turn. Tick should pick up only the new line. */
     fs.appendFileSync(

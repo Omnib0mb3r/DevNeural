@@ -205,3 +205,19 @@ captured in C:/tmp/codex-stage-2-review.md). Contract decisions
 adopted in this stage's commits match the review verdicts on
 generator API shape, idempotency model, NULL-chunk handling, and
 the six blocking tests.
+
+## Stage 2 status: COMPLETE (2026-05-25)
+
+All Stage 2 commits in (c03b356, a290545, e861e88, c466251,
+f308198, 69e5056, 8854179) plus the related voice mic-init OOM
+recurrence fix (f237673) and the jsonl-repoint drain-loss patch
+shipped as a single commit on top. Worker stopped here per
+operator directive: smoke test on Stages 0+1+2 + voice fix +
+repoint fix as one batch before resuming with Stages 5-12.
+
+Bug stays OPEN pending live attached-session smoke validation on
+the running daemon (end session, confirm `ref_summary` lands on
+the matching `lex_transcript_ref` row + `last_summary` recomposes
+as the deterministic concat of the N=3 newest per-session
+artifacts). 24h no-recurrence window starts when the smoke pass
+completes.
