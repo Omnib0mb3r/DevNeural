@@ -21,7 +21,16 @@
 
 [CmdletBinding()]
 param(
-    [string]$DaemonRoot
+    [string]$DaemonRoot,
+    # When set, skip the "already alive" health probe and always
+    # spawn node. Used by the /admin/daemon/restart route: the old
+    # daemon may still be answering /health during its graceful
+    # shutdown window (chokidar watcher close + app.close + store
+    # close take 2-6s on Windows), so a probe at relauncher-spawn
+    # time would self-skip and leave nothing alive once the sidecar
+    # hard-kill fires at +6s. Task Scheduler autostart MUST NOT pass
+    # this flag; it relies on the probe to no-op when healthy.
+    [switch]$Force
 )
 
 # Resolve the daemon root relative to this script's location. Use a
@@ -51,15 +60,39 @@ if (-not (Test-Path -LiteralPath $dist)) {
 # localhost:3747 we exit silently to avoid burning CPU on a no-op
 # Node startup. Daemon's own PID-file singleton check is the
 # authoritative guard, but skipping the spawn entirely is friendlier.
+#
+# Skipped when -Force is set (dashboard restart path). See param block.
 $port = if ($env:DEVNEURAL_PORT) { [int]$env:DEVNEURAL_PORT } else { 3747 }
-try {
-    $existing = Invoke-WebRequest -Uri "http://localhost:$port/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
-    if ($existing.StatusCode -eq 200) {
-        Write-Host "[start-daemon] already alive on :$port; skipping spawn"
-        exit 0
+if (-not $Force) {
+    try {
+        $existing = Invoke-WebRequest -Uri "http://localhost:$port/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+        if ($existing.StatusCode -eq 200) {
+            Write-Host "[start-daemon] already alive on :$port; skipping spawn"
+            exit 0
+        }
+    } catch {
+        # Not reachable; proceed with launch.
     }
-} catch {
-    # Not reachable; proceed with launch.
+} else {
+    Write-Host "[start-daemon] -Force set; bypassing already-alive probe"
+    # When called from /admin/daemon/restart, the old daemon may still
+    # hold :$port during its graceful shutdown. Spawning node now would
+    # EADDRINUSE the listen socket. Wait up to 20s for the port to free.
+    # The restart route's sidecar kill fires at +6s so the worst-case
+    # ungraceful exit still clears the port well inside this window.
+    $portFreeDeadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $portFreeDeadline) {
+        $stillBound = $false
+        try {
+            $probe = Invoke-WebRequest -Uri "http://localhost:$port/health" -UseBasicParsing -TimeoutSec 1 -ErrorAction Stop
+            if ($probe.StatusCode -eq 200) { $stillBound = $true }
+        } catch {
+            # Not reachable means port is free (or at least no Fastify
+            # answering). Good enough to attempt the bind.
+        }
+        if (-not $stillBound) { break }
+        Start-Sleep -Milliseconds 500
+    }
 }
 
 # PowerShell 5.1 (default Windows shell) doesn't support `?.` so we

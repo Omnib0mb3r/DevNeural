@@ -3272,7 +3272,17 @@ export async function registerDashboardRoutes(
      * quoting, no `timeout` shell builtin. Keeps the spawn argv clean
      * and avoids the "bad argument" error path some shells produce when
      * their builtins see a quoted operand. */
-    const inline = `Start-Sleep -Seconds 2; & '${startScript.replace(/'/g, "''")}'`;
+    /* -Force on start-daemon.ps1 bypasses the "already alive" probe so
+     * the relauncher cannot self-skip during the old daemon's graceful
+     * shutdown window. Without -Force, the probe at t+2s sees the old
+     * Fastify still answering /health (chokidar watcher close + app
+     * close + store close take 2-6s on Windows) and exits 0 with
+     * "already alive; skipping spawn". The sidecar Stop-Process then
+     * kills the old daemon at t+6s and nothing is left to bind :3747
+     * until the Task Scheduler 5-min autostart tick — average wait
+     * ~2.5min, worst ~5min. Task Scheduler itself does NOT pass -Force;
+     * its job is to no-op when the daemon is healthy. */
+    const inline = `Start-Sleep -Seconds 2; & '${startScript.replace(/'/g, "''")}' -Force`;
     try {
       const child = spawn(
         'powershell.exe',
