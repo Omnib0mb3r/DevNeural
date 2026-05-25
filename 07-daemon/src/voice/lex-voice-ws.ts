@@ -793,6 +793,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * order matters because that block also wants brainstormId. */
     let brainstormForFeedback: { id: string; prompt_version: string | null } | null = null;
     let brainstormModeForChunk: 'conversation' | 'notes' | 'push-to-talk' = 'conversation';
+    /* Originating CC session id for the chunk-write below
+     * (LEX-AUTONOMY-PAYLOAD-SPEC Stage 0). Prefer the bound PTY
+     * handle's session id; fall back to the watcher's tracked
+     * session id; NULL out when neither is available so the column
+     * stays NULL rather than receiving a stale value. */
+    let ccSessionIdForChunk: string | null = null;
     try {
       const handle = state.bindKey
         ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
@@ -815,6 +821,8 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         brainstormModeForChunk =
           bsMode === 'notes' || bsMode === 'push-to-talk' ? bsMode : 'conversation';
       }
+      ccSessionIdForChunk =
+        handle?.sessionId ?? state.watchSessionId ?? null;
     } catch {
       /* observability only */
     }
@@ -858,6 +866,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
             text: isPreToolAck ? text : fullText,
             model_id: process.env.DEVNEURAL_LEX_MODEL_ID ?? 'claude',
             no_decay: 1,
+            cc_session_id: ccSessionIdForChunk,
           });
         } catch {
           /* observational; never block speak() */
@@ -1203,6 +1212,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         mode: state.mode,
         text: userText,
         model_id: 'voice-direct-llm',
+        /* direct-LLM voice path has no CC session bound; per spec
+         * (LEX-AUTONOMY-PAYLOAD-SPEC Stage 0) NULL is the
+         * documented behavior for non-CC-attached writers. */
+        cc_session_id: null,
       });
     } catch (err) {
       console.log(
@@ -1264,6 +1277,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           mode: state.mode,
           text: reply.text,
           model_id: reply.modelId,
+          cc_session_id: null,
         });
       } catch (err) {
         console.log(

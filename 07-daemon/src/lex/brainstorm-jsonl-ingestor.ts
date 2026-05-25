@@ -35,6 +35,10 @@ import type { IndexDb, BrainstormSessionRow } from '../store/index-db.js';
 interface JsonlEntry {
   type?: string;
   uuid?: string;
+  /** CC stamps every line with the originating session id. Surfaced
+   * onto brainstorm_chunks.cc_session_id for Stage 2 per-session
+   * distillation scoping (LEX-AUTONOMY-PAYLOAD-SPEC Stage 0). */
+  sessionId?: string;
   message?: {
     role?: string;
     content?:
@@ -211,6 +215,10 @@ export function runBrainstormJsonlIngestTick(
       const turnText = extractText(entry.message);
       if (!turnText) continue;
       const role: 'user' | 'lex' = entry.type === 'assistant' ? 'lex' : 'user';
+      const ccSessionId =
+        typeof entry.sessionId === 'string' && entry.sessionId.length > 0
+          ? entry.sessionId
+          : null;
       try {
         deps.db.insertBrainstormChunk({
           id: uuid,
@@ -221,6 +229,7 @@ export function runBrainstormJsonlIngestTick(
           text: turnText,
           model_id: role === 'lex' ? (process.env.DEVNEURAL_LEX_MODEL_ID ?? 'claude') : '',
           no_decay: 1,
+          cc_session_id: ccSessionId,
         });
         inserted += 1;
       } catch (err) {

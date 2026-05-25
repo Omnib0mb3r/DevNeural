@@ -303,6 +303,11 @@ export interface BrainstormChunkRow {
   model_id: string;
   no_decay: number;
   created_at: string;
+  /** Originating CC session id at the time of write. NULL for
+   * historical rows (pre-Stage 0 of LEX-AUTONOMY-PAYLOAD-SPEC) and
+   * for direct-LLM ingestion paths. Stage 2 per-session distillation
+   * scopes by (brainstorm_id, cc_session_id). */
+  cc_session_id: string | null;
 }
 
 /* lex_session row. The durable Lex brainstorm anchor introduced in
@@ -898,14 +903,20 @@ export class IndexDb {
     text: string;
     model_id: string;
     no_decay?: number;
+    /** Originating CC session for per-session distillation scoping
+     * (LEX-AUTONOMY-PAYLOAD-SPEC Stage 0). NULL when the writer has
+     * no bound CC session (direct-LLM ingestion, historical
+     * backfill). Callers with a session id SHOULD pass it; the
+     * column is nullable for backwards-compatibility only. */
+    cc_session_id?: string | null;
   }): void {
     this.db
       .prepare(
         `INSERT OR REPLACE INTO brainstorm_chunks
-           (id, brainstorm_id, turn_index, role, mode, text, model_id, no_decay)
-         VALUES (@id, @brainstorm_id, @turn_index, @role, @mode, @text, @model_id, @no_decay)`,
+           (id, brainstorm_id, turn_index, role, mode, text, model_id, no_decay, cc_session_id)
+         VALUES (@id, @brainstorm_id, @turn_index, @role, @mode, @text, @model_id, @no_decay, @cc_session_id)`,
       )
-      .run({ no_decay: 1, ...row });
+      .run({ no_decay: 1, cc_session_id: null, ...row });
     /* Keep brainstorm_sessions.turn_count in sync so the past-sessions
      * list and the empty-row filter (listBrainstormsFiltered) can
      * decide substance without a JOIN on every read. Recompute the
