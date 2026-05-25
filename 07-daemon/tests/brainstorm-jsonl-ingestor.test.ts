@@ -230,6 +230,69 @@ describe('runBrainstormJsonlIngestTick', () => {
     expect(rows.map((r) => r.role)).toEqual(['user', 'lex', 'user', 'lex']);
   });
 
+  /* Stage 1 capture invariant (LEX-AUTONOMY-PAYLOAD-SPEC + bug
+   * 2026-05-24). Attachment is additive, never a gate. Lex's own
+   * chunks MUST land regardless of whether a worker is bound to the
+   * brainstorm. The bug repro was: end an attached session, find that
+   * brainstorm_chunks has zero role='lex' rows, see cold-start
+   * preload pick a stale pre-attach sibling. Asserting parity between
+   * the attached and unattached writes pins the invariant. If a
+   * future change re-introduces a gate, both halves of this test
+   * (the attached one specifically) will go red. */
+  it("attaches a worker to the brainstorm and still ingests every Lex turn (capture invariant)", () => {
+    seedBrainstorm();
+    db.updateBrainstorm(BS_ID, {
+      attached_worker_session_id: '99999999-aaaa-bbbb-cccc-dddddddddddd',
+      lifecycle_state: 'attached',
+    } as Partial<Parameters<typeof db.updateBrainstorm>[1]>);
+    /* Sanity: the attached marker actually landed; if updateBrainstorm
+     * silently swallows the field this whole test is vacuous. */
+    const post = db.getBrainstorm(BS_ID);
+    expect(post?.attached_worker_session_id).toBe(
+      '99999999-aaaa-bbbb-cccc-dddddddddddd',
+    );
+    fs.writeFileSync(
+      jsonlFile,
+      jsonlLine({
+        type: 'assistant',
+        uuid: 'lex-1',
+        sessionId: CC_SESSION,
+        message: { content: [{ type: 'text', text: 'lex turn one' }] },
+      }) +
+        jsonlLine({
+          type: 'user',
+          uuid: 'user-1',
+          sessionId: CC_SESSION,
+          message: { content: 'user reply' },
+        }) +
+        jsonlLine({
+          type: 'assistant',
+          uuid: 'lex-2',
+          sessionId: CC_SESSION,
+          message: { content: [{ type: 'text', text: 'lex turn two' }] },
+        }) +
+        jsonlLine({
+          type: 'assistant',
+          uuid: 'lex-3',
+          sessionId: CC_SESSION,
+          message: { content: [{ type: 'text', text: 'lex turn three' }] },
+        }),
+      'utf-8',
+    );
+    const r = runBrainstormJsonlIngestTick(deps());
+    expect(r.inserted).toBe(4);
+    const rows = db.listBrainstormChunks(BS_ID, 100);
+    const lexRows = rows.filter((row) => row.role === 'lex');
+    expect(lexRows.length).toBe(3);
+    expect(lexRows.map((row) => row.id)).toEqual(['lex-1', 'lex-2', 'lex-3']);
+    /* Stage 0 stamping must travel through alongside the invariant:
+     * the originating cc_session_id from the jsonl line is on every
+     * Lex chunk written under an attached brainstorm. */
+    for (const row of lexRows) {
+      expect(row.cc_session_id).toBe(CC_SESSION);
+    }
+  });
+
   it('rewinds the offset to the last complete line so a partial trailing line is re-read', () => {
     seedBrainstorm();
     /* Write two full lines + a third line missing its trailing
