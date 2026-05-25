@@ -101,7 +101,7 @@ const MAX_MIC_GAIN = 3.0;
  * 16kHz). The client converts ms → frames at VAD init time. */
 const DEFAULT_VAD_REDEMPTION_MS = 768;
 const MIN_VAD_REDEMPTION_MS = 200;
-const MAX_VAD_REDEMPTION_MS = 3000;
+const MAX_VAD_REDEMPTION_MS = 6000;
 
 function readPersistedPrefs(): {
   voice?: string;
