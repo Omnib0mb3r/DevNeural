@@ -1,23 +1,24 @@
 /**
- * Regression test for Fix 2026-05-24:
- *   cold-start preload pulls stale distillation despite recent
- *   ended sessions.
+ * Regression test for Fix 2026-05-24, updated for Stage 2 of
+ * LEX-AUTONOMY-PAYLOAD-SPEC. After Stage 2 the canonical session-end
+ * path writes per-session ref_summary onto lex_transcript_ref FIRST,
+ * then recomposes brainstorm_sessions.last_summary as a deterministic
+ * concat of the N newest ref_summaries on the same anchor. These
+ * tests still assert last_summary lands; the mechanism changed but
+ * the user-visible guarantee did not.
  *
- * Confirms that ending a brainstorm via the canonical session-end
- * pipeline path (claudeSessionId + projectId both resolvable +
- * attached_worker_session_id set, i.e. a worker is bound) leaves
- * brainstorm_sessions.last_summary populated. Previously the
- * canonical path wrote only the brainstorm-summary raw_chunks
- * record and left last_summary NULL; the cold-start sibling
- * preload reads last_summary and silently fell back to the most
- * recent older sibling that DID have a value, pinning the
- * preamble to a stale distillation timestamp.
+ * Stubs both distillation generators via vi.mock so the test never
+ * hits ollama:
+ *   - createLlmDistillationGenerator (anchor-flat, legacy) still
+ *     returns a stub string for any callers still on that surface.
+ *   - createPerSessionDistillationGenerator (Stage 2) returns the
+ *     {summary, provenance} shape the new wiring expects.
  *
- * Stubs the LLM provider via vi.mock on distillation-generator so
- * the test does not hit ollama. Pipeline side steps (gpu drain,
- * force ingest, audio finalise, summary refresh) are best-effort
- * and log+continue on failure, so this test only asserts the
- * last_summary write rather than every step's success.
+ * The seed adds the Stage 0 prerequisites (lex_session row,
+ * lex_transcript_ref row keyed by cc_session_id, brainstorm_chunks
+ * with cc_session_id stamped) so the per-session path's "no_session_
+ * scoped_chunks" guard does NOT fire and the writer reaches the
+ * updateLexTranscriptRef + rolling aggregate steps.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
@@ -33,7 +34,18 @@ vi.mock('../src/lex/distillation-generator.js', async () => {
     createLlmDistillationGenerator: () => async (row: { id: string }) => {
       return `stub last_summary for ${row.id}`;
     },
+    createPerSessionDistillationGenerator: () => async (input: {
+      brainstorm_id: string;
+      cc_session_id: string;
+      totalChunksInSession: number;
+    }) => ({
+      summary: `stub ref_summary for ${input.brainstorm_id}`,
+      source_chunk_count: input.totalChunksInSession,
+      source_session_ids: JSON.stringify([input.cc_session_id]),
+      coverage_score: 1,
+    }),
     SYSTEM_BLOCK: { text: 'stub', cache: false },
+    PER_SESSION_SYSTEM_BLOCK: { text: 'stub', cache: false },
   };
 });
 
@@ -136,6 +148,32 @@ describe('session-end pipeline last_summary write (Fix 2026-05-24)', () => {
       runtime_mode: 'cc-pty',
     });
 
+    /* Stage 0 substrate: lex_session row (brainstorm_id ==
+     * lex_session id per migration-018 contract) + matching
+     * lex_transcript_ref row keyed by cc_session_id. The Stage 2
+     * writer looks up the ref by cc_session_id and updates it in
+     * place; without the ref row, the per-session path logs "no
+     * lex_transcript_ref" and skips. */
+    db.insertLexSession({
+      id: bsId,
+      created_ms: Date.now() - 60_000,
+      title: 'attached',
+      derived_title: null,
+      status: 'live',
+      current_pty_id: null,
+      cwd,
+    });
+    db.insertLexTranscriptRef({
+      lex_session_id: bsId,
+      cc_session_id: lexSessionId,
+      transcript_path: '/synthetic/attached-test/cc.jsonl',
+      started_ms: Date.now() - 60_000,
+      ended_ms: null,
+      ordering: 0,
+    });
+
+    /* cc_session_id MUST be stamped (Stage 0 contract) for the
+     * per-session scoped read to find these rows. */
     db.insertBrainstormChunk({
       id: 'chunk-user-1',
       brainstorm_id: bsId,
@@ -145,6 +183,7 @@ describe('session-end pipeline last_summary write (Fix 2026-05-24)', () => {
       text: 'lets discuss the cold-start preload bug',
       model_id: '',
       no_decay: 1,
+      cc_session_id: lexSessionId,
     });
     db.insertBrainstormChunk({
       id: 'chunk-lex-1',
@@ -155,6 +194,7 @@ describe('session-end pipeline last_summary write (Fix 2026-05-24)', () => {
       text: 'walk me through the symptom and the recent commits in the area',
       model_id: 'claude',
       no_decay: 1,
+      cc_session_id: lexSessionId,
     });
     db.close();
 
@@ -176,11 +216,22 @@ describe('session-end pipeline last_summary write (Fix 2026-05-24)', () => {
 
     const verifyDb = new IndexDb(dbFile);
     const row = verifyDb.getBrainstorm(bsId);
-    verifyDb.close();
+    /* The rolling aggregate stitches per-session ref_summaries with
+     * `## Session <cc-id-short> (<iso>)` headers; assert presence
+     * of the stub payload + the cc id short prefix rather than the
+     * exact literal so a separator/header tweak does not break this
+     * regression guard. */
     expect(row).not.toBeNull();
     expect(row?.attached_worker_session_id).toBe(workerSessionId);
-    expect(row?.last_summary).toBe(`stub last_summary for ${bsId}`);
+    expect(row?.last_summary).toContain(`stub ref_summary for ${bsId}`);
+    expect(row?.last_summary).toContain(lexSessionId.slice(0, 8));
     expect(row?.last_summary_ms ?? 0).toBeGreaterThan(0);
+    /* Per-session artifact also landed on the ref row. */
+    const ref = verifyDb.getLexTranscriptRefByCc(lexSessionId);
+    verifyDb.close();
+    expect(ref?.ref_summary).toBe(`stub ref_summary for ${bsId}`);
+    expect(ref?.ref_summary_ms ?? 0).toBeGreaterThan(0);
+    expect(ref?.coverage_score).toBe(1);
   });
 
   it('redistill flush also writes last_summary on a brainstorm whose end already ran without one', async () => {
@@ -224,6 +275,23 @@ describe('session-end pipeline last_summary write (Fix 2026-05-24)', () => {
       last_summary: null,
       last_summary_ms: null,
     });
+    db.insertLexSession({
+      id: bsId,
+      created_ms: Date.now() - 7200_000,
+      title: 'retro',
+      derived_title: null,
+      status: 'dormant',
+      current_pty_id: null,
+      cwd,
+    });
+    db.insertLexTranscriptRef({
+      lex_session_id: bsId,
+      cc_session_id: lexSessionId,
+      transcript_path: '/synthetic/retro-test/cc.jsonl',
+      started_ms: Date.now() - 7200_000,
+      ended_ms: Date.now() - 3600_000,
+      ordering: 0,
+    });
     db.insertBrainstormChunk({
       id: 'chunk-r1',
       brainstorm_id: bsId,
@@ -233,6 +301,7 @@ describe('session-end pipeline last_summary write (Fix 2026-05-24)', () => {
       text: 'retro session content',
       model_id: '',
       no_decay: 1,
+      cc_session_id: lexSessionId,
     });
     db.close();
 
@@ -254,6 +323,6 @@ describe('session-end pipeline last_summary write (Fix 2026-05-24)', () => {
     const row = verifyDb.getBrainstorm(bsId);
     verifyDb.close();
     expect(row?.status).toBe('ended');
-    expect(row?.last_summary).toBe(`stub last_summary for ${bsId}`);
+    expect(row?.last_summary).toContain(`stub ref_summary for ${bsId}`);
   });
 });

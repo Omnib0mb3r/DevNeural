@@ -49,7 +49,11 @@ import { updateSummary, readSummary } from '../curation/session-summarizer.js';
 import { listProjects } from '../identity/registry.js';
 import { withSessionEndLock } from './session-end-lock.js';
 import { distillBrainstorm } from './brainstorm-distillation.js';
-import { createLlmDistillationGenerator } from './distillation-generator.js';
+import {
+  createLlmDistillationGenerator,
+  createPerSessionDistillationGenerator,
+} from './distillation-generator.js';
+import { recomputeRollingAggregate } from './rolling-aggregate.js';
 import { gpuQueue } from '../gpu/queue.js';
 import {
   finalize as finalizeAudioBundle,
@@ -473,51 +477,96 @@ async function runOrderedPipeline(
     log(`[session-end] distilled_at update failed: ${(err as Error).message}`);
   }
 
-  /* Step 7a (Fix 2026-05-24): Lex-side last_summary write.
+  /* Step 7a (Stage 2 of LEX-AUTONOMY-PAYLOAD-SPEC, replaces the
+   * 2026-05-24 anchor-flat fix).
    *
-   * Additive append. The canonical pipeline above wrote a
-   * brainstorm-summary chunk into raw_chunks (step 6) but never
-   * touched brainstorm_sessions.last_summary, the column the
-   * cold-start sibling preload (sibling-distillation-preload.ts:85)
-   * reads to render the spawn-time preamble. Result: every cc-pty
-   * brainstorm with a registered project_session kept last_summary
-   * NULL forever, the preload fell back to the most recent older
-   * sibling that did have a value, and the preamble pinned to a
-   * stale distillation timestamp despite newer ended sessions.
-   * Bug: docs/bugs/2026-05-24-cold-start-preload-stale-distillation.md.
+   * Per-CC-session distillation: write the artifact for THIS session
+   * onto lex_transcript_ref.ref_summary + provenance, then
+   * deterministically recompose brainstorm_sessions.last_summary as
+   * the rolling aggregate of the N newest ref_summaries on this
+   * anchor. No second LLM pass; the aggregate is a string assembly.
    *
-   * Runs the same LLM generator + updateBrainstorm pair that the
-   * brainstorm_chunks fallback path below uses, so cc-pty and
-   * direct-llm/no-project-session brainstorms produce equivalent
-   * last_summary values via the same code path. Lex chunks land
-   * via lex-voice-ws.ts:823 (assistant-text) and brainstorm-jsonl-
-   * ingestor.ts on Lex's own claude_session_id regardless of
-   * attached_worker_session_id, so this generator has source
-   * material whether or not a worker is bound.
+   * NULL cc_session_id chunks (anomalous state where chunks were
+   * stamped pre-Stage 0 or by a writer that lost session binding)
+   * are skipped with structured log reason 'no_session_scoped_chunks'
+   * per spec Q6 user-adopted contract: no backfill, no anchor-flat
+   * fallback for the normal session-end path.
    *
-   * Best-effort: any failure (no provider, BF-4 anthropic block,
-   * no chunks, validation throw) logs and leaves last_summary as
-   * NULL rather than blocking teardown. */
+   * Retry semantics: per-ref write is keyed by the ref row id; calling
+   * the pipeline twice for the same cc_session_id overwrites the same
+   * row deterministically. The aggregate recompute is pure read +
+   * write so it is idempotent by construction.
+   *
+   * Best-effort: any failure (no ref row, no scoped chunks, generator
+   * skip, aggregate empty) logs and leaves the prior last_summary in
+   * place rather than blocking teardown. */
   try {
-    const generator = createLlmDistillationGenerator({ db: store.db, log });
-    const refreshed = store.db.getBrainstorm(input.brainstormId);
-    if (refreshed) {
-      const lexSummary = await generator(refreshed);
-      if (lexSummary && lexSummary.trim().length > 0) {
-        store.db.updateBrainstorm(input.brainstormId, {
-          last_summary: lexSummary,
-          last_summary_ms: Date.now(),
-        });
+    const ccId = input.claudeSessionId!;
+    const ref = store.db.getLexTranscriptRefByCc(ccId);
+    if (!ref) {
+      log(
+        `[session-end] per-session distill skipped: no lex_transcript_ref for cc=${ccId.slice(0, 8)}`,
+      );
+    } else {
+      const totalScoped = store.db.countBrainstormChunksForSession(
+        input.brainstormId,
+        ccId,
+      );
+      if (totalScoped === 0) {
+        /* Structured skip per spec contract. Tag the log line with
+         * the exact reason string the spec calls out so the audit
+         * panel + future grep find it cleanly. */
         log(
-          `[session-end] last_summary written chars=${lexSummary.length}`,
+          `[session-end] per-session distill skipped: no_session_scoped_chunks brainstorm=${input.brainstormId.slice(0, 8)} cc=${ccId.slice(0, 8)}`,
         );
       } else {
-        log(`[session-end] last_summary generator returned empty`);
+        const perSessionGen = createPerSessionDistillationGenerator({
+          db: store.db,
+          log,
+        });
+        const result = await perSessionGen({
+          brainstorm_id: input.brainstormId,
+          cc_session_id: ccId,
+          totalChunksInSession: totalScoped,
+        });
+        if (result) {
+          store.db.updateLexTranscriptRef(ref.id, {
+            ref_summary: result.summary,
+            ref_summary_ms: Date.now(),
+            source_chunk_count: result.source_chunk_count,
+            source_session_ids: result.source_session_ids,
+            coverage_score: result.coverage_score,
+          });
+          log(
+            `[session-end] ref_summary written ref=${ref.id} cc=${ccId.slice(0, 8)} chars=${result.summary.length} coverage=${result.coverage_score.toFixed(2)}`,
+          );
+          /* Aggregate recompute. The lex_session id matches the
+           * brainstorm id per the migration-018 spec contract. */
+          const agg = recomputeRollingAggregate(
+            store.db,
+            input.brainstormId,
+          );
+          if (agg) {
+            store.db.updateBrainstorm(input.brainstormId, {
+              last_summary: agg.summary,
+              last_summary_ms: agg.summary_ms || Date.now(),
+            });
+            log(
+              `[session-end] rolling aggregate written n=${agg.source_ref_ids.length} chars=${agg.summary.length}`,
+            );
+          } else {
+            log(`[session-end] rolling aggregate empty; last_summary untouched`);
+          }
+        } else {
+          log(
+            `[session-end] per-session distill returned null brainstorm=${input.brainstormId.slice(0, 8)} cc=${ccId.slice(0, 8)} (see per-session-distill log line for reason)`,
+          );
+        }
       }
     }
   } catch (err) {
     log(
-      `[session-end] last_summary generation failed: ${(err as Error).message}`,
+      `[session-end] per-session distill / aggregate failed: ${(err as Error).message}`,
     );
   }
 
