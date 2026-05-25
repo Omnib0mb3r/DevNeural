@@ -632,19 +632,34 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   function pollJsonl(): void {
     if (!state.jsonlPath && state.watchSessionId) {
       /* Late jsonl creation: the file may not have existed at bind
-       * time but was created on first user/assistant turn. */
+       * time but was created on first user/assistant turn.
+       *
+       * Fix 30 (2026-05-25): start at offset 0, not EOF. By the time
+       * pollJsonl late-resolves the file, Claude Code has already
+       * written the user record AND begun streaming the assistant
+       * turn (handleUtteranceEnd:1913 starts the watcher AFTER the
+       * inject; first tick is ~250ms later; short turns finish
+       * inside that window). Stamping EOF here lands the offset
+       * past the assistant text and the watcher never speaks it,
+       * giving the well-known "turn 1 text-only, turn 2+ spoken"
+       * symptom. The existing awaitingResponseSince > 0 gate at
+       * line 717 + rec.type !== 'assistant' filter at line 710 +
+       * spokenSegmentHashes dedupe at line 745 already prevent any
+       * pre-bind content from being spoken, so reading from 0 only
+       * admits the assistant turn that started AFTER the inject.
+       * Same shape as the 2026-05-14 compaction-restart fix at
+       * line 1055 (offset = 0 there too); that fix never propagated
+       * to this fresh-bind path. */
       const jsonl = findJsonlBySessionId(state.watchSessionId);
       if (jsonl) {
         state.jsonlPath = jsonl;
-        try {
-          state.jsonlOffset = fs.statSync(jsonl).size;
-        } catch {
-          state.jsonlOffset = 0;
-        }
+        state.jsonlOffset = 0;
       }
     }
     if (!state.jsonlPath) {
-      /* Re-resolve the jsonl path if the PTY just bound a session_id. */
+      /* Re-resolve the jsonl path if the PTY just bound a session_id.
+       * Same Fix 30 reasoning: offset = 0, not EOF, so turn 1's
+       * already-written assistant text is read on the first tick. */
       const handle = state.bindKey
         ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
         : undefined;
@@ -662,11 +677,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         );
         if (fs.existsSync(jsonl)) {
           state.jsonlPath = jsonl;
-          try {
-            state.jsonlOffset = fs.statSync(jsonl).size;
-          } catch {
-            /* ignore */
-          }
+          state.jsonlOffset = 0;
         }
       }
     }
