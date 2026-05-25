@@ -128,3 +128,80 @@ Bug stays open. Stage 2 (per-session distillation writer) is the
 next step toward the actual cure. Live attached-session repro still
 TODO to disambiguate root cause between distillation-not-firing and
 ingestor-tailing-wrong-jsonl.
+
+## Stage 2 progress (2026-05-25)
+
+Per-session distillation pipeline shipped across six commits:
+
+- `c03b356` migration 038: lex_transcript_ref.source_chunk_count,
+  source_session_ids, coverage_score (CHECK 0..1).
+- `a290545` LexTranscriptRefRow type extended; updateLexTranscriptRef
+  accepts the new fields + ref_summary + ref_summary_ms;
+  listRecentRefSummariesForLexSession(id, n) backs the aggregate.
+- `e861e88` listBrainstormChunksForSession +
+  countBrainstormChunksForSession. Scoped read via the migration-036
+  composite index. Explicitly does NOT fall back to anchor-flat when
+  the scoped pair is empty - the per-session path needs to detect
+  this and log structured skip.
+- `c466251` createPerSessionDistillationGenerator with new
+  PER_SESSION_SYSTEM_BLOCK prompt. Returns {summary, source_chunk_
+  count, source_session_ids, coverage_score} | null. Legacy
+  createLlmDistillationGenerator kept for sibling-distillation-
+  preload + backfill + idle-watcher + dashboard redistill (Stage 2
+  scope was normal session-end only per spec Q6).
+- `f308198` session-end-pipeline rewire: looks up ref row by
+  cc_session_id, calls per-session generator, writes ref_summary +
+  provenance, recomputes brainstorm_sessions.last_summary as
+  deterministic concat of N=3 newest ref_summaries with separators +
+  hard 8000 char cap. NO second LLM pass. NULL cc_session_id chunks
+  log 'no_session_scoped_chunks' and skip with no fallback.
+  Existing Fix 2026-05-24 tests adapted to seed lex_session +
+  lex_transcript_ref + cc_session_id chunks and mock the new
+  generator; intent preserved.
+- `69e5056` six Codex-adopted contract tests:
+  attached/no-worker/concurrent-isolation/retry-idempotent/N=0-
+  empty/NULL-no-crash. All green.
+
+What this fixes vs the original bug:
+
+- Cold-start preload now reads brainstorm_sessions.last_summary
+  composed from RECENT per-session artifacts. The 22:15 EDT stale
+  pin happened because the canonical pipeline wrote nothing to that
+  column; with Stage 2 it lands a fresh aggregate on every
+  session-end that has scoped chunks.
+- The user-flagged hypothesis ("Lex chunks dropped when worker
+  attaches") was already disproven at the write layer in Stage 1.
+  Stage 2 closes the actual mechanism: even with Lex chunks
+  present, the legacy pipeline wrote them only to raw_chunks
+  (brainstorm-summary kind), never to brainstorm_sessions.
+  last_summary. The Fix 2026-05-24 patch tried to plug this but
+  used the anchor-flat generator, which would have summarised the
+  oldest 50 chunks of the anchor's entire lifetime. Stage 2 scopes
+  the LLM call to a single CC session and stitches via aggregate.
+
+What this does NOT fix (deferred):
+
+- 858 tests green is unit-coverage, not live repro. Need to end an
+  actual attached worker session on the running daemon, dump
+  lex_transcript_ref + brainstorm_sessions for the anchor, confirm
+  ref_summary lands + last_summary recomposes. Pending user-side
+  smoke pass.
+- The cold-start preamble's "loaded N sibling sessions" line still
+  reads from sibling-distillation-preload which is anchor-flat.
+  Stage 3+ (sync barrier + freshness signaling) will rewire that
+  surface to read per-session artifacts.
+- claude_session_id re-point on worker attach (the other hypothesis
+  from the Stage 1 audit) still unverified in production. Stage 5
+  (worker boot payload) will exercise that path explicitly.
+
+Bug stays open. Status remains:
+- substrate complete (Stages 0-2)
+- live repro + cold-start preload rewire pending (Stage 3+)
+- 24h observation window starts when the next live attached session
+  ends on the running daemon
+
+Codex peer review was conducted before Stage 2 shipped (review
+captured in C:/tmp/codex-stage-2-review.md). Contract decisions
+adopted in this stage's commits match the review verdicts on
+generator API shape, idempotency model, NULL-chunk handling, and
+the six blocking tests.
