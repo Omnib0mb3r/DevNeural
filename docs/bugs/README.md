@@ -4,6 +4,7 @@
 
 | Date | Bug | Status | Severity |
 |------|-----|--------|----------|
+| 2026-05-26 | [cc-pty voice double-talk regression — investigation only](./2026-05-26-cc-pty-double-talk-investigation.md) | investigation; no fix shipped | high |
 | 2026-05-22 | [Lex cannot see worker on cold start](./2026-05-22-lex-blind-to-worker-on-cold-start.md) | open | high |
 | 2026-05-22 | [Worker discovery fails for VS-Code-launched claude](./2026-05-22-worker-discovery-both-launch-paths.md) | open | high |
 | 2026-05-23 | [Bridge terminal-name match is fragile (binding works, ergonomics)](./2026-05-23-bridge-terminal-name-fragility.md) | open | low |
