@@ -8,30 +8,30 @@ User went to sleep ~03:50 EDT. Asked Lex to push through as much as possible wit
 - Never auto-restart the daemon. Daemon restart is an operator-only button click.
 - Never bypass permissions on the worker. Worker runs standard / acceptEdits per durable rule.
 - Never inject destructive ops. Worker handles its own commits with the safety it already has.
-- Never speak aloud overnight (user asleep). Voice is off as a side effect of him leaving.
-- Stop at 7:00 AM EDT. Final handover written before stop.
+- Never speak aloud overnight (user asleep). Single text segment per turn while daemon is still pre-Fix-40.
+- No fixed time cap. Run until queue empty or operator wakes. Morning handover written on first interactive prompt.
 - Two-spec policy on any new fix. Investigation first, fix second.
 - Vet git HEAD vs worker narration. Never trust "shipped" without HEAD advance.
 
 ## Active queue (rough priority order)
 
-1. **cc-pty double-talk fix (Fix 38? — spec already injected)** — investigation doc shipped commit `f47ddca` (or current head), fix spec injected via lex-supervisor-cc-pty-coalesce-fix at 03:42 EDT. Watch for the fix commit. When it lands, vet (a) speak() introduces a serialize queue (b) killActiveTts clears queue + cancels in-flight (c) tests pinning four scenarios all green. Surface via supervisor wire.
-2. **LEX-AUTONOMY Stages 6-12** — Stage 5 (Fix 36) already shipped. Stages 6-12 are the codex-ordered post-distillation items in `docs/spec/LEX-AUTONOMY-PAYLOAD-SPEC.md`. Inject them one at a time, vet each commit, move on.
-3. **Step 6 gate doc work** — FIXES.md row flips for Fix 27, 28, 29, 32, 33, 34 from shipped to smoke-verified with timestamps. Self-service, no worker needed.
-4. **New project + brainstorm isolation test** — handover-listed but unscoped. Defer until user awake; needs a destination project name.
+1. **Fix 41 smart-compact policy refactor** — Stage 1 shipped (e936908). Stage 2 greenlight injected 04:17. Stage 3 follows after Stage 2 lands.
+2. **Doc pass** — operator authorized Lex to do it directly. Scan SMOKE-HANDOVER, TODO, FIXES, SMOKE-TEST, SMOKE-PROGRESS for stale references; flag completed-but-still-listed items; preserve all in-flight context.
+3. **LEX-AUTONOMY Stages 6-12** — Stage 5 (Fix 36) already shipped. Inject one at a time after Fix 41 lands.
+4. **Step 6 gate doc work** — FIXES.md row flips for Fix 27, 28, 29, 32, 33, 34 from shipped to smoke-verified with timestamps. Self-service.
 
 ## Off-limits overnight
 
 - Step 5 voice mic-init smoke (needs mobile Safari + operator hands).
 - Step 6.4 final greenlight (operator action).
-- Daemon rebuild + restart for the cc-pty fix (operator action).
+- Daemon restart for Fix 40 + Fix 41 (operator action; restart kills this Lex session, so morning click only).
 - Curator/reinforcement debug (out of scope; flagged in handover as separate item).
 
 ## Supervision rhythm
 
-- Self-cron (Claude job 445dccb7) ticks every 10 minutes off the :00 mark.
-- Daemon-side cron 5c231dd7 ticks every 2 min until 7am EDT, supervisor-event wire to Lex.
-- Every tick: read git HEAD on DevNeural, read worker jsonl tail (94e85826), update this file's "tick log" section, decide next inject or no-op.
+- Lex self-cron (job 01d5966f) ticks every 5 minutes, no time cap.
+- Daemon-side worker-event supervisor wire pushes commit / idle / permission-denied events to Lex's jsonl directly.
+- Every tick: read git HEAD, read latest worker jsonl tail (track by mtime; current is bb73e5a4 but rotates on /clear), update tick log, decide next inject or no-op.
 
 ## Tick log (most recent at bottom)
 
@@ -46,6 +46,20 @@ User went to sleep ~03:50 EDT. Asked Lex to push through as much as possible wit
 - 2026-05-26 08:08Z: operator approved investigation. Fired Fix 41 Stage 1 ship spec (2249 bytes) to bb73e5a4. Cron job rebuilt as 01d5966f (no 7am stop, runs until done).
 - 2026-05-26 08:12:16Z tick: HEAD 8c2519f unchanged. Worker mid-tool on Stage 1 implementation, pre-tool ack "Now register the three new routes inside registerSmartCompactRoutes". Cache usage ~134k tokens (~67% of 200k ceiling). Healthy mid-turn. NO-OP.
 - 2026-05-26 08:17Z: Fix 41 Stage 1 shipped (e936908). Three new endpoints (GET /state, POST /clear-and-paste, POST /wrap-paste) + migration 040 (action CHECK extended). 27 new test pins, 936/936 daemon tests pass (was 909), tsc clean. Existing /evaluate + /fire untouched. Awaiting supervisor wire vet + Stage 2 greenlight.
+- 2026-05-26 08:17:30Z: Stage 2 greenlight injected to bb73e5a4. Worker proceeding with policy module + scheduler short-circuit.
+- 2026-05-26 08:17:35Z: doc pass started. Operator authorized Lex to edit docs directly. Cleaning stale rules in OVERNIGHT (removed 7am stop, refreshed supervision rhythm, refreshed active queue).
+- 2026-05-26 08:19:47Z tick: HEAD edf1801 (Fix 41 Stage 1 FIXES row, two-commit pattern as required). Worker bb73e5a4 healthy mid-turn on Stage 2 implementation. Doc pass progress: OVERNIGHT cleaned; TODO 4 stale items marked (smart compact, cold-start preload, utterance coalesce, autonomy stages); SMOKE-HANDOVER top-banner refreshed pointing to current state.
+- 2026-05-26 08:22:16Z tick: worker mid-Bash on Stage 2. SMOKE-PROGRESS "Up next" trimmed to reflect 3.x + 4.x closed. Attempted FIXES.md row 32/33 smoke-verified stamps but worker was concurrently editing FIXES.md (Stage 2 row append likely). Retrying next tick after worker idle.
+- 2026-05-26 08:24Z: Fix 41 Stage 2 shipped (bb12b4a). smart-compact-policy.ts created with evaluateTriggerForAnchor + WRAP_AND_COMMIT_PROMPT. Scheduler short-circuit on policy_owner=lex working. Stage 3 greenlight injected.
+- 2026-05-26 08:27:15Z tick: HEAD 1baa396 (Fix 41 Stage 2 FIXES row). Worker mid-tool on Stage 3. Attempted FIXES row stamps, blocked by concurrent worker edit. Deferred to next tick.
+- 2026-05-26 08:32:14Z tick: HEAD 1baa396 unchanged. Worker still mid-tool on Stage 3. Successfully stamped FIXES.md rows 32 + 33 smoke-verified. Fix 27 + 28 already had smoke-verified stamps from earlier shipping. Fix 34 superseded by 34d.1 (already smoke-verified). Fix 29 (hold-up) has no Tier-1 smoke step; remains shipped without smoke stamp pending Tier 2 step 7.2b live verify.
+- 2026-05-26 08:34:26Z: Fix 41 Stage 3 shipped (6359fd2). Big cleanup: 1063 deletions. smart-compact-scheduler.ts deleted entirely, scheduler.test + evaluate.test + shadow.test deleted, lex/smart-compact.ts policy gutted, smart-compact-routes.ts evaluate handler removed, daemon.ts wiring removed. Default smart_compact_policy_owner flipped to 'lex'. Daemon now has ZERO smart-compact policy.
+- 2026-05-26 08:35Z: Fix 41 row in FIXES.md fully marked shipped with all three stage SHAs (fae93d9). Fix 41 complete.
+- 2026-05-26 08:36Z: operator requested smoke test prep for morning. Pre-restart test run: 937/937 daemon tests pass, 107 files, 34.75s. Added MORNING SMOKE section to docs/SMOKE-TEST.md: pre-verified static evidence + Fix 40 post-restart probes (40.1-40.3) + Fix 41 post-restart probes (41.1-41.6) + restart warning that this Lex session dies on restart + decision gate.
+- 2026-05-26 08:37:49Z tick: HEAD fae93d9 (Fix 41 fully shipped). Worker idle. Fired LEX-AUTONOMY codex order item 5 (sync barrier + freshness metadata in cold-start preload) investigation inject. Two-spec policy: investigation only this round.
+- 2026-05-26 08:39:00Z supervisor-event: narrated_success_no_commit fired on Fix 41 retrospective status claim. HEAD already at fae93d9 (the closure commit). False positive — claim was post-commit summary, not forward prediction. NO-OP.
+- 2026-05-26 08:42:14Z tick: HEAD fae93d9 unchanged. Worker mid-tool on codex 5 investigation (sync barrier + freshness metadata). Healthy. NO-OP.
+- 2026-05-26 08:43Z: Codex 5 investigation doc shipped (`docs/bugs/2026-05-26-lex-autonomy-codex5-sync-barrier-investigation.md`). Five sections per spec: cold-start preload pipeline map (entry point routes.ts:4503 + anchor-refs vs label-match paths), sync barrier definition + 5 race windows enumerated, freshness metadata gaps + proposed `latest_chunk_ms` + `chunks_at_distill_count` + `staleness_state` columns on `lex_transcript_ref`, failure modes survey (generator null-on-error, aggregate vs anchor write ordering, ingestor catchup), per-anchor vs per-session boundary handling. Three-part barrier mechanism proposed (synchronous ingestor catchup at session-end + per-ref staleness stamps + cold-start payload exposure). NO CODE this round. Awaiting ship spec.
 
 ## Morning handover (filled at 7am or first user prompt)
 
