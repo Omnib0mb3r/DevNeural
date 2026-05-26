@@ -366,6 +366,33 @@ export function broadcastVoiceControl(
   return { ok: true, delivered, bind_keys: reached, reason };
 }
 
+/* Push a `recovery-exhausted` frame to the active voice client (if
+ * any) for a given bind key. Called by the cancelled-tool-recovery
+ * background service after two strikes inside the 30 s window so the
+ * client can surface a dashboard banner. Best-effort: no client
+ * connected = silent no-op, the audit row + log line are the durable
+ * record. */
+export function broadcastRecoveryExhausted(
+  bindKey: string,
+  reason: string,
+): { delivered: number } {
+  const registry = testRegistryOverride ??
+    (activeByBindKey as unknown as Map<
+      string,
+      { ws: { send: (data: string) => void }; closed: boolean; bindKey: string | null }
+    >);
+  const target = registry.get(bindKey);
+  if (!target || target.closed) return { delivered: 0 };
+  try {
+    target.ws.send(
+      JSON.stringify({ t: 'recovery-exhausted', reason: reason.slice(0, 256) }),
+    );
+    return { delivered: 1 };
+  } catch {
+    return { delivered: 0 };
+  }
+}
+
 /* Narrow state shape for the flush helper. Defined here (not as part
  * of ConnState) so the helper can be unit-tested with a hand-rolled
  * partial without satisfying the full ConnState surface. */

@@ -447,6 +447,44 @@ async function main(): Promise<void> {
     );
   }
 
+  /* Cancelled-tool recovery (Fix 33). Tails the same active brainstorm
+   * jsonls as the brainstorm-jsonl-ingestor; when a tool_result line
+   * carries a CC reject envelope, arms the session. After 5 s without
+   * an assistant follow-up the service fires a single recovery inject
+   * via cross-session-inject. Two strikes inside 30 s escalates to
+   * recovery_exhausted (audit row + WS frame to the active voice
+   * client). Removes the "Lex stuck until user types again" failure
+   * mode regardless of what caused the cancellation. */
+  let cancelledToolRecoveryHandle:
+    | { stop(): void; tickNow(): void }
+    | null = null;
+  try {
+    const { startCancelledToolRecovery } = await import(
+      './lex/cancelled-tool-recovery.js'
+    );
+    const { broadcastRecoveryExhausted } = await import(
+      './voice/lex-voice-ws.js'
+    );
+    cancelledToolRecoveryHandle = startCancelledToolRecovery({
+      deps: {
+        db: store.db,
+        notifyExhausted: (ccId, reason): void => {
+          try {
+            broadcastRecoveryExhausted(ccId, reason);
+          } catch {
+            /* broadcaster best-effort; audit row already landed */
+          }
+        },
+        log: logger,
+      },
+    });
+    logger('cancelled-tool-recovery: started');
+  } catch (err) {
+    logger(
+      `cancelled-tool-recovery bootstrap failed: ${(err as Error).message}`,
+    );
+  }
+
   /* Phase 5 wire-up of docs/spec/LEX-STANDALONE-SUPERVISION.md.
    * Boots the idle-watcher with the production grooming deps so
    * standalone brainstorms get light/mid/cold/day-cap passes on
@@ -1404,6 +1442,11 @@ async function main(): Promise<void> {
     }
     try {
       if (dashboardSupervisor) await dashboardSupervisor.stop();
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (cancelledToolRecoveryHandle) cancelledToolRecoveryHandle.stop();
     } catch {
       /* ignore */
     }
