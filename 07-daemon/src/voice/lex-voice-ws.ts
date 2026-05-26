@@ -366,7 +366,104 @@ export function broadcastVoiceControl(
   return { ok: true, delivered, bind_keys: reached, reason };
 }
 
+/* Narrow state shape for the flush helper. Defined here (not as part
+ * of ConnState) so the helper can be unit-tested with a hand-rolled
+ * partial without satisfying the full ConnState surface. */
+export interface _FlushPendingUtterancesState {
+  pendingUserUtterances: string[];
+  bindKey: string | null;
+  mode: 'conversation' | 'notes' | string;
+  awaitingResponseSince: number;
+}
+
+export interface _FlushPendingUtterancesDeps {
+  state: _FlushPendingUtterancesState;
+  ptyInject: (
+    key: string,
+    text: string,
+    commit: boolean,
+  ) => { ok: true } | { ok: false; error: string };
+  send: (msg: Record<string, unknown>) => void;
+  /* Test seam: when omitted, defaults to a normal setTimeout with
+   * unref. Tests pass a synchronous capture so the bare-CR follow-up
+   * can be fired without sleeping. */
+  scheduleFollowupCr?: (fn: () => void, delayMs: number) => void;
+  /* Override the 850 ms delay only for tests. Production uses the
+   * default to match DEFAULT_COMMIT_DELAY_MS in cross-session-inject. */
+  followupDelayMs?: number;
+  /* Test seam: capture the log line instead of writing to stdout. */
+  log?: (msg: string) => void;
+}
+
+function _defaultScheduleFollowupCr(fn: () => void, delayMs: number): void {
+  const t = setTimeout(fn, delayMs);
+  if (typeof (t as { unref?: () => void }).unref === 'function') {
+    (t as { unref: () => void }).unref();
+  }
+}
+
+/* Mid-turn queue flush. Exported as `_flushPendingUtterancesImpl` so
+ * the regression test (lex-voice-ws.flush-cr.test.ts) can drive it
+ * without standing up a full WS attach. The closure inside
+ * attachLexVoiceWs delegates here; the body lives here so the test
+ * exercises the same code path as production. */
+export function _flushPendingUtterancesImpl(
+  deps: _FlushPendingUtterancesDeps,
+): void {
+  const { state, ptyInject, send } = deps;
+  if (state.pendingUserUtterances.length === 0) return;
+  if (!state.bindKey) return;
+  const queued = state.pendingUserUtterances.slice();
+  state.pendingUserUtterances = [];
+  const header =
+    queued.length === 1
+      ? '[voice-context: queued-mid-turn-utterance] The user spoke this while you were mid-turn; it was held until your turn boundary.\n\n'
+      : `[voice-context: queued-mid-turn-utterances (${queued.length})] The user spoke these follow-on utterances while you were mid-turn. They were held until your turn boundary; treat as one combined message:\n\n${queued.map((t, i) => `${i + 1}. ${t}`).join('\n')}\n\n`;
+  const body = queued.length === 1 ? `${header}${queued[0]}` : header;
+  const voiceTag =
+    state.mode === 'notes'
+      ? '[voice mode: notes, silent reply, capture as artifact] '
+      : '[voice mode] ';
+  const ir = ptyInject(state.bindKey, body + voiceTag, true);
+  if (!ir.ok) {
+    send({
+      t: 'error',
+      code: 'inject',
+      message: `flush-mid-turn-queue: ${ir.error}`,
+    });
+    state.pendingUserUtterances = queued.concat(state.pendingUserUtterances);
+    return;
+  }
+  /* Bare-CR follow-up. Mirrors cross-session-inject.ts:297-306: bridge-
+   * attached workers sometimes receive the primary atomic write into
+   * the input field but never submit, so the cursor sits after
+   * '[voice mode] ' and the worker stays idle. Fire an explicit '\r'
+   * through the same transport ~850 ms later (matches
+   * DEFAULT_COMMIT_DELAY_MS) to settle it. commit=false on the nudge
+   * so ptyInject does not append a second CR onto a bare CR. */
+  const schedule = deps.scheduleFollowupCr ?? _defaultScheduleFollowupCr;
+  const delayMs = deps.followupDelayMs ?? 850;
+  schedule(() => {
+    if (!state.bindKey) return;
+    try {
+      ptyInject(state.bindKey, '\r', false);
+    } catch {
+      /* nudge is fire-and-forget */
+    }
+  }, delayMs);
+  (deps.log ?? console.log)(
+    `[voice-ws] mid-turn-no-tts queue flush count=${queued.length}`,
+  );
+  send({
+    t: 'injected',
+    source: 'mid-turn-queue-flush',
+    count: queued.length,
+  });
+  state.awaitingResponseSince = Date.now();
+}
+
 export function attachLexVoiceWs(socket: FastifyWS): void {
+  console.log(`[voice-ws] client connected (attach)`);
   const state: ConnState = {
     ws: socket,
     bindKey: null,
@@ -1437,31 +1534,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * the start of a new conversation. Voice tag is preserved so Lex's
    * conversational voice contract still applies. */
   function flushPendingUtterances(): void {
-    if (state.pendingUserUtterances.length === 0) return;
-    if (!state.bindKey) return;
-    const queued = state.pendingUserUtterances.slice();
-    state.pendingUserUtterances = [];
-    const header =
-      queued.length === 1
-        ? '[voice-context: queued-mid-turn-utterance] The user spoke this while you were mid-turn; it was held until your turn boundary.\n\n'
-        : `[voice-context: queued-mid-turn-utterances (${queued.length})] The user spoke these follow-on utterances while you were mid-turn. They were held until your turn boundary; treat as one combined message:\n\n${queued.map((t, i) => `${i + 1}. ${t}`).join('\n')}\n\n`;
-    const body =
-      queued.length === 1 ? `${header}${queued[0]}` : header;
-    const voiceTag =
-      state.mode === 'notes'
-        ? '[voice mode: notes, silent reply, capture as artifact] '
-        : '[voice mode] ';
-    const ir = ptyInject(state.bindKey, body + voiceTag, true);
-    if (!ir.ok) {
-      send({ t: 'error', code: 'inject', message: `flush-mid-turn-queue: ${ir.error}` });
-      state.pendingUserUtterances = queued.concat(state.pendingUserUtterances);
-      return;
-    }
-    console.log(
-      `[voice-ws] mid-turn-no-tts queue flush count=${queued.length}`,
-    );
-    send({ t: 'injected', source: 'mid-turn-queue-flush', count: queued.length });
-    state.awaitingResponseSince = Date.now();
+    _flushPendingUtterancesImpl({
+      state,
+      ptyInject,
+      send,
+    });
   }
 
   /* Voice-command dispatch shared by the whisper-transcript path
@@ -1696,6 +1773,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       return;
     }
     send({ t: 'transcript', text: result.text, ms: result.ms });
+    console.log(
+      `[voice-ws] transcript received words=${wordCount} bindKey=${state.bindKey ?? 'null'} duringTts=${state.utteranceStartedDuringTts} text=${JSON.stringify(trimmed.slice(0, 120))}`,
+    );
     /* Wave 2 day 2 step 11: persist this utterance into the per-session
      * audio bundle so /brainstorms/:id/audio can serve it back later.
      * Brainstorm sessions retain audio by default; meeting sessions
@@ -1754,6 +1834,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      *                  continue; the user must re-engage via the UI
      *                  to get TTS back) */
     const cmd = matchVoiceCommand(result.text);
+    console.log(
+      `[voice-ws] matcher result kind=${cmd?.kind ?? 'none'} duringTts=${state.utteranceStartedDuringTts}`,
+    );
     if (cmd) {
       dispatchVoiceCommand(cmd.kind, 'transcript');
       state.utteranceStartedDuringTts = false;
