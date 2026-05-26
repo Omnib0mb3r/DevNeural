@@ -4881,6 +4881,47 @@ export async function registerDashboardRoutes(
     return { ok: true, rows };
   });
 
+  /* Codex item 7 (Fix 44): pin / unpin a lex_transcript_ref row.
+   *
+   * POST /lex/refs/:cc_session_id/pin   body: { pinned: boolean }
+   *
+   * The adaptive walk-back scorer treats pinned=1 as a pre-pass
+   * bonus that forces inclusion ahead of recency + freshness ranking.
+   * Audit row lands in cross_session_injection_log with
+   * caller_label='ref-pin' so the dashboard injection panel can
+   * show pin / unpin history without a new table. */
+  app.post('/lex/refs/:cc_session_id/pin', async (req, reply) => {
+    const cc = (req.params as { cc_session_id: string }).cc_session_id;
+    if (!cc || typeof cc !== 'string') {
+      reply.code(400);
+      return { ok: false, error: 'cc_session_id required' };
+    }
+    const body = (req.body ?? {}) as { pinned?: boolean };
+    if (typeof body.pinned !== 'boolean') {
+      reply.code(400);
+      return { ok: false, error: 'pinned (boolean) required' };
+    }
+    const changed = store.db.setLexTranscriptRefPinned(cc, body.pinned);
+    if (!changed) {
+      reply.code(404);
+      return { ok: false, error: 'ref not found for cc_session_id' };
+    }
+    try {
+      const { randomUUID } = await import('node:crypto');
+      store.db.insertCrossSessionLog({
+        id: randomUUID(),
+        target_session: cc,
+        caller_label: 'ref-pin',
+        text_preview: body.pinned ? 'pin' : 'unpin',
+        text_length: body.pinned ? 3 : 5,
+        decision: 'accepted',
+      });
+    } catch {
+      /* audit row is observational; never block the response */
+    }
+    return { ok: true, cc_session_id: cc, pinned: body.pinned };
+  });
+
   /* Lex standalone idle activity (Phase 5 of LSS).
    *
    * Surface for the "Standalone brainstorm idle activity" dashboard

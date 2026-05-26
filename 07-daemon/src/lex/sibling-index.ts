@@ -30,6 +30,7 @@ import type {
   LexTranscriptRefRow,
 } from '../store/index-db.js';
 import { isRefStale } from './lex-transcript-ref.js';
+import { buildRecentErrorMap, pickBundles } from './adaptive-walk-back.js';
 
 export interface BuildSiblingIndexOptions {
   db: IndexDb;
@@ -217,10 +218,29 @@ function buildAnchorTranscriptBlock(opts: BuildSiblingIndexOptions): string {
   const allRefs = opts.db.listLexTranscriptRefs(opts.anchorId);
   if (allRefs.length === 0) return '';
   const currentCc = opts.currentCcSessionId ?? null;
-  const prior = allRefs
-    .filter((r) => !currentCc || r.cc_session_id !== currentCc)
-    .sort((a, b) => b.ordering - a.ordering)
-    .slice(0, refLimit);
+  /* Codex item 7: adaptive walk-back scorer picks the rendered set.
+   * Pinned refs land first, then the score-ranked remainder by
+   * recency + freshness - supersession - failure. Coverage floor 0.3
+   * excludes weak refs unless pinned. */
+  const eligible = allRefs.filter(
+    (r) => !currentCc || r.cc_session_id !== currentCc,
+  );
+  if (eligible.length === 0) return '';
+  let errorMap: Map<string, number> | undefined;
+  try {
+    const errRows = opts.db.listRecentDistillationErrors(200, {
+      brainstormId: opts.anchorId,
+    });
+    errorMap = buildRecentErrorMap(errRows);
+  } catch {
+    /* migration 042 may not have applied yet */
+  }
+  const { selected } = pickBundles(eligible, {
+    now,
+    limit: refLimit,
+    ...(errorMap ? { recentErrorCountByCc: errorMap } : {}),
+  });
+  const prior = selected.map((s) => s.ref);
   if (prior.length === 0) return '';
   const brainstorm = opts.db.getBrainstorm(opts.anchorId);
   const total = prior.length;

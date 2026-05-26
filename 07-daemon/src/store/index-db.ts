@@ -371,6 +371,13 @@ export interface LexTranscriptRefRow {
    * ref_summary_ms to derive staleness for cold-start preload. NULL
    * means "no chunks observed yet"; preload treats NULL as fresh. */
   latest_chunk_ms: number | null;
+  /* Codex item 7 pin bit (migration 043): operator-toggled "always
+   * include this ref in cold-start preload" flag. Defaults to 0 on
+   * every row; flipped via POST /lex/refs/:cc/pin. The adaptive walk-
+   * back scorer treats pinned=1 as a pre-pass bonus that forces
+   * inclusion ahead of recency + freshness ranking, capped at the
+   * walk-back N=6 ceiling. */
+  pinned: number;
 }
 
 /* project_session row. Durable per-project anchor identity, daemon-
@@ -2070,6 +2077,7 @@ export class IndexDb {
       | 'source_session_ids'
       | 'coverage_score'
       | 'latest_chunk_ms'
+      | 'pinned'
     >,
   ): LexTranscriptRefRow {
     /* Insert lands the ref row with NULL distillation columns. The
@@ -2101,7 +2109,29 @@ export class IndexDb {
       source_session_ids: null,
       coverage_score: null,
       latest_chunk_ms: null,
+      pinned: 0,
     };
+  }
+
+  /* Codex item 7: pin / unpin a lex_transcript_ref row by its
+   * cc_session_id. Returns true when the row exists and the bit was
+   * flipped; false when no row matches. Idempotent: re-flipping the
+   * same value is a no-op write. Best-effort wrap so a missing
+   * migration 043 returns false rather than throwing. */
+  setLexTranscriptRefPinned(ccSessionId: string, pinned: boolean): boolean {
+    if (!ccSessionId) return false;
+    try {
+      const r = this.db
+        .prepare(
+          `UPDATE lex_transcript_ref
+              SET pinned = ?
+            WHERE cc_session_id = ?`,
+        )
+        .run(pinned ? 1 : 0, ccSessionId);
+      return r.changes > 0;
+    } catch {
+      return false;
+    }
   }
 
   updateLexTranscriptRef(

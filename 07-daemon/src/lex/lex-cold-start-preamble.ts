@@ -36,6 +36,7 @@ import { extractLastTurnPairs } from './sibling-index.js';
 import { findLatestHandover } from './handover-writer.js';
 import { isRefStale } from './lex-transcript-ref.js';
 import type { PerSessionDistillationGenerator } from './distillation-generator.js';
+import { buildRecentErrorMap, pickBundles } from './adaptive-walk-back.js';
 import * as fs from 'node:fs';
 
 export interface ColdStartPreloadInput {
@@ -265,10 +266,31 @@ function summarizeFromAnchor(
   const currentCc = input.currentCcSessionId ?? null;
   const refLimit = input.anchorRefLimit ?? ANCHOR_REF_LIMIT_DEFAULT;
   const pairs = input.anchorPairsPerRef ?? ANCHOR_PAIRS_PER_REF_DEFAULT;
-  const prior = refs
-    .filter((r) => !currentCc || r.cc_session_id !== currentCc)
-    .sort((a, b) => b.ordering - a.ordering)
-    .slice(0, refLimit);
+  /* Codex item 7: replace the blunt `sort by ordering DESC + slice`
+   * with the adaptive walk-back scorer. Pinned refs land first; the
+   * remainder is ranked by recency + freshness - supersession -
+   * failure; coverage floor 0.3 excludes weak refs unless pinned.
+   * Mirrors the spec's "session bundle" semantics where bundle = ref. */
+  const eligible = refs.filter(
+    (r) => !currentCc || r.cc_session_id !== currentCc,
+  );
+  if (eligible.length === 0) return null;
+  let errorMap: Map<string, number> | undefined;
+  try {
+    const errRows = input.db.listRecentDistillationErrors(200, {
+      brainstormId: anchorId,
+    });
+    errorMap = buildRecentErrorMap(errRows);
+  } catch {
+    /* migration 042 may not have applied; scoring falls back to zero
+     * failure penalty across the board */
+  }
+  const { selected } = pickBundles(eligible, {
+    now: (input.now ?? Date.now)(),
+    limit: refLimit,
+    ...(errorMap ? { recentErrorCountByCc: errorMap } : {}),
+  });
+  const prior = selected.map((s) => s.ref);
   if (prior.length === 0) return null;
   const read = input.readTranscript ?? readJsonl;
   let turns = 0;
