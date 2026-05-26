@@ -42,6 +42,7 @@ import {
   loadIndexBullets,
   renderIndexSection,
 } from './docs-index.js';
+import { buildSourceGraphPayload } from './source-graph-payload.js';
 
 export interface BacklogEntry {
   id: string;
@@ -426,25 +427,56 @@ export function buildWorkerHandoff(
   const entries = parseBacklog(readBacklog(backlogPath));
   const docsIndexPath = opts.docsIndexPath ?? DEFAULT_DOCS_INDEX_PATH;
   const chunkLimit = opts.brainstormChunkLimit ?? 6;
-  /* Brainstorm-context lookup: the worker IS this brainstorm's tool;
-   * dump the brainstorm's accumulated thread into the worker's first
-   * turn so /clear and fresh spawns do not lose continuity. */
+  /* Codex item 8 (Fix 45): replace the anchor-flat brainstorm-context
+   * read with a projection through `buildSourceGraphPayload`. The same
+   * primitive powers cold-start preload (Lex side); both consumers see
+   * pickBundles + isRefStale + distillation_error_log surfacing.
+   *
+   * The legacy `brainstorm_context` field on the sections object is
+   * kept for back-compat with existing renderers + tests, but its
+   * recent_chunks list is now populated from the bundle picked by the
+   * walk-back scorer rather than the last-6-anchor-flat read. */
   let brainstormContext: WorkerHandoffSections['brainstorm_context'] = null;
   if (opts.db && opts.workerSessionId) {
     try {
       const bs = opts.db.getBrainstormByAttachedWorker(opts.workerSessionId);
       if (bs) {
-        const chunks = opts.db.listBrainstormChunks(bs.id, chunkLimit, {
-          order: 'desc',
+        const payload = buildSourceGraphPayload({
+          db: opts.db,
+          anchorId: bs.id,
+          currentCcSessionId: opts.workerSessionId,
+          refLimit: 3,
+          pairsPerRef: 3,
+          now: opts.now ?? Date.now,
         });
+        /* Compose legacy `recent_chunks` from the highest-scored bundle's
+         * turn pairs so existing renderers stay compatible. */
+        const topBundle = payload.refs[0];
+        const recent: Array<{ role: 'user' | 'lex' | 'tool'; text: string }> = [];
+        if (topBundle) {
+          for (const t of topBundle.turn_pairs) {
+            recent.push({
+              role: t.role === 'user' ? 'user' : 'lex',
+              text: t.text,
+            });
+          }
+        }
+        /* Fallback to the legacy anchor-flat last-N read when the
+         * walk-back surfaced zero bundles (e.g. anchor with no refs
+         * yet, codex-9 first-attach edge case). */
+        if (recent.length === 0) {
+          const chunks = opts.db.listBrainstormChunks(bs.id, chunkLimit, {
+            order: 'desc',
+          });
+          for (const c of chunks.reverse()) {
+            recent.push({ role: c.role, text: c.text });
+          }
+        }
         brainstormContext = {
           brainstorm_id: bs.id,
           user_label: bs.user_label ?? bs.derived_label ?? null,
           last_summary: bs.last_summary ?? null,
-          recent_chunks: chunks.reverse().map((c) => ({
-            role: c.role,
-            text: c.text,
-          })),
+          recent_chunks: recent,
         };
       }
     } catch {
