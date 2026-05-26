@@ -42,6 +42,10 @@ User went to sleep ~03:50 EDT. Asked Lex to push through as much as possible wit
 - 2026-05-26 04:00:55Z tick: operator cleared worker manually. New session bb73e5a4 detected (delta from snapshot). Fired refactor spec inject (lex-supervisor-policy-refactor-spec, 3851 bytes) + bare CR via bridge. Both accepted. Worker initializing.
 - 2026-05-26 04:01:23Z supervisor-event: idle on new session bb73e5a4. Expected. Fresh session, inject just landed in last-prompt slot. NO-OP, monitoring next tick.
 - 2026-05-26 08:04Z: Fix 41 investigation doc shipped (`docs/bugs/2026-05-26-smart-compact-policy-refactor.md`). Four sections per spec: per-function mechanical-vs-policy audit across the 4 daemon files, proposed new endpoints (`/state`, `/clear-and-paste`, `/wrap-paste`), Lex-side ownership (threshold/window/stop-classification/wrap-authorship), three-stage cutover with rollback toggle. NO CODE this round. Awaiting ship spec.
+- 2026-05-26 08:05:18Z tick: HEAD 8c2519f (Fix 41 investigation). Worker bb73e5a4 end_turn idle 20s post-commit. Investigation alignment verified Sections 1 + 2: per-function audit lines correct, new endpoint shapes match the policy-out / mechanical-in split. Sections 3 + 4 not yet read. NO inject pending operator sign-off on investigation.
+- 2026-05-26 08:08Z: operator approved investigation. Fired Fix 41 Stage 1 ship spec (2249 bytes) to bb73e5a4. Cron job rebuilt as 01d5966f (no 7am stop, runs until done).
+- 2026-05-26 08:12:16Z tick: HEAD 8c2519f unchanged. Worker mid-tool on Stage 1 implementation, pre-tool ack "Now register the three new routes inside registerSmartCompactRoutes". Cache usage ~134k tokens (~67% of 200k ceiling). Healthy mid-turn. NO-OP.
+- 2026-05-26 08:17Z: Fix 41 Stage 1 shipped (e936908). Three new endpoints (GET /state, POST /clear-and-paste, POST /wrap-paste) + migration 040 (action CHECK extended). 27 new test pins, 936/936 daemon tests pass (was 909), tsc clean. Existing /evaluate + /fire untouched. Awaiting supervisor wire vet + Stage 2 greenlight.
 
 ## Morning handover (filled at 7am or first user prompt)
 
