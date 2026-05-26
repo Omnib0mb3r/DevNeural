@@ -186,10 +186,24 @@ export async function openProjectAnchor(
 
   const now = opts.now ?? Date.now;
   const promise = (async (): Promise<OpenResult | OpenError> => {
-    const command = opts.dangerous
-      ? 'claude --dangerously-skip-permissions'
-      : 'claude';
+    /* Fix 37 (2026-05-26): workers are no longer permitted to spawn
+     * with --dangerously-skip-permissions. The dashboard "Start (skip
+     * permissions)" button used to flip opts.dangerous=true; that
+     * flag is now inert for project anchors. Lex's own brainstorm
+     * spawn still uses skip-permissions because Lex runs in a daemon-
+     * owned scratch cwd with no project files; workers run in user
+     * project trees where the permissions prompt is the only thing
+     * standing between an autonomous loop and a destructive shell
+     * call. Backward compat: we accept the param shape but warn so
+     * dashboard regressions surface in the open() response and the
+     * log instead of silently degrading safety. */
+    const command = 'claude';
     const warnings: string[] = [];
+    if (opts.dangerous) {
+      warnings.push(
+        'skip-permissions ignored: workers no longer accept --dangerously-skip-permissions per architectural rule (2026-05-26)',
+      );
+    }
     const bootstrap = opts.bootstrapQueue ?? queueProjectBootstrap;
     try {
       bootstrap(row.cwd, command);

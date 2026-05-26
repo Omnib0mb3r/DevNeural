@@ -235,7 +235,14 @@ describe('openProjectAnchor', () => {
     expect(bootstrapCalls[0]!.cwd.toLowerCase()).toContain('proj-a');
   });
 
-  it('spawn path: dangerous=true emits --dangerously-skip-permissions', async () => {
+  it('spawn path: dangerous=true is INERT for workers; command is plain `claude` + warning', async () => {
+    /* Fix 37 (2026-05-26): workers no longer bypass the permissions
+     * onboarding wizard. The dashboard button may still ship
+     * dangerous=true on legacy clients; daemon ignores it and surfaces
+     * a warning in res.warnings so a regression that silently degrades
+     * safety is loud rather than silent. Lex's own brainstorm spawn
+     * is NOT affected (separate /spawn-lex + /lex/anchors paths still
+     * pass extraArgs explicitly). */
     const inflight = createOpenInFlightMap();
     const res = await openProjectAnchor(
       db,
@@ -251,9 +258,10 @@ describe('openProjectAnchor', () => {
     );
     expect(res.ok).toBe(true);
     if (!res.ok) return;
-    expect(res.command).toBe('claude --dangerously-skip-permissions');
-    expect(bootstrapCalls[0]!.command).toBe(
-      'claude --dangerously-skip-permissions',
+    expect(res.command).toBe('claude');
+    expect(bootstrapCalls[0]!.command).toBe('claude');
+    expect(res.warnings ?? []).toContain(
+      'skip-permissions ignored: workers no longer accept --dangerously-skip-permissions per architectural rule (2026-05-26)',
     );
   });
 
