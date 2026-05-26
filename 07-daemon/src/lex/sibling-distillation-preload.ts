@@ -44,6 +44,11 @@ export interface PreloadOptions {
   limit?: number;
   /** Clock for the last_summary_ms stamp. */
   now?: () => number;
+  /** Codex item 12: active brainstorm's project_scope_id (migration
+   * 044). When set, siblings are grouped by matching scope id instead
+   * of by user_label. Falls back to label when null or when a sibling
+   * row has no scope id yet (legacy compat). */
+  projectScopeId?: string | null;
 }
 
 export interface PreloadResult {
@@ -77,8 +82,17 @@ export async function preloadSiblingDistillations(
    * limit rows. */
   const rows = opts.db.listBrainstorms({ limit: 200 });
   const exclude = opts.excludeId ?? null;
+  const activeScope = opts.projectScopeId ?? null;
+  /* Codex item 12 (Fix 49): prefer project_scope_id grouping when
+   * BOTH the active anchor and the candidate row carry a non-null
+   * scope id. Falls back to label-match when either side is null
+   * (legacy compat). TODO codex 12 follow-up: kill the label fallback
+   * branch after the 30-day backfill window. */
   const matches = rows.filter((r) => {
     if (exclude && r.id === exclude) return false;
+    const rowScope = (r as unknown as { project_scope_id?: string | null })
+      .project_scope_id;
+    if (activeScope && rowScope) return rowScope === activeScope;
     return normLabel(r.user_label) === target;
   });
 
