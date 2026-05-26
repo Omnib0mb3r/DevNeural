@@ -26,20 +26,28 @@ export function SessionsTable() {
   });
   const [showIdle, setShowIdle] = useState(false);
   const [showStale, setShowStale] = useState(false);
-  /* Track in-flight start-claude posts per project so the buttons
-   * disable + show "starting…" until the bridge claims the marker
-   * (visible as a new live session row appearing). Reset on success. */
-  const [pendingStart, setPendingStart] = useState<Record<string, "vanilla" | "skip">>({});
+  /* Track in-flight start-claude posts per project so the button
+   * disables + shows "starting…" until the bridge claims the marker
+   * (visible as a new live session row appearing). Reset on success.
+   *
+   * Fix 39 (2026-05-26): single button. The pre-fix UI had a second
+   * "Start (skip permissions)" affordance that flipped dangerous=true
+   * for the daemon. Workers no longer accept that flag; the button is
+   * dead. Pending-start state collapses to a Set<projectId>. */
+  const [pendingStart, setPendingStart] = useState<Set<string>>(new Set());
   const startMutation = useMutation({
-    mutationFn: (vars: { id: string; dangerous: boolean; mode: "vanilla" | "skip" }) =>
-      startClaude(vars.id, vars.dangerous),
-    onMutate: (vars) => {
-      setPendingStart((p) => ({ ...p, [vars.id]: vars.mode }));
+    mutationFn: (id: string) => startClaude(id),
+    onMutate: (id) => {
+      setPendingStart((prev) => {
+        const next = new Set(prev);
+        next.add(id);
+        return next;
+      });
     },
-    onSettled: (_data, _err, vars) => {
-      setPendingStart((p) => {
-        const next = { ...p };
-        delete next[vars.id];
+    onSettled: (_data, _err, id) => {
+      setPendingStart((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
         return next;
       });
       qc.invalidateQueries({ queryKey: ["sessions"] });
@@ -114,7 +122,7 @@ export function SessionsTable() {
           </div>
           <ul className="divide-y divide-border2">
             {idleProjects.map((p) => {
-              const pending = pendingStart[p.id];
+              const pending = pendingStart.has(p.id);
               return (
                 <li
                   key={p.id}
@@ -131,32 +139,11 @@ export function SessionsTable() {
                   <div className="flex items-center gap-2 flex-shrink-0">
                     <button
                       type="button"
-                      disabled={Boolean(pending)}
-                      onClick={() =>
-                        startMutation.mutate({
-                          id: p.id,
-                          dangerous: false,
-                          mode: "vanilla",
-                        })
-                      }
+                      disabled={pending}
+                      onClick={() => startMutation.mutate(p.id)}
                       className="px-3 py-1.5 text-xs font-emphasized rounded-pill bg-surface2 hairline hover:bg-surface3 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
-                      {pending === "vanilla" ? "starting…" : "Start Claude"}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={Boolean(pending)}
-                      onClick={() =>
-                        startMutation.mutate({
-                          id: p.id,
-                          dangerous: true,
-                          mode: "skip",
-                        })
-                      }
-                      className="px-3 py-1.5 text-xs font-emphasized rounded-pill bg-attn/15 text-attn hairline hover:bg-attn/25 disabled:opacity-50 disabled:cursor-not-allowed"
-                      title="claude --dangerously-skip-permissions"
-                    >
-                      {pending === "skip" ? "starting…" : "Start (skip permissions)"}
+                      {pending ? "starting…" : "Start Claude"}
                     </button>
                   </div>
                 </li>

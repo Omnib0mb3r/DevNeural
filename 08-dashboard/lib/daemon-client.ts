@@ -334,13 +334,18 @@ export const sessions = () =>
     idle_projects?: IdleProject[];
   }>("/sessions");
 
+/* Fix 39 (2026-05-26): workers no longer accept --dangerously-skip-
+ * permissions. The daemon's /projects/:id/start-claude endpoint ignores
+ * any `dangerous` flag and always emits the plain `claude` command;
+ * the dashboard button shape stops passing the field entirely so a
+ * stale UI cannot quietly suggest a permission bypass that no longer
+ * exists. */
 export const startClaude = (
   projectId: string,
-  dangerous: boolean,
 ): Promise<{ ok: boolean; project_id?: string; root?: string; command?: string; warnings?: string[]; error?: string }> =>
   request(`/projects/${encodeURIComponent(projectId)}/start-claude`, {
     method: "POST",
-    body: { dangerous },
+    body: { dangerous: false },
   });
 
 // ── Daemon-PTY (Lex) ─────────────────────────────────────────────
