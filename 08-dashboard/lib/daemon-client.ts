@@ -737,11 +737,19 @@ export interface WorkerExpectationRow {
   last_suggested_correction: string | null;
 }
 
+export interface BrainstormStaleness {
+  fresh: number;
+  stale: number;
+  total: number;
+  oldest_stale_ms: number | null;
+}
+
 export const getBrainstormApi = (id: string) =>
   request<{
     ok: boolean;
     brainstorm: BrainstormDecorated;
     open_expectations?: WorkerExpectationRow[];
+    staleness?: BrainstormStaleness;
     error?: string;
   }>(`/brainstorms/${encodeURIComponent(id)}`);
 
@@ -1722,6 +1730,12 @@ export interface ColdStartPreloadEvent {
   already_present_ids: string[];
   failure_reason: string | null;
   preamble: string;
+  /* Codex item 6 freshness barrier counters. Default 0/0/false on
+   * legacy rows so the dashboard chip renders only when at least one
+   * field is non-zero. */
+  stale_refs_count?: number;
+  synced_refs_count?: number;
+  partial_sync?: boolean;
 }
 
 export interface ColdStartPreloadEventGroup {

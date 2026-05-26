@@ -114,6 +114,7 @@ export function BrainstormDetail({ id }: { id: string }) {
       {bs.last_summary ? (
         <section>
           <h2 className="text-sm font-semibold">Summary</h2>
+          <StalenessPill staleness={detail.data.staleness ?? null} />
           <p className="whitespace-pre-wrap text-sm text-txt2">{bs.last_summary}</p>
         </section>
       ) : null}
@@ -127,6 +128,72 @@ export function BrainstormDetail({ id }: { id: string }) {
       />
     </div>
   );
+}
+
+/* Codex item 6 (Fix 43): per-brainstorm freshness pill. Reads the
+ * staleness counts the daemon attaches to GET /brainstorms/:id and
+ * renders one of three messages:
+ *
+ *   no refs        -> nothing (legacy anchors with no transcript refs)
+ *   fresh          -> "Summary: N refs fresh"
+ *   stale within   -> "Summary: K of N refs catching up..."
+ *   stale beyond   -> "Summary: K of N refs STALE - oldest <h>h ago"
+ *
+ * Threshold for "beyond" matches the stale-watcher default (10 min)
+ * so the pill and the bell agree on what counts as actionable. */
+const STALE_PILL_BEYOND_MS = 10 * 60_000;
+
+function StalenessPill({
+  staleness,
+}: {
+  staleness:
+    | { fresh: number; stale: number; total: number; oldest_stale_ms: number | null }
+    | null;
+}) {
+  if (!staleness || staleness.total === 0) return null;
+  if (staleness.stale === 0) {
+    return (
+      <p
+        data-testid="brainstorm-staleness-pill"
+        data-tone="ok"
+        className="mt-1 text-xs text-ok"
+      >
+        {staleness.total} refs fresh
+      </p>
+    );
+  }
+  const ageMs = staleness.oldest_stale_ms
+    ? Date.now() - staleness.oldest_stale_ms
+    : 0;
+  const beyond = ageMs >= STALE_PILL_BEYOND_MS;
+  const ago = ageMs > 0 ? humanAgeShort(ageMs) : "just now";
+  if (beyond) {
+    return (
+      <p
+        data-testid="brainstorm-staleness-pill"
+        data-tone="err"
+        className="mt-1 text-xs text-err"
+      >
+        {staleness.stale} of {staleness.total} refs STALE - oldest {ago} ago
+      </p>
+    );
+  }
+  return (
+    <p
+      data-testid="brainstorm-staleness-pill"
+      data-tone="warn"
+      className="mt-1 text-xs text-warn"
+    >
+      {staleness.stale} of {staleness.total} refs catching up...
+    </p>
+  );
+}
+
+function humanAgeShort(ms: number): string {
+  if (ms < 60_000) return `${Math.floor(ms / 1000)}s`;
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m`;
+  if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)}h`;
+  return `${Math.floor(ms / 86_400_000)}d`;
 }
 
 /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B + section

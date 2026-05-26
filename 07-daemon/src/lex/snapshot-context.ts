@@ -35,6 +35,7 @@ import {
   renderIndexSection,
 } from './docs-index.js';
 import type { ProjectSessionRow } from '../store/index-db.js';
+import { isRefStale } from './lex-transcript-ref.js';
 
 /* Resolve the active brainstorm's MEMORY.md by mapping the brainstorm
  * cwd to the Claude Code per-project memory directory (under
@@ -141,6 +142,62 @@ export function buildVoiceSnapshot(opts: VoiceSnapshotOptions = {}): string {
         .join('\n')
     : '  (none)';
 
+  /* Codex item 6: per-anchor freshness summary. One line per active
+   * brainstorm carrying either "freshness: N refs fresh" or
+   * "freshness: K/N stale (oldest <h>h)". Reads `lex_transcript_ref`
+   * directly because the rolling aggregate's `last_summary_ms` lags
+   * the per-ref staleness signal by one aggregate cycle (codex 5
+   * race-window 3). Best-effort per row; a DB read failure renders
+   * "freshness: unknown" rather than blocking the snapshot. */
+  const freshnessLines = (() => {
+    if (brainstorms.length === 0) return null;
+    const store = (() => {
+      try {
+        return getStore();
+      } catch {
+        return null;
+      }
+    })();
+    if (!store) return null;
+    const lines: string[] = [];
+    for (const b of brainstorms.slice(0, 5)) {
+      const label = b.user_label ?? b.derived_label ?? b.id.slice(0, 8);
+      try {
+        const refs = store.db.listLexTranscriptRefs(b.id);
+        const total = refs.length;
+        if (total === 0) {
+          lines.push(`  - ${label}: freshness: no prior refs`);
+          continue;
+        }
+        let stale = 0;
+        let oldestLatestMs: number | null = null;
+        for (const r of refs) {
+          if (!isRefStale(r)) continue;
+          stale += 1;
+          if (
+            r.latest_chunk_ms !== null &&
+            (oldestLatestMs === null || r.latest_chunk_ms < oldestLatestMs)
+          ) {
+            oldestLatestMs = r.latest_chunk_ms;
+          }
+        }
+        if (stale === 0) {
+          lines.push(`  - ${label}: freshness: ${total} refs fresh`);
+        } else {
+          const ageTag = oldestLatestMs
+            ? ` (oldest ${ageHuman(oldestLatestMs)})`
+            : '';
+          lines.push(
+            `  - ${label}: freshness: ${stale}/${total} stale${ageTag}`,
+          );
+        }
+      } catch {
+        lines.push(`  - ${label}: freshness: unknown`);
+      }
+    }
+    return lines.length > 0 ? lines.join('\n') : null;
+  })();
+
   /* Wave 3 Lane B step 36 (LX-13): curator events (audit findings, lint
    * flags, draft conflicts). Read from SQLite via the brainstorm-store
    * singleton's IndexDb. Best-effort: if the store is not initialised
@@ -199,6 +256,12 @@ export function buildVoiceSnapshot(opts: VoiceSnapshotOptions = {}): string {
   if (curatorFlags) {
     parts.push('curator_flags (actionable - surface if asked about system health):');
     parts.push(curatorFlags);
+  }
+  if (freshnessLines) {
+    parts.push(
+      'brainstorm_freshness (per-anchor per-session distillation health; stale means new chunks landed after the last distill):',
+    );
+    parts.push(freshnessLines);
   }
 
   /* Memory index (per-brainstorm MEMORY.md). Read live every turn so

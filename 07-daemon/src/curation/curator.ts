@@ -39,6 +39,7 @@ import { recordInjection, recordRawInjection } from '../reinforcement/index.js';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { wikiPagesDir, wikiPendingDir } from '../paths.js';
+import { isRefStale } from '../lex/lex-transcript-ref.js';
 
 const COSINE_FLOOR_WIKI = Number(
   process.env.DEVNEURAL_COSINE_FLOOR_WIKI ?? 0.55,
@@ -276,6 +277,12 @@ export async function curate(
     };
   }
 
+  /* Codex item 6: compute the per-anchor brainstorm freshness line.
+   * Only included when at least one active brainstorm has a non-zero
+   * stale ref count under it; otherwise the existing curator output
+   * shape stays identical. */
+  const freshnessLine = buildCuratorFreshnessLine(store);
+
   // Compose deterministic version first.
   const deterministic = composeDeterministic({
     wiki: bestWiki
@@ -290,6 +297,7 @@ export async function curate(
       : undefined,
     glossary: matched,
     taskBody,
+    freshnessLine,
   });
 
   let injection = deterministic.injection;
@@ -402,9 +410,67 @@ interface ComposeArgs {
     | undefined;
   glossary: GlossaryEntry[];
   taskBody: string;
+  /* Codex item 6: Brainstorm freshness line. Emitted only when at
+   * least one active anchor has a non-zero stale ref count so the
+   * happy path keeps its existing compact injection shape. Shape:
+   *   "<label>: <stale>/<total> stale (oldest <h>h)"
+   * Pre-joined by the caller; the curator-side compose stays pure. */
+  freshnessLine?: string | null;
 }
 
-function composeDeterministic(args: ComposeArgs): { injection: string } {
+/* Codex item 6: build the brainstorm freshness line surfaced inside
+ * the curator's `[devneural-brainstorm-freshness]` section. One
+ * compact line per active brainstorm with at least one stale ref;
+ * anchors that are entirely fresh are omitted so the curator output
+ * stays compact. Best-effort - any DB read failure returns null and
+ * the section is skipped entirely. */
+export function buildCuratorFreshnessLine(store: Store): string | null {
+  try {
+    const rows = store.db.listBrainstorms({ status: 'active', limit: 8 });
+    if (rows.length === 0) return null;
+    const parts: string[] = [];
+    for (const b of rows) {
+      let refs;
+      try {
+        refs = store.db.listLexTranscriptRefs(b.id);
+      } catch {
+        continue;
+      }
+      const total = refs.length;
+      if (total === 0) continue;
+      let stale = 0;
+      let oldest: number | null = null;
+      for (const r of refs) {
+        if (!isRefStale(r)) continue;
+        stale += 1;
+        if (
+          r.latest_chunk_ms !== null &&
+          (oldest === null || r.latest_chunk_ms < oldest)
+        ) {
+          oldest = r.latest_chunk_ms;
+        }
+      }
+      if (stale === 0) continue;
+      const label = b.user_label ?? b.derived_label ?? b.id.slice(0, 8);
+      const ageTag = oldest ? ` (oldest ${formatAgo(oldest)})` : '';
+      parts.push(`${label}: ${stale}/${total} stale${ageTag}`);
+    }
+    if (parts.length === 0) return null;
+    return parts.join('\n');
+  } catch {
+    return null;
+  }
+}
+
+function formatAgo(ms: number): string {
+  const d = Date.now() - ms;
+  if (d < 60_000) return `${Math.floor(d / 1000)}s`;
+  if (d < 3600_000) return `${Math.floor(d / 60_000)}m`;
+  if (d < 86_400_000) return `${Math.floor(d / 3600_000)}h`;
+  return `${Math.floor(d / 86_400_000)}d`;
+}
+
+export function composeDeterministic(args: ComposeArgs): { injection: string } {
   const sections: string[] = [];
 
   if (args.wiki) {
@@ -432,6 +498,12 @@ ${m.text_preview ?? ''}`,
 
   if (args.taskBody) {
     sections.push(`[devneural-current-task]\n${args.taskBody.slice(0, 240)}`);
+  }
+
+  if (args.freshnessLine && args.freshnessLine.trim().length > 0) {
+    sections.push(
+      `[devneural-brainstorm-freshness]\n${args.freshnessLine.trim()}`,
+    );
   }
 
   if (sections.length === 0) return { injection: '' };

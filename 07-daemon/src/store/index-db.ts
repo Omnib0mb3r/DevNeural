@@ -2750,6 +2750,96 @@ export class IndexDb {
     }
   }
 
+  /* Codex item 6 (Fix 43): distillation_error_log helpers.
+   *
+   * Append-only audit of every structured failure path inside the
+   * per-session + anchor-flat distillation generators. The stale-
+   * watcher reads this to escalate severity when an anchor has fresh
+   * failure rows; the dashboard panel reads via
+   * /lex/distillation-errors. */
+  insertDistillationError(row: {
+    id: string;
+    brainstorm_id: string | null;
+    cc_session_id: string | null;
+    generator: string;
+    error_class: string;
+    error_message?: string | null;
+    detail?: string | null;
+  }): void {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO distillation_error_log
+             (id, brainstorm_id, cc_session_id, generator, error_class, error_message, detail)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          row.id,
+          row.brainstorm_id,
+          row.cc_session_id,
+          row.generator,
+          row.error_class,
+          row.error_message ?? null,
+          row.detail ?? null,
+        );
+    } catch {
+      /* migration 042 may not have applied yet; never fatal. */
+    }
+  }
+
+  listRecentDistillationErrors(
+    limit: number = 20,
+    opts: { brainstormId?: string | null } = {},
+  ): Array<{
+    id: string;
+    ts: string;
+    brainstorm_id: string | null;
+    cc_session_id: string | null;
+    generator: string;
+    error_class: string;
+    error_message: string | null;
+    detail: string | null;
+  }> {
+    try {
+      const capped = Math.min(200, Math.max(1, limit));
+      if (opts.brainstormId) {
+        return this.db
+          .prepare(
+            `SELECT * FROM distillation_error_log
+                WHERE brainstorm_id = ?
+                ORDER BY ts DESC LIMIT ?`,
+          )
+          .all(opts.brainstormId, capped) as Array<{
+          id: string;
+          ts: string;
+          brainstorm_id: string | null;
+          cc_session_id: string | null;
+          generator: string;
+          error_class: string;
+          error_message: string | null;
+          detail: string | null;
+        }>;
+      }
+      return this.db
+        .prepare(
+          `SELECT * FROM distillation_error_log
+              ORDER BY ts DESC LIMIT ?`,
+        )
+        .all(capped) as Array<{
+        id: string;
+        ts: string;
+        brainstorm_id: string | null;
+        cc_session_id: string | null;
+        generator: string;
+        error_class: string;
+        error_message: string | null;
+        detail: string | null;
+      }>;
+    } catch {
+      return [];
+    }
+  }
+
   countSmartCompactsForAnchor(anchorId: string): number {
     try {
       const row = this.db

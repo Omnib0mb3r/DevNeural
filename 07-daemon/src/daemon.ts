@@ -439,6 +439,26 @@ async function main(): Promise<void> {
     );
   }
 
+  /* Codex item 6 (Fix 43): distillation staleness watcher. Walks
+   * active brainstorm anchors every 5 min, emits notify_class='signal'
+   * when any anchor's oldest stale ref crosses the threshold T
+   * (default 10 min via DEVNEURAL_STALE_REMINDER_MS). Per-anchor 30
+   * min debounce so the bell never sees the same anchor twice inside
+   * the window. Bell-only this round; push='suppress' bypasses the
+   * web-push pipeline so the phone stays quiet. */
+  try {
+    const { startStaleWatch } = await import('./lex/stale-watcher.js');
+    startStaleWatch({
+      deps: {
+        db: store.db,
+        log: logger,
+      },
+    });
+    logger('stale-watcher: started');
+  } catch (err) {
+    logger(`stale-watcher bootstrap failed: ${(err as Error).message}`);
+  }
+
   /* Cancelled-tool recovery (Fix 33). Tails the same active brainstorm
    * jsonls as the brainstorm-jsonl-ingestor; when a tool_result line
    * carries a CC reject envelope, arms the session. After 5 s without

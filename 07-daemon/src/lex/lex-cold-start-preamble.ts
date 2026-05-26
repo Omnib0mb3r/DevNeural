@@ -637,6 +637,14 @@ export interface PreloadEventLogRow {
   already_present_ids: string[];
   failure_reason: string | null;
   preamble: string;
+  /* Codex item 6: surface the Fix 42 freshness barrier counters on
+   * the event log so the dashboard panel can render the staleness
+   * chip without re-deriving from the audit row's JSON reject_reason
+   * blob. Defaults to 0/0/false for legacy rows + the no-staleness
+   * happy path. */
+  stale_refs_count: number;
+  synced_refs_count: number;
+  partial_sync: boolean;
 }
 
 export function buildPreloadEventLogRow(input: {
@@ -657,6 +665,9 @@ export function buildPreloadEventLogRow(input: {
     already_present_ids: input.summary.preload.already_present.slice(),
     failure_reason: input.summary.failure_reason,
     preamble: input.preamble,
+    stale_refs_count: input.summary.stale_refs_count,
+    synced_refs_count: input.summary.synced_refs_count,
+    partial_sync: input.summary.partial_sync,
   };
 }
 

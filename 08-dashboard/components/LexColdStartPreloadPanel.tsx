@@ -76,6 +76,21 @@ function fmtDistilledMs(ms: number | null): string {
   });
 }
 
+function staleChipForLatest(
+  latest: ColdStartPreloadEvent | undefined,
+): { text: string; tone: string } | null {
+  if (!latest) return null;
+  const stale = latest.stale_refs_count ?? 0;
+  const synced = latest.synced_refs_count ?? 0;
+  const partial = latest.partial_sync === true;
+  if (stale === 0 && synced === 0 && !partial) return null;
+  const net = Math.max(0, stale - synced);
+  if (partial) return { text: `[stale ${net}/partial]`, tone: "text-err" };
+  if (net > 0) return { text: `[stale ${net}]`, tone: "text-warn" };
+  if (synced > 0) return { text: `[caught up ${synced}]`, tone: "text-ok" };
+  return null;
+}
+
 function PreloadEventCard({
   group,
   initiallyOpen,
@@ -89,6 +104,7 @@ function PreloadEventCard({
   const turns = latest?.recent_turns_appended ?? 0;
   const failure = latest?.failure_reason ?? null;
   const tone = failure ? "text-err" : "text-ok";
+  const staleChip = staleChipForLatest(latest);
   return (
     <li
       data-testid="lex-cold-start-preload-event-card"
@@ -105,6 +121,14 @@ function PreloadEventCard({
         <span className="text-txt1 flex-1 truncate">
           {group.brainstorm_id.slice(0, 12)}
         </span>
+        {staleChip && (
+          <span
+            data-testid="lex-cold-start-preload-stale-chip"
+            className={`shrink-0 ${staleChip.tone}`}
+          >
+            {staleChip.text}
+          </span>
+        )}
         <span className={`shrink-0 ${tone}`}>
           {failure ? `failed (${failure})` : `${sibling} siblings · ${turns} turns`}
         </span>
@@ -143,6 +167,18 @@ function PreloadEventCard({
                 {r.already_present_ids.length > 0 && (
                   <span title={r.already_present_ids.join(", ")}>
                     cached: {r.already_present_ids.length}
+                  </span>
+                )}
+                {((r.stale_refs_count ?? 0) > 0 ||
+                  (r.synced_refs_count ?? 0) > 0 ||
+                  r.partial_sync === true) && (
+                  <span
+                    data-testid="lex-cold-start-preload-stale-row"
+                    className={r.partial_sync ? "text-err" : "text-warn"}
+                  >
+                    stale: {r.stale_refs_count ?? 0} · synced:{" "}
+                    {r.synced_refs_count ?? 0}
+                    {r.partial_sync ? " · partial" : ""}
                   </span>
                 )}
                 {r.cc_session_id && (

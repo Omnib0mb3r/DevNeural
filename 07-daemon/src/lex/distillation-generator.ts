@@ -30,6 +30,7 @@
  * the provider is swappable so tests can drive the pipeline with a
  * stub.
  */
+import { randomUUID } from 'node:crypto';
 import type {
   BrainstormSessionRow,
   IndexDb,
@@ -37,6 +38,39 @@ import type {
 import type { LlmProvider } from '../llm/index.js';
 import { pickProvider } from '../llm/index.js';
 import type { DistillationGenerator } from './sibling-distillation-preload.js';
+
+/* Codex item 6 (Fix 43): every null-return path in the per-session
+ * generator writes a structured row to distillation_error_log so the
+ * stale-watch + dashboard can correlate "ref_summary stayed NULL"
+ * back to the reason. error_class is a stable tag; error_message is
+ * the verbatim provider error text when available. Pure helper so
+ * the generator stays a one-liner per branch. */
+function logDistillationOutcome(
+  db: IndexDb,
+  args: {
+    brainstormId: string | null;
+    ccSessionId: string | null;
+    generator: 'per-session' | 'anchor-flat';
+    errorClass: string;
+    errorMessage?: string | null;
+    detail?: string | null;
+  },
+): void {
+  try {
+    db.insertDistillationError({
+      id: randomUUID(),
+      brainstorm_id: args.brainstormId,
+      cc_session_id: args.ccSessionId,
+      generator: args.generator,
+      error_class: args.errorClass,
+      error_message: args.errorMessage ?? null,
+      detail: args.detail ?? null,
+    });
+  } catch {
+    /* observational; the log line in the surrounding caller still
+     * lands in stdout so this is purely additive */
+  }
+}
 
 export interface CreateGeneratorOptions {
   db: IndexDb;
@@ -251,12 +285,25 @@ export function createPerSessionDistillationGenerator(
     const provider = opts.provider ?? pickProvider();
     if (!provider) {
       log(`[per-session-distill] no provider; skip ${tag}`);
+      logDistillationOutcome(opts.db, {
+        brainstormId: input.brainstorm_id,
+        ccSessionId: input.cc_session_id,
+        generator: 'per-session',
+        errorClass: 'no_provider',
+      });
       return null;
     }
     if (!provider.isConfigured()) {
       log(
         `[per-session-distill] provider ${provider.name} not configured; skip ${tag}`,
       );
+      logDistillationOutcome(opts.db, {
+        brainstormId: input.brainstorm_id,
+        ccSessionId: input.cc_session_id,
+        generator: 'per-session',
+        errorClass: 'provider_not_configured',
+        detail: provider.name,
+      });
       return null;
     }
     /* BF-4 mirror: brainstorm chunks never leave the host. */
@@ -264,6 +311,12 @@ export function createPerSessionDistillationGenerator(
       log(
         `[per-session-distill] BF-4 skip ${tag}: anthropic provider blocked for brainstorm content`,
       );
+      logDistillationOutcome(opts.db, {
+        brainstormId: input.brainstorm_id,
+        ccSessionId: input.cc_session_id,
+        generator: 'per-session',
+        errorClass: 'bf4_anthropic_blocked',
+      });
       return null;
     }
     /* Pull the newest chunkLimit chunks scoped to this CC session.
@@ -285,6 +338,12 @@ export function createPerSessionDistillationGenerator(
       log(
         `[per-session-distill] no_session_scoped_chunks ${tag}; skip`,
       );
+      logDistillationOutcome(opts.db, {
+        brainstormId: input.brainstorm_id,
+        ccSessionId: input.cc_session_id,
+        generator: 'per-session',
+        errorClass: 'no_session_scoped_chunks',
+      });
       return null;
     }
     const ordered = fetched.slice().reverse();
@@ -298,6 +357,12 @@ export function createPerSessionDistillationGenerator(
       .slice(0, maxTranscriptBytes);
     if (transcript.length === 0) {
       log(`[per-session-distill] empty_transcript ${tag}; skip`);
+      logDistillationOutcome(opts.db, {
+        brainstormId: input.brainstorm_id,
+        ccSessionId: input.cc_session_id,
+        generator: 'per-session',
+        errorClass: 'empty_transcript',
+      });
       return null;
     }
     let text: string;
@@ -317,10 +382,23 @@ export function createPerSessionDistillationGenerator(
       log(
         `[per-session-distill] provider call failed for ${tag}: ${(err as Error).message}`,
       );
+      logDistillationOutcome(opts.db, {
+        brainstormId: input.brainstorm_id,
+        ccSessionId: input.cc_session_id,
+        generator: 'per-session',
+        errorClass: 'provider_threw',
+        errorMessage: (err as Error).message,
+      });
       return null;
     }
     if (!text) {
       log(`[per-session-distill] empty_llm_reply ${tag}; skip`);
+      logDistillationOutcome(opts.db, {
+        brainstormId: input.brainstorm_id,
+        ccSessionId: input.cc_session_id,
+        generator: 'per-session',
+        errorClass: 'empty_llm_reply',
+      });
       return null;
     }
     /* coverage_score = chunks shipped to LLM / total chunks in

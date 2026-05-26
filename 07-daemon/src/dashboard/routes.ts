@@ -3561,10 +3561,46 @@ export async function registerDashboardRoutes(
     } catch {
       /* observational */
     }
+    /* Codex item 6: per-anchor freshness pill. Compose by reading
+     * lex_transcript_ref + isRefStale (Fix 42). Best-effort; legacy
+     * daemons before migration 041 stay with NULL latest_chunk_ms,
+     * so isRefStale returns false uniformly and the pill renders
+     * "healthy" - which is the correct fallback. */
+    let staleness: {
+      fresh: number;
+      stale: number;
+      total: number;
+      oldest_stale_ms: number | null;
+    } = { fresh: 0, stale: 0, total: 0, oldest_stale_ms: null };
+    try {
+      const { isRefStale } = await import('../lex/lex-transcript-ref.js');
+      const refs = store.db.listLexTranscriptRefs(id);
+      let stale = 0;
+      let oldest: number | null = null;
+      for (const r of refs) {
+        if (!isRefStale(r)) continue;
+        stale += 1;
+        if (
+          r.latest_chunk_ms !== null &&
+          (oldest === null || r.latest_chunk_ms < oldest)
+        ) {
+          oldest = r.latest_chunk_ms;
+        }
+      }
+      staleness = {
+        fresh: refs.length - stale,
+        stale,
+        total: refs.length,
+        oldest_stale_ms: oldest,
+      };
+    } catch {
+      /* observational; pill renders zeros */
+    }
     return {
       ok: true,
       brainstorm: decorateBrainstorm(row),
       open_expectations,
+      staleness,
     };
   });
 
@@ -4824,6 +4860,25 @@ export async function registerDashboardRoutes(
       ok: true,
       groups: groupPreloadEventsBySession({ perSessionLimit }),
     };
+  });
+
+  /* Codex item 6 (Fix 43): distillation error log surface.
+   *
+   * Returns recent rows from distillation_error_log so the dashboard
+   * (codex 7 will wire the panel) + the stale-watcher can correlate
+   * "ref_summary still NULL" with the structured error class. Pure
+   * read; observational. Returns rows: [] when migration 042 has not
+   * applied yet. */
+  app.get('/lex/distillation-errors', async (req) => {
+    const q = (req.query ?? {}) as {
+      brainstorm_id?: string;
+      limit?: string;
+    };
+    const limit = q.limit ? Math.min(200, Math.max(1, Number(q.limit))) : 20;
+    const rows = store.db.listRecentDistillationErrors(limit, {
+      brainstormId: q.brainstorm_id ?? null,
+    });
+    return { ok: true, rows };
   });
 
   /* Lex standalone idle activity (Phase 5 of LSS).
