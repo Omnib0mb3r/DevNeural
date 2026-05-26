@@ -303,10 +303,27 @@ export function startWorkerEventListener(
 
   let watcher: FSWatcher | null = null;
   if (fs.existsSync(root)) {
-    watcher = chokidar.watch(`${root}/**/*.jsonl`, {
+    /* Fix 34b: chokidar v4 removed glob support entirely. The prior
+     * form watched the glob string root + slash + double-star + slash
+     * + asterisk + .jsonl as a LITERAL file path that did not exist,
+     * so the watcher bound (emitting 'ready') but never matched any
+     * subsequent jsonl write. Switch to watching the directory and
+     * filtering with `ignored` -- the same pattern fs-watcher.ts
+     * already uses. Directories are not ignored so chokidar recurses
+     * into ~/.claude/projects/<slug>/; non-jsonl files are skipped
+     * once stats arrive. ignorePermissionErrors keeps the daemon log
+     * clean if any subdir is unreadable. */
+    watcher = chokidar.watch(root, {
       ignoreInitial: true,
       persistent: true,
       awaitWriteFinish: { stabilityThreshold: 250, pollInterval: 100 },
+      ignored: (filePath: string, stats?: fs.Stats) => {
+        if (stats && stats.isFile()) {
+          return !filePath.endsWith('.jsonl');
+        }
+        return false;
+      },
+      ignorePermissionErrors: true,
     });
     const handler = (file: string): void => {
       try {
