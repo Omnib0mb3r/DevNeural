@@ -48,14 +48,6 @@ import {
 } from './dashboard/reminder-push.js';
 import { runDistillationBackfill, BACKFILL_DEFAULT_LIMIT } from './lex/sibling-distillation-backfill.js';
 import { createLlmDistillationGenerator } from './lex/distillation-generator.js';
-import { runSmartCompactTick } from './dashboard/smart-compact-scheduler.js';
-import { ptyInject, listPtys } from './dashboard/pty-host.js';
-import {
-  queueSessionPrompt,
-  queueSessionSuggestion,
-  deriveContextFromTail,
-} from './dashboard/sessions.js';
-import { makeSmartCompactInjector } from './dashboard/smart-compact-injector.js';
 import { jsonlForAnchor } from './dashboard/smart-compact-routes.js';
 import {
   runWorkerStallTick,
@@ -559,71 +551,15 @@ async function main(): Promise<void> {
     logger(`idle-watcher bootstrap failed: ${(err as Error).message}`);
   }
 
-  /* Smart-compact scheduler. Walks every live project_session anchor,
-   * runs evaluateSmartCompact, and fires the resulting fire/wrap
-   * through fireSmartCompact. Global toggle
-   * DEVNEURAL_SMART_COMPACT_ENABLED gates the live inject inside
-   * fireSmartCompact; off-state still produces shadow audit rows so
-   * the operator sees what would have fired. Cadence configurable
-   * via DEVNEURAL_SMART_COMPACT_TICK_MS (default 60s). */
-  const smartCompactTickMs = Number(
-    process.env.DEVNEURAL_SMART_COMPACT_TICK_MS ?? 60_000,
-  );
-  /* Scheduler shares the same bridge-fallback resolver as the REST
-   * route. Without this, the tick called bare ptyInject which always
-   * returned pty_not_found on bridge-only workers, so context never
-   * auto-compacted on sessions launched outside the daemon. */
-  const schedulerInjector = makeSmartCompactInjector({
-    listPtys,
-    ptyInject,
-    queueSessionPrompt,
-    queueSessionSuggestion,
-  });
-  /* Production ctxProvider. The scheduler was previously passing
-   * no ctxProvider, so evaluateSmartCompact's `if (opts.ctxProvider)`
-   * branch never ran, ctxPct stayed null, and every anchor was
-   * resolved as 'wait' / 'below-window' regardless of how much
-   * context it had actually consumed. Workers happily ran past the
-   * 60% / 65% / 90% gates without a single fire. Bind to the same
-   * derivation the dashboard already uses for the session-detail
-   * context bar (deriveContextFromTail) and return a percent so the
-   * evaluator can compare it against the thresholds. */
-  const ctxProvider = (jsonlPath: string): number | null => {
-    const ctx = deriveContextFromTail(jsonlPath);
-    if (!ctx || ctx.max <= 0) return null;
-    return Math.round((ctx.tokens / ctx.max) * 1000) / 10;
-  };
-  async function tickSmartCompact(): Promise<void> {
-    try {
-      const r = await runSmartCompactTick({
-        db: store.db,
-        injector: schedulerInjector,
-        ctxProvider,
-        log: (m) => logger(m),
-      });
-      if (
-        r.fired.length ||
-        r.wrapped.length ||
-        r.deferredFire.length ||
-        r.shortCircuited.length ||
-        r.errors.length
-      ) {
-        logger(
-          `[smart-compact] evaluated=${r.evaluated} fired=${r.fired.length} wrapped=${r.wrapped.length} deferred=${r.deferredFire.length} short_circuit=${r.shortCircuited.length} waited=${r.waited.length} errors=${r.errors.length}`,
-        );
-      }
-    } catch (err) {
-      logger(`[smart-compact] tick failed: ${(err as Error).message}`);
-    }
-  }
-  const smartCompactTimer = setTimeout(() => {
-    void tickSmartCompact();
-    const repeat = setInterval(() => void tickSmartCompact(), smartCompactTickMs);
-    if (typeof repeat.unref === 'function') repeat.unref();
-  }, 90_000);
-  if (typeof smartCompactTimer.unref === 'function') {
-    smartCompactTimer.unref();
-  }
+  /* Fix 41 Stage 3: smart-compact scheduler removed. Lex drives the
+   * loop entirely via the policy-out endpoints (GET /state +
+   * POST /clear-and-paste + POST /wrap-paste). The legacy 60s
+   * daemon-side walker, the DEVNEURAL_SMART_COMPACT_TICK_MS env, the
+   * shared schedulerInjector, and the production ctxProvider that
+   * fed evaluateSmartCompact are all dead code now. The same
+   * deriveContextFromTail-based ctxProvider used to live here; it
+   * still lives in dashboard/routes.ts, bound directly into
+   * registerSmartCompactRoutes for GET /lex/smart-compact/state. */
 
   /* Worker mid-turn stall watch. Walks live anchors every
    * DEVNEURAL_STALL_TICK_MS (default 60s) and fires the existing

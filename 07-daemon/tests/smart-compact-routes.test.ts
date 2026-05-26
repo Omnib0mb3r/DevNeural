@@ -16,7 +16,6 @@ import { IndexDb } from '../src/store/index-db.js';
 import { runMigrations } from '../src/db/migrate.js';
 import {
   clearAndPaste,
-  evaluateSmartCompact,
   fireSmartCompact,
   parseSmartCompactPolicyOwner,
   parseSmartCompactValue,
@@ -111,64 +110,7 @@ function seedAnchor(opts: {
   });
 }
 
-describe('evaluateSmartCompact', () => {
-  it('returns 404-style error when anchor is unknown', async () => {
-    const r = await evaluateSmartCompact(db, 'missing');
-    expect(r.ok).toBe(false);
-    expect(r.error).toBe('anchor not found');
-  });
-
-  it('returns wait + null ctx_pct when no transcript ref or ctx provider', async () => {
-    seedAnchor({ id: 'a' });
-    const r = await evaluateSmartCompact(db, 'a');
-    expect(r.ok).toBe(true);
-    expect(r.action).toBe('wait');
-    expect(r.ctx_pct).toBeNull();
-  });
-
-  it('passes through explicit ctx_pct and phase to the evaluator and does NOT return a summary (v2 Lex-authored)', async () => {
-    seedAnchor({ id: 'a' });
-    const r = await evaluateSmartCompact(db, 'a', {
-      ctxPct: 60,
-      phase: 'idle',
-      lastCommitMs: null,
-      lastToolMs: null,
-    });
-    expect(r.action).toBe('fire');
-    expect(r.reason).toBe('window-open');
-    /* v2 contract: daemon no longer builds the summary; Lex authors
-     * it at fire time and posts it on opts.summary. */
-    expect((r as { summary?: unknown }).summary).toBeUndefined();
-  });
-
-  it('returns shadow=true while attempt count is under threshold', async () => {
-    process.env.DEVNEURAL_SMART_COMPACT_SHADOW_N = '3';
-    seedAnchor({ id: 'a' });
-    const r = await evaluateSmartCompact(db, 'a', { ctxPct: 60, phase: 'idle' });
-    expect(r.shadow).toBe(true);
-  });
-});
-
 describe('fireSmartCompact', () => {
-  it('writes a shadow audit row and skips inject while under shadow threshold', () => {
-    process.env.DEVNEURAL_SMART_COMPACT_SHADOW_N = '3';
-    seedAnchor({ id: 'a' });
-    const injector = vi.fn(() => ({ ok: true as const }));
-    const r = fireSmartCompact(db, 'a', {
-      caller: 'lex',
-      reason: 'window-open',
-      action: 'fire',
-      ctxPct: 60,
-      summary: 'resume here',
-      injector,
-    });
-    expect(r.action).toBe('shadow');
-    expect(r.shadow).toBe(true);
-    expect(injector).not.toHaveBeenCalled();
-    const rows = recentSmartCompacts(db);
-    expect(rows[0]!.action).toBe('shadow');
-  });
-
   it('injects /clear and the summary when not in shadow and pty is bound', () => {
     seedAnchor({ id: 'a', pty: 'pty-A', cc: 'cc-A' });
     const injector = vi.fn(() => ({ ok: true as const }));
@@ -244,24 +186,6 @@ describe('fireSmartCompact', () => {
     expect(injector).toHaveBeenNthCalledWith(2, 'cc-A', 'resume here', true);
   });
 
-  it('force=true bypasses the shadow gate', () => {
-    process.env.DEVNEURAL_SMART_COMPACT_SHADOW_N = '3';
-    seedAnchor({ id: 'a', pty: 'pty-A' });
-    const injector = vi.fn(() => ({ ok: true as const }));
-    const r = fireSmartCompact(db, 'a', {
-      caller: 'dashboard',
-      reason: 'manual',
-      action: 'fire',
-      ctxPct: 65,
-      summary: 'go',
-      injector,
-      force: true,
-    });
-    expect(r.shadow).toBe(false);
-    expect(r.action).toBe('fire');
-    expect(injector).toHaveBeenCalledTimes(2);
-  });
-
   it('persists payload_text on the audit row (full summary, not just preview)', () => {
     seedAnchor({ id: 'a', pty: 'pty-A' });
     const longSummary = 'You were working on demo. '.repeat(40);
@@ -283,7 +207,9 @@ describe('fireSmartCompact', () => {
     seedAnchor({ id: 'a', pty: 'pty-A' });
     const prior = process.env.DEVNEURAL_SMART_COMPACT_ENABLED;
     /* Default-off: explicitly unset to confirm the kill-switch is
-     * the default at launch (shadow-only until operator opts in). */
+     * the default at launch (shadow-only until operator opts in).
+     * Stage 3 removed the per-anchor isShadow gate so the global
+     * mode='shadow' kill-switch is the only safety net left. */
     delete process.env.DEVNEURAL_SMART_COMPACT_ENABLED;
     try {
       const injector = vi.fn(() => ({ ok: true as const }));
@@ -294,9 +220,6 @@ describe('fireSmartCompact', () => {
         ctxPct: 60,
         summary: 'queued payload',
         injector,
-        /* force=true would normally bypass the per-anchor shadow
-         * counter; the global toggle must still win. */
-        force: true,
       });
       expect(r.action).toBe('shadow');
       expect(r.shadow).toBe(true);
@@ -969,15 +892,15 @@ describe('smart-compact policy-owner toggle (Fix 41 Stage 2)', () => {
     expect(parseSmartCompactPolicyOwner(undefined)).toBeNull();
   });
 
-  it("defaults to 'daemon' when runtime_config is empty (Stage 2 opt-in flip)", () => {
-    expect(smartCompactPolicyOwner(db)).toBe('daemon');
+  it("defaults to 'lex' when runtime_config is empty (Fix 41 Stage 3 flipped default)", () => {
+    expect(smartCompactPolicyOwner(db)).toBe('lex');
   });
 
-  it("runtime_config 'lex' overrides the default", () => {
-    db.setRuntimeConfig(SMART_COMPACT_POLICY_OWNER_KEY, 'lex', 'test');
-    expect(smartCompactPolicyOwner(db)).toBe('lex');
+  it("runtime_config 'daemon' overrides the default (rollback path)", () => {
     db.setRuntimeConfig(SMART_COMPACT_POLICY_OWNER_KEY, 'daemon', 'test');
     expect(smartCompactPolicyOwner(db)).toBe('daemon');
+    db.setRuntimeConfig(SMART_COMPACT_POLICY_OWNER_KEY, 'lex', 'test');
+    expect(smartCompactPolicyOwner(db)).toBe('lex');
   });
 
   async function buildApp(): Promise<ReturnType<typeof Fastify>> {
@@ -1001,11 +924,11 @@ describe('smart-compact policy-owner toggle (Fix 41 Stage 2)', () => {
         runtime_value: string | null;
         default_owner: string;
       };
-      expect(body1.owner).toBe('daemon');
+      expect(body1.owner).toBe('lex');
       expect(body1.runtime_value).toBeNull();
-      expect(body1.default_owner).toBe('daemon');
+      expect(body1.default_owner).toBe('lex');
 
-      db.setRuntimeConfig(SMART_COMPACT_POLICY_OWNER_KEY, 'lex', 'test');
+      db.setRuntimeConfig(SMART_COMPACT_POLICY_OWNER_KEY, 'daemon', 'test');
       const res2 = await app.inject({
         method: 'GET',
         url: '/lex/smart-compact/policy-owner',
@@ -1014,8 +937,8 @@ describe('smart-compact policy-owner toggle (Fix 41 Stage 2)', () => {
         owner: string;
         runtime_value: string | null;
       };
-      expect(body2.owner).toBe('lex');
-      expect(body2.runtime_value).toBe('lex');
+      expect(body2.owner).toBe('daemon');
+      expect(body2.runtime_value).toBe('daemon');
     } finally {
       await app.close();
     }

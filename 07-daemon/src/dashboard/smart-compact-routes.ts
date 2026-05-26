@@ -1,26 +1,37 @@
 /**
  * Smart compact routes (SMART-COMPACT.md "Mechanics" + "Audit").
  *
- * v2 - Lex-authored resume prompts. The daemon no longer builds the
- * resume summary. Lex composes the prompt at fire time using live
- * conversation context and posts it as opts.summary on
- * /lex/smart-compact/fire. The daemon is transport + audit log only
- * for the summary inject. The wrap path stays daemon-authored
- * (WRAP_AND_COMMIT_PROMPT).
+ * Fix 41 Stage 3 cutover. The daemon is a transport + audit log;
+ * Lex owns every decision. Endpoints:
  *
- *   POST /lex/smart-compact/evaluate    {anchor_id}
- *     -> {action, reason, ctx_pct, shadow}  // no summary
+ *   GET  /lex/smart-compact/state            consolidated raw inputs
+ *                                            for Lex's evaluator.
+ *   POST /lex/smart-compact/clear-and-paste  Lex-supplied summary;
+ *                                            /clear + readiness gate
+ *                                            + summary paste + audit
+ *                                            row action='clear-and-paste'.
+ *   POST /lex/smart-compact/wrap-paste       Lex-supplied wrap prompt;
+ *                                            single inject + audit row
+ *                                            action='wrap-paste'.
+ *   POST /lex/smart-compact/fire             legacy back-compat shim;
+ *                                            still resolves /clear +
+ *                                            summary for action='fire'
+ *                                            and WRAP_AND_COMMIT_PROMPT
+ *                                            for action='wrap'. Lex
+ *                                            does not call this in the
+ *                                            Stage 3+ loop; kept for
+ *                                            dashboard manual fires.
+ *   GET  /lex/smart-compact/recent           audit log read.
+ *   GET  /lex/smart-compact/toggle           three-state mode
+ *                                            (off|shadow|live).
+ *   POST /lex/smart-compact/toggle           flip the mode.
+ *   GET  /lex/smart-compact/policy-owner     policy-owner toggle
+ *                                            (daemon|lex), default lex.
+ *   POST /lex/smart-compact/policy-owner     flip the owner.
  *
- *   POST /lex/smart-compact/fire        {anchor_id, reason, action,
- *                                        caller?, summary}
- *     -> 400 when action='fire' and summary is missing/empty.
- *        Otherwise writes audit row; if not shadow and the anchor
- *        has a current PTY, injects /clear then the caller-supplied
- *        summary. action='wrap' injects WRAP_AND_COMMIT_PROMPT and
- *        does NOT require summary.
- *
- *   GET  /lex/smart-compact/recent      ?limit=20
- *     -> {ok, rows: SmartCompactLogRow[]}
+ * POST /lex/smart-compact/evaluate was removed in Stage 3; Lex runs
+ * its own evaluator against /state. Per-anchor isShadow gating was
+ * also removed; only the global mode='shadow' kill-switch survives.
  *
  * Handlers are exported as pure functions over IndexDb + an injected
  * PTY transport so tests can drive them without spinning up fastify.
@@ -33,14 +44,10 @@ import * as os from 'node:os';
 import type { FastifyInstance } from 'fastify';
 import type { IndexDb, SmartCompactLogRow } from '../store/index-db.js';
 import {
-  defaults,
-  evaluateTrigger,
-  isShadow,
   WRAP_AND_COMMIT_PROMPT,
   type EvalAction,
   type EvalReason,
-  type Phase,
-} from '../lex/smart-compact.js';
+} from '../lex/smart-compact-policy.js';
 import {
   awaitNewSessionReady,
   capturePreClearJsonlSet,
@@ -54,28 +61,6 @@ export interface PtyInjector {
     text: string,
     commit: boolean,
   ): { ok: true } | { ok: false; error: string };
-}
-
-export interface EvaluateOptions {
-  /** ctx_pct override; if absent the evaluator pulls from the anchor's
-   * current transcript jsonl tail via the injected ctxProvider. */
-  ctxPct?: number;
-  ctxProvider?: (jsonlPath: string) => number | null;
-  lastCommitMs?: number | null;
-  lastToolMs?: number | null;
-  phase?: Phase;
-  now?: number;
-}
-
-export interface EvaluateResult {
-  ok: boolean;
-  error?: string;
-  action: EvalAction;
-  reason: EvalReason;
-  ctx_pct: number | null;
-  shadow: boolean;
-  jsonl_path: string | null;
-  anchor_id: string;
 }
 
 export function jsonlForAnchor(db: IndexDb, anchorId: string): string | null {
@@ -133,69 +118,6 @@ function deriveLastCommit(cwd: string): number | null {
   } catch {
     return null;
   }
-}
-
-export async function evaluateSmartCompact(
-  db: IndexDb,
-  anchorId: string,
-  opts: EvaluateOptions = {},
-): Promise<EvaluateResult> {
-  const anchor = db.getProjectSession(anchorId);
-  if (!anchor) {
-    return {
-      ok: false,
-      error: 'anchor not found',
-      action: 'wait',
-      reason: 'below-window',
-      ctx_pct: null,
-      shadow: false,
-      jsonl_path: null,
-      anchor_id: anchorId,
-    };
-  }
-  const jsonlPath = jsonlForAnchor(db, anchorId);
-  let ctxPct: number | null = opts.ctxPct ?? null;
-  if (ctxPct === null && jsonlPath && opts.ctxProvider) {
-    ctxPct = opts.ctxProvider(jsonlPath);
-  }
-  if (ctxPct === null) {
-    return {
-      ok: true,
-      action: 'wait',
-      reason: 'below-window',
-      ctx_pct: null,
-      shadow: isShadow(db, anchorId),
-      jsonl_path: jsonlPath,
-      anchor_id: anchorId,
-    };
-  }
-  const cfg = defaults();
-  const now = opts.now ?? Date.now();
-  const lastCommitMs =
-    opts.lastCommitMs ?? deriveLastCommit(anchor.cwd);
-  const lastToolMs = opts.lastToolMs ?? deriveLastTool(jsonlPath);
-  const phase = opts.phase ?? 'unknown';
-  const verdict = evaluateTrigger({
-    ctxPct,
-    threshold: cfg.threshold,
-    bandHalf: cfg.bandHalf,
-    hardCeiling: cfg.hardCeiling,
-    stopWindowMs: cfg.stopWindowMs,
-    now,
-    lastCommitMs,
-    lastToolMs,
-    phase,
-  });
-  const shadow = isShadow(db, anchorId);
-  return {
-    ok: true,
-    action: verdict.action,
-    reason: verdict.reason,
-    ctx_pct: ctxPct,
-    shadow,
-    jsonl_path: jsonlPath,
-    anchor_id: anchorId,
-  };
 }
 
 export interface FireOptions {
@@ -259,13 +181,12 @@ export interface FireResult {
  *            a runaway evaluator is spamming /clear and the
  *            operator needs to drop the system without bouncing the
  *            daemon.
- *   shadow — shadow audit rows always; PTY inject never runs. The
- *            old default behaviour when smartCompactGloballyEnabled
- *            returned false. Used to validate trigger conditions on
- *            a new anchor before opting it in.
- *   live   — per-anchor isShadow() decides. Anchor in shadow mode →
- *            shadow row, no inject. Otherwise inject + fire/wrap
- *            row.
+ *   shadow — global shadow: every fire writes a shadow audit row,
+ *            PTY inject never runs. Validates trigger conditions
+ *            without disturbing the worker.
+ *   live   — inject + fire/wrap audit row. Fix 41 Stage 3 removed
+ *            the per-anchor isShadow gate; once mode='live' every
+ *            fire goes through. Per-anchor gating now lives in Lex.
  *
  * Back-compat: env truthy spellings ('true', '1', 'on', 'live') map
  * to 'live'; falsey spellings ('false', '0', 'off') map to 'off';
@@ -307,22 +228,24 @@ export function smartCompactGloballyEnabled(db: IndexDb): boolean {
 
 export { SMART_COMPACT_CONFIG_KEY };
 
-/* Fix 41 Stage 2 — policy-owner runtime flag.
+/* Fix 41 Stage 3 — policy-owner runtime flag, default flipped to 'lex'.
  *
  * Resolution order:
  *   1. runtime_config.smart_compact_policy_owner   (dashboard toggle)
- *   2. default = 'daemon'
+ *   2. default = 'lex'
  *
  * Values:
- *   daemon — legacy path. The 60s scheduler still walks anchors and
- *            fires wrap / defers fire to Lex (per Fix 36).
- *   lex    — scheduler short-circuits to log-only. Lex drives the
- *            entire loop via the new state + clear-and-paste +
- *            wrap-paste endpoints. Stage 3 removes the daemon scheduler
- *            entirely; Stage 2 keeps it as the rollback path.
+ *   daemon — rollback path. Reserved for the operator if the Lex loop
+ *            misbehaves; the daemon scheduler module has been removed
+ *            in Stage 3, so flipping back to 'daemon' currently has no
+ *            in-daemon side effect. Kept as a runtime value so the
+ *            dashboard toggle can record the intent for diagnostics.
+ *   lex    — Lex drives the loop entirely. The daemon stays a
+ *            transport over /state + /clear-and-paste + /wrap-paste.
  *
- * Default stays 'daemon' through Stage 2 so the flip is opt-in until
- * the Lex loop is verified. */
+ * Default is 'lex' from Stage 3 forward. Earlier stages defaulted to
+ * 'daemon' so the cutover could be opt-in; with the scheduler gone
+ * the only sane default is 'lex'. */
 const SMART_COMPACT_POLICY_OWNER_KEY = 'smart_compact_policy_owner';
 export type SmartCompactPolicyOwner = 'daemon' | 'lex';
 
@@ -340,7 +263,7 @@ export function smartCompactPolicyOwner(db: IndexDb): SmartCompactPolicyOwner {
   const fromRuntime = parseSmartCompactPolicyOwner(
     db.getRuntimeConfig(SMART_COMPACT_POLICY_OWNER_KEY),
   );
-  return fromRuntime ?? 'daemon';
+  return fromRuntime ?? 'lex';
 }
 
 export { SMART_COMPACT_POLICY_OWNER_KEY };
@@ -367,9 +290,13 @@ export function fireSmartCompact(
     };
   }
 
+  /* Fix 41 Stage 3 — per-anchor isShadow gate removed. The only
+   * shadow path now is the global mode='shadow' kill-switch which
+   * is operator-set and applies to every anchor uniformly. opts.force
+   * is no longer meaningful but is retained on the type to keep
+   * compat with callers that still pass it; it has no effect. */
   const globallyDisabled = mode !== 'live';
-  const shadow =
-    globallyDisabled || (!opts.force && isShadow(db, anchorId));
+  const shadow = globallyDisabled;
 
   if (shadow) {
     const logId = randomUUID();
@@ -832,23 +759,10 @@ export function registerSmartCompactRoutes(
   log: (msg: string) => void = () => undefined,
   options: RegisterOptions = {},
 ): void {
-  app.post('/lex/smart-compact/evaluate', async (req, reply) => {
-    const body = (req.body ?? {}) as {
-      anchor_id?: string;
-      ctx_pct?: number;
-      phase?: Phase;
-    };
-    if (!body.anchor_id) {
-      reply.code(400);
-      return { ok: false, error: 'anchor_id required' };
-    }
-    const r = await evaluateSmartCompact(db, body.anchor_id, {
-      ctxPct: typeof body.ctx_pct === 'number' ? body.ctx_pct : undefined,
-      phase: body.phase,
-    });
-    if (!r.ok) reply.code(404);
-    return r;
-  });
+  /* Fix 41 Stage 3 removed POST /lex/smart-compact/evaluate. The
+   * decisioning surface lives in Lex; daemon exposes /state (raw
+   * inputs) and the action endpoints (/clear-and-paste, /wrap-paste)
+   * instead. Use those. */
 
   app.post('/lex/smart-compact/fire', async (req, reply) => {
     const body = (req.body ?? {}) as {
@@ -1102,7 +1016,7 @@ export function registerSmartCompactRoutes(
       ok: true,
       owner: smartCompactPolicyOwner(db),
       runtime_value: runtimeValue,
-      default_owner: 'daemon' as SmartCompactPolicyOwner,
+      default_owner: 'lex' as SmartCompactPolicyOwner,
     };
   });
 
@@ -1131,7 +1045,7 @@ export function registerSmartCompactRoutes(
       ok: true,
       owner: smartCompactPolicyOwner(db),
       runtime_value: db.getRuntimeConfig(SMART_COMPACT_POLICY_OWNER_KEY),
-      default_owner: 'daemon' as SmartCompactPolicyOwner,
+      default_owner: 'lex' as SmartCompactPolicyOwner,
     };
   });
 
