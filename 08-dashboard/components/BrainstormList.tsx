@@ -8,7 +8,7 @@
  * user back to /sessions/new (the existing new-session entry point;
  * a dedicated /brainstorms/new is out of Wave 2 scope).
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -18,6 +18,7 @@ import {
   type BrainstormDecorated,
   type BrainstormFilter,
 } from "@/lib/daemon-client";
+import { subscribeDashboardEvents } from "@/lib/dashboard-events";
 
 export interface BrainstormListProps {
   initialKind?: "brainstorm" | "meeting";
@@ -43,6 +44,16 @@ export function BrainstormList({ initialKind = "brainstorm" }: BrainstormListPro
 
   const router = useRouter();
   const qc = useQueryClient();
+  /* SSE-driven invalidation: refresh the brainstorm list the moment
+   * the daemon flips a row to ended, instead of waiting for the 5s
+   * polling tick. */
+  useEffect(() => {
+    return subscribeDashboardEvents((ev) => {
+      if (ev.type === "brainstorm-ended") {
+        void qc.invalidateQueries({ queryKey: ["brainstorms"] });
+      }
+    });
+  }, [qc]);
   /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
    * "+ standalone" mints a brainstorm with runtime_mode=direct-llm
    * and no PTY backing it. Voice WS attaches by brainstorm_id and

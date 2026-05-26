@@ -295,6 +295,48 @@ export async function registerDashboardRoutes(
 
   app.get('/dashboard/daily-brief', async () => getDailyBrief());
 
+  /* Server-Sent Events stream for cross-tab state push.
+   *
+   * One connection per dashboard tab. Publishers call
+   * publishDashboardEvent() in event-bus.ts; this handler fans the
+   * payload out to every live client. Tabs use the stream to invalidate
+   * react-query caches without waiting for the 5s polling tick (eg
+   * brainstorm-ended flips the StreamDeck tile within ~100ms instead
+   * of up to 5s). Comments + 15s ping keep proxies from closing the
+   * idle stream. */
+  app.get('/dashboard/events', async (req, reply) => {
+    const { dashboardEvents } = await import('./event-bus.js');
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    reply.raw.write(`: connected ${new Date().toISOString()}\n\n`);
+    const onEvent = (ev: unknown): void => {
+      try {
+        reply.raw.write(`data: ${JSON.stringify(ev)}\n\n`);
+      } catch {
+        /* socket may have closed mid-write */
+      }
+    };
+    dashboardEvents.on('event', onEvent);
+    const keepalive = setInterval(() => {
+      try {
+        reply.raw.write(`: ping ${Date.now()}\n\n`);
+      } catch {
+        /* socket may have closed */
+      }
+    }, 15_000);
+    const cleanup = (): void => {
+      clearInterval(keepalive);
+      dashboardEvents.off('event', onEvent);
+    };
+    req.raw.on('close', cleanup);
+    req.raw.on('error', cleanup);
+    return reply;
+  });
+
   /* Live reinforcement-log tail. Returns the last N events from
    * reinforcement.log.jsonl in newest-first order so the dashboard
    * can render injection / hit / no-hit / raw-hit / raw-hit-ingest /

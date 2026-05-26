@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   focusSession,
   sessions as sessionsClient,
@@ -14,6 +14,7 @@ import { Icon } from "./Icon";
 import { StatusDot } from "./StatusDot";
 import { NavGrid } from "./NavGrid";
 import { lexPickStable } from "@/lib/lex";
+import { subscribeDashboardEvents } from "@/lib/dashboard-events";
 
 /* Stream Deck rail = remote analog of the physical Elgato deck.
  *
@@ -100,6 +101,20 @@ export function StreamDeck() {
     queryFn: lexAnchorTiles,
     refetchInterval: 5_000,
   });
+  /* SSE-driven invalidation: when the daemon flips a brainstorm to
+   * ended, refetch the anchor tiles + session list immediately so the
+   * tile flips and the End button hides without waiting for the 5s
+   * polling tick. */
+  const qc = useQueryClient();
+  useEffect(() => {
+    return subscribeDashboardEvents((ev) => {
+      if (ev.type === "brainstorm-ended") {
+        void qc.invalidateQueries({ queryKey: ["lex-anchor-tiles"] });
+        void qc.invalidateQueries({ queryKey: ["sessions"] });
+        void qc.invalidateQueries({ queryKey: ["brainstorms"] });
+      }
+    });
+  }, [qc]);
   /* Default: show only sessions the daemon flags as active. The flag
    * uses a 24h jsonl-mtime window, so a live session stays visible
    * through normal idle gaps. Toggle pulls in older history when

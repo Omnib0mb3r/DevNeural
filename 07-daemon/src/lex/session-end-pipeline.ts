@@ -60,6 +60,7 @@ import {
   discard as discardAudioBundle,
 } from '../voice/audio-bundle.js';
 import { writeThreadDoc } from './thread-doc.js';
+import { publishDashboardEvent } from '../dashboard/event-bus.js';
 
 export interface SessionEndInput {
   /** Brainstorm row id, used only for logging; the pipeline does not
@@ -308,10 +309,20 @@ async function runOrderedPipeline(
     try {
       const existing = store.db.getBrainstorm(input.brainstormId);
       if (existing && existing.status !== 'ended') {
+        const endedMs = existing.ended_ms ?? Date.now();
         store.db.updateBrainstorm(input.brainstormId, {
           status: 'ended',
-          ended_ms: existing.ended_ms ?? Date.now(),
+          ended_ms: endedMs,
         });
+        try {
+          publishDashboardEvent({
+            type: 'brainstorm-ended',
+            brainstorm_id: input.brainstormId,
+            ended_ms: endedMs,
+          });
+        } catch {
+          /* event bus best-effort */
+        }
       }
     } catch (err) {
       log(`[session-end] ended_ms update failed: ${(err as Error).message}`);
@@ -660,14 +671,24 @@ async function runBrainstormChunksFallback(
 
   if (markEnded && existing.status !== 'ended') {
     try {
+      const endedMs = existing.ended_ms ?? Date.now();
       store.db.updateBrainstorm(input.brainstormId, {
         status: 'ended',
-        ended_ms: existing.ended_ms ?? Date.now(),
+        ended_ms: endedMs,
         lifecycle_state: 'ended',
       });
       log(
         `[chunks-fallback] brainstorm=${input.brainstormId} status='ended' flipped`,
       );
+      try {
+        publishDashboardEvent({
+          type: 'brainstorm-ended',
+          brainstorm_id: input.brainstormId,
+          ended_ms: endedMs,
+        });
+      } catch {
+        /* event bus best-effort */
+      }
     } catch (err) {
       log(
         `[chunks-fallback] status flip failed: ${(err as Error).message}`,
@@ -737,6 +758,89 @@ async function runBrainstormChunksFallback(
   } catch (err) {
     log(
       `[chunks-fallback] summary generation failed: ${(err as Error).message}`,
+    );
+  }
+
+  /* Step 7a port (Stage 2 of LEX-AUTONOMY-PAYLOAD-SPEC). The chunks
+   * fallback runs for the two paths the canonical pipeline cannot
+   * cover (direct-llm without a cc_session_id, and cc-pty without a
+   * project_session row). The per-session ref machinery only fires
+   * when a cc_session_id is bound; the direct-llm case has no ref to
+   * write and is skipped with a structured log. Placed AFTER the LLM
+   * last_summary write so the deterministic rolling aggregate
+   * overwrites the LLM string when ref data is available. Best-effort:
+   * any failure logs and leaves the prior last_summary in place. */
+  if (input.claudeSessionId) {
+    try {
+      const ccId = input.claudeSessionId;
+      const ref = store.db.getLexTranscriptRefByCc(ccId);
+      if (!ref) {
+        log(
+          `[chunks-fallback] per-session distill skipped: no lex_transcript_ref for cc=${ccId.slice(0, 8)}`,
+        );
+      } else {
+        const totalScoped = store.db.countBrainstormChunksForSession(
+          input.brainstormId,
+          ccId,
+        );
+        if (totalScoped === 0) {
+          log(
+            `[chunks-fallback] per-session distill skipped: no_session_scoped_chunks brainstorm=${input.brainstormId.slice(0, 8)} cc=${ccId.slice(0, 8)}`,
+          );
+        } else {
+          const perSessionGen = createPerSessionDistillationGenerator({
+            db: store.db,
+            log,
+          });
+          const result = await perSessionGen({
+            brainstorm_id: input.brainstormId,
+            cc_session_id: ccId,
+            totalChunksInSession: totalScoped,
+          });
+          if (result) {
+            store.db.updateLexTranscriptRef(ref.id, {
+              ref_summary: result.summary,
+              ref_summary_ms: Date.now(),
+              source_chunk_count: result.source_chunk_count,
+              source_session_ids: result.source_session_ids,
+              coverage_score: result.coverage_score,
+            });
+            log(
+              `[chunks-fallback] ref_summary written ref=${ref.id} cc=${ccId.slice(0, 8)} chars=${result.summary.length} coverage=${result.coverage_score.toFixed(2)}`,
+            );
+            const agg = recomputeRollingAggregate(
+              store.db,
+              input.brainstormId,
+            );
+            if (agg) {
+              store.db.updateBrainstorm(input.brainstormId, {
+                last_summary: agg.summary,
+                last_summary_ms: agg.summary_ms || Date.now(),
+              });
+              out.summary_written = true;
+              log(
+                `[chunks-fallback] rolling aggregate written n=${agg.source_ref_ids.length} chars=${agg.summary.length}`,
+              );
+            } else {
+              log(
+                `[chunks-fallback] rolling aggregate empty; last_summary untouched`,
+              );
+            }
+          } else {
+            log(
+              `[chunks-fallback] per-session distill returned null brainstorm=${input.brainstormId.slice(0, 8)} cc=${ccId.slice(0, 8)}`,
+            );
+          }
+        }
+      }
+    } catch (err) {
+      log(
+        `[chunks-fallback] per-session distill / aggregate failed: ${(err as Error).message}`,
+      );
+    }
+  } else {
+    log(
+      `[chunks-fallback] per-session distill skipped: no cc_session_id (direct-llm path)`,
     );
   }
 
