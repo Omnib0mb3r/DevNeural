@@ -889,6 +889,32 @@ export function registerSmartCompactRoutes(
       reply.code(404);
       return { ok: false, error: 'anchor not found' };
     }
+    /* Codex item 10 (Fix 47): loose-ends gate pre-flight. Block when
+     * an operator-only loose end is present; pass through on auto-
+     * resolve or clear. The gate uses default fireAutoAction (no-op
+     * 'skipped' status) for this round; codex 11 wires the real
+     * recovery + redistill helpers behind the same hook. */
+    try {
+      const { enforceLooseEndsGate } = await import(
+        '../lex/loose-ends-gate.js'
+      );
+      const decision = await enforceLooseEndsGate(db, body.anchor_id, {});
+      if (decision.kind === 'blocked') {
+        reply.code(409);
+        return {
+          ok: false,
+          error: 'loose-ends gate blocked clear-and-paste',
+          loose_ends: decision.report,
+        };
+      }
+      if (decision.kind === 'auto-resolving') {
+        log(
+          `[smart-compact] loose-ends auto-resolve anchor=${body.anchor_id.slice(0, 8)} actions=${decision.auto_actions.length}`,
+        );
+      }
+    } catch {
+      /* observational; never block the route on gate failure */
+    }
     /* Build the optional readiness gate the same way the legacy /fire
      * route did. Skipped when the anchor has no resolvable cwd, or
      * when the caller explicitly passes use_readiness_gate=false. */
