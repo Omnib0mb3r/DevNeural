@@ -39,6 +39,7 @@ import {
 import { bindKillSwitch } from './worker-event-killswitch.js';
 import { recordWorkerEventDiagnostic } from './worker-event-diagnostics.js';
 import { ptyInject } from './pty-host.js';
+import { defaultGitHelpers, type GitHelpers } from './worker-event-git.js';
 import { randomUUID } from 'node:crypto';
 
 const DEFAULT_TAIL_BYTES = 32 * 1024;
@@ -66,6 +67,10 @@ export interface ListenerDeps {
   resolveTarget?: () => string | null;
   /** Tail bytes to read per change. */
   tailBytes?: number;
+  /** Fix 34d.2 test seam: git helpers for the narrated-success
+   * detector. Production uses cached git rev-parse + log; tests
+   * inject a deterministic stub. */
+  gitHelpers?: GitHelpers;
 }
 
 export interface ProcessChangeResult {
@@ -288,6 +293,11 @@ export interface ProcessChangeDeps {
   resolveTarget?: () => string | null;
   tailBytes?: number;
   now?: () => number;
+  /** Fix 34d.2: git helpers for the narrated-success detector. */
+  gitHelpers?: GitHelpers;
+  /** Fix 34d.2 test override: skip the grace window so a contract
+   * test can fire the event without sleeping 60 s. */
+  successClaimGraceMs?: number;
 }
 
 export function processChange(
@@ -328,12 +338,25 @@ export function processChange(
   }
   const now = (deps.now ?? Date.now)();
   const parsed = parseJsonlTail(tail.text);
+  /* Fix 34d.2: read git HEAD + recent commits for the anchor's cwd
+   * so deriveEvents can run the narrated-success-no-commit detector.
+   * Default helpers cache for 5 s; tests inject a deterministic stub. */
+  const git = deps.gitHelpers ?? defaultGitHelpers;
+  const currentHeadSha = anchor.cwd ? git.getHeadSha(anchor.cwd) : null;
+  const recentCommits = anchor.cwd ? git.getRecentCommits(anchor.cwd, 3) : [];
   const { events, nextState } = deriveEvents(
     parsed,
     prev,
     anchor,
     now,
     tail.sig,
+    {
+      currentHeadSha,
+      recentCommits,
+      ...(deps.successClaimGraceMs !== undefined
+        ? { successClaimGraceMs: deps.successClaimGraceMs }
+        : {}),
+    },
   );
   deps.state.set(anchor.id, nextState);
   if (events.length === 0) return { outcome: 'no-events', anchor_id: anchor.id };
@@ -408,6 +431,7 @@ export function startWorkerEventListener(
     onKillSwitch,
     ...(deps.resolveTarget ? { resolveTarget: deps.resolveTarget } : {}),
     ...(tailBytes !== undefined ? { tailBytes } : {}),
+    ...(deps.gitHelpers ? { gitHelpers: deps.gitHelpers } : {}),
   };
 
   let watcher: FSWatcher | null = null;

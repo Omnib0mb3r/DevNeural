@@ -248,6 +248,39 @@ describe('extractEventSnippet — commit', () => {
   });
 });
 
+describe('extractEventSnippet — narrated_success_no_commit (Fix 34d.2)', () => {
+  it('renders claim + HEAD-not-advanced + sha_at_claim + recent_commits', () => {
+    const snippet = extractEventSnippet(
+      'narrated_success_no_commit',
+      '',
+      {
+        narratedSuccess: {
+          claimText: 'Bundle shipped.',
+          headShaAtClaim: 'deadbeefcafefacefeedface',
+          recentCommits: [
+            'c2bff48 docs(fixes): record Fix 34d.1 row',
+            '318260f fix(supervisor): route Lex injects through pty',
+            '2e0d590 fix(supervisor): lex-queue branch',
+          ],
+        },
+      },
+    );
+    expect(snippet).toMatch(/claim: Bundle shipped\./);
+    expect(snippet).toMatch(/git HEAD did not advance/);
+    expect(snippet).toMatch(/sha_at_claim: deadbeefcafe/);
+    expect(snippet).toMatch(/recent_commits:/);
+    expect(snippet).toMatch(/- c2bff48 docs\(fixes\)/);
+  });
+
+  it('falls back to (no recent activity) when no narratedSuccess context supplied', () => {
+    const snippet = extractEventSnippet(
+      'narrated_success_no_commit',
+      'tail bytes ignored',
+    );
+    expect(snippet).toBe('(no recent activity)');
+  });
+});
+
 describe('extractEventSnippet — expectation_drift', () => {
   it('uses the supervisor-provided drift summary verbatim', () => {
     const snippet = extractEventSnippet(

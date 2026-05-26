@@ -219,3 +219,135 @@ describe('deriveEvents', () => {
     expect(types).toContain('commit');
   });
 });
+
+describe('deriveEvents — narrated_success_no_commit (Fix 34d.2)', () => {
+  function claimAssistant(text: string, tsMs: number): string {
+    return JSON.stringify({
+      type: 'assistant',
+      uuid: `a-${tsMs}`,
+      timestamp: new Date(tsMs).toISOString(),
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text }],
+        stop_reason: 'end_turn',
+      },
+    });
+  }
+  function basePrev() {
+    return newAnchorTailState();
+  }
+
+  it('fires when worker claims shipped but HEAD has not advanced after 60s', () => {
+    const claimMs = NOW - 60_000;
+    const parsed = parseJsonlTail(claimAssistant('Bundle shipped.', claimMs));
+    const seeded = deriveEvents(parsed, basePrev(), anchor(), claimMs, 'sig-1', {
+      currentHeadSha: 'sha-A',
+      recentCommits: [{ sha: 'sha-A', subject: 'prior commit' }],
+    });
+    /* Initial observation: seed pending claim, do not fire yet — */
+    expect(seeded.events.map((e) => e.type)).not.toContain(
+      'narrated_success_no_commit',
+    );
+    expect(seeded.nextState.pendingSuccessClaim?.headShaAtClaim).toBe('sha-A');
+    /* Tick 60 s later with HEAD unchanged. */
+    const after = deriveEvents(
+      parseJsonlTail(''),
+      seeded.nextState,
+      anchor(),
+      NOW + 1_000,
+      'sig-2',
+      {
+        currentHeadSha: 'sha-A',
+        recentCommits: [{ sha: 'sha-A', subject: 'prior commit' }],
+      },
+    );
+    expect(after.events.map((e) => e.type)).toContain(
+      'narrated_success_no_commit',
+    );
+    const ev = after.events.find(
+      (e) => e.type === 'narrated_success_no_commit',
+    )!;
+    expect(ev.snippet).toMatch(/claim: Bundle shipped\./);
+    expect(ev.snippet).toMatch(/git HEAD did not advance/);
+    expect(ev.snippet).toMatch(/sha_at_claim: sha-A/);
+    expect(ev.snippet).toMatch(/recent_commits:/);
+    expect(after.nextState.pendingSuccessClaim?.fired).toBe(true);
+  });
+
+  it('does NOT fire when HEAD advanced after the claim (commit landed)', () => {
+    const claimMs = NOW - 90_000;
+    const parsed = parseJsonlTail(claimAssistant('All done.', claimMs));
+    const seeded = deriveEvents(parsed, basePrev(), anchor(), claimMs, 'sig-3', {
+      currentHeadSha: 'sha-pre',
+    });
+    expect(seeded.nextState.pendingSuccessClaim?.headShaAtClaim).toBe(
+      'sha-pre',
+    );
+    /* A commit landed between seed and the next tick: HEAD moved. */
+    const after = deriveEvents(
+      parseJsonlTail(''),
+      seeded.nextState,
+      anchor(),
+      NOW,
+      'sig-4',
+      { currentHeadSha: 'sha-post' },
+    );
+    expect(after.events.map((e) => e.type)).not.toContain(
+      'narrated_success_no_commit',
+    );
+    /* Pending claim cleared because HEAD advanced. */
+    expect(after.nextState.pendingSuccessClaim).toBeNull();
+  });
+
+  it('does NOT re-fire for an earlier claim once a commit landed; tracks per-claim', () => {
+    /* Step 1: seed claim A at HEAD=sha-A. */
+    const t1 = NOW - 200_000;
+    const seedA = deriveEvents(
+      parseJsonlTail(claimAssistant('Shipped first thing.', t1)),
+      newAnchorTailState(),
+      anchor(),
+      t1,
+      'sig-a1',
+      { currentHeadSha: 'sha-A' },
+    );
+    /* Step 2: commit lands; HEAD moves to sha-B. Claim A cleared. */
+    const afterCommit = deriveEvents(
+      parseJsonlTail(''),
+      seedA.nextState,
+      anchor(),
+      t1 + 30_000,
+      'sig-a2',
+      { currentHeadSha: 'sha-B' },
+    );
+    expect(afterCommit.nextState.pendingSuccessClaim).toBeNull();
+    expect(afterCommit.events.map((e) => e.type)).not.toContain(
+      'narrated_success_no_commit',
+    );
+    /* Step 3: a NEW claim arrives, but it is for the work that just
+     * landed. Per the spec, the earlier claim must not retroactively
+     * fire just because a follow-up claim happened without a fresh
+     * commit. We confirm by checking that no narrated_success_no_commit
+     * event fires here AND that the newly-tracked claim is keyed on
+     * the post-commit HEAD (sha-B), not the pre-commit sha-A. */
+    const t3 = t1 + 60_000;
+    const newClaim = deriveEvents(
+      parseJsonlTail(claimAssistant('Patch landed cleanly.', t3)),
+      afterCommit.nextState,
+      anchor(),
+      t3,
+      'sig-a3',
+      { currentHeadSha: 'sha-B' },
+    );
+    expect(newClaim.events.map((e) => e.type)).not.toContain(
+      'narrated_success_no_commit',
+    );
+    /* The NEW claim is seeded against the post-commit HEAD; the
+     * earlier (sha-A) claim is gone and cannot retroactively fire. */
+    expect(newClaim.nextState.pendingSuccessClaim?.headShaAtClaim).toBe(
+      'sha-B',
+    );
+    expect(newClaim.nextState.pendingSuccessClaim?.text).toBe(
+      'Patch landed cleanly.',
+    );
+  });
+});

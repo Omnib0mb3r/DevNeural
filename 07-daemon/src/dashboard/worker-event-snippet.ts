@@ -192,6 +192,15 @@ export interface ExtractOpts {
    * the LLM-judged drift summary directly; the jsonl tail does not
    * carry that text). */
   driftSnippet?: string;
+  /** Fix 34d.2: context for the narrated-success-no-commit
+   * formatter. claimText + headShaAtClaim come from the pending
+   * claim tracked in AnchorTailState; recentCommits is filled by the
+   * git helper. */
+  narratedSuccess?: {
+    claimText: string;
+    headShaAtClaim: string | null;
+    recentCommits: string[];
+  };
 }
 
 export function extractEventSnippet(
@@ -202,6 +211,23 @@ export function extractEventSnippet(
   if (eventType === 'expectation_drift') {
     const drift = (opts.driftSnippet ?? rawTail).trim();
     return drift ? capToMax(`drift: ${drift}`) : EMPTY_PLACEHOLDER;
+  }
+  if (eventType === 'narrated_success_no_commit') {
+    const ctx = opts.narratedSuccess;
+    if (!ctx) return EMPTY_PLACEHOLDER;
+    const parts: string[] = [];
+    parts.push(`claim: ${brief(ctx.claimText, 220)}`);
+    parts.push('git HEAD did not advance');
+    parts.push(
+      `sha_at_claim: ${ctx.headShaAtClaim ? ctx.headShaAtClaim.slice(0, 12) : 'unknown'}`,
+    );
+    if (ctx.recentCommits.length > 0) {
+      parts.push('recent_commits:');
+      for (const c of ctx.recentCommits) {
+        parts.push(`- ${brief(c, 160)}`);
+      }
+    }
+    return capToMax(parts.join('\n'));
   }
   const lines = parseMeaningfulLines(rawTail);
 

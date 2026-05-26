@@ -34,7 +34,13 @@ export type WorkerEventType =
    * expected outcome. Routing through WorkerEventGate keeps the
    * per-anchor 12/hour cap honest so a misbehaving evaluator cannot
    * spam Lex with corrections. */
-  | 'expectation_drift';
+  | 'expectation_drift'
+  /* Fix 34d.2 (2026-05-26): false-shipment detector. Worker assistant
+   * text claims "shipped" / "done" / "landed" / etc., but git HEAD
+   * has not advanced for >=60 s since the claim. Cron-driven Lex
+   * supervision was trusting narration over git; this surfaces the
+   * mismatch so Lex can challenge rather than rubber-stamp. */
+  | 'narrated_success_no_commit';
 
 export interface WorkerEvent {
   type: WorkerEventType;
