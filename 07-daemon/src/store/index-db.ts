@@ -1959,6 +1959,46 @@ export class IndexDb {
       .all(limit) as LexSessionRow[];
   }
 
+  /* Fix 34: find the Lex anchor supervising a given project anchor.
+   * The event-driven supervisor needs an anchor-scoped resolver so a
+   * worker event for project X routes to the Lex anchor that has
+   * explicitly bound to X via lex_session.supervises_project_anchor_id.
+   * Before this helper landed, resolveLexTargetSession scanned every
+   * live lex_session and picked the most-recently-created one
+   * regardless of which project it supervised - which left the wire
+   * silently no-op when the live Lex anchor's supervises field did
+   * not happen to be the first match.
+   *
+   * Status filter is applied at the SQL level; the most recent live
+   * row wins when more than one lex_session supervises the same
+   * project (degenerate state, but covered by the ORDER BY for
+   * determinism). */
+  listLexSessionsBySupervises(
+    projectAnchorId: string,
+    opts: { status?: 'live' | 'dormant'; limit?: number } = {},
+  ): LexSessionRow[] {
+    const limit = opts.limit ?? 10;
+    if (opts.status) {
+      return this.db
+        .prepare(
+          `SELECT * FROM lex_session
+             WHERE supervises_project_anchor_id = ?
+               AND status = ?
+             ORDER BY created_ms DESC
+             LIMIT ?`,
+        )
+        .all(projectAnchorId, opts.status, limit) as LexSessionRow[];
+    }
+    return this.db
+      .prepare(
+        `SELECT * FROM lex_session
+           WHERE supervises_project_anchor_id = ?
+           ORDER BY created_ms DESC
+           LIMIT ?`,
+      )
+      .all(projectAnchorId, limit) as LexSessionRow[];
+  }
+
   deleteLexSession(id: string): void {
     /* ON DELETE CASCADE on lex_transcript_ref drops the children. */
     this.db.prepare(`DELETE FROM lex_session WHERE id = ?`).run(id);

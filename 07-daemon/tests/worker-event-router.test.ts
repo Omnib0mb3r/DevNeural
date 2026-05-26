@@ -424,4 +424,145 @@ describe('resolveLexTargetSession', () => {
       'cc-original',
     );
   });
+
+  /* Fix 34 regression. Two live lex_sessions exist; only one is
+   * bound to the project anchor that the worker event came from.
+   * Pre-fix the resolver picked the most-recently-created live
+   * session globally and silently delivered into the wrong Lex
+   * (or into none when the global pick had no open ref). */
+  it('prefers the lex_session bound via supervises_project_anchor_id over the most-recent live row', () => {
+    db.insertProjectSession({
+      id: 'project-anchor-aaaa',
+      project_slug: 'proj-aaaa',
+      cwd: 'C:/p/aaaa',
+      title: null,
+      status: 'live',
+      current_session_id: null,
+      current_bridge_id: null,
+      current_pty_id: null,
+      created_ms: 500,
+      last_seen_ms: 500,
+      supervision_mode: 'event',
+    });
+    db.insertLexSession({
+      id: 'lex-wrong',
+      created_ms: 10_000,
+      title: 'unbound newer',
+      derived_title: null,
+      status: 'live',
+      current_pty_id: null,
+      cwd: 'C:/p/lex-wrong',
+    });
+    db.insertLexTranscriptRef({
+      lex_session_id: 'lex-wrong',
+      cc_session_id: 'cc-wrong',
+      transcript_path: 'C:/p/lex-wrong/cc-wrong.jsonl',
+      started_ms: 10_000,
+      ended_ms: null,
+      ordering: 0,
+    });
+    db.insertLexSession({
+      id: 'lex-right',
+      created_ms: 1_000,
+      title: 'bound older',
+      derived_title: null,
+      status: 'live',
+      current_pty_id: null,
+      cwd: 'C:/p/lex-right',
+      supervises_project_anchor_id: 'project-anchor-aaaa',
+    });
+    db.insertLexTranscriptRef({
+      lex_session_id: 'lex-right',
+      cc_session_id: 'cc-right',
+      transcript_path: 'C:/p/lex-right/cc-right.jsonl',
+      started_ms: 1_000,
+      ended_ms: null,
+      ordering: 0,
+    });
+    resetLexTargetCacheForTest();
+    /* Without anchorId: legacy behaviour picks the most recent
+     * live row (cc-wrong). */
+    expect(resolveLexTargetSession(db, { now: 12_000 })).toBe('cc-wrong');
+    resetLexTargetCacheForTest();
+    /* With anchorId: anchor-scoped lookup wins. */
+    expect(
+      resolveLexTargetSession(db, {
+        now: 12_000,
+        anchorId: 'project-anchor-aaaa',
+      }),
+    ).toBe('cc-right');
+  });
+
+  it('falls back to global pick when the project anchor has no supervisor bound', () => {
+    db.insertLexSession({
+      id: 'lex-only',
+      created_ms: 1_000,
+      title: 'unbound',
+      derived_title: null,
+      status: 'live',
+      current_pty_id: null,
+      cwd: 'C:/p/lex-only',
+    });
+    db.insertLexTranscriptRef({
+      lex_session_id: 'lex-only',
+      cc_session_id: 'cc-fallback',
+      transcript_path: 'C:/p/lex-only/cc-fallback.jsonl',
+      started_ms: 1_000,
+      ended_ms: null,
+      ordering: 0,
+    });
+    resetLexTargetCacheForTest();
+    expect(
+      resolveLexTargetSession(db, {
+        now: 5_000,
+        anchorId: 'project-anchor-no-supervisor',
+      }),
+    ).toBe('cc-fallback');
+  });
+
+  it('caches per-anchor so a miss on one project does not poison another', () => {
+    db.insertProjectSession({
+      id: 'proj-A',
+      project_slug: 'proj-A',
+      cwd: 'C:/p/A',
+      title: null,
+      status: 'live',
+      current_session_id: null,
+      current_bridge_id: null,
+      current_pty_id: null,
+      created_ms: 500,
+      last_seen_ms: 500,
+      supervision_mode: 'event',
+    });
+    db.insertLexSession({
+      id: 'lex-A',
+      created_ms: 1_000,
+      title: 'A',
+      derived_title: null,
+      status: 'live',
+      current_pty_id: null,
+      cwd: 'C:/p/lex-A',
+      supervises_project_anchor_id: 'proj-A',
+    });
+    db.insertLexTranscriptRef({
+      lex_session_id: 'lex-A',
+      cc_session_id: 'cc-A',
+      transcript_path: 'C:/p/lex-A/cc-A.jsonl',
+      started_ms: 1_000,
+      ended_ms: null,
+      ordering: 0,
+    });
+    resetLexTargetCacheForTest();
+    /* First call for proj-B finds nothing (no supervisor, no global
+     * either - we have a lex_session but its supervises field is
+     * proj-A). Global fallback still returns lex-A's cc id. */
+    expect(
+      resolveLexTargetSession(db, { now: 1_000, anchorId: 'proj-B' }),
+    ).toBe('cc-A');
+    /* Subsequent call for proj-A is NOT poisoned by the proj-B
+     * lookup; the anchor-scoped resolver hits a separate cache key. */
+    expect(
+      resolveLexTargetSession(db, { now: 1_100, anchorId: 'proj-A' }),
+    ).toBe('cc-A');
+  });
 });

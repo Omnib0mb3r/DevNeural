@@ -172,7 +172,11 @@ export interface ProcessChangeDeps {
   gate: WorkerEventGate;
   inject: (target: string, text: string) => { ok: boolean; reason?: string };
   onKillSwitch: (anchorId: string) => void;
-  resolveTarget: () => string | null;
+  /* Optional after Fix 34: when unset, processChange resolves the
+   * target via resolveLexTargetSession with the project anchor scoped
+   * in. Test code that needs a deterministic spy passes its own
+   * function and bypasses the anchor lookup. */
+  resolveTarget?: () => string | null;
   tailBytes?: number;
   now?: () => number;
 }
@@ -234,10 +238,21 @@ export function processChange(
     });
   }
   const routed: RouteResult[] = [];
+  /* Fix 34: anchor-scoped resolver. Pre-fix the listener installed a
+   * global default that picked "most recent live lex_session" without
+   * checking which project anchor it actually supervised, so the
+   * wire silently no-op'd whenever the project's real supervisor was
+   * not the most-recently-created lex row. Test code can still
+   * inject a deterministic resolveTarget through deps; production
+   * leaves it unset and falls through to the anchor-scoped
+   * resolveLexTargetSession(..., anchorId) call. */
+  const resolveForEvent = deps.resolveTarget ??
+    ((): string | null =>
+      resolveLexTargetSession(deps.db, { anchorId: anchor.id }));
   for (const ev of events) {
     const result = routeWorkerEvent(ev, {
       gate: deps.gate,
-      resolveTarget: deps.resolveTarget,
+      resolveTarget: resolveForEvent,
       inject: deps.inject,
       anchor,
       onKillSwitch: deps.onKillSwitch,
@@ -269,8 +284,11 @@ export function startWorkerEventListener(
   const gate = deps.gate ?? getSharedWorkerEventGate();
   const inject = deps.inject ?? buildInject(deps.db);
   const onKillSwitch = deps.onKillSwitch ?? bindKillSwitch(deps.db);
-  const resolveTarget =
-    deps.resolveTarget ?? (() => resolveLexTargetSession(deps.db));
+  /* Fix 34: do NOT install a global-pick default here. processChange
+   * resolves per-anchor via resolveLexTargetSession(db, { anchorId })
+   * when no explicit override was supplied. The pre-fix path always
+   * threaded a global-pick resolver into procDeps, which silently
+   * shadowed the anchor-scoped lookup. */
   const tailBytes = deps.tailBytes;
 
   const procDeps: ProcessChangeDeps = {
@@ -279,7 +297,7 @@ export function startWorkerEventListener(
     gate,
     inject,
     onKillSwitch,
-    resolveTarget,
+    ...(deps.resolveTarget ? { resolveTarget: deps.resolveTarget } : {}),
     ...(tailBytes !== undefined ? { tailBytes } : {}),
   };
 

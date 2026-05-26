@@ -224,45 +224,84 @@ interface CachedTarget {
   ccSessionId: string | null;
   resolvedAtMs: number;
 }
-let cachedTarget: CachedTarget | null = null;
+/* Per-anchor cache. The pre-Fix-34 resolver kept a single global
+ * cache, which meant the first call's verdict (often null when no
+ * Lex was alive yet) leaked across every other project anchor for
+ * 60 s. Keyed by the project anchor_id supplied by the caller so a
+ * miss on one project does not poison the others; the unscoped
+ * lookup (no anchor_id) uses the literal '__global__' key for
+ * backward compatibility with /lex/inject-cross-session callers that
+ * do not know which project they belong to. */
+const cachedTargets = new Map<string, CachedTarget>();
+const GLOBAL_KEY = '__global__';
 const TARGET_CACHE_TTL_MS = 60_000;
+
+export interface ResolveLexTargetSessionOptions {
+  now?: number;
+  ttlMs?: number;
+  /** Fix 34: project anchor whose supervising Lex session should be
+   * resolved. When provided, the resolver filters lex_session rows
+   * by supervises_project_anchor_id = anchorId AND status = 'live'.
+   * When omitted, falls back to the legacy "most recent live
+   * lex_session globally" pick so callers outside the event-driven
+   * supervisor keep working. */
+  anchorId?: string | null;
+}
 
 export function resolveLexTargetSession(
   db: IndexDb,
-  opts: { now?: number; ttlMs?: number } = {},
+  opts: ResolveLexTargetSessionOptions = {},
 ): string | null {
   const now = opts.now ?? Date.now();
   const ttl = opts.ttlMs ?? TARGET_CACHE_TTL_MS;
-  if (cachedTarget && now - cachedTarget.resolvedAtMs < ttl) {
-    return cachedTarget.ccSessionId;
+  const cacheKey = opts.anchorId ?? GLOBAL_KEY;
+  const cached = cachedTargets.get(cacheKey);
+  if (cached && now - cached.resolvedAtMs < ttl) {
+    return cached.ccSessionId;
   }
   let ccSessionId: string | null = null;
   try {
-    const rows = db.listLexSessions({ status: 'live', limit: 50 });
-    /* Pick the most recently created live lex_session. The legacy
-     * mode column lived on brainstorm_sessions; lex_session rows
-     * inherit "conversation" by default and notes mode lives on the
-     * legacy table only, so live lex_session rows are all
-     * conversation-mode for supervision purposes. */
-    const ordered = rows
-      .slice()
-      .sort((a, b) => b.created_ms - a.created_ms);
-    const first = ordered[0];
-    if (first) {
-      const refs = db.listLexTranscriptRefs(first.id);
-      const openRef = refs.find((r) => r.ended_ms === null) ??
-        refs[refs.length - 1];
-      ccSessionId = openRef?.cc_session_id ?? null;
+    /* Fix 34: anchor-scoped resolution. The supervisor pipeline now
+     * threads the project anchor through, so this branch picks the
+     * Lex session that has explicitly bound to that anchor via
+     * lex_session.supervises_project_anchor_id. Pre-fix the resolver
+     * picked the most recent live lex_session globally, which left
+     * the wire silently no-op whenever the project's true supervisor
+     * was not the most-recently-created lex row.
+     *
+     * Anchor-scoped pass tries supervising-Lex first. If none is
+     * bound, falls back to the legacy global-pick so unbound projects
+     * still get supervision (existing behaviour). */
+    let candidates = opts.anchorId
+      ? db.listLexSessionsBySupervises(opts.anchorId, {
+          status: 'live',
+          limit: 5,
+        })
+      : [];
+    if (candidates.length === 0) {
+      candidates = db
+        .listLexSessions({ status: 'live', limit: 50 })
+        .slice()
+        .sort((a, b) => b.created_ms - a.created_ms);
+    }
+    for (const row of candidates) {
+      const refs = db.listLexTranscriptRefs(row.id);
+      const openRef =
+        refs.find((r) => r.ended_ms === null) ?? refs[refs.length - 1];
+      if (openRef?.cc_session_id) {
+        ccSessionId = openRef.cc_session_id;
+        break;
+      }
     }
   } catch {
     ccSessionId = null;
   }
-  cachedTarget = { ccSessionId, resolvedAtMs: now };
+  cachedTargets.set(cacheKey, { ccSessionId, resolvedAtMs: now });
   return ccSessionId;
 }
 
 export function resetLexTargetCacheForTest(): void {
-  cachedTarget = null;
+  cachedTargets.clear();
 }
 
 /* ── Side-effect entry ─────────────────────────────────────────────── */
