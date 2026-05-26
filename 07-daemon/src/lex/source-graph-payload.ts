@@ -107,6 +107,96 @@ export interface SourcePayload {
 const DEFAULT_REF_LIMIT = 5;
 const DEFAULT_PAIRS_PER_REF = 5;
 
+/* Codex item 9 (Fix 46): first-attach detector.
+ *
+ * Returns true when this anchor has NO prior lex_transcript_ref AND
+ * NO brainstorm_chunks rows. That combination is the signal "a worker
+ * is connecting for the very first time; there is no prior state for
+ * the source-graph builder to project". The direct-llm edge case
+ * (anchor has chunks but no refs) returns false: those chunks ARE
+ * prior state the worker needs to honor on its first-attach payload.
+ *
+ * Best-effort: DB read failures default to false so the route renders
+ * smart-clear (safer; first-attach drops the "where you left off"
+ * sections that a real prior session needs).
+ */
+export function isFirstAttach(
+  db: IndexDb,
+  anchorId: string,
+  brainstormId?: string | null,
+): boolean {
+  let refCount = 0;
+  try {
+    refCount = db.countLexTranscriptRefs(anchorId);
+  } catch {
+    return false;
+  }
+  if (refCount > 0) return false;
+  const bsId = brainstormId ?? anchorId;
+  let chunkCount = 0;
+  try {
+    chunkCount = db.countBrainstormChunks(bsId);
+  } catch {
+    chunkCount = 0;
+  }
+  return chunkCount === 0;
+}
+
+/* Codex item 9 (Fix 46): default first-attach next-action.
+ *
+ * Priority order:
+ *   1. Last user-role brainstorm_chunks row (most recent first; only
+ *      counted when the text starts with a directive-shaped verb or
+ *      ends with "?" or "."). Treats this as the operator's brief.
+ *   2. anchor.last_summary trimmed to one line (when a prior summary
+ *      survived but no refs exist - rare; covers operator-imported
+ *      anchors).
+ *   3. Fallback string anchored on the anchor id + spec pointer when
+ *      available.
+ *
+ * Always returns a non-empty string; the route can pass it directly
+ * into renderWorkerBoot.nextAction. */
+const DIRECTIVE_REGEX =
+  /^(make|add|fix|build|implement|ship|wire|investigate|debug|refactor|test|land|propose|design)\b/i;
+const FIRST_ATTACH_LOOKBACK = 20;
+
+export function deriveFirstAttachNextAction(
+  db: IndexDb,
+  anchorId: string,
+  brainstormId?: string | null,
+): string {
+  const bsId = brainstormId ?? anchorId;
+  try {
+    const chunks = db.listBrainstormChunks(bsId, FIRST_ATTACH_LOOKBACK, {
+      order: 'desc',
+    });
+    for (const c of chunks) {
+      if (c.role !== 'user') continue;
+      const t = c.text.trim();
+      if (!t) continue;
+      if (DIRECTIVE_REGEX.test(t) || /[?.]\s*$/.test(t)) {
+        return t.length > 320 ? t.slice(0, 319).trimEnd() + '…' : t;
+      }
+    }
+  } catch {
+    /* observational; fall through */
+  }
+  try {
+    const bs = db.getBrainstorm(bsId);
+    if (bs?.last_summary) {
+      const firstLine = bs.last_summary.split(/\r?\n/, 1)[0]?.trim();
+      if (firstLine && firstLine.length > 0) {
+        return firstLine.length > 320
+          ? firstLine.slice(0, 319).trimEnd() + '…'
+          : firstLine;
+      }
+    }
+  } catch {
+    /* observational */
+  }
+  return `FIRST-ATTACH: anchor=${anchorId.slice(0, 8)}. State your goal and ship the first atomic commit.`;
+}
+
 function defaultReadTranscript(p: string): string | null {
   try {
     return fs.readFileSync(p, 'utf-8');

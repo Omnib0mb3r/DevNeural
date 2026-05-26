@@ -4528,6 +4528,10 @@ export async function registerDashboardRoutes(
      * to the legacy shape. */
     const mode = workerBootSourceGraphMode(store.db);
     let source_graph_block: string | null = null;
+    const bodyTyped = body as unknown as {
+      mode?: 'smart-clear' | 'first-attach';
+      next_action?: string;
+    };
     if (
       mode !== 'legacy' &&
       result.ok &&
@@ -4538,13 +4542,25 @@ export async function registerDashboardRoutes(
       try {
         const bs = store.db.getBrainstormByAttachedWorker(body.session_id);
         if (bs) {
-          const { buildSourceGraphPayload } = await import(
-            '../lex/source-graph-payload.js'
-          );
+          const {
+            buildSourceGraphPayload,
+            isFirstAttach,
+            deriveFirstAttachNextAction,
+          } = await import('../lex/source-graph-payload.js');
           const { renderWorkerBoot } = await import(
             '../lex/worker-boot-render.js'
           );
           const now = Date.now();
+          /* Codex 9 auto-toggle: detect first-attach from the anchor's
+           * own ref + chunk state. Caller can override via explicit
+           * body.mode for test harnesses. */
+          const detected = isFirstAttach(store.db, bs.id, bs.id);
+          const renderMode =
+            bodyTyped.mode === 'first-attach' || bodyTyped.mode === 'smart-clear'
+              ? bodyTyped.mode
+              : detected
+                ? 'first-attach'
+                : 'smart-clear';
           const payload = buildSourceGraphPayload({
             db: store.db,
             anchorId: bs.id,
@@ -4552,10 +4568,16 @@ export async function registerDashboardRoutes(
             refLimit: 3,
             pairsPerRef: 3,
             now: () => now,
+            firstAttach: renderMode === 'first-attach',
           });
+          let nextAction = bodyTyped.next_action;
+          if (renderMode === 'first-attach' && (!nextAction || !nextAction.trim())) {
+            nextAction = deriveFirstAttachNextAction(store.db, bs.id, bs.id);
+          }
           source_graph_block = renderWorkerBoot(payload, {
-            mode: 'smart-clear',
+            mode: renderMode,
             now,
+            ...(nextAction ? { nextAction } : {}),
           });
         }
       } catch {
