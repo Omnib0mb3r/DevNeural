@@ -215,18 +215,17 @@ describe('processChange', () => {
   });
 });
 
-describe('deliverSupervisorPromptToLex (Fix 34d)', () => {
+describe('deliverSupervisorPromptToLex (Fix 34d.1: pty routing)', () => {
   it('returns no_lex_transcript_ref when the target cc is not bound to a lex_session', () => {
     const r = deliverSupervisorPromptToLex(db, 'cc-unknown', 'hello', () => ({
       ok: true,
-      queued_at: '0',
     }));
     expect(r.ok).toBe(false);
-    expect(r.mode).toBe('lex-queue');
+    expect(r.mode).toBe('lex-pty');
     expect(r.reason).toBe('no_lex_transcript_ref');
   });
 
-  it('routes via queueSessionPrompt keyed on the lex_session.id, not the cc id', () => {
+  it('routes via ptyInject keyed on the CC session id (NOT lex_session.id)', () => {
     db.insertLexSession({
       id: 'lex-A',
       created_ms: 1_000,
@@ -244,26 +243,29 @@ describe('deliverSupervisorPromptToLex (Fix 34d)', () => {
       ended_ms: null,
       ordering: 0,
     });
-    const queueCalls: Array<{ sessionId: string; text: string }> = [];
+    const ptyCalls: Array<{ ccSessionId: string; text: string; commit: boolean }> = [];
     const r = deliverSupervisorPromptToLex(
       db,
       'cc-lex-target',
       '[supervisor-event] sample',
-      (sessionId, text) => {
-        queueCalls.push({ sessionId, text });
-        return { ok: true, queued_at: 'now' };
+      (ccSessionId, text, commit) => {
+        ptyCalls.push({ ccSessionId, text, commit });
+        return { ok: true };
       },
     );
     expect(r.ok).toBe(true);
-    expect(r.mode).toBe('lex-queue');
-    expect(queueCalls).toHaveLength(1);
-    /* Critical contract: hand-off key is the LEX session id, not
-     * the CC session id we received. */
-    expect(queueCalls[0]?.sessionId).toBe('lex-A');
-    expect(queueCalls[0]?.text).toBe('[supervisor-event] sample');
+    expect(r.mode).toBe('lex-pty');
+    expect(ptyCalls).toHaveLength(1);
+    /* Critical contract (Fix 34d.1): inject key is the CC session id
+     * we were handed, NOT the lex_session.id resolved off the ref.
+     * Keying on lex_session.id was the pre-fix routing bug that sent
+     * supervisor payloads to the worker terminal via bridge fallback. */
+    expect(ptyCalls[0]?.ccSessionId).toBe('cc-lex-target');
+    expect(ptyCalls[0]?.text).toBe('[supervisor-event] sample');
+    expect(ptyCalls[0]?.commit).toBe(true);
   });
 
-  it('surfaces queueSessionPrompt errors as lex-queue failures', () => {
+  it('surfaces ptyInject errors as lex-pty failures', () => {
     db.insertLexSession({
       id: 'lex-down',
       created_ms: 1_000,
@@ -285,10 +287,49 @@ describe('deliverSupervisorPromptToLex (Fix 34d)', () => {
       db,
       'cc-down',
       'x',
-      () => ({ ok: false, error: 'bridge offline' }),
+      () => ({ ok: false, error: 'pty not found' }),
     );
     expect(r.ok).toBe(false);
-    expect(r.mode).toBe('lex-queue');
-    expect(r.reason).toBe('bridge offline');
+    expect(r.mode).toBe('lex-pty');
+    expect(r.reason).toBe('pty not found');
+  });
+
+  it('does NOT route through writeBridgePrompt / queueSessionPrompt under any branch', async () => {
+    /* Belt-and-suspenders contract pin: spy on the sessions module's
+     * bridge writer. The Fix 34d.1 spec requires the supervisor wire
+     * to be pty-only; any future regression that wires the bridge
+     * fallback back in MUST fail this pin loudly. */
+    const sessionsModule = await import('../src/dashboard/sessions.js');
+    const spy = vi.spyOn(sessionsModule, 'queueSessionPrompt');
+    try {
+      db.insertLexSession({
+        id: 'lex-pin',
+        created_ms: 1_000,
+        title: null,
+        derived_title: null,
+        status: 'live',
+        current_pty_id: null,
+        cwd: 'C:/p/lex-pin',
+      });
+      db.insertLexTranscriptRef({
+        lex_session_id: 'lex-pin',
+        cc_session_id: 'cc-pin',
+        transcript_path: 'C:/p/lex-pin/cc-pin.jsonl',
+        started_ms: 1_000,
+        ended_ms: null,
+        ordering: 0,
+      });
+      const r = deliverSupervisorPromptToLex(
+        db,
+        'cc-pin',
+        '[supervisor-event] pin',
+        () => ({ ok: true }),
+      );
+      expect(r.ok).toBe(true);
+      expect(r.mode).toBe('lex-pty');
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

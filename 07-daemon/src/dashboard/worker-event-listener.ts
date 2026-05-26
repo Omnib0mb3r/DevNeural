@@ -37,9 +37,8 @@ import {
   type AnchorTailState,
 } from './worker-event-detect.js';
 import { bindKillSwitch } from './worker-event-killswitch.js';
-import { crossSessionInject, issueToken } from '../lex/cross-session-inject.js';
 import { recordWorkerEventDiagnostic } from './worker-event-diagnostics.js';
-import { queueSessionPrompt } from './sessions.js';
+import { ptyInject } from './pty-host.js';
 import { randomUUID } from 'node:crypto';
 
 const DEFAULT_TAIL_BYTES = 32 * 1024;
@@ -80,19 +79,29 @@ export interface ProcessChangeResult {
   anchor_id?: string;
 }
 
-/* Fix 34d: Lex CC sessions do not run under a VS Code 09-bridge VSIX,
- * so cross-session-inject's resolveDeliverableBridgeForSession gate
- * returns no_deliverable_bridge for every supervisor fire that
- * targets a Lex cc. Branch the inject path: when the resolved
- * target maps to a lex_transcript_ref, hand off to
- * queueSessionPrompt with the lex_session.id (NOT the cc id) so
- * delivery rides the bridge-prompt inbox that the Lex side reads.
- * Worker-targeted injects (the legacy path) still flow through
- * crossSessionInject so the bridge / pty dispatch + deliverability
- * gate stays in place for them. Both branches write an audit row
- * with caller_label='event-supervisor' and a delivery_mode tag in
- * reject_reason for forensics. */
-export type SupervisorDeliveryMode = 'lex-queue' | 'bridge';
+/* Fix 34d.1 (2026-05-26): pre-fix shipped routing bug.
+ *
+ * Earlier code keyed queueSessionPrompt on ref.lex_session_id, which
+ * is a brainstorm/lex_session row UUID, NOT a CC session id.
+ * writeBridgePrompt creates a `<id>.in` file the 09-bridge VSIX
+ * watches; with a non-CC id no daemon-tracked terminal matches and
+ * the bridge delivers to whatever VS Code window was in scope =
+ * the worker. Net effect: supervisor-event payloads landed in the
+ * worker's input field, while the audit row reported decision=
+ * 'accepted' delivery_mode='lex-queue'. Operator caught the misroute
+ * 2026-05-26 02:30 EDT.
+ *
+ * Architectural rule (user-stated 2026-05-26 02:35 EDT): daemon NEVER
+ * injects directly to worker. Daemon notifies Lex; Lex decides. Only
+ * Lex's outputs reach worker.
+ *
+ * Replacement: deliver via ptyInject keyed on the Lex CC session id.
+ * Lex CC runs under a daemon-managed pty so getPtyBySession resolves
+ * the handle and the inject lands at Lex's terminal. If the pty
+ * handle is missing (Lex CC launched outside daemon spawn), we
+ * audit-log the miss and drop — NEVER fall back to a bridge or
+ * worker-facing transport. */
+export type SupervisorDeliveryMode = 'lex-pty' | 'rejected-not-lex';
 
 export interface DeliverSupervisorPromptResult {
   ok: boolean;
@@ -104,23 +113,28 @@ export function deliverSupervisorPromptToLex(
   db: IndexDb,
   lexCcSessionId: string,
   text: string,
-  injectQueue: (sessionId: string, text: string) => {
-    ok: true;
-    queued_at: string;
-  } | { ok: false; error: string } = queueSessionPrompt,
+  injectPty: (
+    ccSessionId: string,
+    text: string,
+    commit: boolean,
+  ) => { ok: true } | { ok: false; error: string } = ptyInject,
 ): DeliverSupervisorPromptResult {
   const ref = db.getLexTranscriptRefByCc(lexCcSessionId);
   if (!ref) {
     return {
       ok: false,
-      mode: 'lex-queue',
+      mode: 'lex-pty',
       reason: 'no_lex_transcript_ref',
     };
   }
-  const r = injectQueue(ref.lex_session_id, text);
+  /* Inject keyed on the CC session id (NOT lex_session_id). ptyInject
+   * resolves by ptyId then by sessionId; cc_session_id matches a
+   * daemon-spawned Lex pty's handle.sessionId. The trailing CR commit
+   * + bare-CR follow-up nudge are baked into ptyInject already. */
+  const r = injectPty(lexCcSessionId, text, true);
   return r.ok
-    ? { ok: true, mode: 'lex-queue' }
-    : { ok: false, mode: 'lex-queue', reason: r.error };
+    ? { ok: true, mode: 'lex-pty' }
+    : { ok: false, mode: 'lex-pty', reason: r.error };
 }
 
 function auditSupervisorRow(
@@ -158,71 +172,56 @@ function buildInject(db: IndexDb): (target: string, text: string) => { ok: boole
       verdict: null,
       detail: `target=${target.slice(0, 16)} chars=${text.length}`,
     });
-    /* Branch on whether the resolved target is a Lex CC. Lookup is
-     * cheap (single SELECT keyed on cc_session_id). When the ref
-     * exists the target is a Lex session and bridge-presence will
-     * never claim it; the lex-queue path is the only one that can
-     * deliver. */
+    /* Architectural rule (Fix 34d.1, user-stated 2026-05-26 02:35 EDT):
+     * daemon NEVER injects directly to worker from the supervisor
+     * wire. Daemon notifies Lex; Lex decides. If the resolved target
+     * is not a Lex CC, drop with audit — do not fall through to a
+     * bridge or worker-facing transport. */
     const isLexTarget = !!db.getLexTranscriptRefByCc(target);
-    if (isLexTarget) {
-      try {
-        const result = deliverSupervisorPromptToLex(db, target, text);
-        auditSupervisorRow(
-          db,
-          target,
-          text,
-          result.mode,
-          result.ok,
-          result.reason ?? null,
-        );
-        recordWorkerEventDiagnostic({
-          db,
-          stage: 'inject.result',
-          verdict: result.ok ? 'ok' : 'fail',
-          detail: result.ok
-            ? `mode=${result.mode}`
-            : `mode=${result.mode} error=${result.reason ?? ''}`,
-        });
-        return result.ok
-          ? { ok: true }
-          : { ok: false, reason: result.reason ?? 'lex-queue-failed' };
-      } catch (err) {
-        recordWorkerEventDiagnostic({
-          db,
-          stage: 'inject.result',
-          verdict: 'throw',
-          detail: `mode=lex-queue ${(err as Error).message}`,
-        });
-        return { ok: false, reason: (err as Error).message };
-      }
-    }
-    try {
-      const token = issueToken(target);
-      const r = crossSessionInject(
-        {
-          target_session: target,
-          token,
-          text,
-          caller_label: 'event-supervisor',
-          commit: true,
-        },
+    if (!isLexTarget) {
+      auditSupervisorRow(
         db,
+        target,
+        text,
+        'rejected-not-lex',
+        false,
+        'target_not_lex_cc',
       );
       recordWorkerEventDiagnostic({
         db,
         stage: 'inject.result',
-        verdict: r.ok ? 'ok' : 'fail',
-        detail: r.ok ? `mode=bridge decision=${r.decision}` : `mode=bridge decision=${r.decision} error=${r.error ?? ''}`,
+        verdict: 'fail',
+        detail: 'mode=rejected-not-lex reason=target_not_lex_cc',
       });
-      return r.ok
+      return { ok: false, reason: 'target_not_lex_cc' };
+    }
+    try {
+      const result = deliverSupervisorPromptToLex(db, target, text);
+      auditSupervisorRow(
+        db,
+        target,
+        text,
+        result.mode,
+        result.ok,
+        result.reason ?? null,
+      );
+      recordWorkerEventDiagnostic({
+        db,
+        stage: 'inject.result',
+        verdict: result.ok ? 'ok' : 'fail',
+        detail: result.ok
+          ? `mode=${result.mode}`
+          : `mode=${result.mode} error=${result.reason ?? ''}`,
+      });
+      return result.ok
         ? { ok: true }
-        : { ok: false, reason: r.decision };
+        : { ok: false, reason: result.reason ?? 'lex-pty-failed' };
     } catch (err) {
       recordWorkerEventDiagnostic({
         db,
         stage: 'inject.result',
         verdict: 'throw',
-        detail: `mode=bridge ${(err as Error).message}`,
+        detail: `mode=lex-pty ${(err as Error).message}`,
       });
       return { ok: false, reason: (err as Error).message };
     }

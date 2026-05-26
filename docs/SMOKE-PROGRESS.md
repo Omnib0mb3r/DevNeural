@@ -8,11 +8,28 @@ Rolling handoff for the 2026-05-25 active smoke batch. Survives Lex restart, `/c
 
 ## Current cursor
 
-**Active step:** 3.7 — supervisor wire probe (`curl /dashboard/health-supervisor` returns `health:'ok'` after one worker event; new `caller_label='event-supervisor'` row in `cross_session_injection_log`).
+**Active step:** 3.7 REGRESSED — Fix 34d shipped but routed wrong. Re-fix in progress (Fix 34d.1, pty path).
+
+**3.7 status (2026-05-26 02:35 EDT):** REGRESSED (false pass).
+- Original 02:09 EDT PASS was forensic-only: row landed in `cross_session_injection_log` with `caller_label='event-supervisor'` and `reject_reason='delivery_mode=lex-queue'`. Audit row said accepted; live behavior contradicts it.
+- 02:30 EDT: operator caught supervisor-event payload landing in WORKER terminal queue (jsonl 94e85826, 2 queue-operation enqueue rows containing `[supervisor-event] worker=DevNeural event=idle…`), NOT in Lex CC (2a708d6d).
+- Root cause confirmed: `queueSessionPrompt(ref.lex_session_id, text)` keyed on a brainstorm UUID. `writeBridgePrompt` dropped the `<lex_session_id>.in` marker into the bridge inbox; the 09-bridge VSIX with no matching session-id fell through and delivered to whichever VS Code terminal was in scope (= the worker). Audit row never knew.
+- Architectural rule re-affirmed by operator 02:35 EDT: daemon NEVER injects directly to worker. Daemon notifies Lex; Lex decides. Only Lex's outputs reach worker.
+
+**Prior 3.7 history (kept for forensics):**
+
+1. **Fix 34b** (commit `bc9c621`, 12:50 AM EDT) — chokidar v4 glob support dropped; watch directory root + ignored predicate. Rebuilt + daemon restarted. Counter `chokidar.line` confirmed climbing post-restart.
+2. **Fix 34c** (commit `b0e5c22`, 01:19 AM EDT) — resolver was picking ordering=0 (oldest ref, cc770032) because all refs have `ended_ms=null` and the find() walked ASC. Patched to reverse-walk so newest open wins. Daemon restarted, resolver now resolves to ordering=94, cc=`13754c72` (current Lex CC).
+3. **Fix 34d** (commit `2e0d590`, 01:44 AM EDT) — REGRESSED. Introduced lex-queue branch keyed on lex_session.id. Audit-passed but live behavior misrouted to worker. Superseded by Fix 34d.1.
+4. **Fix 34d.1** (this commit, 2026-05-26) — TWO bundled fixes in one rebuild. **(A) Routing:** replace lex-queue branch with `ptyInject(lexCcSessionId, text, true)`. ptyInject resolves via daemon-managed pty handle for Lex CC. Audit mode flips to `lex-pty`. Non-Lex targets are dropped with `rejected-not-lex` instead of falling through to bridge/pty; supervisor wire is Lex-only per architectural rule. **(B) Snippet picker:** new `07-daemon/src/dashboard/worker-event-snippet.ts` replaces the raw-bytes-tail snippet with per-event-type high-signal extraction (idle: stall + last user/assistant + last tool/result; permission_denied: denied_tool + denied_input + reason; commit: branch + subject + files_changed; expectation_drift: supervisor-provided drift summary). Meta / attachment / skill-catalog / hook_additional_context records are stripped. 600-char cap with middle truncation; empty case returns `(no recent activity)`. 12 new pins in `tests/worker-event-snippet.test.ts`. **Combined: 889/889 daemon tests pass; tsc clean.** Bug doc: `docs/bugs/2026-05-26-supervisor-wire-routes-to-worker.md`.
+
+**Current state:** Fix 34d.1 patch applied to `worker-event-listener.ts`. **AWAITING daemon rebuild + restart**, then retest.
+
+**Retest plan:** restart daemon; wait for any worker jsonl write to fire a supervisor event. Verify (a) `chokidar.line` increments, (b) new row in `cross_session_injection_log` with `caller_label='event-supervisor'` AND `reject_reason='delivery_mode=lex-pty'`, (c) supervisor payload appears in Lex CC jsonl (2a708d6d in `C:/Users/michael/.claude/projects/C--dev-data-skill-connections-brainstorm/`), (d) worker jsonl has NO new queue-operation rows containing `[supervisor-event]`, (e) the `Snippet:` block in Lex's payload contains structured `stall_seconds=…\nlast_user: …\nlast_assistant: …` (NOT raw jsonl bytes or skill catalog text).
 
 **Steps 3.1-3.6 PASS evidence captured live in the Lex brainstorm 2026-05-25 evening session (see Completed list below).**
 
-**Last update:** 2026-05-26T04:42Z.
+**Last update:** 2026-05-26 02:35 AM EDT.
 
 ## Completed so far (this run)
 
@@ -25,10 +42,11 @@ Rolling handoff for the 2026-05-25 active smoke batch. Survives Lex restart, `/c
 - [x] Step 3.4 cold-start sibling differentiation — PASS. This session's cold-start preload showed differentiated sibling summaries (no boilerplate duplication).
 - [x] Step 3.5 mid-turn CR auto-submit (Fix 32) — PASS. Queued mid-turn utterances auto-submitted at turn boundary; verified live multiple times.
 - [x] Step 3.6 cancelled-tool-recovery (Fix 33) — PASS. Daemon log shows cancelled-tool-recovery armed at 12:04 EDT on cc cbb015e5, cleared 5s later when assistant follow-up landed (self-heal path exercised).
+- [ ] Step 3.7 supervisor wire — REGRESSED 2026-05-26 02:30 EDT. Original 02:09 PASS was a false positive (audit accepted, live delivery hit worker not Lex). Re-fix 34d.1 patched in `worker-event-listener.ts`; pending rebuild + restart + live retest before re-checking this box.
 
 ## Up next (in order)
 
-1. **3.7** Fix 34 supervisor wire probe (CURRENT) — `curl /dashboard/health-supervisor` returns `health:'ok'` after one worker event; new `caller_label='event-supervisor'` row in `cross_session_injection_log`.
+1. **3.7 (post-Fix-34b)** supervisor wire probe — daemon restart, write to any worker jsonl, expect chokidar.line counter > 0 and `/dashboard/health-supervisor` off `no-events`; row lands in `cross_session_injection_log` with `caller_label='event-supervisor'`.
 2. **4.x** Repoint fix via /clear on a worker.
 3. **5.x** Mic-init vad-error ring buffer + retry verify.
 4. **6.x** Final gate + FIXES.md flips + greenlight autonomy.

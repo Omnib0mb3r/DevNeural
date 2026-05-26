@@ -18,6 +18,7 @@ import {
   detectTestFailure,
   type WorkerEvent,
 } from './worker-event-router.js';
+import { extractEventSnippet } from './worker-event-snippet.js';
 
 export interface AnchorTailState {
   /** Most recent assistant-message ts seen so far. Used by the
@@ -185,12 +186,18 @@ export function deriveEvents(
 
   function pushIfFireable(type: WorkerEvent['type']): void {
     if (!shouldFire(nextState, type, now, gap)) return;
+    /* Fix 34d.1 addendum (2026-05-26): replace raw-tail-bytes snippet
+     * with per-event-type high-signal extraction. The raw tail was
+     * usually CC's SessionStart skill-catalog or hook_additional_context
+     * payload — noise that Lex could not act on. extractEventSnippet
+     * walks the same meaningful-line predicate the jsonl-ingestor uses
+     * and formats per event.type. */
     events.push({
       type,
       anchor_id: anchor.id,
       worker_session_id: ccSessionId,
       timestamp: stamp,
-      snippet: parsed.snippet,
+      snippet: extractEventSnippet(type, parsed.snippet, { now }),
     });
     nextState.lastFiredAt[type] = now;
   }

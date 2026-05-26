@@ -119,7 +119,9 @@ describe('deriveEvents', () => {
     const e = r.events.find((x) => x.type === 'permission_denied')!;
     expect(e.anchor_id).toBe('anchor-A');
     expect(e.worker_session_id).toBe('cc-A');
-    expect(e.snippet).toMatch(/Permission to use Bash/);
+    /* Fix 34d.1 addendum: snippet is per-event-type extraction, not
+     * raw bytes. permission_denied output leads with denied_tool: <name>. */
+    expect(e.snippet).toMatch(/denied_tool:\s*Bash/);
   });
 
   it('fires idle when last assistant ms is older than the threshold and no tool pending', () => {
