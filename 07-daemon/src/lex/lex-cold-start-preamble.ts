@@ -37,6 +37,7 @@ import { findLatestHandover } from './handover-writer.js';
 import { isRefStale } from './lex-transcript-ref.js';
 import type { PerSessionDistillationGenerator } from './distillation-generator.js';
 import { buildRecentErrorMap, pickBundles } from './adaptive-walk-back.js';
+import { buildSourceGraphPayload } from './source-graph-payload.js';
 import * as fs from 'node:fs';
 
 export interface ColdStartPreloadInput {
@@ -261,49 +262,38 @@ function summarizeFromAnchor(
 ): { sibling_count: number; recent_turns_appended: number; last_distilled_ms: number | null } | null {
   const anchorId = input.anchorId;
   if (!anchorId) return null;
-  const refs = input.db.listLexTranscriptRefs(anchorId);
-  if (refs.length === 0) return null;
-  const currentCc = input.currentCcSessionId ?? null;
   const refLimit = input.anchorRefLimit ?? ANCHOR_REF_LIMIT_DEFAULT;
   const pairs = input.anchorPairsPerRef ?? ANCHOR_PAIRS_PER_REF_DEFAULT;
-  /* Codex item 7: replace the blunt `sort by ordering DESC + slice`
-   * with the adaptive walk-back scorer. Pinned refs land first; the
-   * remainder is ranked by recency + freshness - supersession -
-   * failure; coverage floor 0.3 excludes weak refs unless pinned.
-   * Mirrors the spec's "session bundle" semantics where bundle = ref. */
-  const eligible = refs.filter(
-    (r) => !currentCc || r.cc_session_id !== currentCc,
-  );
-  if (eligible.length === 0) return null;
-  let errorMap: Map<string, number> | undefined;
-  try {
-    const errRows = input.db.listRecentDistillationErrors(200, {
-      brainstormId: anchorId,
-    });
-    errorMap = buildRecentErrorMap(errRows);
-  } catch {
-    /* migration 042 may not have applied; scoring falls back to zero
-     * failure penalty across the board */
-  }
-  const { selected } = pickBundles(eligible, {
-    now: (input.now ?? Date.now)(),
-    limit: refLimit,
-    ...(errorMap ? { recentErrorCountByCc: errorMap } : {}),
+  /* Codex item 8 (Fix 45 step 3): call the shared source-graph
+   * primitive instead of re-duplicating the pickBundles + filter +
+   * extract-turn-pairs pipeline. buildSourceGraphPayload runs the
+   * same Fix 44 walk-back scorer with identical inputs (ref pool
+   * filtered by currentCcSessionId, error map from
+   * distillation_error_log, frozen `now` clock); output is
+   * byte-identical for the happy path. */
+  const payload = buildSourceGraphPayload({
+    db: input.db,
+    anchorId,
+    ...(input.currentCcSessionId
+      ? { currentCcSessionId: input.currentCcSessionId }
+      : {}),
+    refLimit,
+    pairsPerRef: pairs,
+    now: input.now ?? Date.now,
+    ...(input.readTranscript
+      ? { readTranscript: input.readTranscript }
+      : {}),
   });
-  const prior = selected.map((s) => s.ref);
-  if (prior.length === 0) return null;
-  const read = input.readTranscript ?? readJsonl;
-  let turns = 0;
-  for (const ref of prior) {
-    const text = read(ref.transcript_path);
-    if (!text) continue;
-    turns += extractLastTurnPairs(text, pairs).length;
-  }
-  const anchorBs = input.db.getBrainstorm(anchorId);
+  if (payload.not_found) return null;
+  if (payload.refs.length === 0) return null;
+  const turns = payload.refs.reduce(
+    (sum, r) => sum + r.turn_pairs.length,
+    0,
+  );
   return {
-    sibling_count: prior.length,
+    sibling_count: payload.refs.length,
     recent_turns_appended: turns,
-    last_distilled_ms: anchorBs?.last_summary_ms ?? null,
+    last_distilled_ms: payload.anchor.last_summary_ms,
   };
 }
 
