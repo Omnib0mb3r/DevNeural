@@ -1,40 +1,84 @@
 # Smoke Test Handover — Paste-Ready Resume
 
-If Lex resets mid-smoke, paste this into a fresh Lex session to restore full context in one shot.
+If Lex resets mid-smoke or you pick this up tomorrow, paste this into a fresh Lex session to restore full context in one shot.
 
 ---
 
-**RESUME PROMPT (copy verbatim to fresh Lex):**
+**RESUME PROMPT (copy verbatim to fresh Lex, 2026-05-26 03:10 EDT snapshot):**
 
-> We are mid-smoke on the 2026-05-25 active batch (Stage 0/1/2 of LEX-AUTONOMY-PAYLOAD-SPEC + repoint fix + voice mic-init fix). Active step is 3.1. The prior Lex session landed two uncommitted code fixes for bugs uncovered during 3.1 and the daemon was just rebuilt + restarted, which is why you are cold. Read `docs/SMOKE-PROGRESS.md` for the live cursor and "Code fixes landed" block. Read `docs/SMOKE-TEST.md` "ACTIVE BATCH (2026-05-25)" section for the full checklist. Rebuild the task panel from the checkmarks — every `[ ]` becomes a pending task, every `[x]` is completed. Mark 3.1 as in_progress. Cold-start sibling preload is unreliable right now; the handover doc + progress doc are the canonical source, not the preload. Announce the next pending step out loud and wait for me to act. Do not skip ahead. Do not re-run completed steps.
+> Pick up from 2026-05-26 overnight session. Smoke gate already closed: 3.1-3.6 PASS live, 3.7 PASSED THEN REGRESSED (Fix 34d routed supervisor payloads to worker instead of Lex — caught by operator 02:30 EDT). Read docs/SMOKE-PROGRESS.md for live cursor. Read docs/SMOKE-HANDOVER.md "Overnight state" below.
+>
+> Active commits NOT YET activated (daemon still pid 196004 uptime 4000s+, NOT restarted yet):
+> - 318260f fix(supervisor): route Lex injects through pty + extract high-signal snippet (Fix 34d.1)
+> - c2bff48 docs(fixes): record Fix 34d.1 row
+>
+> In-flight in worker queue (committed and/or pending):
+> - Fix 34d.2 false-shipment detector (narrated-success-no-commit event type)
+> - Coalesce utterance queue (single-stream invariant, classify queued items, one structured reply)
+> - LEX-AUTONOMY-PAYLOAD-SPEC Stages 5-12 (codex order, distillation query scope first)
+> - Docs sweep + dashboard grooming
+> - Remove skip-permissions for workers
+> - New project + brainstorm isolation test
+>
+> Cron 5c231dd7 ticks every 2 min, silent supervision; will keep injecting until 7am.
+>
+> Once operator clicks dashboard restart-daemon button (NOTE: button copy lies — restart actually takes minutes, not seconds; queued fix on TODO):
+> 1. Wait ~5 min for daemon to come back; /health should report new pid + uptime under 60s
+> 2. Re-run smoke step 3.7 with new criteria: event-supervisor row must appear in Lex CC jsonl (2a708d6d in C:/Users/michael/.claude/projects/C--dev-data-skill-connections-brainstorm/) NOT worker jsonl, with delivery_mode=lex-pty (not lex-queue)
+> 3. If 3.7 passes clean, flip SMOKE-PROGRESS.md step 3.7 from REGRESSED back to PASS and update FIXES.md row 34d.1 to smoke-verified
 
-## Bounce-state context (2026-05-25T22:58Z)
+## Overnight state (2026-05-26 03:10 EDT)
 
-Two real bugs surfaced trying to close step 3.1:
+- Worker session: 94e85826-6b30-45d1-88e0-0d94c44650b9 (post /clear repoint from 837dd156)
+- Lex CC session: 2a708d6d-44db-4668-97f5-bce3e94d19b0
+- Anchor: 391b88f6-396c-4c46-a8d7-b656a2d5ad1d (DevNeural, supervision_mode=event)
+- Daemon: pid 196004, started ~05:55 UTC, NOT restarted post 34d.1 ship (intentional — finishing more work in code first, then one big restart)
+- Cron: job id 5c231dd7, recurring every 2 min, silent unless escalation
 
-1. **Dashboard "End" button skipped the pipeline.** `POST /lex/anchors/:id/end` at `07-daemon/src/dashboard/routes.ts:1263` only ptyKilled + flipped status dormant. No distillation, no `ref_summary` write, no `last_summary` refresh, no RAG embed. That is why session 180 (`e33ad1d4-a8c3-465d-af6b-2f9ab4babd4b`) ended with `ref_summary=NULL`.
+## What shipped tonight (commits)
 
-2. **Voice "Lex end session" path silently inert on anchor-reopened sessions.** Spoken command on session 181 (`5db6b4d3`) produced zero `[voice-ws]` log entries in `daemon.log` (no transcript, no matcher hit, no suppression). Audio path stalled. Suspected: voice WS rebind not happening cleanly on the anchor-reopen path (vs the smart-compact restart path which does rebind at `lex-voice-ws.ts:1077-1089`). Root cause not yet pinned — diagnostic logs were added so the next attempt leaves fingerprints.
+- 318260f Fix 34d.1: route supervisor injects through Lex pty (not bridge-prompt), drop with rejected-not-lex when no active Lex CC; high-signal snippet picker (filter CC meta, per-event payload formatter)
+- c2bff48 FIXES.md row for 34d.1
+- Earlier in session: 34, 34b, 34c (supervisor wire stack), 32 (mid-turn CR), 33 (cancelled-tool recovery), 27 (vad-error ring buffer), 28 (jsonl repoint drain), 29 (hold-up resume), 30 (late-jsonl bind offset), 31 (first-turn TTS)
 
-**Code fixes landed (already committed + built + daemon restarted by the time you read this):**
+## Known gotchas
 
-- `07-daemon/src/dashboard/routes.ts:1263` — `/lex/anchors/:id/end` now invokes `runSessionEndPipeline` on the active transcript before ptyKill. Dashboard End is now behaviorally identical to spoken "Lex end session" per user requirement.
-- `07-daemon/src/voice/lex-voice-ws.ts:1507` — logs on `end_session` matcher match with `bindKey`, `watchSessionId`, `brainstormId` state.
-- `07-daemon/src/voice/lex-voice-ws.ts:2094` — logs pipeline entry with the same state plus reason.
-- `07-daemon/src/voice/lex-voice-ws.ts:2115` — logs the brainstorm-not-resolved silent-return branch (was the worst silent-failure mode).
+- Dashboard restart-daemon button copy says "seconds" but actually takes minutes; operator workaround: hit button, wait 5 min, verify /health pid changed
+- Curator/reinforcement injection has never been observed firing on workers; either cosine threshold too high or pipeline broken. Add validation task before next round.
+- Supervisor wire reads `getLexTranscriptRefByCc` to decide Lex vs worker; if multiple lex_transcript_ref rows for same anchor are unended, Fix 34c reverse-walk picks newest open. Should be self-healing.
 
-**Resume action for step 3.1:**
+## Bounce-state context (2026-05-26T00:30Z)
 
-1. Click dashboard End on the live anchor `4bbafb48-bbfd-47e6-b076-e1a58a334303`. With Fix 1 in place this fires the full pipeline. Tail `C:/dev/data/skill-connections/daemon.log` for `[session-end] brainstorm=4bbafb48 ...` lines.
-2. Run 3.2: `SELECT ref_summary, ref_summary_ms FROM lex_transcript_ref WHERE cc_session_id='<the cc id of the session you just ended>';` Expect non-null `ref_summary`, `ref_summary_ms > 0`.
-3. Run 3.3: `SELECT last_summary FROM brainstorm_sessions WHERE id='4bbafb48-bbfd-47e6-b076-e1a58a334303';` Expect refreshed text reflecting the just-ended session.
-4. Run 3.4 cold-start verification — start a fresh brainstorm on the same anchor and check that the preload header shows differentiated sibling summaries (not 5 identical boilerplate blocks).
+Voice end_session matcher is fully functional. Pipeline runs to completion on the prior attempt: brainstorm_sessions.status='ended' at 1779752499839 (23:41:39 UTC), TTS killed, but `lex_transcript_ref.ref_summary` stayed NULL and dashboard tile never flipped.
 
-**Voice path follow-up (separate from 3.1 closure):**
+Root cause: for Lex direct-llm brainstorms `projectIdBySession` returns null so the pipeline falls into `runBrainstormChunksFallback` (session-end-pipeline.ts:277). That fallback only wrote `brainstorm_sessions.last_summary` via `createLlmDistillationGenerator`. It NEVER wrote `lex_transcript_ref.ref_summary` and never recomputed the rolling aggregate. Step 7a in the main ordered pipeline is the only writer for those fields, and direct-llm rows never reach it.
 
-Voice command "Lex end session" should reproduce on the next session. Watch `daemon.log` for any of the new diagnostic lines. If zero `[voice-ws]` activity again after speaking, the audio path itself is the gap (client mic / WS rebind on anchor-reopen). That's a follow-up fix, not a 3.1 blocker now that the dashboard surface works.
+**Shipped fix — commit `862d42a` (2026-05-25 20:22 EDT):**
 
-**Backfill note:** session 180 (`e33ad1d4`) still has `ref_summary=NULL` because it was ended pre-fix via the broken dashboard route. Acceptable to leave NULL OR run a one-shot pipeline call with `brainstormId=4bbafb48..., claudeSessionId=e33ad1d4..., reason='backfill-pre-fix'` to populate it. Not required to close 3.1.
+- `07-daemon/src/lex/session-end-pipeline.ts` — port Step 7a chain into `runBrainstormChunksFallback` after the existing LLM `last_summary` write, before `setBrainstormDistilledAt`. Same `getLexTranscriptRefByCc` -> `countBrainstormChunksForSession` -> `createPerSessionDistillationGenerator` -> `updateLexTranscriptRef` -> `recomputeRollingAggregate` chain. Gated on `input.claudeSessionId` so the truly direct-llm case logs a structured skip rather than crashing.
+- Dashboard SSE broadcast emit for `brainstorm-ended` on the status flip (both fallback and main pipeline). Dashboard tile re-fetches brainstorm list on receipt.
+
+Daemon + dashboard builds green at commit time. Restart of daemon required before any re-run.
+
+**Resume action for step 3.1 (after daemon restart):**
+
+1. User clicks dashboard restart-daemon button.
+2. Wait ~10s for `/health` to return new pid.
+3. User opens fresh brainstorm OR re-uses the existing `4bbafb48` anchor.
+4. User speaks "Lex end session" OR clicks dashboard End button.
+5. Tail `C:/dev/data/skill-connections/daemon.stdout.log` for `[chunks-fallback] ref_summary written` line.
+6. Run 3.2 query: `SELECT ref_summary, ref_summary_ms FROM lex_transcript_ref WHERE cc_session_id='<the cc id of the session you just ended>';` Expect non-null `ref_summary`, `ref_summary_ms > 0`.
+7. Run 3.3 query: `SELECT last_summary FROM brainstorm_sessions WHERE id='<anchor>';` Expect rolling aggregate text reflecting the just-ended session.
+8. Run 3.4 cold-start verification — start fresh brainstorm same anchor, preload header should show differentiated sibling summaries.
+9. Verify dashboard tile flips to ended within ~2s of pipeline completion (no manual refresh needed).
+
+**Carry-over from prior attempt:** the existing `4bbafb48-bbfd-47e6-b076-e1a58a334303` row is already status='ended' with NULL ref_summary. Acceptable to leave NULL on that one and validate against a freshly-ended session, OR run a one-shot pipeline call to backfill (not required to close 3.1).
+
+**New post-restart probes (run after Step 3.1-3.4 passes):**
+
+- **3.5 Fix 32 mid-turn CR.** In an active voice brainstorm, speak a second utterance while Lex is still mid-reply (forces the mid-turn queue). When Lex finishes the in-flight reply, the queued utterance must auto-submit at the next turn boundary — no manual Enter from the user. If the cursor sits after `[voice mode]` without submitting, the fix regressed.
+- **3.6 Fix 33 cancelled-tool-recovery.** Force a tool-result reject in a Lex session (easiest: send a chat message while Lex is mid-tool, which yields the "Request interrupted by user" envelope). Within ~5 s a row should land in `cross_session_injection_log` with `caller_label='lex-cancelled-tool-recovery'`, and Lex's next assistant turn should resume on its own without further user input. Two consecutive cancellations within 30 s should produce a `decision='shadow'` row with `reject_reason='recovery_exhausted: ...'` and a dashboard banner via the `t:'recovery-exhausted'` WS frame.
+- **3.7 Fix 34 supervisor wire.** After daemon restart, `curl http://localhost:3747/dashboard/health-supervisor` should return `health:'ok'` once the worker emits any watched event (commit, idle past threshold, permission denial, etc.). The same event should produce a new row in `cross_session_injection_log` with `caller_label='event-supervisor'`. Pre-fix the supervisor wrote zero rows even with `supervision_mode='event'` set, so any single row counts as the wire delivering.
 
 ---
 
@@ -48,7 +92,7 @@ Voice command "Lex end session" should reproduce on the next session. Watch `dae
 
 ## Gate
 
-All Steps 1-5 green → flip FIXES.md rows 27 + 28 to smoke-verified → greenlight LEX-AUTONOMY Stages 5-12.
+All Steps 1-5 green -> flip FIXES.md rows 27 + 28 to smoke-verified -> greenlight LEX-AUTONOMY Stages 5-12.
 
 ## Known carry-overs (do not block smoke)
 

@@ -8,7 +8,7 @@ Rolling handoff for the 2026-05-25 active smoke batch. Survives Lex restart, `/c
 
 ## Current cursor
 
-**Active step:** 3.7 REGRESSED — Fix 34d shipped but routed wrong. Re-fix in progress (Fix 34d.1, pty path).
+**Active step:** Step 4 (repoint fix) — Step 3 fully green including 3.7 (Fix 34d.1 smoke-verified 2026-05-26 03:15 EDT).
 
 **3.7 status (2026-05-26 02:35 EDT):** REGRESSED (false pass).
 - Original 02:09 EDT PASS was forensic-only: row landed in `cross_session_injection_log` with `caller_label='event-supervisor'` and `reject_reason='delivery_mode=lex-queue'`. Audit row said accepted; live behavior contradicts it.
@@ -29,7 +29,7 @@ Rolling handoff for the 2026-05-25 active smoke batch. Survives Lex restart, `/c
 
 **Steps 3.1-3.6 PASS evidence captured live in the Lex brainstorm 2026-05-25 evening session (see Completed list below).**
 
-**Last update:** 2026-05-26 02:35 AM EDT.
+**Last update:** 2026-05-26 03:15 AM EDT.
 
 ## Completed so far (this run)
 
@@ -42,7 +42,7 @@ Rolling handoff for the 2026-05-25 active smoke batch. Survives Lex restart, `/c
 - [x] Step 3.4 cold-start sibling differentiation — PASS. This session's cold-start preload showed differentiated sibling summaries (no boilerplate duplication).
 - [x] Step 3.5 mid-turn CR auto-submit (Fix 32) — PASS. Queued mid-turn utterances auto-submitted at turn boundary; verified live multiple times.
 - [x] Step 3.6 cancelled-tool-recovery (Fix 33) — PASS. Daemon log shows cancelled-tool-recovery armed at 12:04 EDT on cc cbb015e5, cleared 5s later when assistant follow-up landed (self-heal path exercised).
-- [ ] Step 3.7 supervisor wire — REGRESSED 2026-05-26 02:30 EDT. Original 02:09 PASS was a false positive (audit accepted, live delivery hit worker not Lex). Re-fix 34d.1 patched in `worker-event-listener.ts`; pending rebuild + restart + live retest before re-checking this box.
+- [x] Step 3.7 supervisor wire — PASS 2026-05-26 03:15 EDT. Live commit event landed in Lex CC 575f97ec with `delivery_mode=lex-pty` decision='accepted' and structured snippet (branch/subject/files_changed). No queue-operation row in worker jsonl. Fix 34d.1 verified end-to-end.
 
 ## Up next (in order)
 
