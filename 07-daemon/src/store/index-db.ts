@@ -2744,6 +2744,101 @@ export class IndexDb {
     }
   }
 
+  /* ─── worker_event_diagnostic_log (migration 039) ─────────────
+   *
+   * Per-stage instrumentation for the event-driven Lex supervisor.
+   * Fix 34: located the dead branch in the chokidar -> detector ->
+   * gate -> resolver -> inject pipeline that was silently dropping
+   * every event. Production keeps the resolver / inject rows on by
+   * default and gates the verbose stages behind
+   * DEVNEURAL_SUPERVISOR_DEBUG=1; tests + admin probes can write
+   * any stage via insertWorkerEventDiagnostic. Silently swallows
+   * the write when the table is missing so older databases still
+   * boot before the migration runs.
+   */
+  insertWorkerEventDiagnostic(row: {
+    id: string;
+    anchor_id: string | null;
+    stage: string;
+    verdict: string | null;
+    detail: string | null;
+  }): void {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO worker_event_diagnostic_log
+             (id, anchor_id, stage, verdict, detail)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(
+          row.id,
+          row.anchor_id ?? null,
+          row.stage,
+          row.verdict ?? null,
+          row.detail ?? null,
+        );
+    } catch {
+      /* table-missing tolerated for tests using an old migration set */
+    }
+  }
+
+  listWorkerEventDiagnostic(opts: { limit?: number } = {}): Array<{
+    id: string;
+    ts: string;
+    anchor_id: string | null;
+    stage: string;
+    verdict: string | null;
+    detail: string | null;
+  }> {
+    const limit = opts.limit ?? 50;
+    try {
+      return this.db
+        .prepare(
+          `SELECT id, ts, anchor_id, stage, verdict, detail
+             FROM worker_event_diagnostic_log
+             ORDER BY ts DESC LIMIT ?`,
+        )
+        .all(limit) as Array<{
+          id: string;
+          ts: string;
+          anchor_id: string | null;
+          stage: string;
+          verdict: string | null;
+          detail: string | null;
+        }>;
+    } catch {
+      return [];
+    }
+  }
+
+  countWorkerEventDiagnosticByStage(opts: {
+    sinceMs?: number;
+  } = {}): Array<{ stage: string; count: number }> {
+    const since = opts.sinceMs;
+    try {
+      if (since !== undefined) {
+        const sinceIso = new Date(since).toISOString();
+        return this.db
+          .prepare(
+            `SELECT stage, COUNT(*) AS count
+               FROM worker_event_diagnostic_log
+               WHERE ts >= ?
+               GROUP BY stage`,
+          )
+          .all(sinceIso) as Array<{ stage: string; count: number }>;
+      }
+      return this.db
+        .prepare(
+          `SELECT stage, COUNT(*) AS count
+             FROM worker_event_diagnostic_log
+             GROUP BY stage`,
+        )
+        .all() as Array<{ stage: string; count: number }>;
+    } catch {
+      return [];
+    }
+  }
+
   /* ─── Lex backlog (migration 026) ─────────────────────────────
    *
    * Canonical store for the autonomous supervisor backlog. Moved

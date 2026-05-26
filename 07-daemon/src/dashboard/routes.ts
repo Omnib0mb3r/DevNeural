@@ -295,6 +295,31 @@ export async function registerDashboardRoutes(
 
   app.get('/dashboard/daily-brief', async () => getDailyBrief());
 
+  /* Fix 34 diagnostics. Per-stage counters + recent 20 rows from the
+   * worker_event_diagnostic_log so an operator can curl the wire and
+   * tell whether the event-driven supervisor pipeline is alive.
+   * 'health' field collapses the counters into one of six verdicts so
+   * a probe does not have to do the math. */
+  app.get('/dashboard/worker-event-stats', async () => {
+    const { getWorkerEventStats } = await import('./worker-event-diagnostics.js');
+    return { ok: true, ...getWorkerEventStats(store.db) };
+  });
+
+  /* Coarse supervisor health for the /health surface. Mirrors the
+   * voice / audio block so a single curl /dashboard/health-supervisor
+   * answers "is the wire alive?" without joining the per-stage
+   * counters. */
+  app.get('/dashboard/health-supervisor', async () => {
+    const { getWorkerEventStats } = await import('./worker-event-diagnostics.js');
+    const stats = getWorkerEventStats(store.db);
+    return {
+      ok: stats.health === 'ok',
+      health: stats.health,
+      counters: stats.counters,
+      uptime_ms: stats.uptime_ms,
+    };
+  });
+
   /* Server-Sent Events stream for cross-tab state push.
    *
    * One connection per dashboard tab. Publishers call

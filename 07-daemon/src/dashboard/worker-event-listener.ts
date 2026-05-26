@@ -38,6 +38,7 @@ import {
 } from './worker-event-detect.js';
 import { bindKillSwitch } from './worker-event-killswitch.js';
 import { crossSessionInject, issueToken } from '../lex/cross-session-inject.js';
+import { recordWorkerEventDiagnostic } from './worker-event-diagnostics.js';
 
 const DEFAULT_TAIL_BYTES = 32 * 1024;
 const DEFAULT_JSONL_ROOT = path.posix.join(
@@ -79,6 +80,12 @@ export interface ProcessChangeResult {
 
 function buildInject(db: IndexDb): (target: string, text: string) => { ok: boolean; reason?: string } {
   return (target: string, text: string) => {
+    recordWorkerEventDiagnostic({
+      db,
+      stage: 'inject.attempted',
+      verdict: null,
+      detail: `target=${target.slice(0, 16)} chars=${text.length}`,
+    });
     try {
       const token = issueToken(target);
       const r = crossSessionInject(
@@ -91,10 +98,22 @@ function buildInject(db: IndexDb): (target: string, text: string) => { ok: boole
         },
         db,
       );
+      recordWorkerEventDiagnostic({
+        db,
+        stage: 'inject.result',
+        verdict: r.ok ? 'ok' : 'fail',
+        detail: r.ok ? `decision=${r.decision}` : `decision=${r.decision} error=${r.error ?? ''}`,
+      });
       return r.ok
         ? { ok: true }
         : { ok: false, reason: r.decision };
     } catch (err) {
+      recordWorkerEventDiagnostic({
+        db,
+        stage: 'inject.result',
+        verdict: 'throw',
+        detail: (err as Error).message,
+      });
       return { ok: false, reason: (err as Error).message };
     }
   };
@@ -165,8 +184,24 @@ export function processChange(
   const ccSessionId = ccSessionIdFromPath(file);
   if (!ccSessionId) return { outcome: 'skipped-no-anchor' };
   const anchor = resolveAnchorForCc(deps.db, ccSessionId);
+  recordWorkerEventDiagnostic({
+    db: deps.db,
+    stage: 'chokidar.line',
+    anchorId: anchor?.id ?? null,
+    verdict: anchor ? 'anchor-resolved' : 'no-anchor',
+    detail: `cc=${ccSessionId.slice(0, 8)}`,
+  });
   if (!anchor) return { outcome: 'skipped-no-anchor' };
-  if ((anchor.supervision_mode ?? deps.db.getDefaultSupervisionMode()) !== 'event') {
+  const effectiveMode =
+    anchor.supervision_mode ?? deps.db.getDefaultSupervisionMode();
+  if (effectiveMode !== 'event') {
+    recordWorkerEventDiagnostic({
+      db: deps.db,
+      stage: 'gate.evaluated',
+      anchorId: anchor.id,
+      verdict: 'skipped-mode',
+      detail: `mode=${effectiveMode}`,
+    });
     return { outcome: 'skipped-mode', anchor_id: anchor.id };
   }
   const tail = readTail(
@@ -189,18 +224,27 @@ export function processChange(
   );
   deps.state.set(anchor.id, nextState);
   if (events.length === 0) return { outcome: 'no-events', anchor_id: anchor.id };
+  for (const ev of events) {
+    recordWorkerEventDiagnostic({
+      db: deps.db,
+      stage: 'detector.matched',
+      anchorId: anchor.id,
+      verdict: ev.type,
+      detail: `worker=${ev.worker_session_id.slice(0, 8)}`,
+    });
+  }
   const routed: RouteResult[] = [];
   for (const ev of events) {
-    routed.push(
-      routeWorkerEvent(ev, {
-        gate: deps.gate,
-        resolveTarget: deps.resolveTarget,
-        inject: deps.inject,
-        anchor,
-        onKillSwitch: deps.onKillSwitch,
-        now,
-      }),
-    );
+    const result = routeWorkerEvent(ev, {
+      gate: deps.gate,
+      resolveTarget: deps.resolveTarget,
+      inject: deps.inject,
+      anchor,
+      onKillSwitch: deps.onKillSwitch,
+      now,
+      db: deps.db,
+    });
+    routed.push(result);
   }
   return { outcome: 'routed', routed, anchor_id: anchor.id };
 }
@@ -263,8 +307,23 @@ export function startWorkerEventListener(
     watcher.on('error', (err: unknown) => {
       log(`[worker-event] watcher error: ${(err as Error)?.message ?? err}`);
     });
+    watcher.on('ready', () => {
+      recordWorkerEventDiagnostic({
+        db: deps.db,
+        stage: 'chokidar.bound',
+        verdict: 'ready',
+        detail: `root=${root}`,
+      });
+      log(`[worker-event] chokidar ready at ${root}`);
+    });
     log(`[worker-event] watching ${root}`);
   } else {
+    recordWorkerEventDiagnostic({
+      db: deps.db,
+      stage: 'chokidar.bound',
+      verdict: 'no-root',
+      detail: `root=${root}`,
+    });
     log(`[worker-event] jsonl root not present: ${root}; listener idle`);
   }
 

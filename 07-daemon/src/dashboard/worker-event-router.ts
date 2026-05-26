@@ -19,6 +19,7 @@
  * trivially testable.
  */
 import type { IndexDb, ProjectSessionRow } from '../store/index-db.js';
+import { recordWorkerEventDiagnostic } from './worker-event-diagnostics.js';
 
 export type WorkerEventType =
   | 'idle'
@@ -280,6 +281,10 @@ export interface RouteDeps {
    * supervision_mode='polling' on the anchor and emits a notification. */
   onKillSwitch?: (anchorId: string) => void;
   now?: number;
+  /** Fix 34 diagnostics. When provided, the router records gate +
+   * route-resolved verdicts to worker_event_diagnostic_log so a dead
+   * branch surfaces in /dashboard/worker-event-stats. */
+  db?: IndexDb;
 }
 
 export type RouteOutcome =
@@ -300,6 +305,18 @@ export function routeWorkerEvent(
 ): RouteResult {
   const now = deps.now ?? Date.now();
   const decision = deps.gate.evaluate(event, now);
+  /* Per-event gate verdict instrumentation. Kept off the hot path
+   * in production via the diagnostics writer's debug gate; here the
+   * call is unconditional so the writer's gate logic stays the
+   * single source of truth. */
+  if (deps.db) {
+    recordGateVerdict(
+      deps.db,
+      event.anchor_id,
+      decision,
+      event.type,
+    );
+  }
   if (decision.decision === 'kill-switch') {
     deps.onKillSwitch?.(event.anchor_id);
     return { outcome: 'kill-switch', decision };
@@ -308,6 +325,9 @@ export function routeWorkerEvent(
     return { outcome: 'debounced', decision };
   }
   const target = deps.resolveTarget?.() ?? null;
+  if (deps.db) {
+    recordRouteResolved(deps.db, event.anchor_id, target, event.type);
+  }
   if (!target) {
     return { outcome: 'no-target', decision };
   }
@@ -318,4 +338,44 @@ export function routeWorkerEvent(
   const r = deps.inject(target, text);
   if (!r.ok) return { outcome: 'inject-failed', decision };
   return { outcome: 'sent', decision };
+}
+
+/* Diagnostics callers split out so the recordWorkerEventDiagnostic
+ * import lives in a single place. The router module deliberately stays
+ * minimal; the writer module owns the DEVNEURAL_SUPERVISOR_DEBUG gate. */
+function recordGateVerdict(
+  db: IndexDb,
+  anchorId: string,
+  decision: RouteDecision,
+  eventType: WorkerEventType,
+): void {
+  recordWorkerEventDiagnostic({
+    db,
+    stage: 'gate.evaluated',
+    anchorId,
+    verdict:
+      decision.decision === 'accept'
+        ? 'accept'
+        : decision.decision === 'kill-switch'
+          ? 'kill-switch'
+          : `debounce-${decision.reason}`,
+    detail: `type=${eventType}`,
+  });
+}
+
+function recordRouteResolved(
+  db: IndexDb,
+  anchorId: string,
+  target: string | null,
+  eventType: WorkerEventType,
+): void {
+  recordWorkerEventDiagnostic({
+    db,
+    stage: 'route.resolved',
+    anchorId,
+    verdict: target ? 'resolved' : 'no-target',
+    detail: target
+      ? `target=${target.slice(0, 16)} type=${eventType}`
+      : `type=${eventType}`,
+  });
 }
