@@ -5666,6 +5666,35 @@ export function coldStartPreloadMode(
   return 'shadow';
 }
 
+/* Codex item 8 (Fix 45 follow-up): worker boot source-graph flag.
+ * Gates the /worker/clear-handoff response shape so the new
+ * source-graph render can ship additive ('both' default) and roll
+ * forward to 'source-graph' once consumers migrate. */
+export const WORKER_BOOT_SOURCE_GRAPH_CONFIG_KEY =
+  'worker_boot_source_graph';
+export type WorkerBootSourceGraphMode = 'legacy' | 'source-graph' | 'both';
+
+export function parseWorkerBootSourceGraphValue(
+  raw: string | null | undefined,
+): WorkerBootSourceGraphMode | null {
+  if (raw === null || raw === undefined) return null;
+  const v = raw.trim().toLowerCase();
+  if (v === 'legacy') return 'legacy';
+  if (v === 'source-graph' || v === 'source_graph') return 'source-graph';
+  if (v === 'both') return 'both';
+  return null;
+}
+
+export function workerBootSourceGraphMode(
+  db: import('../store/index-db.js').IndexDb,
+): WorkerBootSourceGraphMode {
+  const fromRuntime = parseWorkerBootSourceGraphValue(
+    db.getRuntimeConfig(WORKER_BOOT_SOURCE_GRAPH_CONFIG_KEY),
+  );
+  if (fromRuntime) return fromRuntime;
+  return 'both';
+}
+
 /* Decorate a brainstorm row with the audio + cues URLs the dashboard
  * needs without forcing every consumer to know the data-root layout.
  * audio_url is null when no audio bundle was finalised (text-only
