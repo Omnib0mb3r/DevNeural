@@ -489,11 +489,310 @@ export function recentSmartCompacts(
   return db.listRecentSmartCompacts(limit);
 }
 
+/* Fix 41 Stage 1 — policy-out endpoints.
+ *
+ * The three handlers below (state, clearAndPaste, wrapPaste) live
+ * outside registerSmartCompactRoutes as pure functions so tests can
+ * drive them with stub injectors and a stub ctxProvider. The route
+ * binder in registerSmartCompactRoutes wraps them with HTTP request
+ * decoding + response shaping; the underlying mechanics are identical.
+ *
+ * Section 1 audit of the investigation doc routed these handlers as
+ * the "mechanical-only" replacements for the daemon's prior policy
+ * surface. They never read defaults(), never call evaluateTrigger,
+ * never consult isShadow. Lex computes the decision and posts a
+ * concrete action; the daemon transports it. The off-mode global
+ * kill-switch is the ONLY policy gate that stays daemon-side, because
+ * it is the operator-level "drop the whole pipeline" toggle and Lex
+ * must not be able to override it. */
+
+export interface StateResult {
+  ok: boolean;
+  error?: string;
+  anchor_id: string;
+  ctx_pct: number | null;
+  last_commit_ms: number | null;
+  last_tool_ms: number | null;
+  jsonl_path: string | null;
+  shadow_count: number;
+  mode: SmartCompactMode;
+}
+
+export interface StateOptions {
+  ctxProvider?: (jsonlPath: string) => number | null;
+  lastCommitProvider?: (cwd: string) => number | null;
+  lastToolProvider?: (jsonlPath: string) => number | null;
+}
+
+export function readSmartCompactState(
+  db: IndexDb,
+  anchorId: string,
+  opts: StateOptions = {},
+): StateResult {
+  const anchor = db.getProjectSession(anchorId);
+  if (!anchor) {
+    return {
+      ok: false,
+      error: 'anchor not found',
+      anchor_id: anchorId,
+      ctx_pct: null,
+      last_commit_ms: null,
+      last_tool_ms: null,
+      jsonl_path: null,
+      shadow_count: 0,
+      mode: smartCompactMode(db),
+    };
+  }
+  const jsonlPath = jsonlForAnchor(db, anchorId);
+  const ctxProvider = opts.ctxProvider;
+  const lastCommitProvider = opts.lastCommitProvider ?? deriveLastCommit;
+  const lastToolProvider = opts.lastToolProvider ?? deriveLastTool;
+  const ctxPct =
+    jsonlPath && ctxProvider ? ctxProvider(jsonlPath) : null;
+  const lastCommitMs = anchor.cwd ? lastCommitProvider(anchor.cwd) : null;
+  const lastToolMs = jsonlPath ? lastToolProvider(jsonlPath) : null;
+  const shadowCount = db.countSmartCompactsForAnchor(anchorId);
+  return {
+    ok: true,
+    anchor_id: anchorId,
+    ctx_pct: ctxPct,
+    last_commit_ms: lastCommitMs,
+    last_tool_ms: lastToolMs,
+    jsonl_path: jsonlPath,
+    shadow_count: shadowCount,
+    mode: smartCompactMode(db),
+  };
+}
+
+export interface ClearAndPasteOptions {
+  caller?: string;
+  reason: string;
+  summary: string;
+  preCtxPct?: number | null;
+  useReadinessGate?: boolean;
+  injector: PtyInjector;
+  awaitSessionReady?: () => Promise<SessionReadyResult>;
+  fallbackWaitMs?: number;
+  onResumeComplete?: (info: {
+    ship_ok: boolean;
+    wait: SessionReadyResult | null;
+  }) => void;
+}
+
+export interface ClearAndPasteResult {
+  ok: boolean;
+  error?: string;
+  log_id: string;
+  inject_result:
+    | 'accepted'
+    | 'accepted-pending-ready'
+    | 'pty_not_found'
+    | 'noop';
+  anchor_id: string;
+}
+
+export function clearAndPaste(
+  db: IndexDb,
+  anchorId: string,
+  opts: ClearAndPasteOptions,
+): ClearAndPasteResult {
+  const summary = (opts.summary ?? '').trim();
+  if (!summary) {
+    return {
+      ok: false,
+      error: 'summary is required and must be non-empty',
+      log_id: '',
+      inject_result: 'pty_not_found',
+      anchor_id: anchorId,
+    };
+  }
+  const anchor = db.getProjectSession(anchorId);
+  if (!anchor) {
+    return {
+      ok: false,
+      error: 'anchor not found',
+      log_id: '',
+      inject_result: 'pty_not_found',
+      anchor_id: anchorId,
+    };
+  }
+  const mode = smartCompactMode(db);
+  /* off short-circuits before audit + inject so the operator-level
+   * kill-switch is truly inert. Matches fireSmartCompact's off-mode
+   * semantics. */
+  if (mode === 'off') {
+    return {
+      ok: true,
+      log_id: '',
+      inject_result: 'noop',
+      anchor_id: anchorId,
+    };
+  }
+  const target = anchor.current_pty_id ?? anchor.current_session_id ?? null;
+  if (!target) {
+    return {
+      ok: false,
+      error: 'no resolvable target for anchor',
+      log_id: '',
+      inject_result: 'pty_not_found',
+      anchor_id: anchorId,
+    };
+  }
+
+  const useGate = opts.useReadinessGate !== false && !!opts.awaitSessionReady;
+  let injectResult: ClearAndPasteResult['inject_result'] = 'pty_not_found';
+  if (useGate) {
+    const cleared = opts.injector(target, '/clear', true);
+    if (!cleared.ok) {
+      injectResult = 'pty_not_found';
+    } else {
+      injectResult = 'accepted-pending-ready';
+      const fallbackWaitMs = opts.fallbackWaitMs ?? 850;
+      void (async () => {
+        let wait: SessionReadyResult | null = null;
+        try {
+          wait = await opts.awaitSessionReady!();
+        } catch {
+          wait = null;
+        }
+        if (!wait || !wait.ready) {
+          await new Promise<void>((resolve) => {
+            const t = setTimeout(resolve, fallbackWaitMs);
+            if (typeof (t as { unref?: () => void }).unref === 'function') {
+              (t as { unref: () => void }).unref();
+            }
+          });
+        }
+        const ship = opts.injector(target, summary, true);
+        try {
+          opts.onResumeComplete?.({ ship_ok: ship.ok, wait });
+        } catch {
+          /* observational */
+        }
+      })();
+    }
+  } else {
+    const cleared = opts.injector(target, '/clear', true);
+    const ship = opts.injector(target, summary, true);
+    injectResult = cleared.ok && ship.ok ? 'accepted' : 'pty_not_found';
+  }
+
+  const logId = randomUUID();
+  db.insertSmartCompactLog({
+    id: logId,
+    anchor_id: anchorId,
+    cc_session_id: anchor.current_session_id ?? null,
+    caller: opts.caller ?? 'lex',
+    reason: opts.reason,
+    action: 'clear-and-paste',
+    pre_ctx_pct: opts.preCtxPct ?? null,
+    summary_preview: summary.slice(0, 280),
+    payload_text: summary,
+  });
+
+  return {
+    ok:
+      injectResult === 'accepted' || injectResult === 'accepted-pending-ready',
+    log_id: logId,
+    inject_result: injectResult,
+    anchor_id: anchorId,
+  };
+}
+
+export interface WrapPasteOptions {
+  caller?: string;
+  reason: string;
+  prompt: string;
+  preCtxPct?: number | null;
+  injector: PtyInjector;
+}
+
+export interface WrapPasteResult {
+  ok: boolean;
+  error?: string;
+  log_id: string;
+  inject_result: 'wrap-injected' | 'pty_not_found' | 'noop';
+  anchor_id: string;
+}
+
+export function wrapPaste(
+  db: IndexDb,
+  anchorId: string,
+  opts: WrapPasteOptions,
+): WrapPasteResult {
+  const prompt = (opts.prompt ?? '').trim();
+  if (!prompt) {
+    return {
+      ok: false,
+      error: 'prompt is required and must be non-empty',
+      log_id: '',
+      inject_result: 'pty_not_found',
+      anchor_id: anchorId,
+    };
+  }
+  const anchor = db.getProjectSession(anchorId);
+  if (!anchor) {
+    return {
+      ok: false,
+      error: 'anchor not found',
+      log_id: '',
+      inject_result: 'pty_not_found',
+      anchor_id: anchorId,
+    };
+  }
+  const mode = smartCompactMode(db);
+  if (mode === 'off') {
+    return {
+      ok: true,
+      log_id: '',
+      inject_result: 'noop',
+      anchor_id: anchorId,
+    };
+  }
+  const target = anchor.current_pty_id ?? anchor.current_session_id ?? null;
+  if (!target) {
+    return {
+      ok: false,
+      error: 'no resolvable target for anchor',
+      log_id: '',
+      inject_result: 'pty_not_found',
+      anchor_id: anchorId,
+    };
+  }
+  const r = opts.injector(target, prompt, true);
+  const injectResult: WrapPasteResult['inject_result'] = r.ok
+    ? 'wrap-injected'
+    : 'pty_not_found';
+  const logId = randomUUID();
+  db.insertSmartCompactLog({
+    id: logId,
+    anchor_id: anchorId,
+    cc_session_id: anchor.current_session_id ?? null,
+    caller: opts.caller ?? 'lex',
+    reason: opts.reason,
+    action: 'wrap-paste',
+    pre_ctx_pct: opts.preCtxPct ?? null,
+    summary_preview: prompt.slice(0, 280),
+    payload_text: prompt,
+  });
+  return {
+    ok: r.ok,
+    log_id: logId,
+    inject_result: injectResult,
+    anchor_id: anchorId,
+  };
+}
+
+export interface RegisterOptions {
+  ctxProvider?: (jsonlPath: string) => number | null;
+}
+
 export function registerSmartCompactRoutes(
   app: FastifyInstance,
   db: IndexDb,
   injector: PtyInjector,
   log: (msg: string) => void = () => undefined,
+  options: RegisterOptions = {},
 ): void {
   app.post('/lex/smart-compact/evaluate', async (req, reply) => {
     const body = (req.body ?? {}) as {
@@ -580,6 +879,145 @@ export function registerSmartCompactRoutes(
     });
     log(
       `[smart-compact] anchor=${body.anchor_id} reason=${body.reason} action=${r.action} shadow=${r.shadow} inject=${r.inject_result ?? 'n/a'}`,
+    );
+    return r;
+  });
+
+  /* Fix 41 Stage 1 — policy-out endpoints.
+   *
+   * GET /lex/smart-compact/state returns the raw inputs Lex needs to
+   * run evaluateTrigger locally (ctx_pct, last_commit_ms, last_tool_ms,
+   * jsonl_path, shadow_count, mode). No decision, no inject, no audit
+   * row. Lex polls this on its own cadence. */
+  app.get('/lex/smart-compact/state', async (req, reply) => {
+    const q = (req.query ?? {}) as { anchor_id?: string };
+    if (!q.anchor_id) {
+      reply.code(400);
+      return { ok: false, error: 'anchor_id required' };
+    }
+    const r = readSmartCompactState(db, q.anchor_id, {
+      ...(options.ctxProvider ? { ctxProvider: options.ctxProvider } : {}),
+    });
+    if (!r.ok) reply.code(404);
+    return r;
+  });
+
+  /* POST /lex/smart-compact/clear-and-paste. Lex-supplied summary;
+   * daemon runs /clear + readiness gate + summary paste + audit row.
+   * No threshold check, no window math, no shadow gating. */
+  app.post('/lex/smart-compact/clear-and-paste', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      anchor_id?: string;
+      summary?: string;
+      reason?: string;
+      caller?: string;
+      pre_ctx_pct?: number;
+      use_readiness_gate?: boolean;
+    };
+    if (!body.anchor_id) {
+      reply.code(400);
+      return { ok: false, error: 'anchor_id required' };
+    }
+    const summary =
+      typeof body.summary === 'string' ? body.summary.trim() : '';
+    if (!summary) {
+      reply.code(400);
+      return {
+        ok: false,
+        error:
+          'summary is required and must be non-empty (Fix 41: Lex-authored)',
+      };
+    }
+    if (!body.reason) {
+      reply.code(400);
+      return { ok: false, error: 'reason required' };
+    }
+    const anchor = db.getProjectSession(body.anchor_id);
+    if (!anchor) {
+      reply.code(404);
+      return { ok: false, error: 'anchor not found' };
+    }
+    /* Build the optional readiness gate the same way the legacy /fire
+     * route did. Skipped when the anchor has no resolvable cwd, or
+     * when the caller explicitly passes use_readiness_gate=false. */
+    let awaitSessionReady: (() => Promise<SessionReadyResult>) | undefined;
+    if (body.use_readiness_gate !== false && anchor.cwd) {
+      const ccProjectsDir = ccProjectsDirForCwd(os.homedir(), anchor.cwd);
+      const preClearFiles = capturePreClearJsonlSet(ccProjectsDir);
+      awaitSessionReady = () =>
+        awaitNewSessionReady({
+          ccProjectsDir,
+          preClearFiles,
+          io: { log: (msg) => log(msg) },
+        });
+    }
+    const r = clearAndPaste(db, body.anchor_id, {
+      ...(body.caller !== undefined ? { caller: body.caller } : {}),
+      reason: body.reason,
+      summary: body.summary ?? '',
+      preCtxPct:
+        typeof body.pre_ctx_pct === 'number' ? body.pre_ctx_pct : null,
+      ...(body.use_readiness_gate !== undefined
+        ? { useReadinessGate: body.use_readiness_gate }
+        : {}),
+      injector,
+      ...(awaitSessionReady ? { awaitSessionReady } : {}),
+      onResumeComplete: (info) => {
+        log(
+          `[smart-compact] clear-and-paste resume ship_ok=${info.ship_ok} wait=${info.wait?.reason ?? 'none'} elapsed=${info.wait?.elapsed_ms ?? 0}ms`,
+        );
+      },
+    });
+    log(
+      `[smart-compact] anchor=${body.anchor_id} action=clear-and-paste reason=${body.reason} inject=${r.inject_result}`,
+    );
+    return r;
+  });
+
+  /* POST /lex/smart-compact/wrap-paste. Lex-authored wrap prompt;
+   * daemon injects once + writes audit row. No daemon-side
+   * WRAP_AND_COMMIT_PROMPT default. */
+  app.post('/lex/smart-compact/wrap-paste', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      anchor_id?: string;
+      prompt?: string;
+      reason?: string;
+      caller?: string;
+      pre_ctx_pct?: number;
+    };
+    if (!body.anchor_id) {
+      reply.code(400);
+      return { ok: false, error: 'anchor_id required' };
+    }
+    const prompt =
+      typeof body.prompt === 'string' ? body.prompt.trim() : '';
+    if (!prompt) {
+      reply.code(400);
+      return {
+        ok: false,
+        error:
+          'prompt is required and must be non-empty (Fix 41: Lex-authored)',
+      };
+    }
+    if (!body.reason) {
+      reply.code(400);
+      return { ok: false, error: 'reason required' };
+    }
+    const anchor = db.getProjectSession(body.anchor_id);
+    if (!anchor) {
+      reply.code(404);
+      return { ok: false, error: 'anchor not found' };
+    }
+    const r = wrapPaste(db, body.anchor_id, {
+      ...(body.caller !== undefined ? { caller: body.caller } : {}),
+      reason: body.reason,
+      prompt: body.prompt ?? '',
+      preCtxPct:
+        typeof body.pre_ctx_pct === 'number' ? body.pre_ctx_pct : null,
+      injector,
+    });
+    log(
+      `[smart-compact] anchor=${body.anchor_id} action=wrap-paste reason=${body.reason} inject=${r.inject_result}`,
     );
     return r;
   });

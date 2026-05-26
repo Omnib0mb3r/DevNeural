@@ -39,6 +39,7 @@ import {
   bridgeStatus,
   recordClearSupersede,
   buildLexPulseFromTail,
+  deriveContextFromTail,
 } from './sessions.js';
 import { setPhase, type SessionPhase } from './session-phase.js';
 import { setPending, clearPending, getPending } from './pending-prompt.js';
@@ -186,7 +187,19 @@ export async function registerDashboardRoutes(
     queueSessionSuggestion,
   });
   const { registerSmartCompactRoutes } = await import('./smart-compact-routes.js');
-  registerSmartCompactRoutes(app, store.db, smartCompactInjector, log);
+  /* Fix 41 Stage 1 — pass the ctxProvider through so the new
+   * /lex/smart-compact/state endpoint can return real ctx_pct. Mirrors
+   * the binding used by the scheduler in daemon.ts; share a single
+   * derivation path so /state and the scheduler report identical
+   * numbers for the same jsonl tail. */
+  const smartCompactCtxProvider = (jsonlPath: string): number | null => {
+    const ctx = deriveContextFromTail(jsonlPath);
+    if (!ctx || ctx.max <= 0) return null;
+    return Math.round((ctx.tokens / ctx.max) * 1000) / 10;
+  };
+  registerSmartCompactRoutes(app, store.db, smartCompactInjector, log, {
+    ctxProvider: smartCompactCtxProvider,
+  });
 
   /* Background poll that binds a daemon-owned PTY to its claude
    * session_id once the .jsonl file appears. Single global timer; no

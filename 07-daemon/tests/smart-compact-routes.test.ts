@@ -15,12 +15,15 @@ import { fileURLToPath } from 'node:url';
 import { IndexDb } from '../src/store/index-db.js';
 import { runMigrations } from '../src/db/migrate.js';
 import {
+  clearAndPaste,
   evaluateSmartCompact,
   fireSmartCompact,
   parseSmartCompactValue,
+  readSmartCompactState,
   recentSmartCompacts,
   registerSmartCompactRoutes,
   smartCompactMode,
+  wrapPaste,
   SMART_COMPACT_CONFIG_KEY,
 } from '../src/dashboard/smart-compact-routes.js';
 
@@ -530,6 +533,586 @@ describe('POST /lex/smart-compact/fire validation (v2 - Lex-authored summary)', 
       const calls = injector.mock.calls;
       expect(calls.length).toBe(1);
       expect(calls[0]![1]).toMatch(/Wrap your current work/);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+/* Fix 41 Stage 1 — policy-out endpoints. Each describe block pins one
+ * of the three new surfaces: /state (read-only inputs), /clear-and-paste
+ * (Lex-authored summary), /wrap-paste (Lex-authored wrap). Coverage
+ * matrix: happy path, 400 (missing field), 404 (anchor unknown),
+ * audit-row-shape pin where applicable. */
+
+describe('readSmartCompactState (Fix 41 Stage 1)', () => {
+  it('returns ok=false + error when anchor is unknown', () => {
+    const r = readSmartCompactState(db, 'missing');
+    expect(r.ok).toBe(false);
+    expect(r.error).toBe('anchor not found');
+  });
+
+  it('returns null ctx_pct + null last_*_ms + shadow_count=0 for a bare anchor', () => {
+    seedAnchor({ id: 'a', cwd: '' });
+    const r = readSmartCompactState(db, 'a');
+    expect(r.ok).toBe(true);
+    expect(r.anchor_id).toBe('a');
+    expect(r.ctx_pct).toBeNull();
+    expect(r.last_commit_ms).toBeNull();
+    expect(r.last_tool_ms).toBeNull();
+    expect(r.jsonl_path).toBeNull();
+    expect(r.shadow_count).toBe(0);
+    expect(r.mode).toBe('live');
+  });
+
+  it('uses ctxProvider when jsonl_path is resolvable', () => {
+    seedAnchor({ id: 'a' });
+    db.insertProjectTranscriptRef({
+      id: `ref-a-${Math.random().toString(36).slice(2, 8)}`,
+      anchor_id: 'a',
+      jsonl_path: 'C:/tmp/anchor-a.jsonl',
+      cc_session_id: 'cc-a',
+      opened_ms: 1,
+      closed_ms: null,
+    });
+    const ctxProvider = vi.fn(() => 42.5);
+    const r = readSmartCompactState(db, 'a', { ctxProvider });
+    expect(r.ctx_pct).toBe(42.5);
+    expect(r.jsonl_path).toBe('C:/tmp/anchor-a.jsonl');
+    expect(ctxProvider).toHaveBeenCalledWith('C:/tmp/anchor-a.jsonl');
+  });
+
+  it('reflects shadow_count from existing smart_compact_log rows', () => {
+    seedAnchor({ id: 'a' });
+    db.insertSmartCompactLog({
+      id: 'sc1',
+      anchor_id: 'a',
+      cc_session_id: 'cc-a',
+      caller: 'lex',
+      reason: 'window-open',
+      action: 'shadow',
+      pre_ctx_pct: 60,
+    });
+    db.insertSmartCompactLog({
+      id: 'sc2',
+      anchor_id: 'a',
+      cc_session_id: 'cc-a',
+      caller: 'lex',
+      reason: 'window-open',
+      action: 'fire',
+      pre_ctx_pct: 60,
+    });
+    const r = readSmartCompactState(db, 'a');
+    expect(r.shadow_count).toBe(2);
+  });
+
+  it('reflects current smartCompactMode (off / shadow / live)', () => {
+    seedAnchor({ id: 'a' });
+    db.setRuntimeConfig(SMART_COMPACT_CONFIG_KEY, 'off', 'test');
+    expect(readSmartCompactState(db, 'a').mode).toBe('off');
+    db.setRuntimeConfig(SMART_COMPACT_CONFIG_KEY, 'shadow', 'test');
+    expect(readSmartCompactState(db, 'a').mode).toBe('shadow');
+    db.setRuntimeConfig(SMART_COMPACT_CONFIG_KEY, 'live', 'test');
+    expect(readSmartCompactState(db, 'a').mode).toBe('live');
+  });
+});
+
+describe('GET /lex/smart-compact/state (Fix 41 Stage 1)', () => {
+  async function buildApp(opts?: {
+    ctxProvider?: (jsonl: string) => number | null;
+  }): Promise<{
+    app: ReturnType<typeof Fastify>;
+    injector: ReturnType<typeof vi.fn>;
+  }> {
+    const app = Fastify({ logger: false });
+    const injector = vi.fn(() => ({ ok: true as const }));
+    registerSmartCompactRoutes(
+      app,
+      db,
+      injector,
+      () => undefined,
+      opts?.ctxProvider ? { ctxProvider: opts.ctxProvider } : {},
+    );
+    await app.ready();
+    return { app, injector };
+  }
+
+  it('rejects with 400 when anchor_id is missing', async () => {
+    const { app } = await buildApp();
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/lex/smart-compact/state',
+      });
+      expect(res.statusCode).toBe(400);
+      const body = res.json() as { ok: boolean; error: string };
+      expect(body.ok).toBe(false);
+      expect(body.error).toMatch(/anchor_id required/i);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('returns 404 when the anchor is unknown', async () => {
+    const { app } = await buildApp();
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/lex/smart-compact/state?anchor_id=ghost',
+      });
+      expect(res.statusCode).toBe(404);
+      const body = res.json() as { ok: boolean; error: string };
+      expect(body.ok).toBe(false);
+      expect(body.error).toBe('anchor not found');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('happy path: returns the consolidated state shape via the ctxProvider', async () => {
+    seedAnchor({ id: 'a', cwd: '' });
+    db.insertProjectTranscriptRef({
+      id: `ref-a-${Math.random().toString(36).slice(2, 8)}`,
+      anchor_id: 'a',
+      jsonl_path: 'C:/tmp/anchor-a.jsonl',
+      cc_session_id: 'cc-a',
+      opened_ms: 1,
+      closed_ms: null,
+    });
+    const ctxProvider = vi.fn(() => 71.2);
+    const { app } = await buildApp({ ctxProvider });
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/lex/smart-compact/state?anchor_id=a',
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as {
+        ok: boolean;
+        ctx_pct: number;
+        jsonl_path: string;
+        shadow_count: number;
+        mode: string;
+      };
+      expect(body.ok).toBe(true);
+      expect(body.ctx_pct).toBe(71.2);
+      expect(body.jsonl_path).toBe('C:/tmp/anchor-a.jsonl');
+      expect(body.shadow_count).toBe(0);
+      expect(body.mode).toBe('live');
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('clearAndPaste (Fix 41 Stage 1)', () => {
+  it('rejects when summary is empty', () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    const injector = vi.fn(() => ({ ok: true as const }));
+    const r = clearAndPaste(db, 'a', {
+      reason: 'window-open',
+      summary: '   ',
+      injector,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/summary is required/i);
+    expect(injector).not.toHaveBeenCalled();
+    expect(recentSmartCompacts(db).length).toBe(0);
+  });
+
+  it('rejects when anchor is unknown', () => {
+    const injector = vi.fn(() => ({ ok: true as const }));
+    const r = clearAndPaste(db, 'ghost', {
+      reason: 'window-open',
+      summary: 'resume here',
+      injector,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toBe('anchor not found');
+    expect(injector).not.toHaveBeenCalled();
+  });
+
+  it("returns noop when mode='off' (no audit row, no inject)", () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    db.setRuntimeConfig(SMART_COMPACT_CONFIG_KEY, 'off', 'test');
+    const injector = vi.fn(() => ({ ok: true as const }));
+    const r = clearAndPaste(db, 'a', {
+      reason: 'window-open',
+      summary: 'resume here',
+      injector,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.inject_result).toBe('noop');
+    expect(r.log_id).toBe('');
+    expect(injector).not.toHaveBeenCalled();
+    expect(recentSmartCompacts(db).length).toBe(0);
+  });
+
+  it('happy path: injects /clear + summary back-to-back and writes audit row action=clear-and-paste', () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    const injector = vi.fn(() => ({ ok: true as const }));
+    const r = clearAndPaste(db, 'a', {
+      reason: 'window-open',
+      summary: 'Lex-authored resume.',
+      preCtxPct: 62,
+      injector,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.inject_result).toBe('accepted');
+    expect(injector).toHaveBeenNthCalledWith(1, 'pty-A', '/clear', true);
+    expect(injector).toHaveBeenNthCalledWith(
+      2,
+      'pty-A',
+      'Lex-authored resume.',
+      true,
+    );
+    const row = recentSmartCompacts(db)[0]!;
+    expect(row.action).toBe('clear-and-paste');
+    expect(row.payload_text).toBe('Lex-authored resume.');
+    expect(row.pre_ctx_pct).toBe(62);
+    expect(row.caller).toBe('lex');
+  });
+
+  it('uses readiness gate when awaitSessionReady is supplied', async () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    const injector = vi.fn(() => ({ ok: true as const }));
+    const awaitSessionReady = vi.fn(async () => ({
+      ready: true as const,
+      reason: 'ready' as const,
+      elapsed_ms: 10,
+      new_jsonl: 'C:/tmp/new.jsonl',
+    }));
+    const onResumeComplete = vi.fn();
+    const r = clearAndPaste(db, 'a', {
+      reason: 'window-open',
+      summary: 'resume',
+      injector,
+      awaitSessionReady,
+      onResumeComplete,
+    });
+    expect(r.inject_result).toBe('accepted-pending-ready');
+    /* /clear inject happens synchronously; summary paste runs in the
+     * background after the gate resolves. */
+    expect(injector).toHaveBeenCalledTimes(1);
+    expect(injector).toHaveBeenCalledWith('pty-A', '/clear', true);
+    /* Give the async sequence a tick to drain. */
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(awaitSessionReady).toHaveBeenCalledTimes(1);
+    expect(injector).toHaveBeenCalledTimes(2);
+    expect(injector).toHaveBeenNthCalledWith(2, 'pty-A', 'resume', true);
+    expect(onResumeComplete).toHaveBeenCalledWith({
+      ship_ok: true,
+      wait: expect.objectContaining({ ready: true }),
+    });
+  });
+});
+
+describe('POST /lex/smart-compact/clear-and-paste (Fix 41 Stage 1)', () => {
+  async function buildApp(): Promise<{
+    app: ReturnType<typeof Fastify>;
+    injector: ReturnType<typeof vi.fn>;
+  }> {
+    const app = Fastify({ logger: false });
+    const injector = vi.fn(() => ({ ok: true as const }));
+    registerSmartCompactRoutes(app, db, injector, () => undefined);
+    await app.ready();
+    return { app, injector };
+  }
+
+  it('400 when summary missing', async () => {
+    seedAnchor({ id: 'a', cwd: '', pty: 'pty-A' });
+    const { app, injector } = await buildApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/clear-and-paste',
+        payload: { anchor_id: 'a', reason: 'window-open' },
+      });
+      expect(res.statusCode).toBe(400);
+      const body = res.json() as { ok: boolean; error: string };
+      expect(body.error).toMatch(/summary is required/i);
+      expect(injector).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('400 when summary is whitespace-only', async () => {
+    seedAnchor({ id: 'a', cwd: '', pty: 'pty-A' });
+    const { app, injector } = await buildApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/clear-and-paste',
+        payload: {
+          anchor_id: 'a',
+          reason: 'window-open',
+          summary: '   \n\t  ',
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(injector).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('400 when reason missing', async () => {
+    seedAnchor({ id: 'a', cwd: '', pty: 'pty-A' });
+    const { app, injector } = await buildApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/clear-and-paste',
+        payload: { anchor_id: 'a', summary: 'resume here' },
+      });
+      expect(res.statusCode).toBe(400);
+      const body = res.json() as { error: string };
+      expect(body.error).toMatch(/reason required/i);
+      expect(injector).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('404 when anchor unknown', async () => {
+    const { app, injector } = await buildApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/clear-and-paste',
+        payload: {
+          anchor_id: 'ghost',
+          reason: 'window-open',
+          summary: 'resume here',
+        },
+      });
+      expect(res.statusCode).toBe(404);
+      const body = res.json() as { error: string };
+      expect(body.error).toBe('anchor not found');
+      expect(injector).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('happy path: 200 + injector called twice + audit row action=clear-and-paste', async () => {
+    /* cwd='' skips the readiness gate and uses the synchronous
+     * back-to-back inject path; identical to the existing /fire happy
+     * path's setup. */
+    seedAnchor({ id: 'a', cwd: '', pty: 'pty-A' });
+    const { app, injector } = await buildApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/clear-and-paste',
+        payload: {
+          anchor_id: 'a',
+          reason: 'window-open',
+          summary: 'Lex-authored resume.',
+          pre_ctx_pct: 63,
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { ok: boolean; inject_result: string };
+      expect(body.ok).toBe(true);
+      expect(body.inject_result).toBe('accepted');
+      expect(injector).toHaveBeenCalledTimes(2);
+      const row = recentSmartCompacts(db)[0]!;
+      expect(row.action).toBe('clear-and-paste');
+      expect(row.payload_text).toBe('Lex-authored resume.');
+      expect(row.pre_ctx_pct).toBe(63);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('use_readiness_gate=false forces the synchronous back-to-back path even when cwd is present', async () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    const { app, injector } = await buildApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/clear-and-paste',
+        payload: {
+          anchor_id: 'a',
+          reason: 'window-open',
+          summary: 'resume here',
+          use_readiness_gate: false,
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { inject_result: string };
+      /* No accepted-pending-ready; the gate was skipped. */
+      expect(body.inject_result).toBe('accepted');
+      expect(injector).toHaveBeenCalledTimes(2);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('wrapPaste (Fix 41 Stage 1)', () => {
+  it('rejects when prompt is empty', () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    const injector = vi.fn(() => ({ ok: true as const }));
+    const r = wrapPaste(db, 'a', {
+      reason: 'forced-no-stop',
+      prompt: '',
+      injector,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/prompt is required/i);
+    expect(injector).not.toHaveBeenCalled();
+    expect(recentSmartCompacts(db).length).toBe(0);
+  });
+
+  it('rejects when anchor unknown', () => {
+    const injector = vi.fn(() => ({ ok: true as const }));
+    const r = wrapPaste(db, 'ghost', {
+      reason: 'forced-no-stop',
+      prompt: 'wrap up',
+      injector,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toBe('anchor not found');
+    expect(injector).not.toHaveBeenCalled();
+  });
+
+  it("returns noop when mode='off' (no audit row, no inject)", () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    db.setRuntimeConfig(SMART_COMPACT_CONFIG_KEY, 'off', 'test');
+    const injector = vi.fn(() => ({ ok: true as const }));
+    const r = wrapPaste(db, 'a', {
+      reason: 'forced-no-stop',
+      prompt: 'wrap and commit',
+      injector,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.inject_result).toBe('noop');
+    expect(r.log_id).toBe('');
+    expect(injector).not.toHaveBeenCalled();
+    expect(recentSmartCompacts(db).length).toBe(0);
+  });
+
+  it('happy path: injects the caller-supplied prompt and writes action=wrap-paste row', () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    const injector = vi.fn(() => ({ ok: true as const }));
+    const prompt =
+      'Commit what is stable on smart-compact-routes.ts. Defer the readiness-gate refactor with a TODO.';
+    const r = wrapPaste(db, 'a', {
+      reason: 'forced-no-stop',
+      prompt,
+      preCtxPct: 78,
+      injector,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.inject_result).toBe('wrap-injected');
+    expect(injector).toHaveBeenCalledTimes(1);
+    expect(injector).toHaveBeenCalledWith('pty-A', prompt, true);
+    const row = recentSmartCompacts(db)[0]!;
+    expect(row.action).toBe('wrap-paste');
+    expect(row.payload_text).toBe(prompt);
+    expect(row.pre_ctx_pct).toBe(78);
+  });
+});
+
+describe('POST /lex/smart-compact/wrap-paste (Fix 41 Stage 1)', () => {
+  async function buildApp(): Promise<{
+    app: ReturnType<typeof Fastify>;
+    injector: ReturnType<typeof vi.fn>;
+  }> {
+    const app = Fastify({ logger: false });
+    const injector = vi.fn(() => ({ ok: true as const }));
+    registerSmartCompactRoutes(app, db, injector, () => undefined);
+    await app.ready();
+    return { app, injector };
+  }
+
+  it('400 when prompt missing', async () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    const { app, injector } = await buildApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/wrap-paste',
+        payload: { anchor_id: 'a', reason: 'forced-no-stop' },
+      });
+      expect(res.statusCode).toBe(400);
+      const body = res.json() as { error: string };
+      expect(body.error).toMatch(/prompt is required/i);
+      expect(injector).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('400 when reason missing', async () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    const { app, injector } = await buildApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/wrap-paste',
+        payload: { anchor_id: 'a', prompt: 'wrap up please' },
+      });
+      expect(res.statusCode).toBe(400);
+      const body = res.json() as { error: string };
+      expect(body.error).toMatch(/reason required/i);
+      expect(injector).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('404 when anchor unknown', async () => {
+    const { app, injector } = await buildApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/wrap-paste',
+        payload: {
+          anchor_id: 'ghost',
+          reason: 'forced-no-stop',
+          prompt: 'wrap up',
+        },
+      });
+      expect(res.statusCode).toBe(404);
+      const body = res.json() as { error: string };
+      expect(body.error).toBe('anchor not found');
+      expect(injector).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('happy path: 200 + single inject + audit row action=wrap-paste', async () => {
+    seedAnchor({ id: 'a', pty: 'pty-A' });
+    const { app, injector } = await buildApp();
+    const prompt =
+      'Lex-authored wrap: commit the policy-out scaffold; defer cutover.';
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/wrap-paste',
+        payload: {
+          anchor_id: 'a',
+          reason: 'forced-no-stop',
+          prompt,
+          pre_ctx_pct: 77,
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { ok: boolean; inject_result: string };
+      expect(body.ok).toBe(true);
+      expect(body.inject_result).toBe('wrap-injected');
+      expect(injector).toHaveBeenCalledTimes(1);
+      expect(injector).toHaveBeenCalledWith('pty-A', prompt, true);
+      const row = recentSmartCompacts(db)[0]!;
+      expect(row.action).toBe('wrap-paste');
+      expect(row.payload_text).toBe(prompt);
+      expect(row.pre_ctx_pct).toBe(77);
     } finally {
       await app.close();
     }
