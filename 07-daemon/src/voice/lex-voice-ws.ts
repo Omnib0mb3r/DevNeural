@@ -79,6 +79,10 @@ import {
   type VoiceCommandKind,
 } from './lex-voice-commands.js';
 import { runHoldUp } from './lex-voice-hold-up.js';
+import {
+  detectContradiction,
+  formatQueueDrain,
+} from './lex-voice-coalesce.js';
 import { firePanic } from '../dashboard/panic-routes.js';
 import { getStore } from '../lex/brainstorm-store.js';
 import { checkToolGate, notifyLargeFsRead, LARGE_FS_READ_LINE_THRESHOLD } from '../lex/tool-gate.js';
@@ -199,6 +203,15 @@ interface ConnState {
    * null (no brainstorm bind) both keep the original behaviour. */
   brainstormId: string | null;
   runtimeMode: 'cc-pty' | 'direct-llm' | null;
+  /* Fix 35 Phase A (2026-05-26): coalesce single-output-stream
+   * invariant for the direct-llm path. True while a callVoiceChat +
+   * speak() round-trip is in flight; gates handleUtteranceEnd's
+   * direct-llm branch so a second utterance arriving mid-reply is
+   * queued onto pendingUserUtterances and drained on completion
+   * instead of spawning a parallel ollama call. The cc-pty path
+   * already has its own equivalent gate via awaitingResponseSince +
+   * the mid-turn-no-tts queue. */
+  inFlightDirectLlmReply: boolean;
 }
 
 /* 2026-05-22: lifted from 4 MB to 64 MB. The old 4 MB ceiling was a
@@ -514,6 +527,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     pendingUserUtterances: [],
     brainstormId: null,
     runtimeMode: null,
+    inFlightDirectLlmReply: false,
   };
 
   function send(msg: Record<string, unknown>): void {
@@ -1339,6 +1353,40 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    *      the text to speak() so piper streams TTS through the same
    *      pipeline cc-pty uses. lifecycle_state flips through
    *      speaking -> idle so the dashboard sees the state machine. */
+  /* Fix 35 Phase A (2026-05-26): direct-llm coalesce loop. Wraps
+   * handleDirectLlmUtterance with a single-output-stream gate +
+   * post-reply drain so the queue contract is satisfied without
+   * touching the ollama call site itself. Sequencing:
+   *
+   *   1. Stamp inFlightDirectLlmReply=true; run handleDirectLlmUtterance
+   *      to completion (await; failures clear the flag in finally).
+   *   2. Check pendingUserUtterances; if non-empty, drain via
+   *      formatQueueDrain into one combined turn and repeat.
+   *   3. Exit when the queue is empty, leaving inFlightDirectLlmReply
+   *      cleared so the next fresh utterance dispatches immediately.
+   *
+   * The loop is async + fire-and-forget at the call site. */
+  async function runDirectLlmCoalesceLoop(initial: string): Promise<void> {
+    let pending: string = initial;
+    while (pending) {
+      state.inFlightDirectLlmReply = true;
+      try {
+        await handleDirectLlmUtterance(pending);
+      } finally {
+        state.inFlightDirectLlmReply = false;
+      }
+      if (state.pendingUserUtterances.length === 0) break;
+      const queued = state.pendingUserUtterances.slice();
+      state.pendingUserUtterances = [];
+      const drain = formatQueueDrain(queued);
+      if (!drain) break;
+      console.log(
+        `[voice-ws] direct-llm drain count=${drain.count} chars=${drain.text.length}`,
+      );
+      pending = drain.text;
+    }
+  }
+
   async function handleDirectLlmUtterance(userText: string): Promise<void> {
     const bsId = state.brainstormId;
     if (!bsId) return;
@@ -1891,7 +1939,51 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * reply through piper, persist user + assistant chunks. The
      * legacy cc-pty path below stays untouched. */
     if (state.runtimeMode === 'direct-llm' && state.brainstormId) {
-      void handleDirectLlmUtterance(result.text);
+      /* Fix 35 Phase A (2026-05-26): single-output-stream invariant
+       * for direct-llm.
+       *
+       * Pre-fix this branch was `void handleDirectLlmUtterance(text)`
+       * with no reentrancy guard. A second utterance landing while
+       * the first call was still mid-ollama would spawn a parallel
+       * ollama request + a concurrent speak(), violating the sealed
+       * coalesce contract (point 1: never begin response B while
+       * response A is in flight).
+       *
+       * New behaviour:
+       *  - inFlightDirectLlmReply gate: queue subsequent utterances
+       *    onto pendingUserUtterances; drain at reply boundary.
+       *  - Contradiction case (point 5): if the latest utterance
+       *    matches a cancel pattern AND a reply is in flight, drop
+       *    the queue and ack the cancel. The in-flight ollama call
+       *    is not aborted (it still lands as one assistant chunk),
+       *    but the queue is empty so no follow-on inject replays
+       *    the original instruction. */
+      if (state.inFlightDirectLlmReply) {
+        if (detectContradiction(result.text)) {
+          const dropped = state.pendingUserUtterances.length;
+          state.pendingUserUtterances = [];
+          console.log(
+            `[voice-ws] direct-llm contradiction; cleared queue depth=${dropped} text=${JSON.stringify(result.text.slice(0, 80))}`,
+          );
+          send({
+            t: 'contradiction-cancel',
+            text: result.text,
+            dropped_count: dropped,
+          });
+          return;
+        }
+        state.pendingUserUtterances.push(result.text);
+        console.log(
+          `[voice-ws] direct-llm mid-reply queue push depth=${state.pendingUserUtterances.length} text=${JSON.stringify(result.text.slice(0, 80))}`,
+        );
+        send({
+          t: 'queued-mid-turn',
+          text: result.text,
+          queue_depth: state.pendingUserUtterances.length,
+        });
+        return;
+      }
+      void runDirectLlmCoalesceLoop(result.text);
       return;
     }
     if (!state.bindKey) {
