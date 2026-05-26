@@ -39,6 +39,8 @@ import {
 import { bindKillSwitch } from './worker-event-killswitch.js';
 import { crossSessionInject, issueToken } from '../lex/cross-session-inject.js';
 import { recordWorkerEventDiagnostic } from './worker-event-diagnostics.js';
+import { queueSessionPrompt } from './sessions.js';
+import { randomUUID } from 'node:crypto';
 
 const DEFAULT_TAIL_BYTES = 32 * 1024;
 const DEFAULT_JSONL_ROOT = path.posix.join(
@@ -78,6 +80,76 @@ export interface ProcessChangeResult {
   anchor_id?: string;
 }
 
+/* Fix 34d: Lex CC sessions do not run under a VS Code 09-bridge VSIX,
+ * so cross-session-inject's resolveDeliverableBridgeForSession gate
+ * returns no_deliverable_bridge for every supervisor fire that
+ * targets a Lex cc. Branch the inject path: when the resolved
+ * target maps to a lex_transcript_ref, hand off to
+ * queueSessionPrompt with the lex_session.id (NOT the cc id) so
+ * delivery rides the bridge-prompt inbox that the Lex side reads.
+ * Worker-targeted injects (the legacy path) still flow through
+ * crossSessionInject so the bridge / pty dispatch + deliverability
+ * gate stays in place for them. Both branches write an audit row
+ * with caller_label='event-supervisor' and a delivery_mode tag in
+ * reject_reason for forensics. */
+export type SupervisorDeliveryMode = 'lex-queue' | 'bridge';
+
+export interface DeliverSupervisorPromptResult {
+  ok: boolean;
+  mode: SupervisorDeliveryMode;
+  reason?: string;
+}
+
+export function deliverSupervisorPromptToLex(
+  db: IndexDb,
+  lexCcSessionId: string,
+  text: string,
+  injectQueue: (sessionId: string, text: string) => {
+    ok: true;
+    queued_at: string;
+  } | { ok: false; error: string } = queueSessionPrompt,
+): DeliverSupervisorPromptResult {
+  const ref = db.getLexTranscriptRefByCc(lexCcSessionId);
+  if (!ref) {
+    return {
+      ok: false,
+      mode: 'lex-queue',
+      reason: 'no_lex_transcript_ref',
+    };
+  }
+  const r = injectQueue(ref.lex_session_id, text);
+  return r.ok
+    ? { ok: true, mode: 'lex-queue' }
+    : { ok: false, mode: 'lex-queue', reason: r.error };
+}
+
+function auditSupervisorRow(
+  db: IndexDb,
+  target: string,
+  text: string,
+  mode: SupervisorDeliveryMode,
+  ok: boolean,
+  reason: string | null,
+): void {
+  try {
+    db.insertCrossSessionLog({
+      id: randomUUID(),
+      target_session: target,
+      caller_label: 'event-supervisor',
+      text_preview: text.slice(0, 120),
+      text_length: text.length,
+      decision: ok ? 'accepted' : 'rejected_pty',
+      reject_reason:
+        reason !== null
+          ? `delivery_mode=${mode} ${reason}`
+          : `delivery_mode=${mode}`,
+      brainstorm_id: null,
+    });
+  } catch {
+    /* audit best-effort */
+  }
+}
+
 function buildInject(db: IndexDb): (target: string, text: string) => { ok: boolean; reason?: string } {
   return (target: string, text: string) => {
     recordWorkerEventDiagnostic({
@@ -86,6 +158,44 @@ function buildInject(db: IndexDb): (target: string, text: string) => { ok: boole
       verdict: null,
       detail: `target=${target.slice(0, 16)} chars=${text.length}`,
     });
+    /* Branch on whether the resolved target is a Lex CC. Lookup is
+     * cheap (single SELECT keyed on cc_session_id). When the ref
+     * exists the target is a Lex session and bridge-presence will
+     * never claim it; the lex-queue path is the only one that can
+     * deliver. */
+    const isLexTarget = !!db.getLexTranscriptRefByCc(target);
+    if (isLexTarget) {
+      try {
+        const result = deliverSupervisorPromptToLex(db, target, text);
+        auditSupervisorRow(
+          db,
+          target,
+          text,
+          result.mode,
+          result.ok,
+          result.reason ?? null,
+        );
+        recordWorkerEventDiagnostic({
+          db,
+          stage: 'inject.result',
+          verdict: result.ok ? 'ok' : 'fail',
+          detail: result.ok
+            ? `mode=${result.mode}`
+            : `mode=${result.mode} error=${result.reason ?? ''}`,
+        });
+        return result.ok
+          ? { ok: true }
+          : { ok: false, reason: result.reason ?? 'lex-queue-failed' };
+      } catch (err) {
+        recordWorkerEventDiagnostic({
+          db,
+          stage: 'inject.result',
+          verdict: 'throw',
+          detail: `mode=lex-queue ${(err as Error).message}`,
+        });
+        return { ok: false, reason: (err as Error).message };
+      }
+    }
     try {
       const token = issueToken(target);
       const r = crossSessionInject(
@@ -102,7 +212,7 @@ function buildInject(db: IndexDb): (target: string, text: string) => { ok: boole
         db,
         stage: 'inject.result',
         verdict: r.ok ? 'ok' : 'fail',
-        detail: r.ok ? `decision=${r.decision}` : `decision=${r.decision} error=${r.error ?? ''}`,
+        detail: r.ok ? `mode=bridge decision=${r.decision}` : `mode=bridge decision=${r.decision} error=${r.error ?? ''}`,
       });
       return r.ok
         ? { ok: true }
@@ -112,7 +222,7 @@ function buildInject(db: IndexDb): (target: string, text: string) => { ok: boole
         db,
         stage: 'inject.result',
         verdict: 'throw',
-        detail: (err as Error).message,
+        detail: `mode=bridge ${(err as Error).message}`,
       });
       return { ok: false, reason: (err as Error).message };
     }

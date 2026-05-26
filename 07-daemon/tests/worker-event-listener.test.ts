@@ -15,7 +15,10 @@ import { IndexDb } from '../src/store/index-db.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { WorkerEventGate } from '../src/dashboard/worker-event-router.js';
 import { newAnchorTailState } from '../src/dashboard/worker-event-detect.js';
-import { processChange } from '../src/dashboard/worker-event-listener.js';
+import {
+  processChange,
+  deliverSupervisorPromptToLex,
+} from '../src/dashboard/worker-event-listener.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = path.resolve(HERE, '..', 'scripts', 'migrations');
@@ -209,5 +212,83 @@ describe('processChange', () => {
     expect(r.routed?.[0]?.outcome).toBe('kill-switch');
     expect(deps.onKillSwitch).toHaveBeenCalledWith('anchor-A');
     expect(deps.inject).not.toHaveBeenCalled();
+  });
+});
+
+describe('deliverSupervisorPromptToLex (Fix 34d)', () => {
+  it('returns no_lex_transcript_ref when the target cc is not bound to a lex_session', () => {
+    const r = deliverSupervisorPromptToLex(db, 'cc-unknown', 'hello', () => ({
+      ok: true,
+      queued_at: '0',
+    }));
+    expect(r.ok).toBe(false);
+    expect(r.mode).toBe('lex-queue');
+    expect(r.reason).toBe('no_lex_transcript_ref');
+  });
+
+  it('routes via queueSessionPrompt keyed on the lex_session.id, not the cc id', () => {
+    db.insertLexSession({
+      id: 'lex-A',
+      created_ms: 1_000,
+      title: 'lex-A',
+      derived_title: null,
+      status: 'live',
+      current_pty_id: null,
+      cwd: 'C:/p/lex-A',
+    });
+    db.insertLexTranscriptRef({
+      lex_session_id: 'lex-A',
+      cc_session_id: 'cc-lex-target',
+      transcript_path: 'C:/p/lex-A/cc-lex-target.jsonl',
+      started_ms: 1_000,
+      ended_ms: null,
+      ordering: 0,
+    });
+    const queueCalls: Array<{ sessionId: string; text: string }> = [];
+    const r = deliverSupervisorPromptToLex(
+      db,
+      'cc-lex-target',
+      '[supervisor-event] sample',
+      (sessionId, text) => {
+        queueCalls.push({ sessionId, text });
+        return { ok: true, queued_at: 'now' };
+      },
+    );
+    expect(r.ok).toBe(true);
+    expect(r.mode).toBe('lex-queue');
+    expect(queueCalls).toHaveLength(1);
+    /* Critical contract: hand-off key is the LEX session id, not
+     * the CC session id we received. */
+    expect(queueCalls[0]?.sessionId).toBe('lex-A');
+    expect(queueCalls[0]?.text).toBe('[supervisor-event] sample');
+  });
+
+  it('surfaces queueSessionPrompt errors as lex-queue failures', () => {
+    db.insertLexSession({
+      id: 'lex-down',
+      created_ms: 1_000,
+      title: null,
+      derived_title: null,
+      status: 'live',
+      current_pty_id: null,
+      cwd: 'C:/p/lex-down',
+    });
+    db.insertLexTranscriptRef({
+      lex_session_id: 'lex-down',
+      cc_session_id: 'cc-down',
+      transcript_path: 'C:/p/lex-down/cc-down.jsonl',
+      started_ms: 1_000,
+      ended_ms: null,
+      ordering: 0,
+    });
+    const r = deliverSupervisorPromptToLex(
+      db,
+      'cc-down',
+      'x',
+      () => ({ ok: false, error: 'bridge offline' }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.mode).toBe('lex-queue');
+    expect(r.reason).toBe('bridge offline');
   });
 });
