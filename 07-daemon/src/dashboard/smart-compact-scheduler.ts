@@ -27,9 +27,11 @@ import type { IndexDb } from '../store/index-db.js';
 import {
   evaluateSmartCompact,
   fireSmartCompact,
+  smartCompactPolicyOwner,
   type EvaluateOptions,
   type EvaluateResult,
   type PtyInjector,
+  type SmartCompactPolicyOwner,
 } from './smart-compact-routes.js';
 import {
   awaitNewSessionReady,
@@ -48,6 +50,10 @@ export interface SchedulerDeps {
   /** Override the evaluate call. Tests use this to assert the
    * scheduler-built EvaluateOptions shape. */
   evaluator?: typeof evaluateSmartCompact;
+  /** Override the policy-owner read. Tests use this to drive the
+   * short-circuit branch without touching runtime_config; production
+   * resolves through smartCompactPolicyOwner(db). */
+  policyOwnerProvider?: (db: IndexDb) => SmartCompactPolicyOwner;
   log?: (msg: string) => void;
 }
 
@@ -61,6 +67,11 @@ export interface TickResult {
    * resume prompt). */
   deferredFire: string[];
   errors: string[];
+  /** Fix 41 Stage 2: anchors where the scheduler observed a verdict
+   * but skipped all firing because the policy owner is 'lex'. The
+   * scheduler logs the evaluation for visibility and moves on; Lex's
+   * own loop is responsible for the inject. */
+  shortCircuited: string[];
 }
 
 export async function runSmartCompactTick(
@@ -68,6 +79,8 @@ export async function runSmartCompactTick(
 ): Promise<TickResult> {
   const log = deps.log ?? (() => undefined);
   const evaluate = deps.evaluator ?? evaluateSmartCompact;
+  const ownerProvider = deps.policyOwnerProvider ?? smartCompactPolicyOwner;
+  const policyOwner = ownerProvider(deps.db);
   const result: TickResult = {
     evaluated: 0,
     fired: [],
@@ -75,6 +88,7 @@ export async function runSmartCompactTick(
     waited: [],
     deferredFire: [],
     errors: [],
+    shortCircuited: [],
   };
   const live = deps.db.listProjectSessions({ status: 'live', limit: 1000 });
   for (const row of live) {
@@ -86,6 +100,21 @@ export async function runSmartCompactTick(
       if (!v.ok) continue;
       if (v.action === 'wait') {
         result.waited.push(row.id);
+        continue;
+      }
+      /* Fix 41 Stage 2 - when the policy owner is 'lex', the scheduler
+       * walks every live anchor and runs evaluate so the audit surface
+       * still records what the daemon's evaluator would have said, but
+       * skips every inject. Lex owns the entire fire/wrap loop via its
+       * own polling of /lex/smart-compact/state. The short-circuit
+       * fires AFTER the wait check so a clean below-window verdict
+       * still counts as "waited" on the daemon side; only an active
+       * fire/wrap verdict is the one Lex would have driven. */
+      if (policyOwner === 'lex') {
+        result.shortCircuited.push(row.id);
+        log(
+          `[smart-compact-tick] anchor=${row.id.slice(0, 8)} short-circuit policy_owner=lex action=${v.action} reason=${v.reason} ctx=${v.ctx_pct ?? 'n/a'}`,
+        );
         continue;
       }
       if (v.action === 'fire') {

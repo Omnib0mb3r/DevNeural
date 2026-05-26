@@ -307,6 +307,44 @@ export function smartCompactGloballyEnabled(db: IndexDb): boolean {
 
 export { SMART_COMPACT_CONFIG_KEY };
 
+/* Fix 41 Stage 2 — policy-owner runtime flag.
+ *
+ * Resolution order:
+ *   1. runtime_config.smart_compact_policy_owner   (dashboard toggle)
+ *   2. default = 'daemon'
+ *
+ * Values:
+ *   daemon — legacy path. The 60s scheduler still walks anchors and
+ *            fires wrap / defers fire to Lex (per Fix 36).
+ *   lex    — scheduler short-circuits to log-only. Lex drives the
+ *            entire loop via the new state + clear-and-paste +
+ *            wrap-paste endpoints. Stage 3 removes the daemon scheduler
+ *            entirely; Stage 2 keeps it as the rollback path.
+ *
+ * Default stays 'daemon' through Stage 2 so the flip is opt-in until
+ * the Lex loop is verified. */
+const SMART_COMPACT_POLICY_OWNER_KEY = 'smart_compact_policy_owner';
+export type SmartCompactPolicyOwner = 'daemon' | 'lex';
+
+export function parseSmartCompactPolicyOwner(
+  raw: string | null | undefined,
+): SmartCompactPolicyOwner | null {
+  if (raw === null || raw === undefined) return null;
+  const v = raw.trim().toLowerCase();
+  if (v === 'daemon') return 'daemon';
+  if (v === 'lex') return 'lex';
+  return null;
+}
+
+export function smartCompactPolicyOwner(db: IndexDb): SmartCompactPolicyOwner {
+  const fromRuntime = parseSmartCompactPolicyOwner(
+    db.getRuntimeConfig(SMART_COMPACT_POLICY_OWNER_KEY),
+  );
+  return fromRuntime ?? 'daemon';
+}
+
+export { SMART_COMPACT_POLICY_OWNER_KEY };
+
 export function fireSmartCompact(
   db: IndexDb,
   anchorId: string,
@@ -1047,6 +1085,53 @@ export function registerSmartCompactRoutes(
       runtime_value: runtimeValue,
       env_value: envValue,
       default_mode: 'shadow',
+    };
+  });
+
+  /* Fix 41 Stage 2 — policy-owner toggle.
+   *
+   * GET returns the current owner ('daemon' | 'lex') and the raw
+   * runtime_config row so the dashboard can show why the value is
+   * what it is. POST flips the runtime value (no daemon restart
+   * required); on the next scheduler tick the short-circuit branch
+   * either runs or doesn't. Default stays 'daemon' through Stage 2;
+   * Stage 3 deletes the toggle and the scheduler. */
+  app.get('/lex/smart-compact/policy-owner', async () => {
+    const runtimeValue = db.getRuntimeConfig(SMART_COMPACT_POLICY_OWNER_KEY);
+    return {
+      ok: true,
+      owner: smartCompactPolicyOwner(db),
+      runtime_value: runtimeValue,
+      default_owner: 'daemon' as SmartCompactPolicyOwner,
+    };
+  });
+
+  app.post('/lex/smart-compact/policy-owner', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      owner?: string;
+      updated_by?: string;
+    };
+    const next = parseSmartCompactPolicyOwner(body.owner);
+    if (!next) {
+      reply.code(400);
+      return {
+        ok: false,
+        error: "owner must be 'daemon' | 'lex'",
+      };
+    }
+    db.setRuntimeConfig(
+      SMART_COMPACT_POLICY_OWNER_KEY,
+      next,
+      body.updated_by,
+    );
+    log(
+      `[smart-compact] policy-owner -> ${next} by=${body.updated_by ?? 'unknown'}`,
+    );
+    return {
+      ok: true,
+      owner: smartCompactPolicyOwner(db),
+      runtime_value: db.getRuntimeConfig(SMART_COMPACT_POLICY_OWNER_KEY),
+      default_owner: 'daemon' as SmartCompactPolicyOwner,
     };
   });
 

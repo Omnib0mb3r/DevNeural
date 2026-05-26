@@ -1,103 +1,28 @@
 /**
  * Smart compact (SMART-COMPACT.md).
  *
- * Lex orchestrates, daemon executes. This module exposes pure helpers
- * the Lex tool surface calls over HTTP:
- *
- *   evaluateTrigger    decides fire / wrap / wait from a state snapshot
- *   isShadow           gates the first N attempts per anchor to audit-only
- *   ctxPctFromJsonl    convenience wrapper around deriveContextFromTail
- *
- * Resume-prompt assembly lives in `six-section-resume.ts`. The legacy
- * `assembleSummary` single-paragraph builder was removed in the same
- * commit that introduced the six-section schema; no feature flag, no
- * dual path. The new builder is the only resume surface.
- *
- * No daemon-side scheduler thread per spec. The Lex tool polls / asks
- * for evaluate, decides whether to fire, then calls fire which records
- * the audit row and injects via the existing cross-session inject path.
+ * Stage 2 split: `evaluateTrigger` + `WRAP_AND_COMMIT_PROMPT` now live
+ * in `smart-compact-policy.ts` and are re-exported here for back-compat
+ * through the cutover. The mechanical helpers below (isShadow,
+ * shadowThreshold, ctxPctFromJsonl, defaults) stay until Stage 3
+ * deletes the legacy surface.
  */
 import * as fs from 'node:fs';
 import type { IndexDb } from '../store/index-db.js';
 
-export type Phase =
-  | 'thinking'
-  | 'tool'
-  | 'permission'
-  | 'idle'
-  | 'unknown';
-
-export type EvalAction = 'fire' | 'wrap' | 'wait';
-export type EvalReason =
-  | 'window-open'
-  | 'forced-no-stop'
-  | 'hard-ceiling'
-  | 'below-window'
-  | 'no-stop';
-
-export interface EvalInput {
-  ctxPct: number;
-  threshold: number;
-  bandHalf: number;
-  hardCeiling: number;
-  stopWindowMs: number;
-  now: number;
-  lastCommitMs: number | null;
-  lastToolMs: number | null;
-  phase: Phase;
-}
-
-export interface EvalResult {
-  action: EvalAction;
-  reason: EvalReason;
-}
-
-const STOP_PHASES: ReadonlySet<Phase> = new Set(['idle', 'permission']);
-
-export function evaluateTrigger(input: EvalInput): EvalResult {
-  const {
-    ctxPct,
-    threshold,
-    bandHalf,
-    hardCeiling,
-    stopWindowMs,
-    now,
-    lastCommitMs,
-    lastToolMs,
-    phase,
-  } = input;
-
-  if (ctxPct >= hardCeiling) {
-    return { action: 'fire', reason: 'hard-ceiling' };
-  }
-
-  const lo = threshold - bandHalf;
-  const hi = threshold + bandHalf;
-
-  if (ctxPct < lo) {
-    return { action: 'wait', reason: 'below-window' };
-  }
-
-  /* Stop point: any of: recent commit, idle tool, phase ∈ {idle,
-   * permission}. permission = "awaiting-prompt" in spec vocab. */
-  const recentCommit =
-    lastCommitMs !== null && now - lastCommitMs <= stopWindowMs;
-  const idleTool = lastToolMs === null || now - lastToolMs > stopWindowMs;
-  const stopPhase = STOP_PHASES.has(phase);
-  const hasStop = recentCommit || idleTool || stopPhase;
-
-  if (ctxPct <= hi) {
-    if (hasStop) return { action: 'fire', reason: 'window-open' };
-    return { action: 'wait', reason: 'no-stop' };
-  }
-
-  /* ctxPct in (hi, hardCeiling). Window closed without a stop; inject
-   * the wrap-and-commit prompt and wait for the worker to settle. */
-  return { action: 'wrap', reason: 'forced-no-stop' };
-}
-
-export const WRAP_AND_COMMIT_PROMPT =
-  'Wrap your current work: commit what is stable with a meaningful message, defer the rest with a TODO comment if needed. Reply "ready" when done. Reason: context refresh in progress.';
+export type {
+  Phase,
+  EvalAction,
+  EvalReason,
+} from './smart-compact-types.js';
+export {
+  evaluateTrigger,
+  WRAP_AND_COMMIT_PROMPT,
+} from './smart-compact-policy.js';
+export type {
+  EvalInput,
+  EvalResult,
+} from './smart-compact-policy.js';
 
 const DEFAULT_SHADOW_N = 3;
 

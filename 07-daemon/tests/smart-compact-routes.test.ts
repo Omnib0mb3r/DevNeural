@@ -18,13 +18,16 @@ import {
   clearAndPaste,
   evaluateSmartCompact,
   fireSmartCompact,
+  parseSmartCompactPolicyOwner,
   parseSmartCompactValue,
   readSmartCompactState,
   recentSmartCompacts,
   registerSmartCompactRoutes,
   smartCompactMode,
+  smartCompactPolicyOwner,
   wrapPaste,
   SMART_COMPACT_CONFIG_KEY,
+  SMART_COMPACT_POLICY_OWNER_KEY,
 } from '../src/dashboard/smart-compact-routes.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -947,6 +950,100 @@ describe('POST /lex/smart-compact/clear-and-paste (Fix 41 Stage 1)', () => {
       /* No accepted-pending-ready; the gate was skipped. */
       expect(body.inject_result).toBe('accepted');
       expect(injector).toHaveBeenCalledTimes(2);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('smart-compact policy-owner toggle (Fix 41 Stage 2)', () => {
+  it('parseSmartCompactPolicyOwner maps canonical spellings + rejects garbage', () => {
+    expect(parseSmartCompactPolicyOwner('daemon')).toBe('daemon');
+    expect(parseSmartCompactPolicyOwner('DAEMON')).toBe('daemon');
+    expect(parseSmartCompactPolicyOwner('lex')).toBe('lex');
+    expect(parseSmartCompactPolicyOwner('LEX')).toBe('lex');
+    expect(parseSmartCompactPolicyOwner('  lex  ')).toBe('lex');
+    expect(parseSmartCompactPolicyOwner('')).toBeNull();
+    expect(parseSmartCompactPolicyOwner('garbage')).toBeNull();
+    expect(parseSmartCompactPolicyOwner(null)).toBeNull();
+    expect(parseSmartCompactPolicyOwner(undefined)).toBeNull();
+  });
+
+  it("defaults to 'daemon' when runtime_config is empty (Stage 2 opt-in flip)", () => {
+    expect(smartCompactPolicyOwner(db)).toBe('daemon');
+  });
+
+  it("runtime_config 'lex' overrides the default", () => {
+    db.setRuntimeConfig(SMART_COMPACT_POLICY_OWNER_KEY, 'lex', 'test');
+    expect(smartCompactPolicyOwner(db)).toBe('lex');
+    db.setRuntimeConfig(SMART_COMPACT_POLICY_OWNER_KEY, 'daemon', 'test');
+    expect(smartCompactPolicyOwner(db)).toBe('daemon');
+  });
+
+  async function buildApp(): Promise<ReturnType<typeof Fastify>> {
+    const app = Fastify({ logger: false });
+    const injector = vi.fn(() => ({ ok: true as const }));
+    registerSmartCompactRoutes(app, db, injector, () => undefined);
+    await app.ready();
+    return app;
+  }
+
+  it("GET /policy-owner returns the current owner + raw runtime value", async () => {
+    const app = await buildApp();
+    try {
+      const res1 = await app.inject({
+        method: 'GET',
+        url: '/lex/smart-compact/policy-owner',
+      });
+      expect(res1.statusCode).toBe(200);
+      const body1 = res1.json() as {
+        owner: string;
+        runtime_value: string | null;
+        default_owner: string;
+      };
+      expect(body1.owner).toBe('daemon');
+      expect(body1.runtime_value).toBeNull();
+      expect(body1.default_owner).toBe('daemon');
+
+      db.setRuntimeConfig(SMART_COMPACT_POLICY_OWNER_KEY, 'lex', 'test');
+      const res2 = await app.inject({
+        method: 'GET',
+        url: '/lex/smart-compact/policy-owner',
+      });
+      const body2 = res2.json() as {
+        owner: string;
+        runtime_value: string | null;
+      };
+      expect(body2.owner).toBe('lex');
+      expect(body2.runtime_value).toBe('lex');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("POST /policy-owner flips the runtime value and 400s on garbage", async () => {
+    const app = await buildApp();
+    try {
+      const badRes = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/policy-owner',
+        payload: { owner: 'turbo', updated_by: 'test' },
+      });
+      expect(badRes.statusCode).toBe(400);
+      const badBody = badRes.json() as { error: string };
+      expect(badBody.error).toMatch(/owner must be/i);
+      /* runtime_config untouched. */
+      expect(db.getRuntimeConfig(SMART_COMPACT_POLICY_OWNER_KEY)).toBeNull();
+
+      const okRes = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/policy-owner',
+        payload: { owner: 'lex', updated_by: 'test' },
+      });
+      expect(okRes.statusCode).toBe(200);
+      const okBody = okRes.json() as { owner: string };
+      expect(okBody.owner).toBe('lex');
+      expect(db.getRuntimeConfig(SMART_COMPACT_POLICY_OWNER_KEY)).toBe('lex');
     } finally {
       await app.close();
     }

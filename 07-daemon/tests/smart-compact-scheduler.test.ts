@@ -154,6 +154,112 @@ describe('runSmartCompactTick', () => {
     expect(recentSmartCompacts(db).length).toBe(0);
   });
 
+  /* Fix 41 Stage 2: scheduler short-circuit when policy owner is
+   * 'lex'. The scheduler walks anchors and runs evaluate so the log
+   * still shows what the daemon's evaluator would have said, but
+   * skips every inject. Lex's own loop drives /clear-and-paste +
+   * /wrap-paste based on its own evaluator. */
+  it("short-circuits action=wrap to log-only when policy owner is 'lex'", async () => {
+    seedLive('a');
+    const evaluator = vi.fn(() => ({
+      ok: true as const,
+      action: 'wrap' as const,
+      reason: 'forced-no-stop' as const,
+      ctx_pct: 75,
+      shadow: false,
+      jsonl_path: null,
+      anchor_id: 'a',
+    }));
+    const injector = vi.fn(() => ({ ok: true }));
+    const r = await runSmartCompactTick({
+      db,
+      injector,
+      evaluator,
+      policyOwnerProvider: () => 'lex',
+    });
+    expect(r.shortCircuited).toEqual(['a']);
+    expect(r.wrapped).toEqual([]);
+    expect(r.fired).toEqual([]);
+    expect(r.deferredFire).toEqual([]);
+    expect(injector).not.toHaveBeenCalled();
+    expect(recentSmartCompacts(db).length).toBe(0);
+  });
+
+  it("short-circuits action=fire to log-only when policy owner is 'lex'", async () => {
+    seedLive('a');
+    const evaluator = vi.fn(() => ({
+      ok: true as const,
+      action: 'fire' as const,
+      reason: 'window-open' as const,
+      ctx_pct: 60,
+      shadow: false,
+      jsonl_path: null,
+      anchor_id: 'a',
+    }));
+    const injector = vi.fn(() => ({ ok: true }));
+    const r = await runSmartCompactTick({
+      db,
+      injector,
+      evaluator,
+      policyOwnerProvider: () => 'lex',
+    });
+    expect(r.shortCircuited).toEqual(['a']);
+    /* Even though pre-Stage-2 this was deferredFire, the short-circuit
+     * branch beats the fire branch. Lex owns the entire decision. */
+    expect(r.deferredFire).toEqual([]);
+    expect(injector).not.toHaveBeenCalled();
+    expect(recentSmartCompacts(db).length).toBe(0);
+  });
+
+  it("still records wait verdicts as waited when policy owner is 'lex'", async () => {
+    /* Wait is a no-op on both branches; the short-circuit happens
+     * AFTER the wait check so wait verdicts continue to populate
+     * result.waited and feed the dashboard's normal wait timeline. */
+    seedLive('a');
+    const evaluator = vi.fn(() => ({
+      ok: true as const,
+      action: 'wait' as const,
+      reason: 'below-window' as const,
+      ctx_pct: 30,
+      shadow: false,
+      jsonl_path: null,
+      anchor_id: 'a',
+    }));
+    const r = await runSmartCompactTick({
+      db,
+      injector: vi.fn(() => ({ ok: true })),
+      evaluator,
+      policyOwnerProvider: () => 'lex',
+    });
+    expect(r.waited).toEqual(['a']);
+    expect(r.shortCircuited).toEqual([]);
+  });
+
+  it("policy owner 'daemon' (default) keeps the wrap path firing", async () => {
+    /* Pin the back-compat: until operator flips the toggle, the
+     * scheduler's wrap path must behave identically to pre-Stage-2. */
+    seedLive('a');
+    const evaluator = vi.fn(() => ({
+      ok: true as const,
+      action: 'wrap' as const,
+      reason: 'forced-no-stop' as const,
+      ctx_pct: 75,
+      shadow: false,
+      jsonl_path: null,
+      anchor_id: 'a',
+    }));
+    const injector = vi.fn(() => ({ ok: true }));
+    const r = await runSmartCompactTick({
+      db,
+      injector,
+      evaluator,
+      policyOwnerProvider: () => 'daemon',
+    });
+    expect(r.wrapped).toEqual(['a']);
+    expect(r.shortCircuited).toEqual([]);
+    expect(injector).toHaveBeenCalledTimes(1);
+  });
+
   it('continues past an evaluator throw on one anchor', async () => {
     seedLive('a');
     seedLive('b');

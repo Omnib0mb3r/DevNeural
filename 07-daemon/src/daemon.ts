@@ -605,10 +605,11 @@ async function main(): Promise<void> {
         r.fired.length ||
         r.wrapped.length ||
         r.deferredFire.length ||
+        r.shortCircuited.length ||
         r.errors.length
       ) {
         logger(
-          `[smart-compact] evaluated=${r.evaluated} fired=${r.fired.length} wrapped=${r.wrapped.length} deferred=${r.deferredFire.length} waited=${r.waited.length} errors=${r.errors.length}`,
+          `[smart-compact] evaluated=${r.evaluated} fired=${r.fired.length} wrapped=${r.wrapped.length} deferred=${r.deferredFire.length} short_circuit=${r.shortCircuited.length} waited=${r.waited.length} errors=${r.errors.length}`,
         );
       }
     } catch (err) {
