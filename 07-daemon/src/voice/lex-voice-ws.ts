@@ -46,6 +46,10 @@ import type { WebSocket as FastifyWS } from '@fastify/websocket';
 import { transcribeWav, pcm16ToWav } from './whisper.js';
 import { synthesize, piperStatus } from './piper.js';
 import {
+  createSpeakController,
+  type SpeakController,
+} from './lex-voice-speak-controller.js';
+import {
   ptyInject,
   getPty,
   getPtyBySession,
@@ -212,6 +216,16 @@ interface ConnState {
    * already has its own equivalent gate via awaitingResponseSince +
    * the mid-turn-no-tts queue. */
   inFlightDirectLlmReply: boolean;
+  /* Fix 40 (2026-05-26): speak-queue serialisation. The controller
+   * drains entries one at a time, awaiting each piper's natural end
+   * before spawning the next. Multi-segment Lex replies (pre-tool
+   * ack + end_turn body) therefore play back-to-back instead of
+   * spawning concurrent piper children that mix into double-talk.
+   * killActiveTts (and runHoldUp's cancelTts) clear the queue and
+   * cancel the in-flight ctx as one atomic boundary; segments queued
+   * AFTER a kill belong to a fresh logical turn and start a new run. */
+  ttsQueue: Array<{ cleanText: string }>;
+  ttsQueueRunning: boolean;
 }
 
 /* 2026-05-22: lifted from 4 MB to 64 MB. The old 4 MB ceiling was a
@@ -528,7 +542,25 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     brainstormId: null,
     runtimeMode: null,
     inFlightDirectLlmReply: false,
+    ttsQueue: [],
+    ttsQueueRunning: false,
   };
+
+  /* Fix 40 (2026-05-26): centralise piper synth lifecycle behind a
+   * controller that serialises same-turn speak() calls and cancels
+   * cleanly on barge. The legacy inline speak() reassigned
+   * state.ttsActive without cancelling the prior ctx, which produced
+   * audible double-talk whenever a pre-tool ack and the matching
+   * end_turn body both landed text content. See
+   * docs/bugs/2026-05-26-cc-pty-double-talk-investigation.md. */
+  const speakCtrl: SpeakController = createSpeakController(state, {
+    synthesize,
+    send: (frame) => send(frame as Record<string, unknown>),
+    sendBinary,
+    onTtsEnd: () => {
+      lastTtsEndMs = Date.now();
+    },
+  });
 
   function send(msg: Record<string, unknown>): void {
     if (state.closed) return;
@@ -1263,76 +1295,14 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
   }
 
-  async function speak(text: string): Promise<void> {
-    /* Strip markdown asterisks/code fences/heading markers since the
-     * voice doesn't render them — they'd come out as "asterisk
-     * asterisk emphasis asterisk asterisk" otherwise. */
-    const clean = text
-      .replace(/```[\s\S]*?```/g, ' ')
-      .replace(/`([^`]+)`/g, '$1')
-      .replace(/\*\*([^*]+)\*\*/g, '$1')
-      .replace(/\*([^*]+)\*/g, '$1')
-      .replace(/^#+\s+/gm, '')
-      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-      .replace(/\s+/g, ' ')
-      .trim();
-    if (!clean) return;
-    let handle: ReturnType<typeof synthesize>;
-    try {
-      handle = synthesize(clean);
-    } catch (err) {
-      send({ t: 'error', code: 'tts', message: (err as Error).message });
-      return;
-    }
-    const ttsCtx = { cancel: handle.cancel, cancelled: false };
-    state.ttsActive = ttsCtx;
-    /* N-deep barge integration (2026-05-22): capture the cleaned
-     * text so killActiveTts can record what Lex INTENDED to say if
-     * the user barges before piper finishes shipping it. */
-    state.currentTtsText = clean;
-    state.currentTtsStartedAtMs = Date.now();
-    send({ t: 'tts-start', rate: handle.sampleRate });
-    handle.pcm.on('data', (chunk: Buffer) => {
-      /* Drop binary frames that arrived after a forced cancel. The
-       * piper child has been killed but stdout can still flush a
-       * tail chunk before its FD closes; without this guard a
-       * post-cancel chunk would leak into the next reply's audio
-       * stream on the client. */
-      if (ttsCtx.cancelled) return;
-      sendBinary(chunk);
-    });
-    handle.pcm.on('end', () => {
-      /* Cancelled streams emit their own tts-cancel via
-       * killActiveTts; do not double-emit a tts-end after. */
-      if (ttsCtx.cancelled) {
-        if (state.ttsActive === ttsCtx) state.ttsActive = null;
-        return;
-      }
-      send({ t: 'tts-end' });
-      lastTtsEndMs = Date.now();
-      state.ttsActive = null;
-      /* N-deep barge integration: natural completion means Lex
-       * finished the assistant turn the user heard in full. Reset
-       * the intended-text capture so the next reply does not
-       * inherit a stale value. The partialChain is NOT cleared
-       * here; it is cleared at the next successful user inject so a
-       * partial that landed BEFORE this complete reply still gets
-       * carried forward into the conversation context. */
-      state.currentTtsText = null;
-      state.currentTtsStartedAtMs = 0;
-    });
-    handle.pcm.on('error', (err: Error) => {
-      send({ t: 'error', code: 'tts-stream', message: err.message });
-      state.ttsActive = null;
-    });
-    /* Defensive: if handle.done resolves before stream end (shouldn't
-     * normally), still mark TTS finished so the next utterance can
-     * proceed. */
-    void handle.done.then(() => {
-      if (state.ttsActive === ttsCtx) {
-        state.ttsActive = null;
-      }
-    });
+  /* Fix 40 (2026-05-26): speak() is now a thin wrapper over the
+   * speak-queue controller. The controller owns the piper lifecycle
+   * — see lex-voice-speak-controller.ts for the serialise-vs-cancel
+   * contract. Same-turn segments (pre-tool ack + end_turn body)
+   * queue and play back-to-back; barge / hold-up clears the queue
+   * and cancels the in-flight ctx as one atomic boundary. */
+  function speak(text: string): void {
+    speakCtrl.speak(text);
   }
 
   /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
@@ -1552,45 +1522,29 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * boundary (when handleJsonlLine clears awaitingResponseSince on
    * the end_turn record). */
   function killActiveTts(reason: 'utterance-start' | 'barge-in'): void {
-    const ctx = state.ttsActive;
-    if (ctx) {
-      ctx.cancelled = true;
-      try {
-        ctx.cancel();
-      } catch {
-        /* ignore; cancel is best-effort */
-      }
-      state.ttsActive = null;
-      send({ t: 'tts-cancel', reason });
-      /* N-deep barge integration: record the unresolved partial so
-       * the next inject can prepend a [voice-context] block. We
-       * stash the cleaned text passed to piper (what Lex INTENDED
-       * to say) plus the wall-clock cancel offset; the system
-       * prompt rule tells Lex to weave the interrupted thread(s)
-       * into the next reply rather than restarting cold. */
-      if (state.currentTtsText) {
-        state.partialChain.push({
-          intended_text: state.currentTtsText,
-          started_at_ms: state.currentTtsStartedAtMs,
-          cancelled_at_ms: Date.now(),
-        });
-      }
-      state.currentTtsText = null;
-      state.currentTtsStartedAtMs = 0;
-      /* Step 3, gated: only abort the PTY turn when TTS was actually
-       * in flight. The user is interrupting Lex's spoken reply; the
-       * worker should drop the rest of the turn. When TTS is null
-       * we DO NOT abort because the user may be stacking follow-on
-       * context onto an in-flight reasoning/tool sequence (handled
-       * in handleUtteranceEnd via pendingUserUtterances). */
-      if (state.bindKey) {
-        const handle = getPty(state.bindKey) || getPtyBySession(state.bindKey);
-        if (handle && !handle.exited) {
-          try {
-            handle.pty.write('\x03');
-          } catch {
-            /* ignore */
-          }
+    /* Fix 40 (2026-05-26): controller owns the ctx + queue + partial-
+     * chain bookkeeping. It returns true when a real in-flight ctx
+     * was cancelled (vs an idle state with a possibly non-empty
+     * queue). The tts-cancel WS frame + PTY Ctrl+C only fire on a
+     * real cancellation per the existing Fix 20 contract — an
+     * idle-state kill is just a queue-clear and should be silent
+     * on the wire. */
+    const cancelled = speakCtrl.killActive();
+    if (!cancelled) return;
+    send({ t: 'tts-cancel', reason });
+    /* Only abort the PTY turn when TTS was actually in flight. The
+     * user is interrupting Lex's spoken reply; the worker should
+     * drop the rest of the turn. When TTS is null we DO NOT abort
+     * because the user may be stacking follow-on context onto an
+     * in-flight reasoning/tool sequence (handled in
+     * handleUtteranceEnd via pendingUserUtterances). */
+    if (state.bindKey) {
+      const handle = getPty(state.bindKey) || getPtyBySession(state.bindKey);
+      if (handle && !handle.exited) {
+        try {
+          handle.pty.write('\x03');
+        } catch {
+          /* ignore */
         }
       }
     }
@@ -1702,28 +1656,15 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
          * deliberately untouched: no PTY write, no bridge queue
          * write, no /lex/inject-cross-session POST. Already-delivered
          * injects to the worker are NOT clawed back. */
-        const ctx = state.ttsActive;
         const intended = state.currentTtsText;
         runHoldUp({
           cancelTts: () => {
-            if (ctx) {
-              ctx.cancelled = true;
-              try {
-                ctx.cancel();
-              } catch {
-                /* TTS cancel is best-effort */
-              }
-              state.ttsActive = null;
-              if (state.currentTtsText) {
-                state.partialChain.push({
-                  intended_text: state.currentTtsText,
-                  started_at_ms: state.currentTtsStartedAtMs,
-                  cancelled_at_ms: Date.now(),
-                });
-              }
-            }
-            state.currentTtsText = null;
-            state.currentTtsStartedAtMs = 0;
+            /* Fix 40 (2026-05-26): delegate to speakCtrl.killActive so
+             * the queue clear + partialChain capture + ctx-cancellation
+             * stay in lock-step with killActiveTts. hold-up always
+             * boundaries a logical turn, so any queued same-turn
+             * segments must drop with the in-flight ctx. */
+            speakCtrl.killActive();
           },
           ctrlCLexPty: () => {
             if (state.bindKey) {
