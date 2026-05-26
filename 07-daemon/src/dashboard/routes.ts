@@ -4515,7 +4515,57 @@ export async function registerDashboardRoutes(
       db: store.db,
       workerSessionId: typeof body.session_id === 'string' ? body.session_id : undefined,
     });
-    return result;
+    /* Codex item 8 (Fix 45 follow-up): attach source_graph_block when
+     * the runtime flag enables it. 'both' (default) returns both the
+     * legacy sections + the new block; 'source-graph' returns the new
+     * block in the primary slot so the hook prints it; 'legacy' keeps
+     * the existing behavior unchanged.
+     *
+     * Resolve the anchor id from the worker's cwd. Only renders when
+     * the cwd belongs to a known project anchor AND a brainstorm row
+     * has claimed this worker via attached_worker_session_id; otherwise
+     * source_graph_block stays null and the response is byte-identical
+     * to the legacy shape. */
+    const mode = workerBootSourceGraphMode(store.db);
+    let source_graph_block: string | null = null;
+    if (
+      mode !== 'legacy' &&
+      result.ok &&
+      result.reason === 'rendered' &&
+      typeof body.session_id === 'string' &&
+      body.session_id.trim()
+    ) {
+      try {
+        const bs = store.db.getBrainstormByAttachedWorker(body.session_id);
+        if (bs) {
+          const { buildSourceGraphPayload } = await import(
+            '../lex/source-graph-payload.js'
+          );
+          const { renderWorkerBoot } = await import(
+            '../lex/worker-boot-render.js'
+          );
+          const now = Date.now();
+          const payload = buildSourceGraphPayload({
+            db: store.db,
+            anchorId: bs.id,
+            currentCcSessionId: body.session_id,
+            refLimit: 3,
+            pairsPerRef: 3,
+            now: () => now,
+          });
+          source_graph_block = renderWorkerBoot(payload, {
+            mode: 'smart-clear',
+            now,
+          });
+        }
+      } catch {
+        /* best-effort; legacy block still ships */
+      }
+    }
+    if (mode === 'source-graph' && source_graph_block) {
+      return { ...result, block: source_graph_block, source_graph_block };
+    }
+    return { ...result, source_graph_block };
   });
 
   /* POST /lex/cold-start-preload
