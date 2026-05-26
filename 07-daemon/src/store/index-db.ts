@@ -364,6 +364,13 @@ export interface LexTranscriptRefRow {
   source_chunk_count: number | null;
   source_session_ids: string | null;
   coverage_score: number | null;
+  /* Codex item 5 freshness barrier (migration 041): timestamp of the
+   * most recent brainstorm_chunks row written under this ref's
+   * cc_session_id. Maintained by the live writer (insertBrainstormChunk
+   * bumps it through bumpRefLatestChunkMs). Compared against
+   * ref_summary_ms to derive staleness for cold-start preload. NULL
+   * means "no chunks observed yet"; preload treats NULL as fresh. */
+  latest_chunk_ms: number | null;
 }
 
 /* project_session row. Durable per-project anchor identity, daemon-
@@ -951,6 +958,48 @@ export class IndexDb {
          WHERE id = ?`,
       )
       .run(row.brainstorm_id, row.brainstorm_id);
+    /* Codex item 5 (migration 041): bump latest_chunk_ms on the
+     * matching lex_transcript_ref so cold-start preload can detect
+     * "ref_summary written before this chunk landed" staleness. The
+     * UNIQUE index on (cc_session_id) guarantees at-most-one row to
+     * update. Skipped for the cc_session_id-null path (direct-llm /
+     * pre-Stage 0 historical) because there is no ref row to bump
+     * anyway. The monotone guard (latest_chunk_ms IS NULL OR
+     * latest_chunk_ms < ?) makes the write idempotent so a backfill
+     * tick walking historical chunks does not move the column
+     * backwards. */
+    if (row.cc_session_id) {
+      this.bumpLexTranscriptRefLatestChunkMs(row.cc_session_id, Date.now());
+    }
+  }
+
+  /* Codex item 5 write-path helper. Monotone bump of
+   * lex_transcript_ref.latest_chunk_ms keyed by cc_session_id.
+   *
+   * No-op when no matching ref row exists yet (ref insertion runs
+   * during anchor bind which races with the first chunk insert for
+   * a fresh CC session; the next chunk after the ref lands picks up
+   * the field). No-op when the supplied timestamp is not strictly
+   * greater than the current value so concurrent writers cannot
+   * regress freshness. */
+  bumpLexTranscriptRefLatestChunkMs(
+    ccSessionId: string,
+    candidateMs: number,
+  ): void {
+    if (!ccSessionId) return;
+    if (!Number.isFinite(candidateMs)) return;
+    try {
+      this.db
+        .prepare(
+          `UPDATE lex_transcript_ref
+              SET latest_chunk_ms = ?
+            WHERE cc_session_id = ?
+              AND (latest_chunk_ms IS NULL OR latest_chunk_ms < ?)`,
+        )
+        .run(candidateMs, ccSessionId, candidateMs);
+    } catch {
+      /* migration 041 may not have applied yet; not fatal. */
+    }
   }
 
   countBrainstormChunks(brainstormId: string): number {
@@ -2020,6 +2069,7 @@ export class IndexDb {
       | 'source_chunk_count'
       | 'source_session_ids'
       | 'coverage_score'
+      | 'latest_chunk_ms'
     >,
   ): LexTranscriptRefRow {
     /* Insert lands the ref row with NULL distillation columns. The
@@ -2050,6 +2100,7 @@ export class IndexDb {
       source_chunk_count: null,
       source_session_ids: null,
       coverage_score: null,
+      latest_chunk_ms: null,
     };
   }
 
@@ -2064,6 +2115,7 @@ export class IndexDb {
         | 'source_chunk_count'
         | 'source_session_ids'
         | 'coverage_score'
+        | 'latest_chunk_ms'
       >
     >,
   ): void {

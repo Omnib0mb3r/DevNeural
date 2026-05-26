@@ -26,7 +26,7 @@
  * through injected dependencies so tests can drive the race-fix
  * branches without touching ollama or the real db.
  */
-import type { BrainstormSessionRow, IndexDb } from '../store/index-db.js';
+import type { BrainstormSessionRow, IndexDb, LexTranscriptRefRow } from '../store/index-db.js';
 import {
   preloadSiblingDistillations,
   type DistillationGenerator,
@@ -34,6 +34,8 @@ import {
 } from './sibling-distillation-preload.js';
 import { extractLastTurnPairs } from './sibling-index.js';
 import { findLatestHandover } from './handover-writer.js';
+import { isRefStale } from './lex-transcript-ref.js';
+import type { PerSessionDistillationGenerator } from './distillation-generator.js';
 import * as fs from 'node:fs';
 
 export interface ColdStartPreloadInput {
@@ -79,6 +81,20 @@ export interface ColdStartPreloadInput {
    * for "no handover doc found"; the preload falls back to
    * last_summary_ms in that case. */
   findHandover?: (brainstormId: string) => { mtimeMs: number; filePath: string } | null;
+  /** Codex item 5: per-session distillation generator used to catch
+   * up stale refs synchronously before the block ships. Required when
+   * staleness detection is non-zero AND the sync barrier is active;
+   * null disables the catchup (the [stale] tag still renders, but no
+   * distillation runs). */
+  perSessionGenerator?: PerSessionDistillationGenerator | null;
+  /** Codex item 5: total wall-clock budget (ms) across all stale-ref
+   * catchup calls. Refs that miss this window keep their [stale]
+   * tag and surface in partial_sync=true on the audit row. Default
+   * 5000 per spec. */
+  syncBudgetMs?: number;
+  /** Codex item 5: max stale refs to catch up per preload tick.
+   * Default 3 per spec. */
+  syncMaxRefs?: number;
 }
 
 export interface ColdStartPreloadSummary {
@@ -106,11 +122,17 @@ export interface ColdStartPreloadSummary {
    * Always 0 when findHandover is not wired or no handover docs
    * exist for the surfaced rows. */
   handover_sourced_count?: number;
+  /** Codex item 5 freshness barrier metrics. */
+  stale_refs_count: number;
+  synced_refs_count: number;
+  partial_sync: boolean;
 }
 
 const TOP_N_DEFAULT = 2;
 const ANCHOR_REF_LIMIT_DEFAULT = 5;
 const ANCHOR_PAIRS_PER_REF_DEFAULT = 5;
+const SYNC_BUDGET_MS_DEFAULT = 5_000;
+const SYNC_MAX_REFS_DEFAULT = 3;
 
 function readJsonl(p: string): string | null {
   try {
@@ -118,6 +140,113 @@ function readJsonl(p: string): string | null {
   } catch {
     return null;
   }
+}
+
+/* Codex item 5 sync catchup. Pure async helper so the staleness
+ * resolver can be unit-tested without spinning the route up.
+ *
+ * For each stale ref (capped to `maxRefs`), call the per-session
+ * generator and persist its output to lex_transcript_ref. Caps total
+ * wall-clock against `budgetMs`; refs that miss the window remain
+ * stale and surface in `partial`.
+ *
+ * The first overrun ref is the one whose generator call ran past the
+ * remaining budget. Subsequent refs are skipped without invoking the
+ * generator to keep the route's response-time SLO predictable. */
+export interface SyncCatchupInput {
+  db: IndexDb;
+  refs: LexTranscriptRefRow[];
+  brainstormIdForRef: (ref: LexTranscriptRefRow) => string;
+  perSessionGenerator: PerSessionDistillationGenerator;
+  budgetMs: number;
+  maxRefs: number;
+  now?: () => number;
+}
+
+export interface SyncCatchupResult {
+  attempted: number[];
+  synced: number[];
+  partial: boolean;
+}
+
+export async function runStaleRefCatchup(
+  input: SyncCatchupInput,
+): Promise<SyncCatchupResult> {
+  const now = input.now ?? Date.now;
+  const out: SyncCatchupResult = {
+    attempted: [],
+    synced: [],
+    partial: false,
+  };
+  const target = input.refs.slice(0, Math.max(0, input.maxRefs));
+  if (target.length < input.refs.length) {
+    /* spec contract: refs we never tried still count as partial. */
+    out.partial = true;
+  }
+  const startMs = now();
+  for (const ref of target) {
+    const elapsed = now() - startMs;
+    if (elapsed >= input.budgetMs) {
+      out.partial = true;
+      continue;
+    }
+    out.attempted.push(ref.id);
+    const brainstormId = input.brainstormIdForRef(ref);
+    if (!brainstormId || !ref.cc_session_id) {
+      out.partial = true;
+      continue;
+    }
+    const totalScoped = input.db.countBrainstormChunksForSession(
+      brainstormId,
+      ref.cc_session_id,
+    );
+    if (totalScoped === 0) {
+      /* No chunks under this scope; the staleness predicate must have
+       * fired on a NULL ref_summary + non-null latest_chunk_ms set by
+       * a different cc_session_id, which is anomalous. Skip and mark
+       * partial so the audit row records the unresolved entry. */
+      out.partial = true;
+      continue;
+    }
+    let result: Awaited<ReturnType<PerSessionDistillationGenerator>> = null;
+    try {
+      const remainingBudget = Math.max(0, input.budgetMs - (now() - startMs));
+      result = await Promise.race<
+        Awaited<ReturnType<PerSessionDistillationGenerator>>
+      >([
+        input.perSessionGenerator({
+          brainstorm_id: brainstormId,
+          cc_session_id: ref.cc_session_id,
+          totalChunksInSession: totalScoped,
+        }),
+        new Promise((resolve) => {
+          const t = setTimeout(() => resolve(null), remainingBudget);
+          if (typeof (t as { unref?: () => void }).unref === 'function') {
+            (t as { unref: () => void }).unref();
+          }
+        }) as Promise<null>,
+      ]);
+    } catch {
+      result = null;
+    }
+    if (!result) {
+      out.partial = true;
+      continue;
+    }
+    try {
+      input.db.updateLexTranscriptRef(ref.id, {
+        ref_summary: result.summary,
+        ref_summary_ms: now(),
+        source_chunk_count: result.source_chunk_count,
+        source_session_ids: result.source_session_ids,
+        coverage_score: result.coverage_score,
+      });
+      out.synced.push(ref.id);
+    } catch {
+      out.partial = true;
+    }
+  }
+  return out;
 }
 
 /* Anchor-refs path: returns sibling_count + recent_turns_appended for
@@ -165,7 +294,13 @@ export async function preloadColdStartSiblings(
     last_distilled_ms: null,
     recent_turns_appended: 0,
     failure_reason: null,
+    stale_refs_count: 0,
+    synced_refs_count: 0,
+    partial_sync: false,
   };
+  const syncBudgetMs = input.syncBudgetMs ?? SYNC_BUDGET_MS_DEFAULT;
+  const syncMaxRefs = input.syncMaxRefs ?? SYNC_MAX_REFS_DEFAULT;
+  const now = input.now ?? Date.now;
   /* Anchor-refs primary path: when the new session re-binds an
    * existing brainstorm anchor, the prior CC transcripts ARE the
    * siblings. Skip the label-match force-distill (no other brainstorm
@@ -173,6 +308,19 @@ export async function preloadColdStartSiblings(
    * extracted turn count straight away. */
   const fromAnchor = summarizeFromAnchor(input);
   if (fromAnchor) {
+    /* Codex item 5: stale-ref catchup on the anchor-refs path.
+     * Detect refs whose latest_chunk_ms beats their ref_summary_ms
+     * and run the per-session generator against them inside the
+     * shared sync budget. Refs that miss the budget keep their
+     * [stale] tag (rendered by buildSiblingIndex via isRefStale)
+     * and partial_sync=true lands on the audit row. */
+    await runAnchorStaleCatchup({
+      input,
+      summary: out,
+      budgetMs: syncBudgetMs,
+      maxRefs: syncMaxRefs,
+      now,
+    });
     out.sibling_count = fromAnchor.sibling_count;
     out.recent_turns_appended = fromAnchor.recent_turns_appended;
     out.last_distilled_ms = fromAnchor.last_distilled_ms;
@@ -184,7 +332,6 @@ export async function preloadColdStartSiblings(
     return out;
   }
   const forceN = input.forceForTopN ?? TOP_N_DEFAULT;
-  const now = input.now ?? Date.now;
 
   /* Race-fix pass: synchronously distill the top-N siblings whose
    * last_summary is still null. preloadSiblingDistillations is the
@@ -227,6 +374,20 @@ export async function preloadColdStartSiblings(
     return out;
   }
 
+  /* Codex item 5: stale-ref catchup on the label-match path. Each
+   * surfaced sibling has its own set of lex_transcript_ref rows; if
+   * any are stale, the per-session generator catches them up under
+   * the shared budget so the rendered block does not surface a stale
+   * [stale] tag the operator has no way to clear. */
+  await runLabelMatchStaleCatchup({
+    input,
+    siblings: surfaced,
+    summary: out,
+    budgetMs: syncBudgetMs,
+    maxRefs: syncMaxRefs,
+    now,
+  });
+
   let maxDistilledMs: number | null = null;
   let turns = 0;
   let handoverSourced = 0;
@@ -266,6 +427,99 @@ export async function preloadColdStartSiblings(
   out.recent_turns_appended = turns;
   out.handover_sourced_count = handoverSourced;
   return out;
+}
+
+/* Wrapper: anchor-refs path catchup. Collects every stale ref under
+ * the anchor (excluding the active session), passes them through
+ * runStaleRefCatchup, then accumulates the counts onto the
+ * preload summary. */
+async function runAnchorStaleCatchup(args: {
+  input: ColdStartPreloadInput;
+  summary: ColdStartPreloadSummary;
+  budgetMs: number;
+  maxRefs: number;
+  now: () => number;
+}): Promise<void> {
+  const { input, summary } = args;
+  if (!input.anchorId) return;
+  const refs = input.db.listLexTranscriptRefs(input.anchorId);
+  const currentCc = input.currentCcSessionId ?? null;
+  const candidates = refs
+    .filter((r) => !currentCc || r.cc_session_id !== currentCc)
+    .filter((r) => isRefStale(r));
+  if (candidates.length === 0) return;
+  summary.stale_refs_count = candidates.length;
+  if (!input.perSessionGenerator) {
+    /* No generator wired (no provider, BF-4 anthropic-block path).
+     * Refs stay stale; partial_sync stays false because the spec's
+     * partial_sync semantic is "tried but did not catch up", not
+     * "could not try at all". The [stale] tag still renders. */
+    return;
+  }
+  try {
+    const result = await runStaleRefCatchup({
+      db: input.db,
+      refs: candidates,
+      brainstormIdForRef: () => input.anchorId!,
+      perSessionGenerator: input.perSessionGenerator,
+      budgetMs: args.budgetMs,
+      maxRefs: args.maxRefs,
+      now: args.now,
+    });
+    summary.synced_refs_count = result.synced.length;
+    if (result.partial) summary.partial_sync = true;
+  } catch {
+    summary.partial_sync = true;
+  }
+}
+
+/* Wrapper: label-match path catchup. For every surfaced sibling row,
+ * fetch its lex_transcript_ref rows and run staleness catchup against
+ * the union. Shares one budget across all siblings so a single
+ * runaway generator call does not starve the next sibling. */
+async function runLabelMatchStaleCatchup(args: {
+  input: ColdStartPreloadInput;
+  siblings: BrainstormSessionRow[];
+  summary: ColdStartPreloadSummary;
+  budgetMs: number;
+  maxRefs: number;
+  now: () => number;
+}): Promise<void> {
+  const { input, siblings, summary } = args;
+  if (siblings.length === 0) return;
+  const owner = new Map<number, string>();
+  const candidates: LexTranscriptRefRow[] = [];
+  for (const row of siblings) {
+    let refs: LexTranscriptRefRow[];
+    try {
+      refs = input.db.listLexTranscriptRefs(row.id);
+    } catch {
+      continue;
+    }
+    for (const r of refs) {
+      if (!isRefStale(r)) continue;
+      candidates.push(r);
+      owner.set(r.id, row.id);
+    }
+  }
+  if (candidates.length === 0) return;
+  summary.stale_refs_count = candidates.length;
+  if (!input.perSessionGenerator) return;
+  try {
+    const result = await runStaleRefCatchup({
+      db: input.db,
+      refs: candidates,
+      brainstormIdForRef: (ref) => owner.get(ref.id) ?? '',
+      perSessionGenerator: input.perSessionGenerator,
+      budgetMs: args.budgetMs,
+      maxRefs: args.maxRefs,
+      now: args.now,
+    });
+    summary.synced_refs_count = result.synced.length;
+    if (result.partial) summary.partial_sync = true;
+  } catch {
+    summary.partial_sync = true;
+  }
 }
 
 function defaultFindHandover(
@@ -347,9 +601,23 @@ export function formatHeaderStatus(
       text: `context: failed (${summary.failure_reason})`,
     };
   }
+  /* Codex item 5: surface freshness barrier counters next to the
+   * sibling + turns counts. Net post-sync stale count = stale_refs -
+   * synced_refs (the synced ones cleared the [stale] tag). When
+   * everything synced, the pill omits the stale_refs suffix so the
+   * happy path keeps its existing one-liner. */
+  const netStale = Math.max(
+    0,
+    summary.stale_refs_count - summary.synced_refs_count,
+  );
+  let staleSuffix = '';
+  if (netStale > 0) {
+    staleSuffix = `, stale_refs=${netStale}`;
+    if (summary.partial_sync) staleSuffix += ' (partial sync)';
+  }
   return {
     tone: 'ok',
-    text: `context: ${summary.sibling_count} siblings + ${summary.recent_turns_appended} turns`,
+    text: `context: ${summary.sibling_count} siblings + ${summary.recent_turns_appended} turns${staleSuffix}`,
   };
 }
 

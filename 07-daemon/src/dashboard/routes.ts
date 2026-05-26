@@ -4591,14 +4591,23 @@ export async function registerDashboardRoutes(
       const { preloadColdStartSiblings, formatColdStartPreamble, buildPreloadEventLogRow, recordPreloadEvent } =
         await import('../lex/lex-cold-start-preamble.js');
       const { pickProvider } = await import('../llm/index.js');
-      const { createLlmDistillationGenerator } = await import(
+      const { createLlmDistillationGenerator, createPerSessionDistillationGenerator } = await import(
         '../lex/distillation-generator.js'
       );
       const provider = pickProvider();
-      const generator =
-        provider && provider.isConfigured() && provider.name !== 'anthropic'
-          ? createLlmDistillationGenerator({ db: store.db, provider })
-          : null;
+      const generatorActive =
+        provider && provider.isConfigured() && provider.name !== 'anthropic';
+      const generator = generatorActive
+        ? createLlmDistillationGenerator({ db: store.db, provider })
+        : null;
+      /* Codex item 5: per-session generator wired alongside the
+       * anchor-flat one so stale-ref catchup can run inside the
+       * preload window. Same provider-gate (provider configured +
+       * not anthropic per BF-4) so the catchup either runs or the
+       * [stale] tag survives unchanged. */
+      const perSessionGenerator = generatorActive
+        ? createPerSessionDistillationGenerator({ db: store.db, provider })
+        : null;
       preloadSummary = await preloadColdStartSiblings({
         db: store.db,
         generator,
@@ -4607,6 +4616,7 @@ export async function registerDashboardRoutes(
         forceForTopN: 2,
         anchorId: bs.id,
         currentCcSessionId: sessionId,
+        perSessionGenerator,
       });
       preamble = formatColdStartPreamble(preloadSummary);
       recordPreloadEvent(
@@ -4647,8 +4657,28 @@ export async function registerDashboardRoutes(
     /* Audit row: decision tracks the mode so reviewers can filter
      * /lex/injection-log for 'shadow' to see what the feature WOULD
      * have done versus 'accepted' for real fires. caller_label
-     * remains 'cold-start-preload' in both states. */
+     * remains 'cold-start-preload' in both states.
+     *
+     * Codex item 5: when stale_refs_count > 0, pack
+     * {stale_refs_count, synced_refs_count, partial_sync} into the
+     * reject_reason field as JSON so the dashboard audit panel can
+     * grep it and the operator can correlate a "stale_refs=N" pill
+     * back to the audit row. Empty when no staleness was detected so
+     * the happy-path row stays compact. */
     try {
+      let syncMeta: string | undefined;
+      if (
+        preloadSummary &&
+        (preloadSummary.stale_refs_count > 0 ||
+          preloadSummary.synced_refs_count > 0 ||
+          preloadSummary.partial_sync)
+      ) {
+        syncMeta = JSON.stringify({
+          stale_refs_count: preloadSummary.stale_refs_count,
+          synced_refs_count: preloadSummary.synced_refs_count,
+          partial_sync: preloadSummary.partial_sync,
+        });
+      }
       store.db.insertCrossSessionLog({
         id: randomUUID(),
         target_session: sessionId,
@@ -4657,6 +4687,7 @@ export async function registerDashboardRoutes(
         text_length: block.length,
         decision: mode === 'live' ? 'accepted' : 'shadow',
         brainstorm_id: bs.id,
+        ...(syncMeta ? { reject_reason: syncMeta } : {}),
       });
     } catch {
       /* audit row is observational; never block the preload response */

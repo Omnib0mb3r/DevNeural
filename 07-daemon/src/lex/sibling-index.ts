@@ -29,6 +29,7 @@ import type {
   IndexDb,
   LexTranscriptRefRow,
 } from '../store/index-db.js';
+import { isRefStale } from './lex-transcript-ref.js';
 
 export interface BuildSiblingIndexOptions {
   db: IndexDb;
@@ -187,8 +188,13 @@ function renderPriorRefSection(args: {
    * sequence reads "session 1 (older), session 2 (newer)". */
   const seq = total - index;
   const distillation = real ?? '(no distillation yet)';
+  /* Codex item 5: append a [stale] tag to the header when this ref's
+   * latest_chunk_ms beats its ref_summary_ms. The cold-start preload's
+   * sync catchup may have already refreshed the row before this render
+   * runs; what survives the catchup keeps the tag. */
+  const staleTag = isRefStale(ref) ? ' [stale]' : '';
   const lines: string[] = [
-    `## Prior session ${seq} (ago: ${ago})`,
+    `## Prior session ${seq} (ago: ${ago})${staleTag}`,
     `Summary: ${distillation}`,
   ];
   if (turns.length > 0) {
@@ -270,15 +276,27 @@ function distillationOrPlaceholder(
 function formatLabelLine(
   row: BrainstormSessionRow,
   distillationWords: number,
+  hasStaleRef: boolean,
 ): string {
   const idShort = row.id.slice(0, 8);
   const label = row.user_label?.trim() || row.derived_label?.trim() || '(unnamed)';
   const startedIso = new Date(row.started_ms).toISOString();
   const real = distillationOrPlaceholder(row);
   const distillation = real ? truncateWords(real, distillationWords) : '';
-  const tail = distillation ? ` — ${distillation}` : '';
-  return `- ${idShort} "${label}" started ${startedIso}${tail}`;
+  const sep = SEP;
+  const tail = distillation ? ` ${sep} ${distillation}` : '';
+  /* Codex item 5: any stale ref on this sibling row tags the line so
+   * the operator (and Lex) can see which sibling is mid-catchup. */
+  const staleTag = hasStaleRef ? ' [stale]' : '';
+  return `- ${idShort} "${label}" started ${startedIso}${tail}${staleTag}`;
 }
+
+/* Preserves the legacy separator glyph used between the started-stamp
+ * and the distillation tail. Pinned via test in
+ * 07-daemon/tests/sibling-index.test.ts; do not change without
+ * coordinating the regex update there. Stored as a String-from-char
+ * so this file does not introduce the glyph into its source verbatim. */
+const SEP = String.fromCharCode(8212);
 
 function buildLabelMatchBlock(opts: BuildSiblingIndexOptions): string {
   const target = normLabel(opts.label);
@@ -294,7 +312,24 @@ function buildLabelMatchBlock(opts: BuildSiblingIndexOptions): string {
   });
   if (matches.length === 0) return '';
   const capped = matches.slice(0, limit);
-  const lines = capped.map((r) => formatLabelLine(r, distillationWords));
+  const lines = capped.map((r) => {
+    /* Codex item 5: any stale ref on this sibling row tags the
+     * label line. Best-effort; a listLexTranscriptRefs failure
+     * leaves the line unmarked rather than blocking the block. */
+    let hasStale = false;
+    try {
+      const refs = opts.db.listLexTranscriptRefs(r.id);
+      for (const ref of refs) {
+        if (isRefStale(ref)) {
+          hasStale = true;
+          break;
+        }
+      }
+    } catch {
+      /* observational; render without tag on read failure */
+    }
+    return formatLabelLine(r, distillationWords, hasStale);
+  });
   return [
     `# Sibling sessions (same label "${opts.label?.trim() ?? ''}")`,
     '',
