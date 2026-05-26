@@ -209,6 +209,52 @@ describe('createLlmDistillationGenerator', () => {
     expect(provider.call).not.toHaveBeenCalled();
   });
 
+  it('LEX-AUTONOMY Stage 5: ships the NEWEST chunkLimit chunks, not the oldest', async () => {
+    /* Pre-fix buildTranscript used listBrainstormChunks's default ASC
+     * order, so any brainstorm with more than chunkLimit chunks got
+     * the oldest N summarised and the tail (where the load-bearing
+     * decisions live) was dropped. Seed 100 chunks with distinguishable
+     * text and pin that the prompt's user transcript contains the
+     * NEWEST chunkLimit, in chronological order, with the oldest
+     * absent. */
+    insertBs({ id: 'bs-order', started_ms: 1_000 });
+    for (let i = 0; i < 100; i++) {
+      insertChunk({
+        id: `c-${i}`,
+        brainstormId: 'bs-order',
+        turn: i,
+        role: i % 2 === 0 ? 'user' : 'lex',
+        text: `turn-${i}`,
+      });
+    }
+    let capturedUser = '';
+    const provider = stubProvider({
+      respond: (user) => {
+        capturedUser = user;
+        return 'summary';
+      },
+    });
+    const generator = createLlmDistillationGenerator({
+      db,
+      provider,
+      chunkLimit: 50,
+    });
+    const row = db.listBrainstorms({ limit: 5 })[0]!;
+    await generator(row);
+    /* Newest 50 = turns 50..99. Oldest 50 = turns 0..49. The pre-fix
+     * code would have included turn-0 and excluded turn-99; the
+     * fixed code does the opposite. */
+    expect(capturedUser).toContain('turn-99');
+    expect(capturedUser).toContain('turn-50');
+    expect(capturedUser).not.toContain('turn-0\n');
+    expect(capturedUser).not.toContain('turn-49\n');
+    /* Chronological order inside the slice: turn-50 must appear
+     * BEFORE turn-99. */
+    expect(capturedUser.indexOf('turn-50')).toBeLessThan(
+      capturedUser.indexOf('turn-99'),
+    );
+  });
+
   it('catches provider exceptions and returns null', async () => {
     insertBs({ id: 'bs-1', started_ms: 1_000 });
     insertChunk({

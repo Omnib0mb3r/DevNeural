@@ -91,14 +91,32 @@ function buildTranscript(
   chunkLimit: number,
   maxBytes: number,
 ): string {
-  const chunks = db.listBrainstormChunks(row.id, chunkLimit);
-  if (chunks.length === 0) return '';
+  /* LEX-AUTONOMY Stage 5 / codex item 4 (Fix 2026-05-26): fetch the
+   * NEWEST chunkLimit chunks and reverse to chronological for the
+   * prompt. Pre-fix this used the listBrainstormChunks default order
+   * (ASC) which on any active brainstorm distilled the oldest N
+   * turns globally and ignored recent activity entirely. The tail of
+   * the conversation is the load-bearing context for the next-session
+   * handoff; the head is already covered by prior per-session
+   * summaries upstream of the rolling aggregate.
+   *
+   * The maxBytes cap also moves from "head of string" to "tail of
+   * string" so when the transcript exceeds the byte budget we keep
+   * the most recent content instead of dropping it. */
+  const fetched = db.listBrainstormChunks(row.id, chunkLimit, {
+    order: 'desc',
+  });
+  if (fetched.length === 0) return '';
+  const chunks = fetched.slice().reverse();
   const lines = chunks.map((c) => {
     const role =
       c.role === 'lex' ? 'LEX' : c.role === 'user' ? 'USER' : 'TOOL';
     return `${role}: ${c.text}`;
   });
-  return lines.join('\n').slice(0, maxBytes);
+  const joined = lines.join('\n');
+  return joined.length <= maxBytes
+    ? joined
+    : joined.slice(joined.length - maxBytes);
 }
 
 export function createLlmDistillationGenerator(
