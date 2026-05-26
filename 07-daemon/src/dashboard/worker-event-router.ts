@@ -286,8 +286,18 @@ export function resolveLexTargetSession(
     }
     for (const row of candidates) {
       const refs = db.listLexTranscriptRefs(row.id);
+      /* Fix 34c: listLexTranscriptRefs returns refs ORDER BY ordering
+       * ASC. In production every brainstorm ref has ended_ms === null
+       * because the per-ref close-out never runs (separate cleanup
+       * task). The pre-fix `find(r => r.ended_ms === null)` therefore
+       * matched ORDERING=0 -- the oldest cc_session, often weeks
+       * stale and with no bridge presence, so the inject path bailed
+       * with no_deliverable_bridge. Walk newest-first so the most
+       * recent open ref wins; the open-first intent is preserved for
+       * when close-out is eventually wired. */
       const openRef =
-        refs.find((r) => r.ended_ms === null) ?? refs[refs.length - 1];
+        [...refs].reverse().find((r) => r.ended_ms === null) ??
+        refs[refs.length - 1];
       if (openRef?.cc_session_id) {
         ccSessionId = openRef.cc_session_id;
         break;

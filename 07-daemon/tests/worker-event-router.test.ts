@@ -425,6 +425,41 @@ describe('resolveLexTargetSession', () => {
     );
   });
 
+  /* Fix 34c regression. Every brainstorm ref in production has
+   * ended_ms === null because the per-ref close-out path never runs.
+   * Pre-fix the resolver called `refs.find(r => r.ended_ms === null)`
+   * against an ASC-ordered list and matched ordering=0 -- the OLDEST
+   * cc_session, typically weeks stale with no bridge presence. Walk
+   * newest-first so the most recent open ref wins. */
+  it('returns the highest-ordering open ref, not the oldest one', () => {
+    db.insertLexSession({
+      id: 'lex-stack',
+      created_ms: 1_000,
+      title: 'multi-ref',
+      derived_title: null,
+      status: 'live',
+      current_pty_id: null,
+      cwd: 'C:/p/lex-stack',
+    });
+    /* Insert in ASC order to mirror production: ordering 0 is the
+     * oldest, ordering N-1 is the live current session. All have
+     * ended_ms=null because close-out never ran. */
+    for (let i = 0; i < 5; i++) {
+      db.insertLexTranscriptRef({
+        lex_session_id: 'lex-stack',
+        cc_session_id: `cc-${i.toString().padStart(2, '0')}`,
+        transcript_path: `C:/p/lex-stack/cc-${i}.jsonl`,
+        started_ms: 1_000 + i * 100,
+        ended_ms: null,
+        ordering: i,
+      });
+    }
+    resetLexTargetCacheForTest();
+    /* Pre-fix verdict was 'cc-00' (ordering=0). Post-fix the newest
+     * open ref wins -- 'cc-04'. */
+    expect(resolveLexTargetSession(db, { now: 2_000 })).toBe('cc-04');
+  });
+
   /* Fix 34 regression. Two live lex_sessions exist; only one is
    * bound to the project anchor that the worker event came from.
    * Pre-fix the resolver picked the most-recently-created live
