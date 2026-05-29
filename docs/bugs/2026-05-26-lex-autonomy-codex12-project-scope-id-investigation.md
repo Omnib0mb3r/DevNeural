@@ -1,7 +1,7 @@
 # LEX-AUTONOMY codex item 12 (FINAL): project_scope_id + kill label-only preload
 
 **Reported:** 2026-05-26 07:08 EDT
-**Status:** investigation (no code; ship spec follows)
+**Status:** CLOSED 2026-05-29. Shipped as Fix 49 (`7df66e0` + `71729d3` + `dc26f88` + `b189956` + `ecab2d8` + `20419a8` + `196a9b2`). See FIXES.md row 49. LEX-AUTONOMY codex 1-12 sequence fully complete.
 **Related:** spec line 297; closes codex 1-12 sequence. Builds on Fix 44 (adaptive walk-back) + Fix 45 (source-graph payload).
 
 ## Q1: current label-match call sites

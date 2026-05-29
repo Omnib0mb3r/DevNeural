@@ -2,7 +2,7 @@
 
 **Reported:** 2026-05-26 04:35 EDT by operator
 **Severity:** medium (correctness risk on cold-start handoff under ingestion lag; no live bug yet observed)
-**Status:** investigation (no code this round; ship spec follows)
+**Status:** CLOSED. Shipped as Fix 42 (`ec0d98a`, 2026-05-26). See FIXES.md row 42.
 **Related:** `docs/spec/LEX-AUTONOMY-PAYLOAD-SPEC.md` (codex order line 290); Stage 1 written-path invariant; Stage 2 cc_session_id schema; Stage 3 per-session distillation; codex item 4 distillation query scope fix. FIXES rows for Stages 1-4 already shipped. This investigation maps codex item 5 only; items 6-9 deliberately deferred per codex warning at spec line 299 ("do not ship 5-9 before 1-4").
 
 ## Question 1: where is cold-start preload assembled today?

@@ -2,7 +2,7 @@
 
 **Reported:** 2026-05-26 04:00 EDT by operator (Fix 41 pre-investigation)
 **Severity:** medium (architectural; current pipeline works but is blind-scheduled)
-**Status:** investigation (no code this round; ship spec follows)
+**Status:** CLOSED. Shipped as Fix 41 three-stage refactor (`e936908` Stage 1 + `bb12b4a` Stage 2 + `6359fd2` Stage 3, 2026-05-26). See FIXES.md row 41.
 **Related:** `docs/spec/LEX-AUTONOMY-PAYLOAD-SPEC.md` (Stages 5-12, Stage 5 shipped as Fix 36 moved summary authorship to Lex); `docs/spec/LEX-STANDALONE-SUPERVISION.md`; FIXES.md row 36 (Lex-authored resume), row 40 (cc-pty speak-queue).
 
 ## Motivation (operator-stated, 2026-05-26 04:00 EDT)

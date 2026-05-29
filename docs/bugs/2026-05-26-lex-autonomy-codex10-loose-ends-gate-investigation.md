@@ -1,7 +1,7 @@
 # LEX-AUTONOMY codex item 10: enforce loose-ends handoff gate
 
 **Reported:** 2026-05-26 06:34 EDT
-**Status:** investigation (no code; ship spec follows)
+**Status:** CLOSED 2026-05-29. Shipped as Fix 47 (`3da61e1` + `d9bc5d7` + `a82451f` + `40f4624` + `89de4d7` + `528c56e`). See FIXES.md row 47.
 **Related:** spec line 295; builds on Fixes 42 (`isRefStale`) + 43 (`distillation_error_log` + stale-watcher) + 45 (`isFirstAttach` + `buildSourceGraphPayload`) + 46 (first-attach detection).
 
 ## Question 1: worker-start paths

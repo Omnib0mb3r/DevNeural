@@ -1,7 +1,7 @@
 # LEX-AUTONOMY codex item 11: grooming/escalation + freshest artifact compare
 
 **Reported:** 2026-05-26 06:51 EDT
-**Status:** investigation (no code; ship spec follows)
+**Status:** CLOSED 2026-05-29. Shipped as Fix 48 (`b9e5757` + `598e58a` + `190e565` + `77c703c` + `6c43d32`). See FIXES.md row 48.
 **Related:** spec line 296; builds on Fixes 42 (`isRefStale`) + 43 (stale-watcher + `distillation_error_log`) + 47 (loose-ends gate).
 
 ## Q1: current grooming pipeline

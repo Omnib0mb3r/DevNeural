@@ -2,7 +2,7 @@
 
 **Reported:** 2026-05-26 05:48 EDT by operator
 **Severity:** medium (worker boot payload exists but does NOT project from the brainstorm corpus the way the spec mandates)
-**Status:** investigation (no code this round; ship spec follows)
+**Status:** CLOSED. Shipped as Fix 45 (`2463a5f` + `d9370d2` + `23c0eab` + `e51dec6` + `e435a88`, 2026-05-26). See FIXES.md row 45.
 **Related:** `docs/spec/LEX-AUTONOMY-PAYLOAD-SPEC.md` codex order item 8 (line 293); spec line 213 ("worker boot payload as 'best-effort summary from spec/git/jsonl tail.' Wrong source of truth. The brainstorm corpus IS the source. Worker must be projected FROM brainstorm corpus, not reconstructed FROM artifacts"); codex Q5 7-layer payload (line 249-254). Builds on Fixes 36 (Lex-authored resume), 42 (`isRefStale`), 43 (staleness surfacing + error log), 44 (adaptive walk-back). Codex 9 (first-attach path) consumes the same builder.
 
 ## Question 1: current worker boot payload

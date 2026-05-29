@@ -2,7 +2,7 @@
 
 **Reported:** 2026-05-26 04:58 EDT by operator
 **Severity:** medium (codex 5 freshness data now exists; without surfacing the human + Lex still can't see it)
-**Status:** investigation (no code this round; ship spec follows)
+**Status:** CLOSED. Shipped as Fix 43 (`71a4ebc`, 2026-05-26). See FIXES.md row 43.
 **Related:** `docs/spec/LEX-AUTONOMY-PAYLOAD-SPEC.md` codex order item 6; `docs/bugs/2026-05-26-lex-autonomy-codex5-sync-barrier-investigation.md`; Fix 42 (codex 5 ship, commit ec0d98a, adds `latest_chunk_ms` + `isRefStale` + sync barrier + per-row staleness counters). Codex 6 builds the surfacing layer atop the data Fix 42 produces. Codex 7 (adaptive walk-back) is downstream; codex 6 stays descriptive on failure shapes per the operator's caveat.
 
 ## Question 1: UI surface today

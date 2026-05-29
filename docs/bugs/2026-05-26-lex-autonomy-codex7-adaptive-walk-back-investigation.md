@@ -2,7 +2,7 @@
 
 **Reported:** 2026-05-26 05:30 EDT by operator
 **Severity:** medium (current preload picks last N blindly; quality of cold-start context is best-effort recency)
-**Status:** investigation (no code this round; ship spec follows)
+**Status:** CLOSED. Shipped as Fix 44 (`0a0d71f`, 2026-05-26). See FIXES.md row 44.
 **Related:** `docs/spec/LEX-AUTONOMY-PAYLOAD-SPEC.md` codex order item 7 (line 292); Q3 codex tightening (line 247); Stage 4 plan (line 180-181). Builds on Fix 42 (`latest_chunk_ms` + `isRefStale`) and Fix 43 (staleness surfacing + distillation_error_log). Codex 8 (deterministic worker-boot payload) consumes the same walk-back primitive; codex 7 ships first.
 
 ## Question 1: current walk-back behavior

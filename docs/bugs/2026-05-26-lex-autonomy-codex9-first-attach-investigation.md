@@ -2,7 +2,7 @@
 
 **Reported:** 2026-05-26 06:25 EDT by operator
 **Severity:** medium (first-attach worker boots blind because codex 8's source-graph builder is only triggered on smart-clear)
-**Status:** investigation (no code; ship spec follows)
+**Status:** CLOSED. Shipped as Fix 46 (`e4d1c23`, 2026-05-26). See FIXES.md row 46.
 **Related:** spec line 294; Fix 45 (codex 8) at `665d203` ships `buildSourceGraphPayload` + `renderWorkerBoot` with smart-clear vs first-attach modes already defined.
 
 ## Question 1: first-attach detection points

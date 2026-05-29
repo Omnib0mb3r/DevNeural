@@ -3,7 +3,7 @@
 Date: 2026-05-29
 Component: 07-daemon/src/capture/hooks/hook-runner.ts
 Severity: high (silent failure of cold-start preload + worker-handoff feature)
-Status: investigation (pre-ship companion to PRELOAD-1 fix)
+Status: CLOSED 2026-05-29. Shipped as Fix 50 (investigation `b18ffaa` + code `20147a7`). See FIXES.md row 50.
 
 ## 1. Symptom + evidence
 
