@@ -497,6 +497,40 @@ async function main(): Promise<void> {
     );
   }
 
+  /* LEX-AUTONOMY codex item 11 (Fix 48). Grooming watch: 30-min tick
+   * walking every live brainstorm anchor and surfacing six gap
+   * classes (distill_failure_persistent, parked_question_persistent,
+   * distill_error_repeat, loose_ends_block_persistent, grooming_gap,
+   * idle_no_distill). Severity drives push policy through
+   * emitNotification (alert -> 'force', else 'auto', info stays
+   * bell-only). Per-(anchor, class) 30-min debounce keeps the
+   * notifications surface quiet. looseEndsBlockedAt map is left
+   * undefined this round; the loose-ends gate cache wire is a
+   * codex 10 follow-up. */
+  let groomingHandle: { stop(): void; tickNow(): unknown } | null = null;
+  try {
+    const { installGroomingScheduler } = await import(
+      './lex/grooming-watch.js'
+    );
+    const { emitNotification } = await import('./dashboard/notifications.js');
+    groomingHandle = installGroomingScheduler({
+      db: store.db,
+      emit: (input) =>
+        emitNotification({
+          severity: input.severity,
+          source: input.source,
+          title: input.title,
+          body: input.body,
+          link: input.link,
+          push: input.push,
+          notify_class: input.notify_class,
+        }),
+    });
+    logger('grooming-watch: started');
+  } catch (err) {
+    logger(`grooming-watch bootstrap failed: ${(err as Error).message}`);
+  }
+
   /* Phase 5 wire-up of docs/spec/LEX-STANDALONE-SUPERVISION.md.
    * Boots the idle-watcher with the production grooming deps so
    * standalone brainstorms get light/mid/cold/day-cap passes on
@@ -1404,6 +1438,11 @@ async function main(): Promise<void> {
     }
     try {
       if (cancelledToolRecoveryHandle) cancelledToolRecoveryHandle.stop();
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (groomingHandle) groomingHandle.stop();
     } catch {
       /* ignore */
     }

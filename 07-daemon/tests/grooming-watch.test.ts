@@ -10,6 +10,7 @@ import { IndexDb } from '../src/store/index-db.js';
 import { runMigrations } from '../src/db/migrate.js';
 import {
   findFreshestArtifact,
+  installGroomingScheduler,
   runGroomingTick,
 } from '../src/lex/grooming-watch.js';
 
@@ -267,5 +268,40 @@ describe('findFreshestArtifact (Fix 48)', () => {
     });
     expect(out?.mtime_ms).toBe(500);
     expect(out?.path.endsWith('spec.md')).toBe(true);
+  });
+});
+
+describe('installGroomingScheduler (Fix 48 codex 11a daemon boot)', () => {
+  /* Pins the daemon-side boot wire: installGroomingScheduler must
+   * return a handle whose tickNow() runs runGroomingTick against
+   * the injected deps exactly once, and whose stop() detaches the
+   * background interval cleanly so the daemon shutdown closure can
+   * tear it down without leaving an orphan timer. */
+  it('boots once and the handle stops cleanly without firing emits when there are no gaps', () => {
+    /* Seed a fresh ref so no gap class trips; the boot smoke pin
+     * just needs the wire to fire without spurious notifications. */
+    seedRef({ endedAgo: 1000, summary: 'fresh' });
+    const emit = vi.fn();
+    const handle = installGroomingScheduler(
+      {
+        db,
+        now: () => NOW,
+        emit,
+      },
+      /* Use a large intervalMs so the background timer can't fire
+       * during the test; assertions run synchronously off tickNow. */
+      { intervalMs: 60 * 60_000 },
+    );
+    expect(typeof handle.stop).toBe('function');
+    expect(typeof handle.tickNow).toBe('function');
+    const out = handle.tickNow();
+    expect(out.evaluated).toBeGreaterThanOrEqual(1);
+    expect(out.emitted.length).toBe(0);
+    expect(emit).not.toHaveBeenCalled();
+    /* stop() must not throw and any subsequent stop() (idempotent
+     * tear-down) must also be a no-op so the shutdown closure can
+     * call stop() even when boot wiring partially failed. */
+    expect(() => handle.stop()).not.toThrow();
+    expect(() => handle.stop()).not.toThrow();
   });
 });
