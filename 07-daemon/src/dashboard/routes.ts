@@ -137,6 +137,7 @@ import {
   emitNotification,
   unreadCount,
   events as notificationEvents,
+  type Notification,
 } from './notifications.js';
 import { createProject } from './projects-new.js';
 import { buildGraph } from './graph.js';
@@ -4969,6 +4970,25 @@ export async function registerDashboardRoutes(
    * "ref_summary still NULL" with the structured error class. Pure
    * read; observational. Returns rows: [] when migration 042 has not
    * applied yet. */
+  /* LEX-AUTONOMY codex 11c (Fix 48 partial closure step 3): grooming
+   * watch observable surface.
+   *
+   * GET /lex/grooming/recent?limit=20 returns the most recent grooming
+   * events from the notifications log filtered by
+   * source='grooming-watch'. Sorted ts DESC by listNotifications. Limit
+   * defaults to 20, capped at 200. Push integration already flows
+   * through emitNotification (codex 11a): alert rows already pass
+   * push='force' from grooming-watch's emit hook, so the dashboard
+   * does not need to re-derive push policy here. */
+  app.get('/lex/grooming/recent', async (req) => {
+    const q = (req.query ?? {}) as { limit?: string };
+    const limit = q.limit
+      ? Math.min(200, Math.max(1, Number(q.limit) || 20))
+      : 20;
+    const rows = recentGroomingNotifications(limit);
+    return { ok: true, rows };
+  });
+
   app.get('/lex/distillation-errors', async (req) => {
     const q = (req.query ?? {}) as {
       brainstorm_id?: string;
@@ -5886,6 +5906,24 @@ function writeDraftAsPendingWikiPage(args: {
   } catch (err) {
     return { ok: false, error: (err as Error).message };
   }
+}
+
+/* LEX-AUTONOMY codex 11c (Fix 48 partial closure step 3): observable
+ * tail of grooming-watch events.
+ *
+ * Reads through listNotifications and filters source='grooming-watch'.
+ * Over-fetches 500 rows from the underlying notifications log to keep
+ * the post-filter slice deterministic when the dashboard has a flood
+ * of unrelated rows (lex-attention, curator, etc.) sitting on top.
+ *
+ * Push delivery for severity='alert' rows already happens at write
+ * time via emitNotification -> maybePushNotification (codex 11a
+ * wire). This helper is read-only; no audit row, no side effect. */
+export function recentGroomingNotifications(limit = 20): Notification[] {
+  const overFetch = Math.max(limit, 500);
+  const rows = listNotifications({ limit: overFetch });
+  const filtered = rows.filter((n) => n.source === 'grooming-watch');
+  return filtered.slice(0, Math.max(1, limit));
 }
 
 /* LEX-AUTONOMY codex item 12b (Fix 49 partial closure step 3).
