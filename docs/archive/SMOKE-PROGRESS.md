@@ -8,7 +8,31 @@ Rolling handoff for the 2026-05-25 active smoke batch. Survives Lex restart, `/c
 
 ## Current cursor
 
-**Active step:** Step 4 (repoint fix) — Step 3 fully green including 3.7 (Fix 34d.1 smoke-verified 2026-05-26 03:15 EDT).
+**2026-05-29 09:45 EDT update.** Resumed after 3-day pause. Daemon current (pid 38840, uptime ~17h, restarted 2026-05-28 16:54 EDT). Fix 41 endpoints live. Scheduler dead. Mode=live. Worker bb73e5a4 (frozen at 85.9% since spam-stop) /clear+pasted at 13:44Z via Lex-authored six-section summary (audit 1f8de6c3). New worker session 88cc9485 booting.
+
+**MORNING SMOKE PASS today 2026-05-29 13:35 EDT:** 41.1 PASS (mode=live, ctx_pct=85.9, shadow_count=287). 41.2 PASS (empty summary rejected). 41.3 PASS (empty prompt rejected). 41.4 PASS (/evaluate 404). 41.5 PASS (zero scheduler ticks). 41.6 PASS (smartCompactPolicyOwner defaults to 'lex' at routes.ts:266).
+
+**OPEN smoke gates (operator-pending):** 40.1/40.2/40.3 cc-pty speak-queue probes (need voice mode + live brainstorm). 5.1-5.4 voice mic-init (needs mobile Safari + operator hands). 6.1-6.4 final gate flips.
+
+**PRELOAD-1 diagnosed 2026-05-29 13:50 EDT:** cold-start preload route is wired AND fires on every SessionStart, BUT hook-runner.ts:196 writes plain markdown to stdout. CC requires JSON-shaped `{hookSpecificOutput:{hookEventName:'SessionStart',additionalContext}}` for context injection (proven by superpowers + capture-session-id both landing on this session, devneural block missing). Ship spec queued.
+
+**PRIOR ACTIVE BLOCKER (resolved):** 2026-05-26 wrap-prompt spam. Daemon was running stale dist; restart-without-rebuild bit us. Resolved when operator restarted daemon Wed 2026-05-28 after rebuild.
+
+**Why it happened:** Fix 41 Stage 3 (commit 6359fd2, 08:34Z) deleted the daemon-side scheduler in src/. Operator clicked restart-daemon ~10:15 EDT but `dist/` was NEVER rebuilt. Daemon (pid 76292) restarted against stale build artifacts (`dist/dashboard/smart-compact-scheduler.js` dated 04:22 EDT, pre-Fix-41-Stage3). Old scheduler kept ticking with no wrap-cooldown.
+
+**Restart ≠ rebuild.** Overnight handover (OVERNIGHT-2026-05-26.md L152, L156) flagged that work was unrebuilt + unrestarted, but morning checklist only said "click restart-daemon button" — never "run `npm run build` first". That's the gap that bit us.
+
+**Doc fix shipped 12:50 EDT:** new doc `docs/HOW-TO-dev-vs-prod-dashboard.md` covers three independent build steps (07-daemon, 08-dashboard, 09-bridge), port 3000 (dev hot-reload) vs 3747 (prod static), Tailscale dev/prod toggle. Linked from `docs/INDEX.md`, `docs/HOW-TO-dashboard-serving.md` updated to point at it, `TODO.md` got a top-level gotcha summary. Future Lex starting cold should hit this on the index injection.
+
+**Recovery order:**
+1. `cd C:/dev/Projects/DevNeural/07-daemon && npm run build` (also `08-dashboard` if dashboard changed).
+2. Operator clicks restart-daemon. Wait ~5 min for `/health` new pid.
+3. Verify scheduler gone: tail daemon log 60+s, ZERO `[smart-compact-tick]` lines (SMOKE-TEST 41.5).
+4. Flip mode back to `live` via POST /lex/smart-compact/toggle once Fix 41 probes pass.
+5. Worker recovery: `/clear` + Lex-authored six-section summary via POST /lex/smart-compact/clear-and-paste (Fix 41 path).
+6. Resume MORNING SMOKE for Fix 40 + Fix 41 probes (SMOKE-TEST L100-138).
+
+**Prior step:** Step 5 (voice mic-init) pending. Step 4 PASS 2026-05-26 03:23 EDT via natural Lex CC repoint churn on anchor 4bbafb48 (20 cc_session_ids stamped, clean splits per cc).
 
 **3.7 status (2026-05-26 02:35 EDT):** REGRESSED (false pass).
 - Original 02:09 EDT PASS was forensic-only: row landed in `cross_session_injection_log` with `caller_label='event-supervisor'` and `reject_reason='delivery_mode=lex-queue'`. Audit row said accepted; live behavior contradicts it.
@@ -46,10 +70,10 @@ Rolling handoff for the 2026-05-25 active smoke batch. Survives Lex restart, `/c
 
 ## Up next (in order)
 
-1. **3.7 (post-Fix-34b)** supervisor wire probe — daemon restart, write to any worker jsonl, expect chokidar.line counter > 0 and `/dashboard/health-supervisor` off `no-events`; row lands in `cross_session_injection_log` with `caller_label='event-supervisor'`.
-2. **4.x** Repoint fix via /clear on a worker.
-3. **5.x** Mic-init vad-error ring buffer + retry verify.
-4. **6.x** Final gate + FIXES.md flips + greenlight autonomy.
+1. **5.x** Mic-init vad-error ring buffer + retry verify (needs mobile Safari + operator hands).
+2. **6.x** Final gate + FIXES.md flips for Fix 27/28/29/32/33/34 + greenlight autonomy.
+
+Steps 3.1-3.7 and 4.1-4.4 closed PASS as of 2026-05-26 03:23 EDT.
 
 ## Open observations during smoke
 

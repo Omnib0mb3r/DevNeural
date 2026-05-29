@@ -1,10 +1,12 @@
 # Smoke Test Handover — Paste-Ready Resume
 
-If Lex resets mid-smoke or you pick this up tomorrow, paste this into a fresh Lex session to restore full context in one shot.
+**STATUS 2026-05-26 04:18 EDT:** Smoke steps 3.1 through 3.7 all PASS. Step 4 PASS via natural Lex CC repoint churn. Remaining: Step 5 (voice mic-init, needs mobile Safari + operator), Step 6 (FIXES.md flips + greenlight). Active overnight work has moved to Fix 41 (smart-compact policy refactor). See `docs/OVERNIGHT-2026-05-26.md` for current state.
+
+The resume prompt below is from the 03:10 EDT snapshot, retained for historical context. Skip to the current overnight doc for live cursor.
 
 ---
 
-**RESUME PROMPT (copy verbatim to fresh Lex, 2026-05-26 03:10 EDT snapshot):**
+**RESUME PROMPT (copy verbatim to fresh Lex, 2026-05-26 03:10 EDT snapshot — HISTORICAL):**
 
 > Pick up from 2026-05-26 overnight session. Smoke gate already closed: 3.1-3.6 PASS live, 3.7 PASSED THEN REGRESSED (Fix 34d routed supervisor payloads to worker instead of Lex — caught by operator 02:30 EDT). Read docs/SMOKE-PROGRESS.md for live cursor. Read docs/SMOKE-HANDOVER.md "Overnight state" below.
 >

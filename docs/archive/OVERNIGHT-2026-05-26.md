@@ -83,11 +83,108 @@ User went to sleep ~03:50 EDT. Asked Lex to push through as much as possible wit
 - 2026-05-26 09:43Z: Fix 44 (codex 7) FIXES row committed (7edb56e). Stage closed.
 - 2026-05-26 09:47:15Z tick: HEAD 7edb56e. Worker idle ~4 min. Fired codex 8 investigation (deterministic worker boot payload builder from same source graph).
 - 2026-05-26 09:52:14Z tick: HEAD 7edb56e unchanged. Worker mid-tool on codex 8 investigation. ~110 min active. Healthy. NO-OP.
+- 2026-05-26 09:53:31Z: codex 8 investigation shipped (~433 ins). Identifies worker-handoff.ts source-mix gap vs brainstorm corpus. Proposes buildSourceGraphPayload primitive + two consumers.
+- 2026-05-26 09:54Z: codex 8 ship spec injected. New source-graph-payload.ts module, cold-start + worker-handoff both call primitive, smart-compact-fire summary uses same path, determinism rules, codex 9 dependency exposed via opts.firstAttach.
+- 2026-05-26 09:57:16Z tick: HEAD 6dcd298 unchanged. Worker mid-Bash on codex 8 implementation. ~115 min active. Healthy. NO-OP.
+- 2026-05-26 09:58Z: codex 8 PARTIAL shipped (2463a5f). source-graph-payload.ts + worker-boot-render.ts primitives. Three TODOs deferred: route wire, cold-start alignment, test coverage. Worker classified ready.
+- 2026-05-26 10:02:15Z tick: HEAD 2463a5f. Fired codex 8 follow-up inject to complete the three deferred integrations before codex 9 can land.
+- 2026-05-26 10:04:06Z supervisor-event: narrated_success_no_commit false positive on "ready Working tree clean" claim (post-2463a5f announcement, not forward prediction). NO-OP.
+- 2026-05-26 10:04:27Z: codex 8 follow-up partial step 1 shipped — `worker_boot_source_graph` runtime flag helper (29 ins). Worker chunking into atomic commits. More to come.
+- 2026-05-26 10:07:15Z tick: HEAD d9370d2. Worker reported ready after step 1, idle. Fired continuation inject for steps 2 (route wire) + 3 (cold-start alignment + test coverage).
+- 2026-05-26 10:12Z: codex 8 step 2 shipped (23c0eab). Worker parked again after one chunk. Fired step 3 + FIXES row close inject with explicit "don't wait for another inject; this completes codex 8".
+- 2026-05-26 10:13:15Z supervisor-event: narrated_success_no_commit false positive on post-23c0eab "ready" announcement. Step 3 inject already in flight. NO-OP.
+- 2026-05-26 10:17:15Z tick: codex 8 step 3 shipped (e51dec6 cold-start alignment). Worker parked again, deferred tests + FIXES row. Fired closeout inject for tests + Fix 45 row commit.
+- 2026-05-26 10:19:29Z: Fix 45 closed (665d203). Six total commits across codex 8: 2463a5f, d9370d2, 23c0eab, e51dec6, e435a88 (tests), 665d203 (FIXES row).
+- 2026-05-26 10:20Z: Fired codex 9 investigation (first-attach path using identical builder).
+- 2026-05-26 10:21:58Z supervisor-event: false-positive narrated_success_no_commit on post-Fix-45 "complete" claim. Codex 9 inject already delivered. NO-OP.
+- 2026-05-26 10:22:25Z tick: codex 9 investigation shipped (c1796bb). Fired ship spec: isFirstAttach helper, route auto-toggle, nextAction default priority, smart-compact integration safeguard.
+- 2026-05-26 10:27:15Z tick: HEAD c1796bb unchanged (no ship commit). Worker "ready" at 10:27 implies parked post-investigation. Codex 9 ship inject landed in jsonl (grep matches 5x) but worker didn't act. Re-injected with explicit "ship now, two-commit pattern, no parking between commits."
+- 2026-05-26 10:29:07Z supervisor-event: narrated_success_no_commit false-positive again on c1796bb "ready" claim. But worker IS actively working (Bash test run for first-attach at 10:29:33). Detector fires on retrospective claims that haven't yet led to NEW HEAD; the new HEAD is coming. NO-OP.
+- 2026-05-26 10:29:57Z: codex 9 implementation shipped. 3 files, 253 ins. New first-attach.test.ts. Awaiting FIXES row.
+- 2026-05-26 10:30Z: Fix 46 closed (db62c07). Codex 9 done.
+- 2026-05-26 10:32:16Z tick: HEAD db62c07. Worker idle. Fired codex 10 investigation (loose-ends handoff gate before worker start). Worker active ~150 min; Lex-driven smart-compact still unverified, deferring clear.
+- 2026-05-26 10:37:15Z tick: codex 10 investigation shipped (7dc0c21). Fired ship spec: new loose-ends-gate module, 7 detectors, worker-start wire, dashboard banner, tests.
+- 2026-05-26 10:39:15Z supervisor-event: narrated_success_no_commit false-positive on 7dc0c21 "ready" post-investigation. Ship inject just delivered. NO-OP.
+- 2026-05-26 10:39:46Z: codex 10 core shipped (loose-ends-gate.ts, 470 ins). Worker chunking; more commits expected for wire + tests + dashboard + FIXES row.
+- 2026-05-26 10:42:15Z tick: HEAD 3da61e1 (codex 10 core). Worker parked at ready post-core, didn't auto-continue to remaining deliverables. Fired continuation inject covering tests + worker-start wire + LooseEndsBanner + Fix 47 FIXES row.
+- 2026-05-26 10:47:14Z tick: HEAD d9bc5d7 (codex 10 tests, 13 pins). Worker parked again. Fired follow-up inject for wire + banner + Fix 47 FIXES row close.
+- 2026-05-26 10:48:08Z supervisor-event: narrated_success_no_commit false-positive on d9bc5d7 "ready" announcement. Wire inject just delivered. NO-OP.
+- 2026-05-26 10:52:14Z tick: codex 10 smart-compact wire shipped (a82451f). Worker parked. Fired close-out: dashboard route + voice wire + LooseEndsBanner + Fix 47 row.
+- 2026-05-26 10:53:07Z: codex 10 Fix 47 PARTIAL row shipped (gate module + tests + smart-compact wire). Dashboard route + voice wire + LooseEndsBanner deferred — flagged in TODO for tomorrow. Moving to codex 11.
+- 2026-05-26 10:54Z: Fired codex 11 investigation (grooming/escalation wiring + freshest-artifact compare + persistent-gap escalation).
+- 2026-05-26 10:54:50Z supervisor-event: worker confirmed Fix 47 🟡 partial with self-tracked deferrals (dashboard wire + voice wire + LooseEndsBanner + fireAutoAction wiring → codex 11 follow-up). Codex 11 investigation inject already in flight. NO-OP.
+- 2026-05-26 10:57:15Z tick: codex 11 investigation shipped (a099672). Fired ship spec: grooming-watch.ts module, 5 gap detectors, freshest-artifact compare, escalation channels via Fix 21 notify_class, 30-min debounce.
+- 2026-05-26 11:02:25Z tick: codex 11 core shipped (b9e5757 grooming-watch.ts). Worker parked. Fired close-out for tests + daemon wire + Fix 48 row.
+- 2026-05-26 11:07:16Z tick: codex 11 PARTIAL closed (Fix 48 d6334c8, grooming module + 10 tests; daemon wire deferred). Fired codex 12 investigation — FINAL stage: project_scope_id schema + kill label-match preload.
+- 2026-05-26 11:08:04Z supervisor-event: false-positive narrated_success on d6334c8 ready. Codex 12 inject in flight. NO-OP.
+- 2026-05-26 11:09Z: codex 12 (FINAL) investigation shipped. Fired ship spec: migration 044 adds project_scope_id + backfill from supervises_project_anchor_id, sibling preload swap, PATCH route, full test suite.
+- 2026-05-26 11:12:15Z tick: codex 12 core (migration 044) shipped 7df66e0. Worker parked. Fired close-out: insert path + preload swap + PATCH route + tests + Fix 49 row.
+- 2026-05-26 11:14:10Z: codex 12 fix-up — migration 044 backfill JOINs lex_session (self-correction by worker, 71729d3, 1 file, 16/3 +/-). Healthy.
+- 2026-05-26 11:17:16Z tick: HEAD 71729d3. Worker parked at ready. Codex 12 remaining: insert path + preload swap + PATCH route + tests + Fix 49 row. Fired resume inject.
+- 2026-05-26 11:22:15Z tick: codex 12 preload swap shipped (dc26f88). Worker parked. Fired final close-out: insert path + PATCH route + tests + Fix 49 row.
+- 2026-05-26 11:23:04Z supervisor-event: false-positive on dc26f88 ready. Final inject in flight. NO-OP.
+- 2026-05-26 11:23:09Z: Fix 49 PARTIAL row closes codex 12 (sibling preload swap shipped; insert path + PATCH route + tests deferred). LEX-AUTONOMY codex 1-12 sequence nominally COMPLETE. Multiple partials pending (codex 10 dashboard wire, codex 11 daemon wire, codex 12 insert path/PATCH/tests). All on TODO for tomorrow.
+- 2026-05-26 11:27:18Z tick: HEAD d8427a3 stable. Worker idle. LEX-AUTONOMY queue drained. Not injecting more — operator wake imminent (07:27 EDT), morning handover written. Letting worker rest.
+- 2026-05-26 11:32:15Z tick: HEAD d8427a3 stable. Worker idle. NO-OP.
+- 2026-05-26 11:37:13Z tick: HEAD d8427a3 stable. Worker idle. NO-OP.
+- 2026-05-26 11:42:10Z tick: HEAD d8427a3 stable. Worker idle. Queue empty. NO-OP.
+- 2026-05-26 11:47:14Z tick: HEAD stable. Idle wait for operator wake. Handover already in place. NO-OP.
+- 2026-05-26 11:52:10Z tick: HEAD stable. Idle. NO-OP.
+- 2026-05-26 11:57:11Z tick: HEAD stable. Idle. NO-OP.
+- 2026-05-26 12:02:10Z tick: HEAD stable. Idle. NO-OP.
+- 2026-05-26 12:07:11Z tick: HEAD stable. Idle. NO-OP.
+- 2026-05-26 12:12:12Z tick: HEAD stable. Idle. NO-OP.
+- 2026-05-26 12:17Z: stop condition met — queue empty, no pending verification, no open worker question, morning handover in place. CronDeleted self (01d5966f). Lex awaits operator wake.
+- 2026-05-26 14:09Z supervisor-event: post-stop daemon-side narrated_success on stable HEAD d8427a3. Cron already deleted, worker still parked at ready since 11:23Z. NO-OP. Operator still asleep ~10h.
+- 2026-05-26 16:30Z (12:30 EDT) operator wake: showed Lex screenshot of worker terminal flooded with hundreds of identical `Wrap your current work…` pastes. Audit query `/lex/smart-compact/recent?limit=20` confirmed: caller=`scheduler`, reason=`forced-no-stop`, action=`wrap`, anchor 391b88f6, cc bb73e5a4, firing every 60s, ctx ~85%. Diagnosis: daemon restarted ~10:15 EDT (pid 76292, uptime 8078s) but `dist/` never rebuilt before restart. `dist/dashboard/smart-compact-scheduler.js` dated 04:22 EDT, `smart-compact-routes.js` dated 07:18 EDT — both PRE-Fix-41-Stage3. Restart loaded stale binaries, old scheduler kept ticking with no wrap-cooldown. Restart ≠ rebuild. Morning checklist L156 said "click restart-daemon" but never "rebuild first" — gap caused the spam.
+- 2026-05-26 16:35Z: Lex emergency-stopped the loop. POST /lex/smart-compact/toggle mode=off (updated_by=lex-emergency-stop-wrap-spam). New scheduler ticks now short-circuit to action=noop in fireSmartCompact, no PTY inject, no audit row. Spam halted. Worker still has bloated input buffer + ~85% ctx; needs `/clear` + Lex-authored resume after rebuild + restart.
+- 2026-05-26 16:38Z: SMOKE-PROGRESS cursor updated with current blocker + 6-step recovery order. Awaiting operator decision on rebuild.
 - 2026-05-26 09:52Z: Codex 8 investigation doc shipped (`docs/bugs/2026-05-26-lex-autonomy-codex8-worker-boot-payload-investigation.md`). Six sections: current `/worker/clear-handoff` route at routes.ts:4506 + `buildWorkerHandoff` at worker-handoff.ts:380 mapped; source mix today (git + backlog JSON + audit_findings + docs INDEX + anchor-flat last_summary/chunks - corpus access shallow, no isRefStale/walk-back/pin). Proposed shared primitive `buildSourceGraphPayload(anchorId, opts)` in new module `source-graph-payload.ts` consumed by cold-start preload AND worker boot. Action-first render shape replacing today's git-first order. First-attach (codex 9) vs smart-clear delineated; codex 8 ships builder + smart-clear wire, codex 9 wires first-attach. Determinism rules: single-clock anchor, stable tiebreakers on every ORDER BY, no timestamps in render, pin tiebreak by ordering DESC then id ASC. 8 ship-spec deliverables. NO CODE this round. Awaiting ship spec.
 - 2026-05-26 09:31Z: Codex 7 investigation doc shipped (`docs/bugs/2026-05-26-lex-autonomy-codex7-adaptive-walk-back-investigation.md`). Six sections: current walk-back (blunt recency DESC + slice 5 in both anchor-refs + label-match), 12 input signals enumerated (lex_transcript_ref + brainstorm_sessions + distillation_error_log fields, embeddings absent), bundle = one ref per codex Q3 tightening, scoring function with 6 weight terms (recency_decay/freshness/continuity/pin/supersession/failure) + coverage gates per codex line 247, failure modes (no refs/all stale/pin read fail/missing embeddings/label rename), integration via new `07-daemon/src/lex/walk-back.ts` pure module imported by cold-start route. 8 ship-spec deliverables + default constants table (half_life=24h, floor=1500 tokens, ceiling=6000, N=6). NO CODE this round. Awaiting ship spec.
 - 2026-05-26 09:08Z: Codex 6 investigation doc shipped (`docs/bugs/2026-05-26-lex-autonomy-codex6-stale-failure-surfacing-investigation.md`). Five sections: UI surface today (LexColdStartPreloadPanel renders sibling/turns but drops Fix 42 staleness fields; BrainstormDetail has no pill), live_state payload (snapshot-context.ts:78 voice-path + curator.ts text-path - both miss stale_refs section), notification taxonomy + new `source='distillation-stale'` trigger w/ per-anchor cooldown, failure audit via worker_event_diagnostic_log stage='distillation.{skipped,failed,no_chunks}' (no new table), cross-cutting: threshold T default 5min, severity mapping warn/alert, codex 7 walk-back caveat compliance. Eight ship-spec deliverables enumerated. NO CODE this round. Awaiting ship spec.
 - 2026-05-26 08:43Z: Codex 5 investigation doc shipped (`docs/bugs/2026-05-26-lex-autonomy-codex5-sync-barrier-investigation.md`). Five sections per spec: cold-start preload pipeline map (entry point routes.ts:4503 + anchor-refs vs label-match paths), sync barrier definition + 5 race windows enumerated, freshness metadata gaps + proposed `latest_chunk_ms` + `chunks_at_distill_count` + `staleness_state` columns on `lex_transcript_ref`, failure modes survey (generator null-on-error, aggregate vs anchor write ordering, ingestor catchup), per-anchor vs per-session boundary handling. Three-part barrier mechanism proposed (synchronous ingestor catchup at session-end + per-ref staleness stamps + cold-start payload exposure). NO CODE this round. Awaiting ship spec.
 
-## Morning handover (filled at 7am or first user prompt)
+## Morning handover (07:23 EDT, 2026-05-26)
 
-Pending.
+### TL;DR
+
+LEX-AUTONOMY codex order items 1-12 are now nominally complete. All twelve had investigation docs + ship implementations. Codex 5/6/7/8/9 shipped clean. Codex 10/11/12 shipped CORE + tests but deferred peripheral wires (dashboard banner, daemon scheduler boot, insert-path + PATCH route). Those deferrals are tracked below.
+
+Also shipped tonight: Fix 40 cc-pty speak-queue (double-talk bug), Fix 41 smart-compact policy refactor (three-stage, daemon now mechanical-only), Fix 42 sync barrier + freshness metadata, Fix 43 stale/failure surfacing, Fix 44 adaptive walk-back, Fix 45 worker boot payload builder, Fix 46 first-attach path, Fix 47 loose-ends gate (partial), Fix 48 grooming-watch (partial), Fix 49 project_scope_id (partial).
+
+**Nothing has been rebuilt or restarted in the running daemon.** Operator must click dashboard restart-daemon to activate any of tonight's work. This Lex session dies on restart.
+
+### Morning checklist (priority order)
+
+1. **Click dashboard restart-daemon button.** Wait ~5 min for /health to report new pid.
+2. **Run MORNING SMOKE section in docs/SMOKE-TEST.md** — pre-staged with Fix 40 + Fix 41 probes + expected results + evidence queries.
+3. **Investigate codex 10/11/12 partials.** Each FIXES row marks 🟡 partial with explicit deferral list. Decide: ship today, defer to next milestone, or drop.
+
+### Open deferrals (codex 10/11/12 partials)
+
+- Codex 10: dashboard-spawn wire, voice "start project" wire, LooseEndsBanner.tsx, real fireAutoAction implementations (currently noop). Fix 47 row marked partial.
+- Codex 11: daemon.ts boot wire for installGroomingScheduler, dashboard surface for grooming events. Fix 48 row marked partial.
+- Codex 12: insert-path auto-copy of project_scope_id, PATCH /brainstorms/:id/project-scope route, full test suite (project-scope-id.test.ts). Fix 49 row marked partial. Migration 044 + backfill + sibling preload swap DID ship.
+
+### Smoke status
+
+- Steps 3.1 through 4.4 PASS (verified live earlier).
+- Step 5 voice mic-init: needs operator + mobile Safari.
+- Step 6 gate items: FIXES rows 27, 28, 32, 33, 34d.1 stamped smoke-verified earlier. 29 deferred (hold-up has no Tier-1 smoke step).
+- Morning smoke section added with Fix 40 + Fix 41 probes.
+
+### Commits since handover start (chronological)
+
+`be14396` Fix 40 cc-pty speak-queue → `a3e7c5e` Fix 40 row → `cbbe10c` cc-pty investigation → `e936908` Fix 41 Stage 1 → `edf1801` Stage 1 row → `bb12b4a` Stage 2 → `1baa396` Stage 2 row → `6359fd2` Stage 3 → `fae93d9` Fix 41 row close → ... → `7df66e0` codex 12 core → `71729d3` codex 12 backfill JOIN fix → `dc26f88` codex 12 preload swap → Fix 49 row close (just landed).
+
+### Smart-compact policy state post-Fix-41
+
+After daemon restart: daemon scheduler is GONE. Lex owns ALL smart-compact policy. Lex must poll `/lex/smart-compact/state?anchor_id=...` and decide wrap/fire on its own loop. Lex calls `/lex/smart-compact/clear-and-paste` with a Lex-authored summary when it decides to fire. Pre-codex-12 partials: insert path, PATCH route, tests still pending.
+
+### Daemon double-talk state
+
+cc-pty path Fix 40 NOT live until restart. Until then, this Lex session continues to double-talk on multi-segment turns. Post-restart, same-turn segments serialize, only across-turn or barge cancels.
+
+### Hard rules reminder
+
+This Lex session dies on daemon restart. Next Lex session reads OVERNIGHT + memory + recent commits to pick up.
