@@ -19,6 +19,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { IndexDb, LexTranscriptRefRow } from '../store/index-db.js';
+import { readTranscriptFile } from './loose-ends-gate.js';
 
 export type GroomingGapClass =
   | 'distill_failure_persistent'
@@ -61,6 +62,12 @@ export interface GroomingTickDeps {
   emit?: (input: GroomingEmitInput) => unknown;
   readMtime?: (p: string) => number | null;
   scanDir?: (dir: string) => string[];
+  /** Reads the bound worker jsonl. Defaults to the shared
+   * readTranscriptFile helper exported from loose-ends-gate.ts so
+   * the grooming tick and the loose-ends gate hit disk through the
+   * same code path (Fix 48 codex 11b). Tests inject a string-table
+   * stub so detection is deterministic. */
+  readTranscript?: (p: string) => string | null;
   state?: Map<string, number>;
   thresholds?: {
     distillFailurePersistentMs?: number;
@@ -80,6 +87,113 @@ export interface GroomingTickDeps {
 export const GROOMING_TICK_MS_DEFAULT = 30 * 60_000;
 export const GROOMING_DEBOUNCE_MS_DEFAULT = 30 * 60_000;
 const SEV_RANK: Record<GroomingSeverity, number> = { alert: 3, warn: 2, info: 1 };
+
+/* Word-bounded phrases that signal an explicit prompt-for-input
+ * even when the assistant turn does not literally end with '?'.
+ * Held narrow on purpose: a rhetorical "should I trust this?"
+ * inside a paragraph is already covered by the trailing-'?' check
+ * on the last sentence; this list catches the imperative ask shape
+ * where the question mark is missing or appears mid-line. */
+const PARKED_QUESTION_PHRASES = [
+  'let me know',
+  'should i',
+  'want me to',
+  'which one',
+];
+const PARKED_QUESTION_PHRASE_RE = new RegExp(
+  `\\b(?:${PARKED_QUESTION_PHRASES.join('|')})\\b`,
+  'i',
+);
+
+/* Tail-walk a CC jsonl to determine whether the most recent
+ * assistant turn parked on a question that the operator has not
+ * yet answered. Three signals trip the detector:
+ *   1. Trailing '?' on the last sentence of the last assistant turn.
+ *   2. Any of PARKED_QUESTION_PHRASES present as a word-bounded
+ *      match anywhere in the last assistant turn body.
+ * AND for both signals: no user-role record may follow the
+ * candidate assistant turn (we walk from the tail; finding a user
+ * record before the assistant clears the parked state), AND the
+ * assistant turn must be at least ageThresholdMs old.
+ *
+ * Returns the rendered question fragment so the emit body carries
+ * enough detail for the operator to recognise which question is
+ * waiting on a reply. */
+export function detectParkedQuestionPersistent(
+  jsonlText: string,
+  now: number,
+  ageThresholdMs: number,
+): { parked: boolean; question: string | null; age_ms: number | null } {
+  const lines = jsonlText.split(/\r?\n/).filter((l) => l.trim());
+  /* Bound to the last 50 records per spec - the cold-start tail
+   * reader uses the same window. */
+  const tail = lines.slice(-50);
+  let lastAssistantText = '';
+  let lastAssistantMs: number | null = null;
+  for (let i = tail.length - 1; i >= 0; i--) {
+    let rec: {
+      type?: string;
+      timestamp?: string;
+      message?: {
+        role?: string;
+        content?: string | Array<{ type?: string; text?: string }>;
+      };
+    };
+    try {
+      rec = JSON.parse(tail[i]!);
+    } catch {
+      continue;
+    }
+    if (rec.type === 'user') {
+      return { parked: false, question: null, age_ms: null };
+    }
+    if (rec.type === 'assistant') {
+      const c = rec.message?.content;
+      if (typeof c === 'string') {
+        lastAssistantText = c;
+      } else if (Array.isArray(c)) {
+        for (const p of c) {
+          if (p?.type === 'text' && typeof p.text === 'string') {
+            lastAssistantText = p.text;
+          }
+        }
+      }
+      if (rec.timestamp) {
+        const parsed = Date.parse(rec.timestamp);
+        if (Number.isFinite(parsed)) lastAssistantMs = parsed;
+      }
+      break;
+    }
+  }
+  const trimmed = lastAssistantText.trim();
+  if (!trimmed) return { parked: false, question: null, age_ms: null };
+  const lastSentence = trimmed.split(/(?<=[.!?])\s+/).pop() ?? trimmed;
+  const endsWithQuestionMark = lastSentence.endsWith('?');
+  const phraseMatch = PARKED_QUESTION_PHRASE_RE.exec(trimmed);
+  if (!endsWithQuestionMark && !phraseMatch) {
+    return { parked: false, question: null, age_ms: null };
+  }
+  const ageMs = lastAssistantMs ? now - lastAssistantMs : ageThresholdMs + 1;
+  if (ageMs < ageThresholdMs) {
+    return { parked: false, question: null, age_ms: ageMs };
+  }
+  /* Prefer the trailing question sentence for the rendered hint;
+   * fall back to the phrase-anchored fragment when the question
+   * mark was missing. */
+  const hint = endsWithQuestionMark
+    ? lastSentence
+    : phraseMatch
+      ? trimmed.slice(
+          Math.max(0, phraseMatch.index - 30),
+          Math.min(trimmed.length, phraseMatch.index + phraseMatch[0].length + 60),
+        )
+      : trimmed;
+  return {
+    parked: true,
+    question: hint.length > 180 ? hint.slice(0, 179) + '\u2026' : hint,
+    age_ms: ageMs,
+  };
+}
 
 function defaultReadMtime(p: string): number | null {
   try {
@@ -152,7 +266,13 @@ export function runGroomingTick(deps: GroomingTickDeps): GroomingTickResult {
   const t = deps.thresholds ?? {};
   const T = {
     distillFailurePersistentMs: t.distillFailurePersistentMs ?? 2 * 3_600_000,
-    parkedQuestionPersistentMs: t.parkedQuestionPersistentMs ?? 4 * 3_600_000,
+    /* parked_question_persistent: 30-min idle threshold per Fix 48
+     * codex 11b. Loose-ends-gate uses a shorter 5-min window because
+     * it fires on Lex resume (operator just clicked); the grooming
+     * tick is a background sweeper and wants a wider window so it
+     * does not alert on questions the user is actively typing a
+     * reply to. */
+    parkedQuestionPersistentMs: t.parkedQuestionPersistentMs ?? 30 * 60_000,
     distillErrorRepeatCount: t.distillErrorRepeatCount ?? 3,
     distillErrorWindowMs: t.distillErrorWindowMs ?? 24 * 3_600_000,
     looseEndsBlockPersistentMs: t.looseEndsBlockPersistentMs ?? 3_600_000,
@@ -267,11 +387,37 @@ export function runGroomingTick(deps: GroomingTickDeps): GroomingTickResult {
         evidence_ms: a.started_ms,
       });
     }
-    /* parked_question_persistent: piggyback on Fix 47 detector via
-     * tail walk. Cheap implementation: skip in v1; codex 12 can
-     * extend by reading the latest ref's transcript_path. The class
-     * is reserved here so the dashboard surface can map to it once
-     * detection wires. */
+    /* parked_question_persistent: tail-walk the latest ref's
+     * transcript_path looking for an assistant question that has
+     * been sitting unanswered for parkedQuestionPersistentMs. Shares
+     * the readTranscriptFile reader with loose-ends-gate so the
+     * grooming tick and the resume-time gate hit disk through the
+     * same code path. Question = trailing '?' on the last sentence
+     * OR word-bounded prompt-for-input phrase anywhere in the body
+     * ("let me know", "should I", "want me to", "which one"). */
+    const latestRef = refs
+      .slice()
+      .sort((a, b) => b.ordering - a.ordering)[0];
+    if (latestRef?.transcript_path) {
+      const reader = deps.readTranscript ?? readTranscriptFile;
+      const jsonlText = reader(latestRef.transcript_path);
+      if (jsonlText) {
+        const parked = detectParkedQuestionPersistent(
+          jsonlText,
+          now,
+          T.parkedQuestionPersistentMs,
+        );
+        if (parked.parked && parked.question) {
+          out.gaps.push({
+            class: 'parked_question_persistent',
+            anchor_id: anchorId,
+            severity: 'alert',
+            detail: `unanswered question (${humanAge(parked.age_ms ?? 0)} idle): "${parked.question}"`,
+            evidence_ms: parked.age_ms ?? null,
+          });
+        }
+      }
+    }
   }
 
   out.gaps.sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]);

@@ -101,12 +101,20 @@ export interface EvaluateLooseEndsOptions {
   runGit?: (args: string[], cwd: string) => string | null;
 }
 
-function defaultReadTranscript(p: string): string | null {
+/* Default jsonl reader for the gate's tail walkers. Exported so
+ * sibling jsonl consumers (Fix 48 grooming-watch parked-question
+ * detector) can reuse the same disk read instead of duplicating
+ * the readFileSync + try/catch shape. */
+export function readTranscriptFile(p: string): string | null {
   try {
     return fs.readFileSync(p, 'utf-8');
   } catch {
     return null;
   }
+}
+
+function defaultReadTranscript(p: string): string | null {
+  return readTranscriptFile(p);
 }
 
 function defaultRunGit(args: string[], cwd: string): string | null {

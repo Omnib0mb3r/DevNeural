@@ -271,6 +271,114 @@ describe('findFreshestArtifact (Fix 48)', () => {
   });
 });
 
+describe('parked_question_persistent detector (Fix 48 codex 11b)', () => {
+  /* All three pins seed a single ref pointing at a virtual transcript
+   * path. The deps.readTranscript stub returns synthetic jsonl
+   * keyed off the path so each pin builds the exact assistant/user
+   * turn shape it wants under test. The 30-min default threshold
+   * is overridden to a small value so test fixtures can use
+   * predictable timestamps without modelling real-world ages. */
+  const TRANSCRIPT_PATH = '/tmp/codex11b.jsonl';
+
+  function seedLatestRef(): void {
+    db.insertLexTranscriptRef({
+      lex_session_id: ANCHOR,
+      cc_session_id: CC,
+      transcript_path: TRANSCRIPT_PATH,
+      started_ms: NOW - 60 * 60_000,
+      ended_ms: null,
+      ordering: 99,
+    });
+  }
+
+  function makeJsonl(turns: { role: 'assistant' | 'user'; text: string; ts_ms: number }[]): string {
+    return turns
+      .map((t) =>
+        JSON.stringify({
+          type: t.role,
+          timestamp: new Date(t.ts_ms).toISOString(),
+          message: { role: t.role, content: [{ type: 'text', text: t.text }] },
+        }),
+      )
+      .join('\n');
+  }
+
+  it('fires alert when assistant ends with a question and 30 min has passed without a user reply', () => {
+    seedLatestRef();
+    const assistantMs = NOW - 31 * 60_000;
+    const jsonl = makeJsonl([
+      { role: 'user', text: 'go for it', ts_ms: NOW - 45 * 60_000 },
+      {
+        role: 'assistant',
+        text: 'I can take either path - which one do you want first?',
+        ts_ms: assistantMs,
+      },
+    ]);
+    const emit = vi.fn();
+    const out = runGroomingTick({
+      db,
+      now: () => NOW,
+      emit,
+      readTranscript: (p) => (p === TRANSCRIPT_PATH ? jsonl : null),
+    });
+    const parked = out.gaps.find((g) => g.class === 'parked_question_persistent');
+    expect(parked).toBeDefined();
+    expect(parked?.severity).toBe('alert');
+    expect(emit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        push: 'force',
+        severity: 'alert',
+        title: expect.stringContaining('parked_question_persistent'),
+      }),
+    );
+  });
+
+  it('does not fire when the user has replied since the assistant question', () => {
+    seedLatestRef();
+    const jsonl = makeJsonl([
+      {
+        role: 'assistant',
+        text: 'Sure, should I try the deterministic path?',
+        ts_ms: NOW - 35 * 60_000,
+      },
+      { role: 'user', text: 'yes please', ts_ms: NOW - 20 * 60_000 },
+    ]);
+    const emit = vi.fn();
+    const out = runGroomingTick({
+      db,
+      now: () => NOW,
+      emit,
+      readTranscript: () => jsonl,
+    });
+    expect(out.gaps.find((g) => g.class === 'parked_question_persistent')).toBeUndefined();
+    /* emit may have fired for unrelated gap classes; the assertion
+     * is just that no parked_question_persistent emit landed. */
+    const calls = emit.mock.calls.filter((c) =>
+      String((c[0] as { title?: string }).title ?? '').includes('parked_question_persistent'),
+    );
+    expect(calls.length).toBe(0);
+  });
+
+  it('does not fire when the latest assistant turn is a statement (no question marker, no prompt phrase)', () => {
+    seedLatestRef();
+    const jsonl = makeJsonl([
+      {
+        role: 'assistant',
+        text: 'Shipped the patch. Build is clean and the dist regenerated.',
+        ts_ms: NOW - 45 * 60_000,
+      },
+    ]);
+    const emit = vi.fn();
+    const out = runGroomingTick({
+      db,
+      now: () => NOW,
+      emit,
+      readTranscript: () => jsonl,
+    });
+    expect(out.gaps.find((g) => g.class === 'parked_question_persistent')).toBeUndefined();
+  });
+});
+
 describe('installGroomingScheduler (Fix 48 codex 11a daemon boot)', () => {
   /* Pins the daemon-side boot wire: installGroomingScheduler must
    * return a handle whose tickNow() runs runGroomingTick against
