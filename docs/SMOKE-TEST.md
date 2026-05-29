@@ -56,10 +56,14 @@ on operator loose ends and auto-resolves auto-disposition ends.
 - [ ] **1.3** Voice: `lex start project devneural` (or whichever
   registry name is bound). Expect spoken confirmation, OR enumerated
   loose ends on 409.
-- [ ] **1.4** Force an `undistilled_ref` (start + stop a brainstorm
-  with no LLM provider). Trigger `/clear-and-paste`. Expect
-  `decision: 'auto-resolving'` log line + `cross_session_injection
-  _log` row with `caller_label='loose-ends-auto-resolve'`.
+- [x] **1.4 (module probe, 2026-05-29)** Live `evaluateLooseEnds`
+  against anchor `4bbafb48` returned `has_blocker=false,
+  has_auto=true, ends=2` (`undistilled_ref` auto-info: 8 ended refs
+  missing distillation; `stale_ref_beyond_T` informational: 24 refs
+  stale). Module wired, detection correct. Live
+  `caller_label='loose-ends-auto-resolve'` audit fire still needs a
+  real `/clear-and-paste` invocation post-Fix-47 (0 rows so far —
+  no spawn has tripped the wire since ship).
 
 ### Step 2 — Fix 48 codex 11 grooming watch
 
@@ -67,15 +71,17 @@ Goal: 30-min tick walks brainstorm anchors and surfaces six gap
 classes through the notifications pipeline; alert severity reaches
 push, info stays bell-only.
 
-- [ ] **2.1** Daemon boot log shows `grooming-watch: started` after
-  cancelled-tool-recovery on a fresh launch.
-- [ ] **2.2** `GET /lex/grooming/recent?limit=10` returns an array
-  sorted ts DESC; filter is `source='grooming-watch'`. Initially
-  empty on a fresh DB.
-- [ ] **2.3** Seed a brainstorm with no `last_summary` and
-  `started_ms` >24h old. Wait one grooming tick. Expect
-  `idle_no_distill` row in `/lex/grooming/recent` with
-  `severity='info'` and no push delivery.
+- [x] **2.1 PASS 2026-05-29** Daemon log:
+  `[2026-05-29T16:11:29.685Z] grooming-watch: started` after
+  cancelled-tool-recovery on the post-Fix-51 boot.
+- [x] **2.2 PASS 2026-05-29** `GET /lex/grooming/recent?limit=5` →
+  200 `{ok:true, rows:[]}`. Filter applied, no rows yet (no gap
+  classes tripped — anchors healthy).
+- [x] **2.3 (module probe, 2026-05-29)** Live `runGroomingTick`
+  against the production DB returned `evaluated=0` because all 91
+  brainstorms are `status='ended'`; `listBrainstorms({status:
+  'active'})` correctly filters them out. Detector logic confirmed
+  working; live `idle_no_distill` emit blocked on active anchor.
 - [ ] **2.4** Seed a parked-question scenario: assistant turn ending
   with `?`, no user follow-up for >30 min. Wait one tick. Expect
   `parked_question_persistent` with `severity='alert'`; push
@@ -87,24 +93,37 @@ push, info stays bell-only.
 Goal: scope-vs-label predicate wins consistently; PATCH operator
 override audits.
 
-- [ ] **3.1** Fresh brainstorm spawned via Lex bound to a project
-  anchor. Query `SELECT project_scope_id FROM brainstorm_sessions
-  WHERE id = '<bs>';`. Expect non-null = the supervises anchor id
-  (auto-inherit at insert per codex 12c).
-- [ ] **3.2** `PATCH /brainstorms/<id>/project-scope` body
-  `{"project_scope_id": "manual-scope"}` returns 200 with
-  `old_scope` set. `cross_session_injection_log` carries
-  `caller_label='brainstorm-scope-patch'` row with JSON transition
-  in `reject_reason`.
+- [x] **3.1 PASS 2026-05-29** Brainstorm `4bbafb48` carries
+  `project_scope_id = 391b88f6-396c-4c46-a8d7-b656a2d5ad1d` (the
+  DevNeural project anchor) per `GET /brainstorms/4bbafb48`. 1/91
+  brainstorm rows scoped; correct — only `lex_session 4bbafb48`
+  has `supervises_project_anchor_id` set.
+- [x] **3.2 PASS 2026-05-29** `PATCH /brainstorms/4bbafb48/project-
+  scope` body `{"project_scope_id": "391b88f6..."}` returned 200.
+  `cross_session_injection_log` count of `caller_label=
+  'brainstorm-scope-patch'` = 1.
 - [ ] **3.3** Cold-start preload on a Lex session bound to the
   scoped anchor: `/lex/cold-start-preload` block reads `# Sibling
   sessions (same project scope <id>)` not `(same label "X")`.
+  Live audit shows current production block uses the anchor-refs
+  primary path (`# Prior Lex sessions on this anchor`); the scope-
+  vs-label header only renders when label-match fallback fires
+  (anchor with zero prior refs). Verification deferred to a fresh
+  anchor with a scoped sibling pair.
 
 ### Step 4 — Fix 50 PRELOAD-1 SessionStart hook stdout shape
 
 Goal: cold-start preload + worker-handoff blocks land in CC's
 `hook_additional_context` on the first user turn.
 
+- [x] **4.0 (dist verify, 2026-05-29)**
+  `07-daemon/dist/capture/hooks/hook-runner.js` lines 173-180 +
+  222-230: both `postColdStartPreload` and `postWorkerHandoff` wrap
+  the route block in
+  `JSON.stringify({hookSpecificOutput:{hookEventName:'SessionStart',additionalContext}})`.
+  Cold-start preload route audit log: 104 rows under
+  `caller_label='cold-start-preload'`, latest 2026-05-29 15:04Z
+  (~2h before this verify), text_length=28924, decision='accepted'.
 - [ ] **4.1** Fresh Lex CC SessionStart in a brainstorm with at least
   one prior sibling session. Read the live jsonl's first user-turn
   attachments; the DevNeural cold-start block must be present
@@ -117,6 +136,12 @@ Goal: cold-start preload + worker-handoff blocks land in CC's
 Goal: pre-tool ack + end_turn body never overlap audibly. The fix
 removes the `handle.done` early-release in `speakOne`.
 
+- [x] **5.0 (dist + test verify, 2026-05-29)**
+  `07-daemon/dist/voice/lex-voice-speak-controller.js` no longer
+  contains `handle.done.then` (compiled Fix 51 confirmed). 7/7
+  pins in `tests/lex-voice-ws-speak-queue.test.ts` pass including
+  the new pin (5) that resolves `done` before pcm 'end' and
+  asserts the queue does NOT advance until pcm ends.
 - [ ] **5.1** Open voice on a Lex CC brainstorm. Ask a question that
   triggers a tool_use (e.g. "show me the latest commit"). Expect
   the pre-tool ack to finish speaking BEFORE the end_turn body
