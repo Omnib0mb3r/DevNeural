@@ -2492,12 +2492,54 @@ export async function registerDashboardRoutes(
    * via terminal sendText into the host's VS Code. Removed. */
   app.post('/projects/:id/start-claude', async (req, reply) => {
     const id = (req.params as { id: string }).id;
-    const body = (req.body ?? {}) as { dangerous?: boolean };
+    const body = (req.body ?? {}) as {
+      dangerous?: boolean;
+      anchor_id?: string;
+    };
     const { getProject } = await import('../identity/registry.js');
     const proj = getProject(id);
     if (!proj || !proj.root) {
       reply.code(404);
       return { ok: false, error: `project ${id} not found in registry` };
+    }
+    /* LEX-AUTONOMY codex 10b (Fix 47): loose-ends gate preflight.
+     * When the caller supplies an anchor_id (the supervising Lex
+     * brainstorm UUID), enforceLooseEndsGate runs first. Blocked
+     * decisions short-circuit with HTTP 409 + the structured report
+     * so the dashboard can render the LooseEndsBanner before the
+     * worker spawns. Auto-resolving and clear decisions fall
+     * through. Missing anchor_id = caller is not Lex-supervised, so
+     * we skip the gate entirely and spawn as before. */
+    if (typeof body.anchor_id === 'string' && body.anchor_id.trim()) {
+      const { preflightLooseEndsForSpawn } = await import(
+        '../lex/loose-ends-auto-actions.js'
+      );
+      const { pickProvider } = await import('../llm/index.js');
+      const { createPerSessionDistillationGenerator } = await import(
+        '../lex/distillation-generator.js'
+      );
+      const provider = pickProvider();
+      const generatorActive =
+        provider && provider.isConfigured() && provider.name !== 'anthropic';
+      const perSessionGenerator = generatorActive
+        ? createPerSessionDistillationGenerator({ db: store.db, provider })
+        : undefined;
+      const preflight = await preflightLooseEndsForSpawn(
+        store.db,
+        body.anchor_id.trim(),
+        {
+          log: (msg) => log(msg),
+          ...(perSessionGenerator ? { perSessionGenerator } : {}),
+        },
+      );
+      if (preflight.blocked && preflight.decision) {
+        reply.code(409);
+        return {
+          ok: false,
+          error: 'loose-ends gate blocked spawn',
+          loose_ends: preflight.decision.report,
+        };
+      }
     }
     const command = body.dangerous
       ? 'claude --dangerously-skip-permissions'

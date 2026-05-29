@@ -255,3 +255,75 @@ export function createLooseEndsFireAutoAction(
     };
   };
 }
+
+/* LEX-AUTONOMY codex 10b (Fix 47 partial closure step 2): shared
+ * preflight wrapper for any spawn / handoff path that wants to
+ * honour the gate. Wraps enforceLooseEndsGate with the same provider
+ * lookup the smart-compact `/clear-and-paste` preflight uses, so
+ * BF-4 stays mirrored on the dashboard `/projects/:id/start-claude`
+ * spawn and any future caller (voice `start project`, supervisor
+ * auto-spawn).
+ *
+ * Returns a discriminated `{ blocked: boolean, decision: GateDecision | null }`.
+ * The caller forwards the report payload when blocked is true and
+ * proceeds with the spawn otherwise. A gate failure (no anchor, no
+ * refs, observational error) returns `blocked: false` so the spawn
+ * always finishes; the gate must never strand the operator. */
+export interface PreflightLooseEndsOptions {
+  log?: (msg: string) => void;
+  /** Test seam: substitute the gate runner. Defaults to
+   * enforceLooseEndsGate (production). */
+  enforce?: (
+    db: IndexDb,
+    anchorId: string,
+    opts: { fireAutoAction: LooseEndsFireAutoAction },
+  ) => Promise<import('./loose-ends-gate.js').GateDecision>;
+  /** Test seam: substitute the per-session generator factory so the
+   * BF-4 / provider-not-configured branches are deterministic. */
+  perSessionGenerator?: PerSessionDistillationGenerator;
+}
+
+export async function preflightLooseEndsForSpawn(
+  db: IndexDb,
+  anchorId: string,
+  opts: PreflightLooseEndsOptions = {},
+): Promise<{
+  blocked: boolean;
+  decision: import('./loose-ends-gate.js').GateDecision | null;
+}> {
+  const log = opts.log ?? ((): void => undefined);
+  if (!anchorId) return { blocked: false, decision: null };
+  try {
+    const { enforceLooseEndsGate } = await import('./loose-ends-gate.js');
+    /* Default to no perSessionGenerator when the caller did not
+     * inject one; the gate still runs and reports `skipped` for
+     * auto classes (caught by createLooseEndsFireAutoAction's
+     * generator-absent branch) so the audit log captures the gap
+     * without the route having to wire pickProvider itself. */
+    const fireAutoAction = createLooseEndsFireAutoAction({
+      db,
+      anchorId,
+      log,
+      ...(opts.perSessionGenerator
+        ? { perSessionGenerator: opts.perSessionGenerator }
+        : {}),
+    });
+    const enforce = opts.enforce ?? enforceLooseEndsGate;
+    const decision = await enforce(db, anchorId, { fireAutoAction });
+    if (decision.kind === 'blocked') {
+      log(
+        `[loose-ends-preflight] blocked anchor=${anchorId.slice(0, 8)} ends=${decision.report.ends.length}`,
+      );
+      return { blocked: true, decision };
+    }
+    if (decision.kind === 'auto-resolving') {
+      log(
+        `[loose-ends-preflight] auto-resolve anchor=${anchorId.slice(0, 8)} actions=${decision.auto_actions.length}`,
+      );
+    }
+    return { blocked: false, decision };
+  } catch (err) {
+    log(`[loose-ends-preflight] gate threw: ${(err as Error).message}`);
+    return { blocked: false, decision: null };
+  }
+}
