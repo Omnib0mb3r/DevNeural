@@ -48,9 +48,16 @@ export type VoiceCommandKind =
   | 'end_session'
   | 'standby'
   | 'listen'
-  | 'hold_up';
+  | 'hold_up'
+  | 'start_project';
 
-export type VoiceCommand = { kind: VoiceCommandKind };
+/* LEX-AUTONOMY codex 10c (Fix 47 step 3): start_project carries the
+ * captured project name. The lex-voice-ws handler resolves it to a
+ * project registry id via fuzzy match before POSTing to
+ * /projects/:id/start-claude. */
+export type VoiceCommand =
+  | { kind: Exclude<VoiceCommandKind, 'start_project'> }
+  | { kind: 'start_project'; project_name: string };
 
 export const ALL_VOICE_COMMAND_KINDS: ReadonlyArray<VoiceCommandKind> = [
   'disable',
@@ -61,6 +68,7 @@ export const ALL_VOICE_COMMAND_KINDS: ReadonlyArray<VoiceCommandKind> = [
   'standby',
   'listen',
   'hold_up',
+  'start_project',
 ];
 
 const LEX_PREFIX = String.raw`\blex\s+`;
@@ -96,6 +104,14 @@ const DISABLE_RE = new RegExp(LEX_PREFIX + String.raw`disable\b`);
  * which only stops TTS. Distinct from standby ("hold on") which only
  * pauses the mic. Matches "lex hold up" and "lex holdup". */
 const HOLD_UP_RE = new RegExp(LEX_PREFIX + String.raw`(?:hold\s*up|holdup)\b`);
+/* "lex start project <name>" — the trailing capture group eats the
+ * rest of the utterance so multi-word project names ("dev neural")
+ * round-trip through the matcher intact. The handler trims +
+ * collapses whitespace before fuzzy-matching against the project
+ * registry. */
+const START_PROJECT_RE = new RegExp(
+  LEX_PREFIX + String.raw`start\s+project\s+(.+)$`,
+);
 
 function normalize(text: string): string {
   return text
@@ -126,5 +142,14 @@ export function matchVoiceCommand(text: string): VoiceCommand | null {
   if (LISTEN_RE.test(norm)) return { kind: 'listen' };
   if (UNMUTE_RE.test(norm)) return { kind: 'unmute' };
   if (DISABLE_RE.test(norm)) return { kind: 'disable' };
+  /* start_project matched LAST so the matcher's prefix-keyed
+   * commands always win on overlap. "lex start project" never
+   * collides with the static commands above; the broad capture
+   * group here is the reason it sits at the end. */
+  const sp = START_PROJECT_RE.exec(norm);
+  if (sp && sp[1]) {
+    const project = sp[1].trim().replace(/\s+/g, ' ');
+    if (project) return { kind: 'start_project', project_name: project };
+  }
   return null;
 }

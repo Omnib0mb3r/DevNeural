@@ -1582,6 +1582,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   function dispatchVoiceCommand(
     kind: VoiceCommandKind,
     source: 'transcript' | 'wake',
+    payload?: { project_name?: string },
   ): boolean {
     const now = Date.now();
     const prev = state.lastVoiceCmdMs[kind] ?? 0;
@@ -1698,6 +1699,93 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         spokenSegmentHashes.clear();
         return true;
       }
+      case 'start_project': {
+        /* LEX-AUTONOMY codex 10c (Fix 47 step 3): "lex start project
+         * <name>" routes through the same dashboard endpoint that
+         * the Start Claude button hits, so the loose-ends gate +
+         * VS Code spawn behave identically across surfaces. The
+         * voice surface reads the result back to the operator: on
+         * 409 it enumerates the first three blocking loose-end
+         * classes; on success it confirms the project name. */
+        const projectName = (payload?.project_name ?? '').trim();
+        if (!projectName) return false;
+        void runStartProjectVoice(projectName);
+        return true;
+      }
+    }
+  }
+
+  async function runStartProjectVoice(projectName: string): Promise<void> {
+    /* Resolve project registry by case-insensitive fuzzy match:
+     * exact id, then exact name, then prefix-of-name, then
+     * substring. First match wins. Bail with a spoken response
+     * when nothing matches so the operator hears the failure. */
+    let projectId: string | null = null;
+    let projectLabel = projectName;
+    try {
+      const { listProjects } = await import('../identity/registry.js');
+      const projects = listProjects();
+      const target = projectName.toLowerCase();
+      const exactId = projects.find((p) => p.id.toLowerCase() === target);
+      const exactName = projects.find(
+        (p) => (p.name ?? '').toLowerCase() === target,
+      );
+      const prefix = projects.find((p) =>
+        (p.name ?? '').toLowerCase().startsWith(target),
+      );
+      const substr = projects.find((p) =>
+        (p.name ?? '').toLowerCase().includes(target),
+      );
+      const hit = exactId ?? exactName ?? prefix ?? substr ?? null;
+      if (hit) {
+        projectId = hit.id;
+        projectLabel = hit.name ?? hit.id;
+      }
+    } catch {
+      /* registry read failed; fall through to "not found" path */
+    }
+    if (!projectId) {
+      void speak(`Could not find a project matching ${projectName}.`);
+      return;
+    }
+    const port = Number(process.env.DEVNEURAL_PORT ?? 3747);
+    const url = `http://127.0.0.1:${port}/projects/${encodeURIComponent(projectId)}/start-claude`;
+    const anchorId = state.brainstormId ?? null;
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          dangerous: false,
+          ...(anchorId ? { anchor_id: anchorId } : {}),
+        }),
+      });
+      if (res.status === 409) {
+        const body = (await res.json()) as {
+          loose_ends?: {
+            ends?: Array<{ class: string; detail?: string }>;
+          };
+        };
+        const ends = body.loose_ends?.ends ?? [];
+        const top = ends.slice(0, 3).map((e) => e.class.replace(/_/g, ' '));
+        const list =
+          top.length > 0 ? top.join(', ') : 'an unspecified loose end';
+        void speak(
+          `Cannot start ${projectLabel} yet. Loose ends blocking: ${list}.`,
+        );
+        return;
+      }
+      if (!res.ok) {
+        void speak(
+          `Failed to start ${projectLabel}; daemon returned status ${res.status}.`,
+        );
+        return;
+      }
+      void speak(`Starting ${projectLabel}.`);
+    } catch (err) {
+      void speak(
+        `Could not reach the daemon to start ${projectLabel}: ${(err as Error).message}.`,
+      );
     }
   }
 
@@ -1854,7 +1942,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       `[voice-ws] matcher result kind=${cmd?.kind ?? 'none'} duringTts=${state.utteranceStartedDuringTts}`,
     );
     if (cmd) {
-      dispatchVoiceCommand(cmd.kind, 'transcript');
+      dispatchVoiceCommand(
+        cmd.kind,
+        'transcript',
+        cmd.kind === 'start_project' ? { project_name: cmd.project_name } : undefined,
+      );
       state.utteranceStartedDuringTts = false;
       return;
     }
@@ -2024,7 +2116,13 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         console.log(
           `[voice-ws] mid-turn-queue: lex command "${lateCmd.kind}" punches through, dispatching synchronously`,
         );
-        dispatchVoiceCommand(lateCmd.kind, 'transcript');
+        dispatchVoiceCommand(
+          lateCmd.kind,
+          'transcript',
+          lateCmd.kind === 'start_project'
+            ? { project_name: lateCmd.project_name }
+            : undefined,
+        );
         return;
       }
       state.pendingUserUtterances.push(result.text);
