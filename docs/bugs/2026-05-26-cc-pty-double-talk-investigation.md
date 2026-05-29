@@ -1,11 +1,46 @@
 # cc-pty Voice Double-Talk Regression — Investigation
 
 **Reported:** 2026-05-26 03:28 EDT by operator (live, this Lex CC session).
-**Status:** investigation only. No fix shipped. Two-spec policy applies.
+**Status:** CLOSED 2026-05-29. See Closure section at end of doc.
 **Scope:** `07-daemon/src/voice/lex-voice-ws.ts` cc-pty path. Direct-llm
 already coalesced in Fix 35 (commit `2718b85`).
 
 User rule (hard, all paths): never play two TTS streams at the same time.
+
+## Closure (2026-05-29)
+
+Two fixes ship together as the cc-pty double-talk closure:
+
+- **Fix 40** (`be14396`, 2026-05-26): introduced the speak-queue
+  controller (`07-daemon/src/voice/lex-voice-speak-controller.ts`)
+  with SERIALIZE semantics for same-turn `speak()` calls. Candidate 1
+  in this doc named the right surface (`speak()` at line 1288) but
+  recommended cancel-on-replace. Operator clarified the contract
+  during ship to SERIALIZE within a logical turn instead. Fix 40
+  shipped that contract with six test pins.
+
+- **Fix 51** (`e0978ee`, 2026-05-29): root cause. Fix 40's SERIALIZE
+  was correctly drafted but released its `await` Promise on the wrong
+  signal. `speakOne` had THREE release paths — `pcm 'end'`,
+  `pcm 'error'`, AND `void handle.done.then(...)`. `handle.done`
+  resolves in `piper.synthesize` on `proc.on('exit')`, which fires
+  BEFORE the kernel drains piper's stdout pipe. The Readable `pcm`
+  stream's `data` handler kept flushing buffered chunks via
+  `sendBinary` AFTER `speakOne` returned and `runQueue` spawned the
+  next segment. Two PCM streams to the client = audible overlap.
+  Fix: drop the `handle.done.then(...)` branch. Wait for `pcm 'end'`
+  or `pcm 'error'` only. New test pin (5) in
+  `tests/lex-voice-ws-speak-queue.test.ts` resolves `done` while pcm
+  'end' is pending and asserts the queue does NOT advance until pcm
+  ends.
+
+The investigation's "Recommended next-spec scope" section (lines
+216-232) is now obsolete. It recommended cancel-on-replace
+(`killActiveTts('replace')`); the operator-clarified SERIALIZE
+contract from Fix 40 ship superseded that recommendation. Retained
+below for historical context only.
+
+Live smoke pending: SMOKE-TEST.md Step 5.1-5.3.
 
 ## Reproduction context
 
