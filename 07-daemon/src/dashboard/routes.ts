@@ -3710,6 +3710,28 @@ export async function registerDashboardRoutes(
     }
   });
 
+  /* LEX-AUTONOMY codex 12b: operator-facing PATCH for
+   * brainstorm_sessions.project_scope_id. See
+   * patchBrainstormProjectScope at the bottom of this module for
+   * the full validation + audit contract. The route is a thin
+   * wrapper so the pure helper can be unit-tested without a
+   * fastify boot. */
+  app.patch('/brainstorms/:id/project-scope', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { project_scope_id?: string | null };
+    const result = await patchBrainstormProjectScope(store.db, id, body);
+    reply.code(result.status);
+    if (!result.ok) {
+      return { ok: false, error: result.error ?? 'patch failed' };
+    }
+    return {
+      ok: true,
+      brainstorm_id: result.brainstorm_id,
+      project_scope_id: result.project_scope_id ?? null,
+      old_scope: result.old_scope ?? null,
+    };
+  });
+
   /* Wave 3 fixup (bug: 2026-05-10-brainstorm-picker-and-transcripts).
    * Return the brainstorm_chunks rows for a session so the dashboard can
    * render the text transcript alongside the audio player. limit is
@@ -5864,4 +5886,107 @@ function writeDraftAsPendingWikiPage(args: {
   } catch (err) {
     return { ok: false, error: (err as Error).message };
   }
+}
+
+/* LEX-AUTONOMY codex item 12b (Fix 49 partial closure step 3).
+ *
+ * Operator-facing setter for brainstorm_sessions.project_scope_id.
+ * The scope column already auto-inherits from the bound lex_session
+ * at insert time (codex 12c, b189956) and drives the sibling-index
+ * label-match block (codex 12a, ecab2d8); this helper closes the
+ * loop by letting the dashboard / a corrective script repoint or
+ * clear the scope after the fact without touching the DB by hand.
+ *
+ * Validation:
+ *   - id must be a v4-shaped UUID; 400 otherwise.
+ *   - body.project_scope_id is REQUIRED; pass null to clear, a
+ *     non-empty string to set. Omitting the field is a 400 so the
+ *     caller cannot accidentally no-op via a typo.
+ *   - 404 if the brainstorm row does not exist.
+ *
+ * Audit: every accepted patch lands a cross_session_injection_log
+ * row with caller_label='brainstorm-scope-patch'. target_session is
+ * the brainstorm id (the table accepts any uuid-shaped value; this
+ * is the routine convention for non-target operator actions). The
+ * reject_reason column carries a JSON blob {old_scope, new_scope}
+ * so the audit log shows the full transition. No-op patches (new
+ * value equal to old) still log so the trail is dense.
+ *
+ * Returns a status code alongside the body so the route handler can
+ * forward it without re-deriving from the error string. */
+const BRAINSTORM_SCOPE_PATCH_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export interface PatchBrainstormProjectScopeResult {
+  status: number;
+  ok: boolean;
+  error?: string;
+  brainstorm_id?: string;
+  project_scope_id?: string | null;
+  old_scope?: string | null;
+}
+
+export async function patchBrainstormProjectScope(
+  db: import('../store/index-db.js').IndexDb,
+  id: string,
+  body: { project_scope_id?: string | null } | null | undefined,
+): Promise<PatchBrainstormProjectScopeResult> {
+  if (!id || !BRAINSTORM_SCOPE_PATCH_UUID_RE.test(id)) {
+    return { status: 400, ok: false, error: 'id must be uuid' };
+  }
+  if (
+    !body ||
+    !Object.prototype.hasOwnProperty.call(body, 'project_scope_id')
+  ) {
+    return {
+      status: 400,
+      ok: false,
+      error: 'project_scope_id field required (pass null to clear)',
+    };
+  }
+  const existing = db.getBrainstorm(id);
+  if (!existing) {
+    return { status: 404, ok: false, error: 'brainstorm not found' };
+  }
+  const raw = body.project_scope_id;
+  let newScope: string | null;
+  if (raw === null) {
+    newScope = null;
+  } else if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    newScope = trimmed.length === 0 ? null : trimmed;
+  } else {
+    return {
+      status: 400,
+      ok: false,
+      error: 'project_scope_id must be a string or null',
+    };
+  }
+  const oldScope = existing.project_scope_id ?? null;
+  const updated = db.updateBrainstorm(id, { project_scope_id: newScope });
+  try {
+    const { randomUUID } = await import('node:crypto');
+    db.insertCrossSessionLog({
+      id: randomUUID(),
+      target_session: id,
+      caller_label: 'brainstorm-scope-patch',
+      text_preview: '',
+      text_length: 0,
+      decision: 'accepted',
+      reject_reason: JSON.stringify({
+        old_scope: oldScope,
+        new_scope: newScope,
+      }),
+      brainstorm_id: id,
+    });
+  } catch {
+    /* audit row failures must not block the patch response */
+  }
+  return {
+    status: 200,
+    ok: true,
+    brainstorm_id: id,
+    project_scope_id: updated?.project_scope_id ?? newScope,
+    old_scope: oldScope,
+  };
 }
