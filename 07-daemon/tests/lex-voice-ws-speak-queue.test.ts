@@ -93,9 +93,17 @@ function makeBundle(): Bundle {
   return { state, ctrl, synthCalls, handles, sentFrames, binaryChunks };
 }
 
-/* Microtask flush — vitest does not return to event loop between
- * promise-chained awaits unless we yield explicitly. */
+/* Microtask + macrotask flush. The controller's release path depends
+ * on the Readable 'end' event (Fix 51), which Node schedules through
+ * the process.nextTick / setImmediate queue rather than the Promise
+ * microtask queue. Pure microtask drain (Promise.resolve()) leaves
+ * pcm 'end' listeners un-fired between assertions; an explicit
+ * setImmediate yield drains them. */
 async function flush(): Promise<void> {
+  for (let i = 0; i < 5; i++) {
+    await Promise.resolve();
+  }
+  await new Promise<void>((r) => setImmediate(r));
   for (let i = 0; i < 5; i++) {
     await Promise.resolve();
   }
@@ -209,6 +217,40 @@ describe('speak-queue controller (Fix 40)', () => {
     const cancelled = ctrl.killActive();
     expect(cancelled).toBe(false);
     expect(state.partialChain).toEqual([]);
+  });
+
+  it('(5) Fix 51: handle.done resolving early (proc.exit before pcm end) MUST NOT release speakOne until pcm "end"', async () => {
+    /* This is the cc-pty double-talk root cause Fix 40 missed.
+     * piper.synthesize resolves `done` on proc.exit, which fires
+     * BEFORE the kernel drains stdout PCM into the Readable. If the
+     * controller releases on done alone, runQueue spawns the next
+     * piper child while the previous ctx is still emitting buffered
+     * chunks via pcm 'data'. Two PCM streams to client = audible
+     * double-talk. The fix removes the handle.done early-release;
+     * this pin holds the line. */
+    const { ctrl, synthCalls, handles, state } = makeBundle();
+    ctrl.speak('first segment');
+    ctrl.speak('second segment');
+    await flush();
+    expect(synthCalls).toEqual(['first segment']);
+    /* Simulate piper proc.exit arriving before stdout drain: the
+     * `done` promise resolves while pcm 'end' is still pending. */
+    handles[0]!.resolveDone();
+    await flush();
+    /* Critical: ctxB MUST NOT have spawned. state.ttsActive MUST
+     * still reference ctxA. The queue still carries 'second segment'. */
+    expect(synthCalls).toEqual(['first segment']);
+    expect(state.ttsActive).not.toBeNull();
+    expect(state.ttsQueue.length).toBe(1);
+    /* Now fully drain pcm: the 'end' handler fires, speakOne
+     * resolves, runQueue picks up the queued segment. */
+    handles[0]!.pcm.end();
+    await flush();
+    expect(synthCalls).toEqual(['first segment', 'second segment']);
+    handles[1]!.pcm.end();
+    handles[1]!.resolveDone();
+    await flush();
+    expect(state.ttsActive).toBeNull();
   });
 
   it('killActive clears queue even when there is no in-flight ctx', async () => {

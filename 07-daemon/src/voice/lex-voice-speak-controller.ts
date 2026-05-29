@@ -179,10 +179,19 @@ export function createSpeakController(
         state.ttsActive = null;
         finish();
       });
-      void handle.done.then(() => {
-        if (state.ttsActive === ttsCtx) state.ttsActive = null;
-        finish();
-      });
+      /* Fix 51 (2026-05-29): DO NOT release the await on handle.done.
+       * piper.synthesize resolves `done` on proc.exit, which fires
+       * BEFORE the kernel finishes draining piper stdout into the
+       * Readable pcm stream. If we released here, runQueue would
+       * shift the next queued segment and call speakOne, spawning a
+       * second piper child whose PCM starts flowing through
+       * sendBinary WHILE the previous ctx's remaining buffered
+       * chunks were still being emitted by its own pcm 'data'
+       * handler. Two PCM streams to the client = audible
+       * double-talk. Wait for pcm 'end' (or 'error') only — those
+       * guarantee the readable side is fully drained. handle.done
+       * remains available to other consumers (debug logging,
+       * tests) but is no longer a release signal. */
     });
   }
 
