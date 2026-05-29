@@ -21,15 +21,11 @@ A `200` here means the dashboard is live. Do NOT treat "nothing listening on por
 
 The daemon serving the dashboard is part of the daemon's normal job. The dev server is a separate, optional thing that lives alongside it.
 
-## When to start `npm run dev`
+## When `npm run dev` is running
 
-Only when **all** of these are true:
+The daemon's `dashboard-supervisor.ts` module spawns `next dev -p 3000` as a child process on daemon start. Default is ON (toggle via runtime_config key `dashboard_supervisor_enabled` or env `DEVNEURAL_DASHBOARD_SUPERVISOR`). So port 3000 is NOT empty by default on a running daemon.
 
-- You are actively editing files under `08-dashboard/`.
-- You want hot-reload re-renders without a full `npm run build`.
-- You have explicitly asked for it (or the user has explicitly asked for it).
-
-Never start `npm run dev` reflexively because port 3000 has nothing on it. Port 3000 is supposed to be empty by default. The dashboard is on 3747.
+For the full "which port serves what + which build step makes which change live" story, see [HOW-TO-dev-vs-prod-dashboard](HOW-TO-dev-vs-prod-dashboard.md). Short version: port 3000 = hot-reload dev (edit, see, repeat), port 3747 = prod static (only updates after `npm run build`).
 
 ## When the dashboard appears down
 
@@ -37,4 +33,4 @@ Never start `npm run dev` reflexively because port 3000 has nothing on it. Port 
 2. If daemon is up + healthy but the page looks stale or broken, rebuild the static export: `cd C:/dev/Projects/DevNeural/08-dashboard && npm run build`. The daemon picks up the new `out/` directory without restart.
 3. Tailscale serve config: `tailscale serve status` should show `/ proxy http://localhost:3747`. If it's pointing elsewhere, restore it with `tailscale serve --bg --https=443 http://localhost:3747`.
 
-Port 3000 has nothing to do with any of these steps.
+If you want to test dashboard edits with hot-reload, hit port 3000 directly. See [HOW-TO-dev-vs-prod-dashboard](HOW-TO-dev-vs-prod-dashboard.md).

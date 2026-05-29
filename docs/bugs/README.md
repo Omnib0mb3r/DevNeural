@@ -4,11 +4,18 @@
 
 | Date | Bug | Status | Severity |
 |------|-----|--------|----------|
-| 2026-05-26 | [cc-pty voice double-talk regression — investigation only](./2026-05-26-cc-pty-double-talk-investigation.md) | investigation; no fix shipped | high |
-| 2026-05-22 | [Lex cannot see worker on cold start](./2026-05-22-lex-blind-to-worker-on-cold-start.md) | open | high |
-| 2026-05-22 | [Worker discovery fails for VS-Code-launched claude](./2026-05-22-worker-discovery-both-launch-paths.md) | open | high |
+| 2026-05-29 | [Voice PTY paste lands as `[Pasted text #N +5 lines]`, never submits](./2026-05-29-voice-pty-paste-no-commit-regression.md) | investigation shipped 2026-05-29; ship deferred (mirror Fix 32 850ms follow-up into direct-inject path) | high |
 | 2026-05-23 | [Bridge terminal-name match is fragile (binding works, ergonomics)](./2026-05-23-bridge-terminal-name-fragility.md) | open | low |
-| 2026-05-24 | [No TTS on first prompt — fresh session spawn (recurrence)](./2026-05-14-no-tts-on-first-prompt-after-restart.md) | open | medium |
+
+## Recently closed
+
+| Date | Bug | Status | Severity |
+|------|-----|--------|----------|
+| 2026-05-29 | [PRELOAD-1 SessionStart hook stdout shape](./2026-05-29-cold-start-hook-stdout-shape.md) | fixed (Fix 50, 20147a7) — investigation b18ffaa + ship commit + 2 test pins | high |
+| 2026-05-26 | [cc-pty voice double-talk regression](./2026-05-26-cc-pty-double-talk-investigation.md) | fixed (Fix 51, e0978ee) — Fix 40 SERIALIZE was correct but released on proc.exit instead of pcm 'end'; root cause closed | high |
+| 2026-05-24 | [No TTS on first prompt — fresh session spawn (recurrence)](./2026-05-14-no-tts-on-first-prompt-after-restart.md) | fixed (Fix 31, two-layer fix: daemon awaiting migration + client ptyId deps) | medium |
+| 2026-05-22 | [Lex cannot see worker on cold start](./2026-05-22-lex-blind-to-worker-on-cold-start.md) | fixed via supervisor wire stack (Fix 34/34b/34c/34d.1) + project_scope_id (Fix 49) | high |
+| 2026-05-22 | [Worker discovery fails for VS-Code-launched claude](./2026-05-22-worker-discovery-both-launch-paths.md) | fixed via bridge presence files + reconcile loop (memory: project_devneural_bridge_pty_ownership) | high |
 
 ## Recently closed
 
