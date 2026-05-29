@@ -162,7 +162,7 @@ function parsePhase(arg: string | undefined): HookPhase {
  *
  * Bounded timeout; daemon-down or empty-block paths are silent
  * no-ops so a missing daemon never blocks the session start. */
-async function postColdStartPreload(
+export async function postColdStartPreload(
   sessionId: string,
   cwd: string,
 ): Promise<void> {
@@ -189,11 +189,19 @@ async function postColdStartPreload(
       block?: string;
     };
     if (!json.ok || !json.block || json.block.trim().length === 0) return;
-    /* Claude Code's SessionStart hook reads stdout and injects the
-     * payload as additional context on the first user turn. The
-     * trailing newline keeps the markdown block detached from any
-     * harness boilerplate that follows. */
-    process.stdout.write(json.block + '\n');
+    /* Claude Code's SessionStart hook only auto-injects stdout into
+     * the first user turn when the payload is shaped as a
+     * hookSpecificOutput JSON envelope with hookEventName and
+     * additionalContext. Plain markdown is displayed but dropped
+     * from the prompt context. Wrap the block so CC threads it in. */
+    process.stdout.write(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'SessionStart',
+          additionalContext: json.block,
+        },
+      }),
+    );
   } catch {
     /* daemon down / network error / timeout: silent no-op */
   } finally {
@@ -213,7 +221,7 @@ async function postColdStartPreload(
  * SessionStart (startup AND clear/compact) so a /clear inside a
  * project anchor restores the full context, not just a one-line
  * stop hook summary. */
-async function postWorkerHandoff(
+export async function postWorkerHandoff(
   sessionId: string,
   cwd: string,
 ): Promise<void> {
@@ -235,7 +243,17 @@ async function postWorkerHandoff(
     if (!res.ok) return;
     const json = (await res.json()) as { ok?: boolean; block?: string };
     if (!json.ok || !json.block || json.block.trim().length === 0) return;
-    process.stdout.write(json.block + '\n');
+    /* Same SessionStart envelope contract as postColdStartPreload.
+     * Plain stdout is dropped by CC; only the hookSpecificOutput
+     * shape threads additionalContext into the first user turn. */
+    process.stdout.write(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'SessionStart',
+          additionalContext: json.block,
+        },
+      }),
+    );
   } catch {
     /* daemon down / network error / timeout: silent no-op */
   } finally {
@@ -646,9 +664,19 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch(() => {
-  /* hooks must never throw */
-});
+/* Guard the CLI entrypoint so the module is import-safe for tests.
+ * When run as `node hook-runner.js`, import.meta.url matches the
+ * resolved argv[1] file URL and main() fires; when imported by a
+ * test file, the guard is false and only the exported functions
+ * become available. Without this guard, importing the module would
+ * fire main() inside the test worker and block on stdin. */
+import { pathToFileURL as _pathToFileURL } from 'node:url';
+const _entry = process.argv[1] ? _pathToFileURL(process.argv[1]).href : '';
+if (import.meta.url === _entry) {
+  main().catch(() => {
+    /* hooks must never throw */
+  });
 
-process.on('uncaughtException', () => process.exit(0));
-process.on('unhandledRejection', () => process.exit(0));
+  process.on('uncaughtException', () => process.exit(0));
+  process.on('unhandledRejection', () => process.exit(0));
+}
