@@ -889,16 +889,42 @@ export function registerSmartCompactRoutes(
       reply.code(404);
       return { ok: false, error: 'anchor not found' };
     }
-    /* Codex item 10 (Fix 47): loose-ends gate pre-flight. Block when
-     * an operator-only loose end is present; pass through on auto-
-     * resolve or clear. The gate uses default fireAutoAction (no-op
-     * 'skipped' status) for this round; codex 11 wires the real
-     * recovery + redistill helpers behind the same hook. */
+    /* Codex item 10 (Fix 47, codex 10a wire): loose-ends gate pre-flight.
+     * Block when an operator-only loose end is present; pass through
+     * on auto-resolve or clear. fireAutoAction is wired to the real
+     * production dispatcher (codex 10a) so mid_tool fires a
+     * cross-session-inject recovery and distill_error /
+     * undistilled_ref hit the per-session distillation generator.
+     * Provider gate matches the cold-start preload: skip when no
+     * provider OR provider is anthropic (BF-4) - the generator
+     * returns null in that case and the gate records 'skipped' in
+     * the action audit. */
     try {
       const { enforceLooseEndsGate } = await import(
         '../lex/loose-ends-gate.js'
       );
-      const decision = await enforceLooseEndsGate(db, body.anchor_id, {});
+      const { createLooseEndsFireAutoAction } = await import(
+        '../lex/loose-ends-auto-actions.js'
+      );
+      const { pickProvider } = await import('../llm/index.js');
+      const { createPerSessionDistillationGenerator } = await import(
+        '../lex/distillation-generator.js'
+      );
+      const provider = pickProvider();
+      const generatorActive =
+        provider && provider.isConfigured() && provider.name !== 'anthropic';
+      const perSessionGenerator = generatorActive
+        ? createPerSessionDistillationGenerator({ db, provider })
+        : undefined;
+      const fireAutoAction = createLooseEndsFireAutoAction({
+        db,
+        anchorId: body.anchor_id,
+        ...(perSessionGenerator ? { perSessionGenerator } : {}),
+        log: (msg) => log(msg),
+      });
+      const decision = await enforceLooseEndsGate(db, body.anchor_id, {
+        fireAutoAction,
+      });
       if (decision.kind === 'blocked') {
         reply.code(409);
         return {
