@@ -105,6 +105,12 @@ export interface BrainstormSessionRow {
   last_user_utterance_at?: string | null;
   last_grooming_pass_at?: string | null;
   last_grooming_kind?: 'light' | 'mid' | 'cold' | 'day-cap' | null;
+  /* LEX-AUTONOMY codex item 12 (Fix 49, migration 044). Scope token
+   * the cold-start preload uses to find sibling sessions instead of
+   * the legacy label match. Inherited from lex_session
+   * .supervises_project_anchor_id at insert time when present; NULL
+   * for ungrouped / unbound rows (label fallback still applies). */
+  project_scope_id?: string | null;
 }
 
 /* Brainstorm-as-durable-primary-entity (2026-05-22, migration 034).
@@ -1692,18 +1698,32 @@ export class IndexDb {
      * (cc-pty / idle / null). Standalone brainstorms set those
      * explicitly via the followup updateBrainstorm call inside
      * createStandaloneBrainstorm so the same INSERT path serves both
-     * legacy and direct-llm without diverging schemas. */
+     * legacy and direct-llm without diverging schemas.
+     *
+     * project_scope_id (migration 044) auto-inherits from the bound
+     * lex_session's supervises_project_anchor_id when the caller has
+     * not supplied an explicit value. lex_session.id matches the
+     * brainstorm id by contract (migration 018), so the COALESCE
+     * subquery resolves to the supervisor binding when one exists
+     * and stays NULL otherwise. Explicit caller values still win. */
     this.db
       .prepare(
         `INSERT OR REPLACE INTO brainstorm_sessions
          (id, claude_session_id, pty_id, cwd, user_label, derived_label, mode,
           status, started_ms, ended_ms, turn_count, topic_tags_json, artifacts_json,
-          last_summary, last_summary_ms)
+          last_summary, last_summary_ms, project_scope_id)
          VALUES (@id, @claude_session_id, @pty_id, @cwd, @user_label, @derived_label,
           @mode, @status, @started_ms, @ended_ms, @turn_count, @topic_tags_json,
-          @artifacts_json, @last_summary, @last_summary_ms)`,
+          @artifacts_json, @last_summary, @last_summary_ms,
+          COALESCE(
+            @project_scope_id,
+            (SELECT supervises_project_anchor_id
+               FROM lex_session
+              WHERE lex_session.id = @id
+                AND supervises_project_anchor_id IS NOT NULL)
+          ))`,
       )
-      .run(row);
+      .run({ ...row, project_scope_id: row.project_scope_id ?? null });
   }
 
   updateBrainstorm(
