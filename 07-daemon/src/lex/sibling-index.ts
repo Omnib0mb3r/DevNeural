@@ -61,6 +61,13 @@ export interface BuildSiblingIndexOptions {
   readTranscript?: (path: string) => string | null;
   /** Test seam: clock. */
   now?: () => number;
+  /** Codex item 12 (Fix 49): active brainstorm's project_scope_id.
+   * When BOTH the active anchor and a candidate row carry non-null
+   * scope, buildLabelMatchBlock matches by scope id instead of
+   * user_label. Falls back to label match when either side is null
+   * (legacy compat). Mirrors the predicate that already lives in
+   * preloadSiblingDistillations so the two surfaces stay aligned. */
+  projectScopeId?: string | null;
 }
 
 const DEFAULT_REF_LIMIT = 5;
@@ -320,14 +327,26 @@ const SEP = String.fromCharCode(8212);
 
 function buildLabelMatchBlock(opts: BuildSiblingIndexOptions): string {
   const target = normLabel(opts.label);
-  if (!target) return '';
+  const activeScope = opts.projectScopeId ?? null;
+  /* Empty label is only fatal when there is no scope to fall back
+   * on. With a non-null active scope, scope-only matching can still
+   * surface siblings even when the user never named the brainstorm. */
+  if (!target && !activeScope) return '';
   const limit = opts.limit ?? DEFAULT_LIMIT;
   const distillationWords =
     opts.distillationWords ?? DEFAULT_DISTILLATION_WORDS;
   const rows = opts.db.listBrainstorms({ limit: 200 });
   const exclude = opts.excludeId ?? opts.anchorId ?? null;
+  /* Codex item 12 (Fix 49): prefer project_scope_id grouping when
+   * BOTH the active anchor and the candidate row carry a non-null
+   * scope id. Falls back to label match when either side is null
+   * (legacy compat). TODO codex 12 follow-up: kill the label fallback
+   * branch after the 30-day backfill window (calendar 2026-06-25). */
   const matches = rows.filter((r) => {
     if (exclude && r.id === exclude) return false;
+    const rowScope = r.project_scope_id ?? null;
+    if (activeScope && rowScope) return rowScope === activeScope;
+    if (!target) return false;
     return normLabel(r.user_label) === target;
   });
   if (matches.length === 0) return '';
@@ -350,13 +369,17 @@ function buildLabelMatchBlock(opts: BuildSiblingIndexOptions): string {
     }
     return formatLabelLine(r, distillationWords, hasStale);
   });
-  return [
-    `# Sibling sessions (same label "${opts.label?.trim() ?? ''}")`,
-    '',
-    'Prior brainstorms the user named the same way. Reference if context demands; do not re-read the transcripts unless asked.',
-    '',
-    ...lines,
-  ].join('\n');
+  /* Header reflects the grouping the matcher actually used. When
+   * the active anchor carries a scope id, the block is grouped by
+   * project_scope_id; otherwise the legacy label-match header
+   * applies. */
+  const headerLine = activeScope
+    ? `# Sibling sessions (same project scope ${activeScope})`
+    : `# Sibling sessions (same label "${opts.label?.trim() ?? ''}")`;
+  const intro = activeScope
+    ? 'Prior brainstorms bound to the same project anchor. Reference if context demands; do not re-read the transcripts unless asked.'
+    : 'Prior brainstorms the user named the same way. Reference if context demands; do not re-read the transcripts unless asked.';
+  return [headerLine, '', intro, '', ...lines].join('\n');
 }
 
 export function buildSiblingIndex(opts: BuildSiblingIndexOptions): string {

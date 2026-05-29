@@ -407,3 +407,136 @@ describe('buildSiblingIndex - anchor transcript_refs path (TODO bug 2026-05-13)'
     expect(out).toMatch(/- anchor-o/);
   });
 });
+
+/* Codex item 12a (Fix 49) parallel scope swap for buildLabelMatchBlock.
+ * preloadSiblingDistillations already prefers project_scope_id over
+ * user_label when both the active anchor and the candidate row carry
+ * non-null scope; the sibling-index label-match block now mirrors that
+ * predicate. The same insertBs helper above does not stamp
+ * project_scope_id, so this block uses a thicker fixture that writes
+ * the column on the row. */
+function insertBsWithScope(opts: {
+  id: string;
+  user_label: string | null;
+  started_ms: number;
+  project_scope_id: string | null;
+  last_summary?: string | null;
+}): void {
+  db.insertBrainstorm({
+    id: opts.id,
+    claude_session_id: null,
+    pty_id: null,
+    cwd: 'C:/p/lex',
+    user_label: opts.user_label,
+    derived_label: null,
+    mode: 'conversation',
+    status: 'active',
+    started_ms: opts.started_ms,
+    ended_ms: null,
+    turn_count: 0,
+    topic_tags_json: '[]',
+    artifacts_json: '{}',
+    last_summary: opts.last_summary ?? null,
+    last_summary_ms: null,
+    project_scope_id: opts.project_scope_id,
+  });
+}
+
+describe('buildSiblingIndex - project_scope_id parallel swap (codex 12a)', () => {
+  it('groups by scope when both active and candidate carry non-null scope, ignoring label divergence', () => {
+    insertBsWithScope({
+      id: 'anchor-active',
+      user_label: 'Active Label',
+      started_ms: 5_000,
+      project_scope_id: 'proj-A',
+    });
+    insertBsWithScope({
+      id: 'anchor-sib-1',
+      user_label: 'Different Label',
+      started_ms: 4_000,
+      project_scope_id: 'proj-A',
+      last_summary: 'sibling one',
+    });
+    insertBsWithScope({
+      id: 'anchor-noise',
+      user_label: 'Active Label',
+      started_ms: 3_000,
+      project_scope_id: 'proj-B',
+      last_summary: 'noise',
+    });
+    const out = buildSiblingIndex({
+      db,
+      label: 'Active Label',
+      anchorId: 'anchor-active',
+      excludeId: 'anchor-active',
+      projectScopeId: 'proj-A',
+    });
+    expect(out).toMatch(/^# Sibling sessions \(same project scope proj-A\)/);
+    expect(out).toMatch(/- anchor-s/);
+    expect(out).not.toMatch(/- anchor-n/);
+  });
+
+  it('falls back to label match when the candidate has no scope but labels align (legacy compat)', () => {
+    insertBsWithScope({
+      id: 'anchor-active2',
+      user_label: 'Legacy Label',
+      started_ms: 5_000,
+      project_scope_id: 'proj-A',
+    });
+    insertBsWithScope({
+      id: 'anchor-legacy',
+      user_label: 'Legacy Label',
+      started_ms: 4_000,
+      project_scope_id: null,
+      last_summary: 'pre-scope brainstorm',
+    });
+    const out = buildSiblingIndex({
+      db,
+      label: 'Legacy Label',
+      anchorId: 'anchor-active2',
+      excludeId: 'anchor-active2',
+      projectScopeId: 'proj-A',
+    });
+    /* Legacy row has null scope -> the row falls through to the
+     * label-match branch and still surfaces. Header reports the
+     * scope-grouping because the active anchor carries one. */
+    expect(out).toMatch(/^# Sibling sessions \(same project scope proj-A\)/);
+    expect(out).toMatch(/- anchor-l/);
+  });
+
+  it('keeps label match for two siblings with different scopes but the same label (kill-label deferred)', () => {
+    /* Until the 2026-06-25 kill-label calendar, two rows that
+     * differ on scope but agree on label still surface via the
+     * label branch when the active anchor has no scope set. */
+    insertBsWithScope({
+      id: 'anchor-no-scope',
+      user_label: 'Common Label',
+      started_ms: 5_000,
+      project_scope_id: null,
+    });
+    insertBsWithScope({
+      id: 'anchor-x',
+      user_label: 'Common Label',
+      started_ms: 4_000,
+      project_scope_id: 'scope-x',
+      last_summary: 'x notes',
+    });
+    insertBsWithScope({
+      id: 'anchor-y',
+      user_label: 'Common Label',
+      started_ms: 3_000,
+      project_scope_id: 'scope-y',
+      last_summary: 'y notes',
+    });
+    const out = buildSiblingIndex({
+      db,
+      label: 'Common Label',
+      anchorId: 'anchor-no-scope',
+      excludeId: 'anchor-no-scope',
+      projectScopeId: null,
+    });
+    expect(out).toMatch(/^# Sibling sessions \(same label "Common Label"\)/);
+    expect(out).toMatch(/- anchor-x/);
+    expect(out).toMatch(/- anchor-y/);
+  });
+});

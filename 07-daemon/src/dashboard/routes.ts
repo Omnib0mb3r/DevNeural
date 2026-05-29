@@ -4750,6 +4750,12 @@ export async function registerDashboardRoutes(
       excludeId: bs.id,
       limit: 5,
       distillationWords: 20,
+      /* Codex item 12a (Fix 49): mirror the scope-wins-over-label
+       * predicate that preloadSiblingDistillations already uses.
+       * When the active brainstorm carries a non-null scope, the
+       * label-match block groups by scope; falls back to label
+       * when scope is null (legacy compat). */
+      projectScopeId: bs.project_scope_id ?? null,
     });
     if (!block) {
       auditEarlyOut('no-siblings', bs.id);
