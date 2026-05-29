@@ -10,6 +10,8 @@ The rule: anyone reading this should be able to start cold and know
 **where the code is**, **what is in flight**, **what is shippable
 next**, and **what blockers exist**.
 
+Last touched: 2026-05-29 after shell-side smoke audit.
+
 ## Where we are
 
 DevNeural v2 is a local-first second brain (capture, semantic RAG,
@@ -27,6 +29,24 @@ Code-truth specs: `docs/spec/FUNCTIONAL-SPEC.md` (architecture),
 deferred). All other waves and phase plans live in
 `docs/archive/spec/`.
 
+## Live state (2026-05-29 post-smoke audit)
+
+- Daemon pid 39980, booted 2026-05-29T16:11:29Z, restart after Fix
+  51 dist regen. Boot log shows brainstorm-jsonl-ingestor,
+  stale-watcher, cancelled-tool-recovery, grooming-watch,
+  idle-watcher all started.
+- Dashboard: prod static at port 3747 (Tailscale-exposed), dev
+  hot-reload at port 3000. Both 200.
+- Tree clean. HEAD `99ff119`.
+- Tests: 1063/1063 daemon pass, 138/138 dashboard unit pass.
+- Active brainstorms in DB: 0 (all 91 rows `status='ended'`). Lex
+  is idle. New work requires a fresh brainstorm spawn.
+- Cold-start preload mode: `live` (runtime override). 104 audit
+  rows under `caller_label='cold-start-preload'`, latest 15:04Z.
+- One scoped brainstorm: 4bbafb48 (DevNeural Testing) ->
+  391b88f6 (DevNeural project anchor). Migration 044 backfill +
+  codex 12c auto-inherit both correct on this row.
+
 ## Most-recent shipped (current cycle, oldest first)
 
 Per `FIXES.md` row, in commit order. Every row marked ✅ is in the
@@ -40,56 +60,90 @@ running daemon after the operator restarts.
 | 50  | PRELOAD-1 SessionStart hook stdout shape | b18ffaa + 20147a7 |
 | 51  | cc-pty double-talk: pcm 'end' release, not proc.exit | e0978ee |
 
-All daemon build + dist regen done. Dashboard prod build + dev server
-both running. Daemon restart at the end of the cycle leaves Fix 51
-live.
+## Smoke status (per SMOKE-TEST.md, current cycle)
+
+| Step | Status | Notes |
+|------|--------|-------|
+| 0.x prep | ✅ | Daemon + dashboard built, restart done, hard-reload done |
+| 1.4 loose-ends gate detection | ✅ module probe | `evaluateLooseEnds(4bbafb48)`: 2 ends. Live auto-resolve audit row pending real spawn |
+| 1.1 - 1.3 | ⏳ hardware | dashboard click + voice command + dirty-worktree gate fire |
+| 2.1 grooming-watch boot | ✅ | Daemon log confirms |
+| 2.2 /lex/grooming/recent | ✅ | 200 {rows:[]} |
+| 2.3 runGroomingTick | ✅ module probe | evaluated=0; all anchors ended; correct skip |
+| 2.4 | ⏳ hardware | parked_question push fire |
+| 3.1 project_scope_id | ✅ | 4bbafb48 -> 391b88f6 |
+| 3.2 PATCH scope route | ✅ | 200 round-trip, audit row |
+| 3.3 | ⏳ hardware | scope-vs-label header on fresh fallback anchor |
+| 4.0 Fix 50 dist | ✅ | `hookSpecificOutput` envelope present, 104 audit rows |
+| 4.1 - 4.2 | ⏳ hardware | first-user-turn jsonl attachment readout |
+| 5.0 Fix 51 dist + tests | ✅ | `handle.done.then` removed, 7/7 pins pass |
+| 5.1 - 5.3 | ⏳ hardware | voice mode tool_use sequence + barge |
 
 ## In flight (open work)
 
-- **None right now.** Codex 1-12 sequence complete. Smoke gate is the
-  next operator action.
+- **None right now.** Codex 1-12 sequence complete. Smoke gate is
+  the next operator action OR a pick from the "diagnosed but
+  unshipped" list below.
 
 ## Diagnosed but unshipped (waiting on operator green-light or scope)
 
-- **Fix 24** mid-reply TTS truncation. Watchdog `ctx_state` gate.
-- **Fix 25** mic input level + sensitivity scaling. vadThresholds
-  mapping + GainNode before silero.
-- **Fix 26** Lex hold-up kills mic permanently. Add `tts-cancel`
-  frame to hold_up dispatch.
 - **Voice PTY paste-no-commit regression**
   (`docs/bugs/2026-05-29-voice-pty-paste-no-commit-regression.md`).
-  Investigation shipped 2026-05-29; ship deferred.
+  Investigation shipped 2026-05-29 (94ad63f); ship deferred. Scope:
+  mirror Fix 32 850ms bare-CR follow-up into the direct-inject path
+  at `lex-voice-ws.ts:2147`. Closes the "[Pasted text #N +5 lines]"
+  stuck-paste failure mode in voice mode.
+- **Fix 24** mid-reply TTS truncation. Watchdog `ctx_state` gate.
+- **Fix 25** mic input level + sensitivity scaling. vadThresholds
+  mapping + GainNode before silero + clearer toast.
+- **Fix 26** Lex hold-up kills mic permanently. Asymmetric cancel
+  path; `runHoldUp.cancelTts` does not send `tts-cancel` frame to
+  client. Add the frame OR add client-side handler.
 
-## Active smoke gate
+## Active smoke gate (operator hardware required)
 
 Live punch list: `docs/SMOKE-TEST.md`. Cycle-specific cursor for the
 current batch is at the top of that file. Operator-pending items:
 
-- Voice mic-init on mobile Safari (needs hands).
-- Fix 51 cc-pty double-talk verification: speak through a Lex CC
-  brainstorm; confirm pre-tool ack + end_turn body no longer
-  overlap.
-- Fix 50 cold-start preload hook envelope: fresh SessionStart in a
-  Lex brainstorm; verify the audit log row's block appears in the
-  first user turn's `hook_additional_context`.
+- 1.1 dashboard click with dirty worktree -> 409 + LooseEndsBanner.
+- 1.2 banner dismiss + 5-min localStorage mute round-trip.
+- 1.3 voice `lex start project devneural` -> spoken confirm OR
+  enumerated loose ends on 409.
+- 2.4 parked_question_persistent push notification on subscribed
+  device.
+- 3.3 cold-start preload on a fresh anchor that uses the label-
+  match fallback path: header reads `# Sibling sessions (same
+  project scope <id>)` not `(same label "X")`.
+- 4.1 fresh Lex CC SessionStart in 4bbafb48: read jsonl, confirm
+  DevNeural cold-start block in first user turn's
+  hook_additional_context attachments.
+- 4.2 fresh worker CC SessionStart bound to a project anchor: same
+  check against worker-handoff block.
+- 5.1 voice mode: ask question that triggers tool_use; pre-tool ack
+  finishes BEFORE end_turn body, zero audible overlap.
+- 5.2 daemon log tail: `tts-start` frames not followed by a second
+  `tts-start` inside the prior piper's lifetime.
+- 5.3 barge mid pre-tool ack: `tts-cancel` frame + PTY Ctrl+C +
+  partialChain captures cancelled segment.
 
 ## Hard rules
 
+- Lex orchestrates commits. Worker executes per Lex instruction.
 - Workers spawn standard or `acceptEdits`. NEVER
   `--dangerously-skip-permissions`.
 - Never push to remote. Never force-anything.
 - Never auto-restart the daemon (operator-only).
-- Never inject destructive ops to a worker. The worker handles its
-  own commits.
 - Two-spec policy: investigation doc first, ship second. Both
   commits are atomic and follow the two-commit pattern (code +
-  FIXES row).
+  FIXES row). When a fix ships, the per-bug investigation doc
+  status line MUST be flipped to CLOSED + SHA + FIXES pointer in
+  the same cycle.
 - Atomic commits. Every commit body carries `Rebuild: yes/no
   <reason>`.
 - No em dashes anywhere. No AI co-author tags.
 
 ## Resume command
 
-Pick a row from "diagnosed but unshipped" or "active smoke gate"; ship
-per the two-commit pattern; update this file in place when the
+Pick a row from "diagnosed but unshipped" or "active smoke gate";
+ship per the two-commit pattern; update this file in place when the
 cursor moves.
