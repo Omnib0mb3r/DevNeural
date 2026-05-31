@@ -97,6 +97,13 @@ export interface ColdStartPreloadInput {
   /** Codex item 5: max stale refs to catch up per preload tick.
    * Default 3 per spec. */
   syncMaxRefs?: number;
+  /** Fix 55: when distillation lags the latest child session by more
+   * than this many ms, verdict promotes to 'stale'. Default
+   * STALE_GAP_MS_DEFAULT (1h). */
+  staleGapMs?: number;
+  /** Fix 55: when distillation lags by more than this, verdict
+   * promotes to 'outdated'. Default OUTDATED_GAP_MS_DEFAULT (7d). */
+  outdatedGapMs?: number;
 }
 
 export interface ColdStartPreloadSummary {
@@ -128,7 +135,45 @@ export interface ColdStartPreloadSummary {
   stale_refs_count: number;
   synced_refs_count: number;
   partial_sync: boolean;
+  /** Fix 55 cold-start vetting: a single token Lex (and the panel) can
+   * branch on without re-deriving from the underlying counts.
+   *   - 'fresh':    distillation is current; recent_turns small enough
+   *                 that the summary covers the active thread.
+   *   - 'stale':    distillation exists but lags the latest child
+   *                 session by more than STALE_GAP_MS_DEFAULT.
+   *   - 'outdated': distillation lag > OUTDATED_GAP_MS_DEFAULT, OR
+   *                 last_distilled_ms is null AND there is at least
+   *                 one prior child session. Treat as "no usable
+   *                 context": Lex should ask the operator for a
+   *                 catch-up.
+   *   - 'partial':  partial_sync=true, OR stale_refs > synced_refs;
+   *                 the catchup ran but didn't finish.
+   *   - 'empty':    no prior sibling sessions at all (cold-cold start).
+   */
+  context_verdict: 'fresh' | 'stale' | 'partial' | 'outdated' | 'empty';
+  /** Fix 55: id of the most recent child CC session bound to the
+   * brainstorm. null when no refs exist. Lex reads this to decide
+   * what to confirm with the operator on cold start. */
+  last_child_session_id: string | null;
+  /** Fix 55: human label for that session. Prefers
+   * lex_session.title -> lex_session.derived_title -> brainstorm
+   * user_label -> derived_label -> first 60 chars of cc_session_id.
+   * null when no refs exist. */
+  last_child_session_title: string | null;
+  /** Fix 55: ended_ms of that child session (falls back to started_ms
+   * when ended_ms is null). null when no refs exist. */
+  last_child_session_ended_ms: number | null;
+  /** Fix 55: milliseconds between last_child_session_ended_ms and
+   * last_distilled_ms. Positive => distillation lags; null when
+   * either side is missing. Drives the verdict thresholds and
+   * surfaces in the preamble so Lex can quote it back. */
+  distillation_gap_ms: number | null;
 }
+
+/** Fix 55 cold-start vetting thresholds. Tunable via env so the user
+ * can tighten or loosen the "good enough" window without a rebuild. */
+export const STALE_GAP_MS_DEFAULT = 60 * 60 * 1000;
+export const OUTDATED_GAP_MS_DEFAULT = 7 * 24 * 60 * 60 * 1000;
 
 const TOP_N_DEFAULT = 2;
 const ANCHOR_REF_LIMIT_DEFAULT = 5;
@@ -251,6 +296,114 @@ export async function runStaleRefCatchup(
   return out;
 }
 
+/* Fix 55: pick the most recent child session bound to the
+ * brainstorm (anchor-refs path) OR the most recent surfaced sibling
+ * (label-match path), then resolve a verdict by comparing
+ * distillation lag against the configured thresholds. Mutates the
+ * summary in place. */
+function finalizeContextVerdict(args: {
+  summary: ColdStartPreloadSummary;
+  db: IndexDb;
+  anchorId: string | null;
+  siblingRows: BrainstormSessionRow[] | null;
+  now: () => number;
+  staleGapMs?: number;
+  outdatedGapMs?: number;
+}): void {
+  const { summary, db, anchorId, siblingRows, now } = args;
+  const staleGap = args.staleGapMs ?? STALE_GAP_MS_DEFAULT;
+  const outdatedGap = args.outdatedGapMs ?? OUTDATED_GAP_MS_DEFAULT;
+
+  /* Last child session lookup. Anchor-refs path: walk
+   * lex_transcript_ref for the anchor and pick the newest. Label-match
+   * path: take the first surfaced sibling (DESC by started_ms). */
+  if (anchorId) {
+    try {
+      const refs = db.listLexTranscriptRefs(anchorId);
+      if (refs.length > 0) {
+        const newest = refs
+          .slice()
+          .sort((a, b) => {
+            const ea = a.ended_ms ?? a.started_ms ?? 0;
+            const eb = b.ended_ms ?? b.started_ms ?? 0;
+            if (eb !== ea) return eb - ea;
+            return b.ordering - a.ordering;
+          })[0]!;
+        summary.last_child_session_id = newest.cc_session_id ?? null;
+        summary.last_child_session_ended_ms =
+          newest.ended_ms ?? newest.started_ms ?? null;
+        const lexSession = (() => {
+          try {
+            return db.getLexSession(anchorId);
+          } catch {
+            return null;
+          }
+        })();
+        summary.last_child_session_title =
+          lexSession?.title?.trim() ||
+          lexSession?.derived_title?.trim() ||
+          newest.cc_session_id?.slice(0, 8) ||
+          null;
+      }
+    } catch {
+      /* observational: missing anchor or read failure leaves
+       * last_child_session_* null and the verdict resolver treats it
+       * as no-child-session. */
+    }
+  } else if (siblingRows && siblingRows.length > 0) {
+    const first = siblingRows[0]!;
+    summary.last_child_session_id = first.id;
+    summary.last_child_session_title =
+      first.user_label?.trim() || first.derived_label?.trim() || first.id.slice(0, 8);
+    summary.last_child_session_ended_ms =
+      first.ended_ms ?? first.started_ms ?? null;
+  }
+
+  if (
+    summary.last_distilled_ms !== null &&
+    summary.last_child_session_ended_ms !== null
+  ) {
+    summary.distillation_gap_ms = Math.max(
+      0,
+      summary.last_child_session_ended_ms - summary.last_distilled_ms,
+    );
+  } else {
+    summary.distillation_gap_ms = null;
+  }
+
+  /* Verdict resolution. Order matters: 'partial' wins when the
+   * catchup did not finish so the operator sees the in-flight gap
+   * before any age signal. 'outdated' beats 'stale' on the lag
+   * threshold. 'empty' only when there are literally no prior
+   * sessions to talk about. */
+  void now;
+  if (summary.sibling_count === 0 && summary.last_child_session_id === null) {
+    summary.context_verdict = 'empty';
+    return;
+  }
+  if (
+    summary.partial_sync ||
+    summary.stale_refs_count > summary.synced_refs_count
+  ) {
+    summary.context_verdict = 'partial';
+    return;
+  }
+  const gap = summary.distillation_gap_ms;
+  if (summary.last_distilled_ms === null && summary.last_child_session_id) {
+    summary.context_verdict = 'outdated';
+    return;
+  }
+  if (gap !== null && gap > outdatedGap) {
+    summary.context_verdict = 'outdated';
+    return;
+  }
+  if (gap !== null && gap > staleGap) {
+    summary.context_verdict = 'stale';
+    return;
+  }
+  summary.context_verdict = 'fresh';
+}
+
 /* Anchor-refs path: returns sibling_count + recent_turns_appended for
  * the prior CC transcripts bound to this anchor. Mirrors
  * buildSiblingIndex's primary path so the preamble's "Loaded N sibling
@@ -309,6 +462,11 @@ export async function preloadColdStartSiblings(
     stale_refs_count: 0,
     synced_refs_count: 0,
     partial_sync: false,
+    context_verdict: 'empty',
+    last_child_session_id: null,
+    last_child_session_title: null,
+    last_child_session_ended_ms: null,
+    distillation_gap_ms: null,
   };
   const syncBudgetMs = input.syncBudgetMs ?? SYNC_BUDGET_MS_DEFAULT;
   const syncMaxRefs = input.syncMaxRefs ?? SYNC_MAX_REFS_DEFAULT;
@@ -336,11 +494,29 @@ export async function preloadColdStartSiblings(
     out.sibling_count = fromAnchor.sibling_count;
     out.recent_turns_appended = fromAnchor.recent_turns_appended;
     out.last_distilled_ms = fromAnchor.last_distilled_ms;
+    finalizeContextVerdict({
+      summary: out,
+      db: input.db,
+      anchorId: input.anchorId ?? null,
+      siblingRows: null,
+      now,
+      staleGapMs: input.staleGapMs,
+      outdatedGapMs: input.outdatedGapMs,
+    });
     return out;
   }
   const label = (input.label ?? '').trim();
   if (!label) {
     out.failure_reason = 'no-label';
+    finalizeContextVerdict({
+      summary: out,
+      db: input.db,
+      anchorId: input.anchorId ?? null,
+      siblingRows: null,
+      now,
+      staleGapMs: input.staleGapMs,
+      outdatedGapMs: input.outdatedGapMs,
+    });
     return out;
   }
   const forceN = input.forceForTopN ?? TOP_N_DEFAULT;
@@ -364,6 +540,15 @@ export async function preloadColdStartSiblings(
       });
     } catch (err) {
       out.failure_reason = `preload-threw: ${(err as Error).message}`;
+      finalizeContextVerdict({
+        summary: out,
+        db: input.db,
+        anchorId: input.anchorId ?? null,
+        siblingRows: null,
+        now,
+        staleGapMs: input.staleGapMs,
+        outdatedGapMs: input.outdatedGapMs,
+      });
       return out;
     }
   }
@@ -383,6 +568,15 @@ export async function preloadColdStartSiblings(
 
   if (surfaced.length === 0) {
     out.failure_reason = 'no-siblings';
+    finalizeContextVerdict({
+      summary: out,
+      db: input.db,
+      anchorId: input.anchorId ?? null,
+      siblingRows: null,
+      now,
+      staleGapMs: input.staleGapMs,
+      outdatedGapMs: input.outdatedGapMs,
+    });
     return out;
   }
 
@@ -438,6 +632,15 @@ export async function preloadColdStartSiblings(
   out.last_distilled_ms = maxDistilledMs;
   out.recent_turns_appended = turns;
   out.handover_sourced_count = handoverSourced;
+  finalizeContextVerdict({
+    summary: out,
+    db: input.db,
+    anchorId: input.anchorId ?? null,
+    siblingRows: surfaced,
+    now,
+    staleGapMs: input.staleGapMs,
+    outdatedGapMs: input.outdatedGapMs,
+  });
   return out;
 }
 
@@ -569,8 +772,8 @@ export function formatColdStartPreamble(
   summary: ColdStartPreloadSummary,
   opts: FormatPreambleOptions = {},
 ): string {
-  if (summary.sibling_count === 0) {
-    return 'Cold start: no prior sibling sessions found.';
+  if (summary.sibling_count === 0 && !summary.last_child_session_id) {
+    return 'Cold start: no prior sibling sessions found. context_verdict=empty';
   }
   const word = summary.sibling_count === 1 ? 'session' : 'sessions';
   const head = `Loaded ${summary.sibling_count} sibling ${word}`;
@@ -586,7 +789,26 @@ export function formatColdStartPreamble(
   }
   const turnWord = summary.recent_turns_appended === 1 ? 'turn' : 'turns';
   const turns = `${summary.recent_turns_appended} recent ${turnWord} appended`;
-  return `${head}, ${distilled}, ${turns}.`;
+  /* Fix 55: append the verdict + last child session + lag so Lex's
+   * cold-start vetting protocol can quote them back. The verdict is
+   * the single token Lex branches on; the supporting numbers are
+   * there so a partial / stale / outdated verdict has a "since X"
+   * the operator can verify. */
+  const verdictLine = `context_verdict=${summary.context_verdict}`;
+  const childParts: string[] = [];
+  if (summary.last_child_session_title) {
+    childParts.push(`last_child=${summary.last_child_session_title}`);
+  }
+  if (summary.last_child_session_ended_ms !== null) {
+    childParts.push(
+      `child_ended_ms=${summary.last_child_session_ended_ms}`,
+    );
+  }
+  if (summary.distillation_gap_ms !== null) {
+    childParts.push(`distillation_gap_ms=${summary.distillation_gap_ms}`);
+  }
+  const childLine = childParts.length > 0 ? ` ${childParts.join(' ')}` : '';
+  return `${head}, ${distilled}, ${turns}. ${verdictLine}${childLine}`;
 }
 
 function defaultTimeZoneTag(): string {
@@ -657,6 +879,15 @@ export interface PreloadEventLogRow {
   stale_refs_count: number;
   synced_refs_count: number;
   partial_sync: boolean;
+  /* Fix 55: mirror the new verdict + last-child fields onto the event
+   * log shape so the dashboard panel can render them without re-
+   * deriving from the audit row's JSON blob. Defaults to verdict='empty'
+   * and null last_child_* for legacy rows / non-Fix-55 daemons. */
+  context_verdict?: 'fresh' | 'stale' | 'partial' | 'outdated' | 'empty';
+  last_child_session_id?: string | null;
+  last_child_session_title?: string | null;
+  last_child_session_ended_ms?: number | null;
+  distillation_gap_ms?: number | null;
 }
 
 export function buildPreloadEventLogRow(input: {
@@ -680,6 +911,11 @@ export function buildPreloadEventLogRow(input: {
     stale_refs_count: input.summary.stale_refs_count,
     synced_refs_count: input.summary.synced_refs_count,
     partial_sync: input.summary.partial_sync,
+    context_verdict: input.summary.context_verdict,
+    last_child_session_id: input.summary.last_child_session_id,
+    last_child_session_title: input.summary.last_child_session_title,
+    last_child_session_ended_ms: input.summary.last_child_session_ended_ms,
+    distillation_gap_ms: input.summary.distillation_gap_ms,
   };
 }
 

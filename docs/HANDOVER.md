@@ -69,7 +69,8 @@ running daemon after the operator restarts.
 | 51  | cc-pty double-talk: pcm 'end' release, not proc.exit | e0978ee |
 | 52  | project anchors seeded on boot + bridge-presence auto-create on unknown cwd (PROJECT-ANCHORS.md `## Seeding` line 57) | f758514 |
 | 53  | cold-start distillation boot recovery sweep + partial verdict promoted from green OK | 9f754f4 |
-| 54  | jsonl-fallback distillation closes the chunkless-skip gap | (this commit) |
+| 54  | jsonl-fallback distillation closes the chunkless-skip gap | 1b5021b |
+| 55  | context_verdict + last_child surface + Lex cold-start vetting protocol | (this commit) |
 
 ## Smoke status (per SMOKE-TEST.md, current cycle)
 

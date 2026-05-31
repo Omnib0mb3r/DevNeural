@@ -216,9 +216,10 @@ describe('formatColdStartPreamble', () => {
       },
       { timeZoneTag: 'EDT' },
     );
-    expect(out).toBe(
+    expect(out).toContain(
       'Loaded 4 sibling sessions, last distilled 14:32 EDT, 12 recent turns appended.',
     );
+    expect(out).toContain('context_verdict=');
   });
 
   it('singularises the sibling + turn words for count=1', () => {
@@ -232,9 +233,10 @@ describe('formatColdStartPreamble', () => {
       },
       { timeZoneTag: 'EDT' },
     );
-    expect(out).toBe(
+    expect(out).toContain(
       'Loaded 1 sibling session, last distilled 09:05 EDT, 1 recent turn appended.',
     );
+    expect(out).toContain('context_verdict=');
   });
 
   it('falls back to "distillation not yet available" when no sibling has been distilled', () => {
@@ -262,7 +264,85 @@ describe('formatColdStartPreamble', () => {
       },
       { timeZoneTag: 'EDT' },
     );
-    expect(out).toBe('Cold start: no prior sibling sessions found.');
+    expect(out).toContain('Cold start: no prior sibling sessions found.');
+    expect(out).toContain('context_verdict=empty');
+  });
+
+  it('appends the verdict + last_child + distillation_gap on a stale summary', () => {
+    const out = formatColdStartPreamble(
+      {
+        preload: { preloaded: [], skipped: [], already_present: [] },
+        sibling_count: 3,
+        last_distilled_ms: 1_000,
+        recent_turns_appended: 8,
+        failure_reason: null,
+        stale_refs_count: 1,
+        synced_refs_count: 0,
+        partial_sync: false,
+        context_verdict: 'stale',
+        last_child_session_id: 'cc-aaaa',
+        last_child_session_title: 'DevNeural Testing',
+        last_child_session_ended_ms: 7_300_000,
+        distillation_gap_ms: 7_299_000,
+      },
+      { timeZoneTag: 'EDT' },
+    );
+    expect(out).toContain('context_verdict=stale');
+    expect(out).toContain('last_child=DevNeural Testing');
+    expect(out).toContain('distillation_gap_ms=7299000');
+  });
+});
+
+describe('context_verdict resolver', () => {
+  it('promotes partial when partial_sync=true regardless of gap', async () => {
+    /* Direct call to formatColdStartPreamble surfaces the wired
+     * verdict in the line. Verdict resolution itself lives in
+     * preloadColdStartSiblings via finalizeContextVerdict; this pin
+     * locks the contract that partial_sync overrides every other
+     * threshold so the operator never sees fresh while refs are
+     * still in flight. */
+    const out = formatColdStartPreamble(
+      {
+        preload: { preloaded: [], skipped: [], already_present: [] },
+        sibling_count: 2,
+        last_distilled_ms: 9_000_000,
+        recent_turns_appended: 3,
+        failure_reason: null,
+        stale_refs_count: 0,
+        synced_refs_count: 0,
+        partial_sync: true,
+        context_verdict: 'partial',
+        last_child_session_id: 'cc',
+        last_child_session_title: 'Active anchor',
+        last_child_session_ended_ms: 9_000_001,
+        distillation_gap_ms: 1,
+      },
+      { timeZoneTag: 'EDT' },
+    );
+    expect(out).toContain('context_verdict=partial');
+  });
+
+  it('renders verdict=outdated label distinctly', () => {
+    const out = formatColdStartPreamble(
+      {
+        preload: { preloaded: [], skipped: [], already_present: [] },
+        sibling_count: 1,
+        last_distilled_ms: 1_000,
+        recent_turns_appended: 0,
+        failure_reason: null,
+        stale_refs_count: 0,
+        synced_refs_count: 0,
+        partial_sync: false,
+        context_verdict: 'outdated',
+        last_child_session_id: 'cc-old',
+        last_child_session_title: 'Stale anchor',
+        last_child_session_ended_ms: 10 * 24 * 60 * 60 * 1000,
+        distillation_gap_ms: 10 * 24 * 60 * 60 * 1000 - 1_000,
+      },
+      { timeZoneTag: 'EDT' },
+    );
+    expect(out).toContain('context_verdict=outdated');
+    expect(out).toContain('last_child=Stale anchor');
   });
 });
 

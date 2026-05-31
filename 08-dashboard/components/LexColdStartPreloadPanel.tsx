@@ -66,10 +66,22 @@ function fmtTs(ts: string): string {
   });
 }
 
+function fmtGap(ms: number): string {
+  if (!ms || ms < 0) return "0";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  return `${d}d`;
+}
+
 function fmtDistilledMs(ms: number | null): string {
-  if (!ms) return "—";
+  if (!ms) return "-";
   const d = new Date(ms);
-  if (Number.isNaN(d.valueOf())) return "—";
+  if (Number.isNaN(d.valueOf())) return "-";
   return d.toLocaleTimeString(undefined, {
     hour: "2-digit",
     minute: "2-digit",
@@ -104,16 +116,28 @@ function PreloadEventCard({
   const turns = latest?.recent_turns_appended ?? 0;
   const failure = latest?.failure_reason ?? null;
   const partial = latest?.partial_sync === true;
+  const verdict = latest?.context_verdict ?? null;
   /* "ok" is only honest when nothing degraded. partial_sync=true means
    * the catchup ran out of budget or some refs could not be re-
    * distilled; surfacing it as green OK hid the gap that left Lex
-   * landing blind on cold-start. */
-  const tone = failure ? "text-err" : partial ? "text-warn" : "text-ok";
+   * landing blind on cold-start. Verdict from Fix 55 overrides when
+   * present so the panel shows what Lex actually saw. */
+  const verdictTone =
+    verdict === "fresh"
+      ? "text-ok"
+      : verdict === "stale" || verdict === "partial"
+        ? "text-warn"
+        : verdict === "outdated" || verdict === "empty"
+          ? "text-err"
+          : null;
+  const tone =
+    failure
+      ? "text-err"
+      : (verdictTone ?? (partial ? "text-warn" : "text-ok"));
+  const verdictLabel = verdict ? `${verdict} · ` : partial ? "partial · " : "";
   const statusLabel = failure
     ? `failed (${failure})`
-    : partial
-      ? `partial · ${sibling} siblings · ${turns} turns`
-      : `${sibling} siblings · ${turns} turns`;
+    : `${verdictLabel}${sibling} siblings · ${turns} turns`;
   const staleChip = staleChipForLatest(latest);
   return (
     <li
@@ -156,16 +180,22 @@ function PreloadEventCard({
                   className={`uppercase tracking-wider text-nano shrink-0 ${
                     r.failure_reason
                       ? "text-err"
-                      : r.partial_sync === true
-                        ? "text-warn"
-                        : "text-ok"
+                      : r.context_verdict === "fresh"
+                        ? "text-ok"
+                        : r.context_verdict === "outdated" ||
+                            r.context_verdict === "empty"
+                          ? "text-err"
+                          : r.context_verdict === "stale" ||
+                              r.context_verdict === "partial" ||
+                              r.partial_sync === true
+                            ? "text-warn"
+                            : "text-ok"
                   }`}
                 >
                   {r.failure_reason
                     ? "failed"
-                    : r.partial_sync === true
-                      ? "partial"
-                      : "ok"}
+                    : (r.context_verdict ??
+                      (r.partial_sync === true ? "partial" : "ok"))}
                 </span>
                 <span className="text-txt2 flex-1 truncate">
                   {r.preamble || "(no preamble)"}
@@ -195,6 +225,33 @@ function PreloadEventCard({
                     stale: {r.stale_refs_count ?? 0} · synced:{" "}
                     {r.synced_refs_count ?? 0}
                     {r.partial_sync ? " · partial" : ""}
+                  </span>
+                )}
+                {r.last_child_session_title && (
+                  <span
+                    data-testid="lex-cold-start-preload-last-child"
+                    className="text-txt2"
+                    title={
+                      r.last_child_session_id ??
+                      r.last_child_session_title ??
+                      ""
+                    }
+                  >
+                    last child: {r.last_child_session_title}
+                  </span>
+                )}
+                {(r.distillation_gap_ms ?? 0) > 0 && (
+                  <span
+                    data-testid="lex-cold-start-preload-distill-gap"
+                    className={
+                      r.context_verdict === "outdated"
+                        ? "text-err"
+                        : r.context_verdict === "stale"
+                          ? "text-warn"
+                          : "text-txt3"
+                    }
+                  >
+                    gap: {fmtGap(r.distillation_gap_ms ?? 0)}
                   </span>
                 )}
                 {r.cc_session_id && (

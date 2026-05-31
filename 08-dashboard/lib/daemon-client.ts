@@ -1736,6 +1736,14 @@ export interface ColdStartPreloadEvent {
   stale_refs_count?: number;
   synced_refs_count?: number;
   partial_sync?: boolean;
+  /* Fix 55 cold-start vetting. Verdict + last-child metadata mirror
+   * the new fields on the daemon-side summary so the panel renders
+   * the same view Lex sees. Optional for legacy rows. */
+  context_verdict?: "fresh" | "stale" | "partial" | "outdated" | "empty";
+  last_child_session_id?: string | null;
+  last_child_session_title?: string | null;
+  last_child_session_ended_ms?: number | null;
+  distillation_gap_ms?: number | null;
 }
 
 export interface ColdStartPreloadEventGroup {
