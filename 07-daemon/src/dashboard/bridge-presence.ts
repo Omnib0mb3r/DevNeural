@@ -35,6 +35,7 @@ import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { IndexDb, ProjectSessionRow } from '../store/index-db.js';
 import { DATA_ROOT } from '../paths.js';
+import { ensureAnchorForCwd } from './seed-project-anchors.js';
 
 export const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 export const BRIDGE_PRESENCE_SUBDIR = '.bridge-presence';
@@ -239,8 +240,26 @@ export function reconcileBridgePresence(
    * back to dormant. */
   const touched = new Set<string>();
   for (const [cwd, recs] of byCwd) {
-    const anchor = db.getProjectSessionByCwd(cwd);
-    if (!anchor) continue;
+    let anchor = db.getProjectSessionByCwd(cwd);
+    if (!anchor) {
+      /* PROJECT-ANCHORS.md `## Seeding`: bridge reports a cwd no
+       * boot seed pass has covered (new top-level dir created after
+       * boot, or a workspace outside DEVNEURAL_PROJECTS_ROOT).
+       * Auto-create the anchor inline so this same pass can flip it
+       * live; otherwise the bridge would be silently dropped until
+       * the next boot. This replaces the prior `continue` drop. */
+      const created = ensureAnchorForCwd(db, cwd, { now });
+      if (!created) {
+        /* Race: another tick created the row between our lookup and
+         * our insert attempt. Re-read; if still missing the helper
+         * itself failed (read-only DB, FK constraint) and there is
+         * nothing more we can do here. */
+        anchor = db.getProjectSessionByCwd(cwd);
+        if (!anchor) continue;
+      } else {
+        anchor = created;
+      }
+    }
     const { marker, primary } = encodeBridgeMarker(recs);
     /* current_session_id: prefer the most recently updated record's
      * first cc session id. If none reports one, leave the existing

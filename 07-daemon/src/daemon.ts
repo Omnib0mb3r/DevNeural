@@ -54,6 +54,11 @@ import {
   readTail as readStallTail,
 } from './dashboard/worker-stall-watch.js';
 import { startBridgePresenceLoop } from './dashboard/bridge-presence.js';
+import {
+  seedProjectAnchors,
+  startProjectsRootWatcher,
+  getProjectsRoot,
+} from './dashboard/seed-project-anchors.js';
 import { startDistillationBackfillScheduler } from './lex/distillation-scheduler.js';
 import { startWorkerEventListener } from './dashboard/worker-event-listener.js';
 import { startExpectationSupervisor } from './lex/expectation-supervisor.js';
@@ -144,6 +149,31 @@ async function main(): Promise<void> {
     log: logger,
   });
   logger('gpu queue + vram monitor up');
+
+  /* Project anchor seeding (PROJECT-ANCHORS.md `## Seeding`, line 57).
+   * Enumerate top-level subdirs of the Projects root and upsert one
+   * project_session row per dir. Idempotent. fs.watch on the root
+   * keeps the seed pass in sync with new dirs created at runtime.
+   *
+   * Must run BEFORE the bridge-presence loop so an unknown-cwd
+   * presence file on first reconcile sees a row to flip live, and
+   * the inline auto-create fallback in reconcileBridgePresence has
+   * a coherent helper to call.
+   *
+   * Tunable via env:
+   *   DEVNEURAL_PROJECTS_ROOT (default C:/dev/Projects)            */
+  try {
+    const seedResult = seedProjectAnchors(store.db, { log: logger });
+    logger(
+      `project anchors seeded (root=${seedResult.root} scanned=${seedResult.scanned} inserted=${seedResult.inserted})`,
+    );
+  } catch (err) {
+    logger(`project anchor seed FAILED: ${(err as Error).message}`);
+  }
+  const projectsWatcherStop = startProjectsRootWatcher(store.db, {
+    root: getProjectsRoot(),
+    log: logger,
+  });
 
   /* Bridge presence resolver (PROJECT-ANCHORS.md step 2 of 6).
    * Polls <bridgeDir>/.bridge-presence/ on a short interval, flips
@@ -1443,6 +1473,11 @@ async function main(): Promise<void> {
     }
     try {
       if (groomingHandle) groomingHandle.stop();
+    } catch {
+      /* ignore */
+    }
+    try {
+      projectsWatcherStop();
     } catch {
       /* ignore */
     }

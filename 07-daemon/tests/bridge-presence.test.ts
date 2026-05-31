@@ -315,7 +315,7 @@ describe('reconcileBridgePresence', () => {
     expect(db.getProjectSession('anchor-A')!.status).toBe('dormant');
   });
 
-  it('ignores presence files whose cwd has no matching anchor', () => {
+  it('auto-creates an anchor for a presence file whose cwd is unseeded, leaving pre-seeded anchors dormant (PROJECT-ANCHORS seeding)', () => {
     const now = 6_000_000;
     writePresence(
       'orphan.json',
@@ -330,7 +330,15 @@ describe('reconcileBridgePresence', () => {
       freshMs: 30_000,
       now: () => now,
     });
-    expect(result.liveAnchorIds).toEqual([]);
+    /* The unseeded cwd now produces an inline anchor and a live flip
+     * in the same pass instead of being silently dropped. The two
+     * pre-seeded anchors (proj-a, proj-b) had no presence file so
+     * they stay dormant. */
+    const created = db.getProjectSessionByCwd('C:/dev/Projects/unknown');
+    expect(created).not.toBeNull();
+    expect(created?.status).toBe('live');
+    expect(created?.current_bridge_id).toBe('bridge-w1');
+    expect(result.liveAnchorIds).toEqual([created!.id]);
     expect(db.getProjectSession('anchor-A')!.status).toBe('dormant');
     expect(db.getProjectSession('anchor-B')!.status).toBe('dormant');
   });
@@ -508,6 +516,37 @@ describe('reconcileBridgePresence', () => {
     const row = db.getProjectSession('anchor-A')!;
     expect(row.current_session_id).toBe('prior-cc');
     expect(row.current_bridge_id).toBe('bridge-w1');
+  });
+
+  it('auto-creates anchor for unknown cwd and flips it live in the same pass (PROJECT-ANCHORS seeding)', () => {
+    const now = 4_500_000;
+    const unknownCwd = 'C:/dev/Projects/just-cloned-repo';
+    expect(db.getProjectSessionByCwd(unknownCwd)).toBeNull();
+
+    writePresence(
+      'new-window.json',
+      {
+        cwd: unknownCwd,
+        bridge_id: 'bridge-new',
+        cc_session_ids: ['cc-2222-2222'],
+        updated_at: new Date(now - 100).toISOString(),
+      },
+      now,
+    );
+
+    const result = reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => now,
+    });
+
+    const created = db.getProjectSessionByCwd(unknownCwd);
+    expect(created).not.toBeNull();
+    expect(created?.status).toBe('live');
+    expect(created?.current_bridge_id).toBe('bridge-new');
+    expect(created?.current_session_id).toBe('cc-2222-2222');
+    expect(created?.project_slug).toBe('just-cloned-repo');
+    expect(result.liveAnchorIds).toContain(created!.id);
   });
 });
 

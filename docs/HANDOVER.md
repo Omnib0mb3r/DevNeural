@@ -10,7 +10,7 @@ The rule: anyone reading this should be able to start cold and know
 **where the code is**, **what is in flight**, **what is shippable
 next**, and **what blockers exist**.
 
-Last touched: 2026-05-29 after shell-side smoke audit.
+Last touched: 2026-05-31 after Fix 52 (project anchors seeding + bridge-presence auto-create).
 
 ## Where we are
 
@@ -29,16 +29,24 @@ Code-truth specs: `docs/spec/FUNCTIONAL-SPEC.md` (architecture),
 deferred). All other waves and phase plans live in
 `docs/archive/spec/`.
 
-## Live state (2026-05-29 post-smoke audit)
+## Live state (2026-05-31 post Fix 52)
 
-- Daemon pid 39980, booted 2026-05-29T16:11:29Z, restart after Fix
-  51 dist regen. Boot log shows brainstorm-jsonl-ingestor,
-  stale-watcher, cancelled-tool-recovery, grooming-watch,
-  idle-watcher all started.
+- Daemon was hung (pid 6492, 590MB) following Docker Desktop install on
+  Windows; process alive but refusing connections on 3747 (Hyper-V /
+  HNS network filter side effect, not a code issue). Killed, lazy-
+  start hook rebound on a fresh pid. Operator restart still required
+  for Fix 52 dist regen.
 - Dashboard: prod static at port 3747 (Tailscale-exposed), dev
-  hot-reload at port 3000. Both 200.
-- Tree clean. HEAD `99ff119`.
-- Tests: 1063/1063 daemon pass, 138/138 dashboard unit pass.
+  hot-reload at port 3000.
+- Tests: 1080/1080 daemon pass (was 1063; +17 from Fix 52 seed + auto-
+  create pins). 138/138 dashboard unit pass.
+- Active brainstorms in DB: 0 (all 91 rows `status='ended'`). Lex
+  is idle. New work requires a fresh brainstorm spawn.
+- Cold-start preload audit: panel reported `OK Loaded 5 sibling
+  sessions, ... stale: 28, synced: 0, partial` on 2026-05-31 13:36 EDT
+  against `4bbafb48`. Preload pipeline degraded silently (LIVE
+  verdict hides partial state). Diagnosis tracked under SMOKE-TEST
+  step 6.6 + bug doc; not closed in this cycle.
 - Active brainstorms in DB: 0 (all 91 rows `status='ended'`). Lex
   is idle. New work requires a fresh brainstorm spawn.
 - Cold-start preload mode: `live` (runtime override). 104 audit
@@ -59,6 +67,7 @@ running daemon after the operator restarts.
 | 49  | project_scope_id + sibling-index scope swap (codex 12) | 7df66e0 + 71729d3 + dc26f88 + b189956 + ecab2d8 + 20419a8 + 196a9b2 |
 | 50  | PRELOAD-1 SessionStart hook stdout shape | b18ffaa + 20147a7 |
 | 51  | cc-pty double-talk: pcm 'end' release, not proc.exit | e0978ee |
+| 52  | project anchors seeded on boot + bridge-presence auto-create on unknown cwd (PROJECT-ANCHORS.md `## Seeding` line 57) | (this commit) |
 
 ## Smoke status (per SMOKE-TEST.md, current cycle)
 

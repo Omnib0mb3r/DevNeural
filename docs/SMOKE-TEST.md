@@ -154,6 +154,46 @@ removes the `handle.done` early-release in `speakOne`.
   Expect `tts-cancel` frame, PTY Ctrl+C, partialChain captures the
   cancelled segment.
 
+### Step 6: Project anchors seeding + presence auto-create (2026-05-31)
+
+Goal: every top-level dir under `C:/dev/Projects` exists as a
+`project_session` row at daemon boot; an unknown-cwd bridge presence
+auto-creates its anchor instead of getting silently dropped. Closes
+`docs/bugs/2026-05-31-project-anchors-not-seeded-silent-drop.md`
+("new projects showing up but production code never finished"; spec
+section `## Seeding` at `docs/spec/PROJECT-ANCHORS.md:57`).
+
+- [ ] **6.1** Fresh daemon boot with empty `project_session` table:
+  `seedProjectAnchors` enumerates every top-level dir under
+  `DEVNEURAL_PROJECTS_ROOT` (default `C:/dev/Projects`) and upserts
+  one row per dir. SELECT count(*) FROM project_session matches `ls
+  C:/dev/Projects | wc -l` (minus dotfiles and non-dirs).
+- [ ] **6.2** Re-run boot. No duplicate rows; same count. Idempotent.
+- [ ] **6.3** `mkdir C:/dev/Projects/__smoke_seed_test__` while daemon
+  running. Within `fs.watch` debounce window: a row appears for the
+  new dir. `rm -rf` the dir; the row stays (spec rule: explicit user
+  delete only).
+- [ ] **6.4** Drop a fake bridge presence file under an unseeded cwd
+  (or remove the anchor row and let bridge re-announce). On next
+  reconcile pass, `bridge-presence.ts` creates the anchor inline AND
+  flips it `status='live'` in the same pass. No silent drop.
+- [ ] **6.5** Dashboard /system Projects panel renders every disk dir
+  exactly once. No phantom / duplicate / missing tiles.
+- [ ] **6.6** Cold-start preload distillation gap. Dashboard /system
+  Cold-Start Preload panel for anchor `4bbafb48` currently reports
+  `OK` while showing `stale: 28, synced: 0, partial`. Trace the
+  distillation pipeline (`07-daemon/src/curation/*distill*` +
+  `lex-cold-start-preamble.ts`), determine why 28 sibling sessions
+  carry no `brainstorm_sessions.last_summary` row, and either fix
+  the worker so distillations land, OR promote the `partial`
+  verdict from informational to actionable (yellow / red banner +
+  structured signal Lex can react to). Acceptance: `stale` count
+  drops to zero under steady state; a `partial` preload no longer
+  hides behind a green `OK` label. Caught when a fresh CC session
+  in this repo had to grep prior jsonl files to figure out where
+  the last session left off; the second brain should have
+  delivered that as a distilled cold-start block.
+
 ## Tier 4 — Hardware-blocked / environment-gated
 
 - [ ] **9.1 iOS PWA push end-to-end** (reminder-push.ts + daemon.ts).
@@ -184,7 +224,8 @@ Investigations in `docs/bugs/`; fixes not yet written:
 ## Not-built / future
 
 - [ ] Auto-discover projects under `C:/dev/Projects` filtered by
-  project-marker files.
+  project-marker files. (Step 6 above lands raw enumeration; the
+  marker-file filter is a follow-up.)
 - [ ] Phase 7 speaker diarization (pyannote).
 - [ ] Phase 8 reliability plan (see `docs/spec/PHASE-8-RELIABILITY-
   PLAN.md`).
