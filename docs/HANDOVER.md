@@ -68,7 +68,8 @@ running daemon after the operator restarts.
 | 50  | PRELOAD-1 SessionStart hook stdout shape | b18ffaa + 20147a7 |
 | 51  | cc-pty double-talk: pcm 'end' release, not proc.exit | e0978ee |
 | 52  | project anchors seeded on boot + bridge-presence auto-create on unknown cwd (PROJECT-ANCHORS.md `## Seeding` line 57) | f758514 |
-| 53  | cold-start distillation boot recovery sweep + partial verdict promoted from green OK | (this commit) |
+| 53  | cold-start distillation boot recovery sweep + partial verdict promoted from green OK | 9f754f4 |
+| 54  | jsonl-fallback distillation closes the chunkless-skip gap | (this commit) |
 
 ## Smoke status (per SMOKE-TEST.md, current cycle)
 

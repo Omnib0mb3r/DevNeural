@@ -214,7 +214,7 @@ describe('runDistillationBackfill', () => {
     expect(r.hit_cap).toBe(false);
     expect(
       logs.find((l) =>
-        /skipped 2 chunkless brainstorms/.test(l),
+        /skipped 2 brainstorms with no chunks and no jsonl refs/.test(l),
       ),
     ).toBeTruthy();
   });

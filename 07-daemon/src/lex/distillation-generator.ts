@@ -38,6 +38,7 @@ import type {
 import type { LlmProvider } from '../llm/index.js';
 import { pickProvider } from '../llm/index.js';
 import type { DistillationGenerator } from './sibling-distillation-preload.js';
+import { readTranscriptFromJsonlRefs } from './jsonl-transcript-reader.js';
 
 /* Codex item 6 (Fix 43): every null-return path in the per-session
  * generator writes a structured row to distillation_error_log so the
@@ -179,16 +180,34 @@ export function createLlmDistillationGenerator(
       );
       return null;
     }
-    const transcript = buildTranscript(
+    let transcript = buildTranscript(
       opts.db,
       row,
       chunkLimit,
       maxTranscriptBytes,
     );
+    let source: 'chunks' | 'jsonl-fallback' = 'chunks';
     if (transcript.length === 0) {
-      log(`[distill-gen] no chunks for ${row.id.slice(0, 8)}`);
-      return null;
+      /* Chunkless brainstorm: read directly from the lex_transcript_ref
+       * jsonl files. Closes the gap that left sessions which ended
+       * before brainstorm_chunks landed (or before chunk writes had a
+       * chance to flush) un-distillable forever. */
+      transcript = readTranscriptFromJsonlRefs(opts.db, row.id, {
+        maxBytes: maxTranscriptBytes,
+        log,
+      });
+      if (transcript.length === 0) {
+        log(
+          `[distill-gen] no chunks and no jsonl-refs for ${row.id.slice(0, 8)}`,
+        );
+        return null;
+      }
+      source = 'jsonl-fallback';
+      log(
+        `[distill-gen] using jsonl-fallback for ${row.id.slice(0, 8)} (chunkless)`,
+      );
     }
+    void source;
     try {
       const result = await provider.call('distillation', {
         systemBlocks: [SYSTEM_BLOCK],

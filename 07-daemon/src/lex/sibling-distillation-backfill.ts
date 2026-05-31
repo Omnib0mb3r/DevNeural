@@ -19,6 +19,7 @@ import type {
   IndexDb,
 } from '../store/index-db.js';
 import type { DistillationGenerator } from './sibling-distillation-preload.js';
+import { hasDistillableJsonlSource } from './jsonl-transcript-reader.js';
 
 export interface BackfillOptions {
   db: IndexDb;
@@ -99,29 +100,44 @@ export async function runDistillationBackfill(
     return true;
   });
 
-  /* Pre-filter chunkless brainstorms. Sessions older than the
-   * brainstorm_chunks table have no transcript rows; the generator
-   * would skip them ("[distill-gen] no chunks for <id>") and return
-   * null, which the old bucketing classified as a failure. Treat
-   * them as skipped so the scheduler summary distinguishes "no
-   * content" from a real LLM / DB / generation error. Pre-filtering
-   * also avoids burning a provider call per chunkless candidate. */
+  /* Pre-filter brainstorms with no distillable source. Chunkless
+   * sessions used to be hard-skipped here; now we accept them if
+   * lex_transcript_ref resolves to readable jsonl files on disk
+   * (the generator falls back to that path). Skip only when BOTH
+   * sources are empty so the scheduler summary still distinguishes
+   * "no content" from a real provider / generation error. */
   const chunked: BrainstormSessionRow[] = [];
   let chunklessSkipCount = 0;
+  let jsonlFallbackCount = 0;
   for (const row of candidates) {
-    if (opts.db.countBrainstormChunks(row.id) === 0) {
-      out.skipped.push(row.id);
-      chunklessSkipCount += 1;
+    const hasChunks = opts.db.countBrainstormChunks(row.id) > 0;
+    if (hasChunks) {
+      chunked.push(row);
       continue;
     }
-    chunked.push(row);
+    if (hasDistillableJsonlSource(opts.db, row.id)) {
+      chunked.push(row);
+      jsonlFallbackCount += 1;
+      continue;
+    }
+    out.skipped.push(row.id);
+    chunklessSkipCount += 1;
   }
-  if (chunklessSkipCount > 0 && opts.log) {
-    opts.log(
-      `[distill-backfill] skipped ${chunklessSkipCount} chunkless brainstorm${
-        chunklessSkipCount === 1 ? '' : 's'
-      }`,
-    );
+  if (opts.log) {
+    if (jsonlFallbackCount > 0) {
+      opts.log(
+        `[distill-backfill] ${jsonlFallbackCount} chunkless brainstorm${
+          jsonlFallbackCount === 1 ? '' : 's'
+        } eligible via jsonl fallback`,
+      );
+    }
+    if (chunklessSkipCount > 0) {
+      opts.log(
+        `[distill-backfill] skipped ${chunklessSkipCount} brainstorm${
+          chunklessSkipCount === 1 ? '' : 's'
+        } with no chunks and no jsonl refs`,
+      );
+    }
   }
 
   for (const row of chunked) {
