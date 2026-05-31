@@ -172,4 +172,64 @@ describe('startDistillationBackfillScheduler', () => {
     handle.stop();
     expect(logs.find((l) => l.includes('BF-4'))).toBeTruthy();
   });
+
+  it('boot recovery sweep runs first with a higher row cap and finishes before the steady-state tick', async () => {
+    /* Seed 18 candidates so the boot cap (default 20 in the wire,
+     * 12 here) catches everything in one pass while the steady-state
+     * limit (5) would have taken several intervals. */
+    for (let i = 0; i < 18; i++) {
+      insertBs(`bs-${i.toString().padStart(2, '0')}`, 1_000 + i);
+    }
+    const provider = stubProvider({});
+    const logs: string[] = [];
+    const handle = startDistillationBackfillScheduler({
+      db,
+      provider,
+      log: (m) => logs.push(m),
+      firstFireDelayMs: 60_000,
+      intervalMs: 600_000,
+      bootRecoveryLimit: 12,
+      bootRecoveryDelayMs: 5,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    for (let i = 0; i < 200; i++) {
+      await Promise.resolve();
+    }
+    handle.stop();
+    const bootLog = logs.find((l) => l.includes('boot-recovery'));
+    expect(bootLog).toBeTruthy();
+    expect(bootLog).toMatch(/processed=12/);
+    expect(bootLog).toMatch(/hit_cap=true/);
+    const populated = db
+      .listBrainstorms({ limit: 100 })
+      .filter((r) => r.last_summary && r.last_summary.length > 0);
+    expect(populated.length).toBe(12);
+    const upLine = logs.find((l) => l.includes('[distill-scheduler] up'));
+    expect(upLine).toMatch(/boot_recovery_limit=12/);
+  });
+
+  it('bootRecoveryLimit=0 disables the boot recovery sweep', async () => {
+    insertBs('bs-only', 1_000);
+    const provider = stubProvider({});
+    const logs: string[] = [];
+    const handle = startDistillationBackfillScheduler({
+      db,
+      provider,
+      log: (m) => logs.push(m),
+      firstFireDelayMs: 60_000,
+      intervalMs: 600_000,
+      bootRecoveryLimit: 0,
+      bootRecoveryDelayMs: 5,
+    });
+    await vi.advanceTimersByTimeAsync(50);
+    for (let i = 0; i < 50; i++) {
+      await Promise.resolve();
+    }
+    handle.stop();
+    expect(logs.find((l) => l.includes('boot-recovery'))).toBeUndefined();
+    const populated = db
+      .listBrainstorms({ limit: 100 })
+      .filter((r) => r.last_summary && r.last_summary.length > 0);
+    expect(populated.length).toBe(0);
+  });
 });

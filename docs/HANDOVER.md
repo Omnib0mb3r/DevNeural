@@ -67,7 +67,8 @@ running daemon after the operator restarts.
 | 49  | project_scope_id + sibling-index scope swap (codex 12) | 7df66e0 + 71729d3 + dc26f88 + b189956 + ecab2d8 + 20419a8 + 196a9b2 |
 | 50  | PRELOAD-1 SessionStart hook stdout shape | b18ffaa + 20147a7 |
 | 51  | cc-pty double-talk: pcm 'end' release, not proc.exit | e0978ee |
-| 52  | project anchors seeded on boot + bridge-presence auto-create on unknown cwd (PROJECT-ANCHORS.md `## Seeding` line 57) | (this commit) |
+| 52  | project anchors seeded on boot + bridge-presence auto-create on unknown cwd (PROJECT-ANCHORS.md `## Seeding` line 57) | f758514 |
+| 53  | cold-start distillation boot recovery sweep + partial verdict promoted from green OK | (this commit) |
 
 ## Smoke status (per SMOKE-TEST.md, current cycle)
 

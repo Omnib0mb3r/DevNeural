@@ -202,7 +202,16 @@ async function main(): Promise<void> {
    * ollama isConfigured() + name !== 'anthropic' (BF-4); when either
    * gate fails the scheduler logs once and no-ops. Tunable via env:
    *   DEVNEURAL_DISTILL_SCHEDULER_INTERVAL_MS  (default 600000 / 10m)
-   *   DEVNEURAL_DISTILL_SCHEDULER_FIRST_FIRE_MS (default 30000 / 30s) */
+   *   DEVNEURAL_DISTILL_SCHEDULER_FIRST_FIRE_MS (default 30000 / 30s)
+   *   DEVNEURAL_DISTILL_BOOT_RECOVERY_LIMIT    (default 20; 0 disables)
+   *   DEVNEURAL_DISTILL_BOOT_RECOVERY_DELAY_MS (default 5000)
+   *
+   * Boot recovery sweep runs a single high-cap tick shortly after
+   * boot to catch up ended-but-undistilled sessions left behind when
+   * the prior daemon died mid-tick (fast restart). Without it,
+   * stale-ref counts on cold-start preload can sit at 20+ for over
+   * an hour because the steady-state tick only handles 5 rows per
+   * 10-minute interval. */
   startDistillationBackfillScheduler({
     db: store.db,
     log: logger,
@@ -211,6 +220,12 @@ async function main(): Promise<void> {
     ),
     firstFireDelayMs: Number(
       process.env.DEVNEURAL_DISTILL_SCHEDULER_FIRST_FIRE_MS ?? 30_000,
+    ),
+    bootRecoveryLimit: Number(
+      process.env.DEVNEURAL_DISTILL_BOOT_RECOVERY_LIMIT ?? 20,
+    ),
+    bootRecoveryDelayMs: Number(
+      process.env.DEVNEURAL_DISTILL_BOOT_RECOVERY_DELAY_MS ?? 5_000,
     ),
   });
 

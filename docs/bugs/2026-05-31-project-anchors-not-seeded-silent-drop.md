@@ -1,6 +1,6 @@
 # 2026-05-31 Project anchors never seeded, presence silently dropped
 
-**Status:** open (production code never finished; rediscovered after Docker install hung daemon and broke prior Lex session 1e762120)
+**Status:** Fix 52 closes the seeding + bridge-presence half. Fix 53 closes the cold-start partial-verdict + boot recovery sweep half. Per-preload `runStaleRefCatchup` cap promotion remains open (Followups).
 
 ## Symptom
 

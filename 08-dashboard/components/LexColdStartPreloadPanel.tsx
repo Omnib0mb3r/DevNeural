@@ -103,7 +103,17 @@ function PreloadEventCard({
   const sibling = latest?.sibling_count ?? 0;
   const turns = latest?.recent_turns_appended ?? 0;
   const failure = latest?.failure_reason ?? null;
-  const tone = failure ? "text-err" : "text-ok";
+  const partial = latest?.partial_sync === true;
+  /* "ok" is only honest when nothing degraded. partial_sync=true means
+   * the catchup ran out of budget or some refs could not be re-
+   * distilled; surfacing it as green OK hid the gap that left Lex
+   * landing blind on cold-start. */
+  const tone = failure ? "text-err" : partial ? "text-warn" : "text-ok";
+  const statusLabel = failure
+    ? `failed (${failure})`
+    : partial
+      ? `partial · ${sibling} siblings · ${turns} turns`
+      : `${sibling} siblings · ${turns} turns`;
   const staleChip = staleChipForLatest(latest);
   return (
     <li
@@ -129,9 +139,7 @@ function PreloadEventCard({
             {staleChip.text}
           </span>
         )}
-        <span className={`shrink-0 ${tone}`}>
-          {failure ? `failed (${failure})` : `${sibling} siblings · ${turns} turns`}
-        </span>
+        <span className={`shrink-0 ${tone}`}>{statusLabel}</span>
         <span className="text-txt3 shrink-0">{group.rows.length} events</span>
       </button>
       {open && (
@@ -146,10 +154,18 @@ function PreloadEventCard({
                 <span className="text-txt3 w-28 shrink-0">{fmtTs(r.ts)}</span>
                 <span
                   className={`uppercase tracking-wider text-nano shrink-0 ${
-                    r.failure_reason ? "text-err" : "text-ok"
+                    r.failure_reason
+                      ? "text-err"
+                      : r.partial_sync === true
+                        ? "text-warn"
+                        : "text-ok"
                   }`}
                 >
-                  {r.failure_reason ? "failed" : "ok"}
+                  {r.failure_reason
+                    ? "failed"
+                    : r.partial_sync === true
+                      ? "partial"
+                      : "ok"}
                 </span>
                 <span className="text-txt2 flex-1 truncate">
                   {r.preamble || "(no preamble)"}

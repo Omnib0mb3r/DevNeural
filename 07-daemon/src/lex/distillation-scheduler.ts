@@ -27,6 +27,8 @@ import {
 
 const DEFAULT_INTERVAL_MS = 10 * 60 * 1000;
 const DEFAULT_FIRST_FIRE_DELAY_MS = 30 * 1000;
+const DEFAULT_BOOT_RECOVERY_LIMIT = 20;
+const DEFAULT_BOOT_RECOVERY_DELAY_MS = 5 * 1000;
 
 export interface DistillationSchedulerOptions {
   db: IndexDb;
@@ -35,6 +37,18 @@ export interface DistillationSchedulerOptions {
   firstFireDelayMs?: number;
   limit?: number;
   provider?: LlmProvider | null;
+  /** Boot recovery sweep: run once on daemon boot with a higher row cap
+   * than the steady-state scheduler tick, before the normal interval
+   * begins. Closes the gap that opens when the daemon dies mid-
+   * distillation (Docker install, host reboot, crash). Without it, the
+   * stale-count for cold-start preload can sit at 20+ for over an hour
+   * after a fast restart because the regular tick only catches 5 per
+   * pass on a 10-minute interval. Set to 0 to disable. */
+  bootRecoveryLimit?: number;
+  /** Delay before the boot recovery tick fires. Shorter than the
+   * steady-state firstFireDelayMs so cold-start preloads on early
+   * brainstorm spawns see fewer stale refs. */
+  bootRecoveryDelayMs?: number;
 }
 
 export interface DistillationSchedulerHandle {
@@ -65,17 +79,22 @@ export function startDistillationBackfillScheduler(
     );
     return { stop: () => undefined };
   }
+  const bootRecoveryLimit =
+    opts.bootRecoveryLimit ?? DEFAULT_BOOT_RECOVERY_LIMIT;
+  const bootRecoveryDelay =
+    opts.bootRecoveryDelayMs ?? DEFAULT_BOOT_RECOVERY_DELAY_MS;
   const generator = createLlmDistillationGenerator({
     db: opts.db,
     log,
     provider,
   });
+  let bootTimer: ReturnType<typeof setTimeout> | null = null;
   let firstTimer: ReturnType<typeof setTimeout> | null = null;
   let intervalTimer: ReturnType<typeof setInterval> | null = null;
   let running = false;
-  const tick = async (): Promise<void> => {
+  const tick = async (tickLimit: number, label: string): Promise<void> => {
     if (running) {
-      log(`[distill-scheduler] previous tick still running; skip`);
+      log(`[distill-scheduler] previous tick still running; skip (${label})`);
       return;
     }
     running = true;
@@ -83,21 +102,34 @@ export function startDistillationBackfillScheduler(
       const result = await runDistillationBackfill({
         db: opts.db,
         generator,
-        limit,
+        limit: tickLimit,
         log,
       });
       log(
-        `[distill-scheduler] processed=${result.processed.length} errors=${result.errors.length} skipped=${result.skipped.length} hit_cap=${result.hit_cap}`,
+        `[distill-scheduler:${label}] processed=${result.processed.length} errors=${result.errors.length} skipped=${result.skipped.length} hit_cap=${result.hit_cap}`,
       );
     } catch (err) {
-      log(`[distill-scheduler] tick failed: ${(err as Error).message}`);
+      log(`[distill-scheduler:${label}] tick failed: ${(err as Error).message}`);
     } finally {
       running = false;
     }
   };
+  /* Boot recovery sweep: high-cap one-shot tick that runs before the
+   * steady-state schedule. Designed to close the stale-count gap on
+   * fast restarts where the daemon died mid-distillation. Set
+   * bootRecoveryLimit=0 to disable; the original 30s first-fire then
+   * runs at the steady-state cap. */
+  if (bootRecoveryLimit > 0) {
+    bootTimer = setTimeout(() => {
+      void tick(bootRecoveryLimit, 'boot-recovery');
+    }, bootRecoveryDelay);
+    if (bootTimer && typeof bootTimer.unref === 'function') {
+      bootTimer.unref();
+    }
+  }
   firstTimer = setTimeout(() => {
-    void tick();
-    intervalTimer = setInterval(() => void tick(), intervalMs);
+    void tick(limit, 'tick');
+    intervalTimer = setInterval(() => void tick(limit, 'tick'), intervalMs);
     if (intervalTimer && typeof intervalTimer.unref === 'function') {
       intervalTimer.unref();
     }
@@ -106,10 +138,11 @@ export function startDistillationBackfillScheduler(
     firstTimer.unref();
   }
   log(
-    `[distill-scheduler] up (interval=${intervalMs}ms first_fire_delay=${firstDelay}ms limit=${limit} provider=${provider.name})`,
+    `[distill-scheduler] up (interval=${intervalMs}ms first_fire_delay=${firstDelay}ms limit=${limit} boot_recovery_limit=${bootRecoveryLimit} boot_recovery_delay=${bootRecoveryDelay}ms provider=${provider.name})`,
   );
   return {
     stop: () => {
+      if (bootTimer) clearTimeout(bootTimer);
       if (firstTimer) clearTimeout(firstTimer);
       if (intervalTimer) clearInterval(intervalTimer);
     },
