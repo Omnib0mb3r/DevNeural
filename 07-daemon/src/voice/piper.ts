@@ -25,6 +25,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Readable } from 'node:stream';
 import { DATA_ROOT } from '../paths.js';
+import { sanitizeForTts } from './tts-sanitize.js';
 
 const DEFAULT_BIN = 'C:/dev/piper/piper/piper.exe';
 const DEFAULT_VOICE_DIR = 'C:/dev/piper/voices';
@@ -530,8 +531,15 @@ export function synthesize(text: string): SynthHandle {
     },
   );
 
+  /* Fix 59 (2026-06-01) TTS sanitizer. Belt-and-suspenders filter:
+   * Lex's voice contract says "no paths, no markup, no UUIDs as
+   * numbers" but the rule lived only in the prompt + memory file.
+   * This stage enforces it server-side so a slip never reaches the
+   * speaker. Pure + idempotent so the call is safe regardless of
+   * what already happened to the text upstream. */
+  const sanitized = sanitizeForTts(text);
   /* Feed text on stdin and close to signal "synthesize this and exit". */
-  proc.stdin?.write(text);
+  proc.stdin?.write(sanitized);
   proc.stdin?.end();
 
   let done: () => void;

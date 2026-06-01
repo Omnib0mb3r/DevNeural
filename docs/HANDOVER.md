@@ -73,7 +73,9 @@ running daemon after the operator restarts.
 | 55  | context_verdict + last_child surface + Lex cold-start vetting protocol | a9779ed |
 | 56  | per-preload catchup ceiling bump (3 -> 6 refs, 5s -> 8s budget) | 9c08e4f |
 | 30  | voice "lex end session" = End button parity | 9c08e4f |
-| 57  | COALESCE Phase B (classifier + conflict push-back + AbortController) + Phase C (text-input WS frame) | (this commit) |
+| 57  | COALESCE Phase B (classifier + conflict push-back + AbortController) + Phase C (text-input WS frame) | a24a83b |
+| 59  | TTS sanitizer (server-side enforcement of voice-mode rules) | (this commit) |
+| 60  | distillation dump-to-markdown helper (`npm run dump-distillations`) | (this commit) |
 
 ## Smoke status (per SMOKE-TEST.md, current cycle)
 

@@ -29,7 +29,8 @@
     "migrate": "tsx src/db/migrate.ts",
     "backfill-brainstorms": "tsx scripts/backfill-brainstorms.ts",
     "audit-doc-ingest": "tsx scripts/audit-doc-ingest.ts",
-    "lex-replay": "tsx scripts/lex-replay.ts"
+    "lex-replay": "tsx scripts/lex-replay.ts",
+    "dump-distillations": "tsx scripts/dump-distillations.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.91.1",

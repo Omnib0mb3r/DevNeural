@@ -24,13 +24,13 @@ Captured 2026-05-04. Living list. Tick when shipped.
 - [ ] Trigger a real reinforcement event in conversation. Send Claude a prompt where the wiki should match, watch dashboard ReinforcementPanel for an `injected` row, then watch for `hit` / `raw-hit` after the reply lands. Confirms curator + reinforcement + panel chain end-to-end.
 - [ ] Live verify Lex session rewrite (commit `5af07d0`). Open past anchor on /lex, confirm spawn-or-bind works, check Brainstorms group renders in Stream Deck, hit end on a session.
 
-## TTS sanitizer (low priority, deferred 2026-05-16)
+## TTS sanitizer
 
-- [ ] Daemon-side `sanitizeForTts(text)` hook in TTS pipeline, runs before Piper synth. Strips: full filesystem paths to basenames (`C:/dev/Projects/DevNeural/foo/bar.ts` -> `bar.ts`), long URLs to host only, angle-bracket / JSX / HTML markup (describe rendered text or drop), UUIDs / SHAs / hex IDs (spell character-by-character or replace with "opaque ID"), telemetry shorthand. Belt-and-suspenders: rules currently enforced only by Lex behavior via memory; server-side filter so a slip never reaches the user. Touchpoints: `07-daemon/src/voice/piper.ts` (or wherever TTS text enters synth), new module `07-daemon/src/voice/tts-sanitize.ts`. Reason: voice-mode rules (no paths, no markup chars, no UUIDs as numbers) have leaked through Lex despite memory; daemon enforcement closes the gap.
+- [x] Daemon-side `sanitizeForTts(text)` shipped 2026-06-01 (Fix 59). New module `07-daemon/src/voice/tts-sanitize.ts` strips Windows + POSIX paths to basenames, URLs to host only, UUIDs + long hex digests to "opaque id", angle-bracket markup, and collapses whitespace. Wired into `piper.ts` `synthesize()` so every TTS string passes through before reaching piper stdin. 14 test pins cover the rule matrix + idempotency.
 
 ## Deferred Wave 2 Day 5 (Lex personality track)
 
-- [ ] Step 20 (LX-1) prompt versioning archive. Daemon writes `07-daemon/data/lex-prompts/<version>.md` on every prompt change. Version = monotonic ISO timestamp + short hash. Backfill existing prompts on first run. Foundation for step 21 A/B replay harness.
+- [x] Step 20 (LX-1) prompt versioning archive. Already shipped per `prompt-archive.ts` + live archive directory at `C:/dev/data/skill-connections/lex-prompts/` (timestamped files visible). System-prompt assembly calls `archivePromptVersion` from `buildLexSystemPromptVersioned`. Foundation for step 21 A/B replay harness in place.
 
 ## Next after Stage 0-2 smoke (LEX-AUTONOMY-PAYLOAD-SPEC)
 
@@ -59,7 +59,7 @@ Captured 2026-05-04. Living list. Tick when shipped.
 
 ## Bugs / friction (captured 2026-05-13 brainstorm)
 
-- [ ] **Dashboard rebuild after panel commits is manual + invisible.** Operator hits /system after a commit and sees stale UI; no signal that `.next` is older than the latest source. Solution (preferred): daemon spawns and supervises `next dev -p 3000` as a managed child process at startup, restarts on crash, kills on stop. Runtime_config toggle `dashboard_supervisor_enabled` (default on, off for CI). Mirrors existing capture/ingest worker supervision. Removes the human rebuild step entirely; hot-reload covers all future code changes. Fallback option: "Rebuild dashboard" button on /system panel that shells `npm run build` + bounces `npm start`.
+- [x] **Dashboard rebuild after panel commits is manual + invisible.** Shipped: `07-daemon/src/dashboard/dashboard-supervisor.ts` (316 lines) owns the lifecycle of `next dev -p 3000`. `runtime_config.dashboard_supervisor_enabled` gates, env `DEVNEURAL_DASHBOARD_SUPERVISOR` fallback, CI=true forces off. Backoff doubles on fast crash, resets on graceful exit. `taskkill /t` on Windows tears the next worker subtree on shutdown. Wired in daemon.ts at line 1373; shutdown closure awaits at line 1480.
 - [x] **Bridge cc_session_ids goes empty when worker idle >30s. Fix: make cc_session_id sticky, gated on bridge presence freshness not jsonl mtime.** Sticky latch shipped 602d91e. /clear stuck-phase follow-up shipped 4796aa8 (60s anti-flap window + latch-first ccSessionLookup priority so daemon /sessions cache cannot self-reinforce a stale uuid).
 - [x] **Dashboard lock state has no visible indicator. Operator can't tell when /unlock is required.** First pass shipped as Task D top-level `AuthGuard` (commit pending). Mounted at `app/layout.tsx`, polls `GET /auth/status` on 30s tick + visibility/focus events, redirects to `/unlock` on `locked=true`, and surfaces a yellow `Session expired — click to unlock.` banner the moment the state flips. Still open as polish: persistent lock pip + remaining-TTL tooltip in TopBar, explicit "Lock now" affordance, sliding-window refresh.
 - [ ] **C-4 live verify gated on daemon restart (2026-05-13).** Bind anchor `4bbafb48-bbfd-47e6-b076-e1a58a334303` (DevNeural Testing brainstorm) to project anchor `391b88f6-396c-4c46-a8d7-b656a2d5ad1d` (DevNeural) via `PATCH /lex/anchors/4bbafb48.../` body `{supervises_project_anchor_id: '391b88f6...'}`, then `POST /lex/inject-cross-session` with `caller_brainstorm_id` only (omit target_session) and confirm the inject lands in the bound project's live worker. Attempted today, blocked: live DB has no `supervises_project_anchor_id` column (migration 025 not applied) and the running daemon predates 295feff / d828762 / ae0a973, so PATCH silently no-op'd `{ok:true}` without persisting and the inject returned the legacy `400 target_session required`. Action: bounce the daemon so migration 025 + the new validate / setLexSessionSupervises / resolveSupervisedTargetSession code paths come up, then rerun. The current_session_id on the project anchor is also stale (`0d25363c` from the pre-/clear era); after Task E (4796aa8) the bridge needs to reload its VS Code extension so the latch flips the presence file onto the live jsonl before the inject can land.
@@ -80,7 +80,7 @@ Captured 2026-05-04. Living list. Tick when shipped.
   2. **HTTP endpoint**: existing route in `07-daemon/src/dashboard/routes.ts:3395` returns the meeting/brainstorm summary by id (path TBD, confirm before use).
   3. **Direct DB query**: `sqlite3 C:\dev\data\skill-connections\index.db "SELECT id, user_label, datetime(last_summary_ms/1000, 'unixepoch'), substr(last_summary,1,500) FROM brainstorm_sessions WHERE last_summary IS NOT NULL ORDER BY last_summary_ms DESC LIMIT 10;"`. Note: sqlite3 not on PATH in OTLCDEV's bash; use DB Browser for SQLite, or run via `npx better-sqlite3` inline script.
 
-  Open: build a quick dump-to-markdown helper that walks recent distillations and writes them to `C:\tmp\distillations-YYYY-MM-DD.md` for casual scanning.
+  - [x] dump-to-markdown helper shipped 2026-06-01 (Fix 60). `npm run dump-distillations -- --limit N --out path.md` walks recent rows and writes a single markdown file. Read-only against the live DB; honours `DEVNEURAL_DATA_ROOT`. Default output `C:/tmp/distillations-YYYY-MM-DD.md`.
 
 ## Pre-publish (before GitHub release)
 
