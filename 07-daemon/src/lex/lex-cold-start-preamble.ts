@@ -178,8 +178,14 @@ export const OUTDATED_GAP_MS_DEFAULT = 7 * 24 * 60 * 60 * 1000;
 const TOP_N_DEFAULT = 2;
 const ANCHOR_REF_LIMIT_DEFAULT = 5;
 const ANCHOR_PAIRS_PER_REF_DEFAULT = 5;
-const SYNC_BUDGET_MS_DEFAULT = 5_000;
-const SYNC_MAX_REFS_DEFAULT = 3;
+/* Fix 56 (2026-05-31): per-preload catchup ceiling bump. The prior
+ * defaults (3 refs / 5s) capped a single cold-start to at most three
+ * re-distillations even when ollama could absorb more. Bumping to 6
+ * refs / 8s closes the typical 4-6 stale-ref windows we see in
+ * production after a fast restart. Both remain env-overridable via the
+ * input opts. */
+const SYNC_BUDGET_MS_DEFAULT = 8_000;
+const SYNC_MAX_REFS_DEFAULT = 6;
 
 function readJsonl(p: string): string | null {
   try {

@@ -179,20 +179,29 @@ section `## Seeding` at `docs/spec/PROJECT-ANCHORS.md:57`).
   flips it `status='live'` in the same pass. No silent drop.
 - [ ] **6.5** Dashboard /system Projects panel renders every disk dir
   exactly once. No phantom / duplicate / missing tiles.
-- [ ] **6.6** Cold-start preload distillation gap. Dashboard /system
-  Cold-Start Preload panel for anchor `4bbafb48` currently reports
-  `OK` while showing `stale: 28, synced: 0, partial`. Trace the
-  distillation pipeline (`07-daemon/src/curation/*distill*` +
-  `lex-cold-start-preamble.ts`), determine why 28 sibling sessions
-  carry no `brainstorm_sessions.last_summary` row, and either fix
-  the worker so distillations land, OR promote the `partial`
-  verdict from informational to actionable (yellow / red banner +
-  structured signal Lex can react to). Acceptance: `stale` count
-  drops to zero under steady state; a `partial` preload no longer
-  hides behind a green `OK` label. Caught when a fresh CC session
-  in this repo had to grep prior jsonl files to figure out where
-  the last session left off; the second brain should have
-  delivered that as a distilled cold-start block.
+- [x] **6.6 PASS 2026-05-31** Cold-start preload distillation gap.
+  Closed by Fix 53 (boot recovery sweep + partial verdict
+  promotion), Fix 54 (jsonl-fallback distillation), Fix 55
+  (context_verdict + last_child surface + Lex vetting protocol).
+  Live API probe `POST /lex/cold-start-preload {session_id:
+  '332e6e5b...'}` returned block with `context_verdict=partial
+  last_child=DevNeural Testing child_ended_ms=1780249008862
+  distillation_gap_ms=0` and 5 sibling distillation summaries
+  inline. Daemon log post-Fix-54 boot showed
+  `[distill-backfill] 37 chunkless brainstorms eligible via jsonl
+  fallback` and per-row `[distill-gen] using jsonl-fallback`
+  lines. 11 remaining unrecoverable rows are dead data (chunks=0
+  AND transcript_path missing on disk; see audit in
+  `docs/bugs/2026-05-31-project-anchors-not-seeded-silent-drop.md`).
+  Catchup ceiling raised in Fix 56 (`syncMaxRefs` 3 -> 6,
+  `syncBudgetMs` 5000 -> 8000).
+- [ ] **6.7** Live brainstorm spawn + Lex first-reply vetting.
+  Open a fresh Lex session against a brainstorm with at least one
+  prior child session; confirm Lex's first turn quotes the verdict
+  honestly (fresh -> brief continuity ack; stale -> "distillation
+  is a couple of hours behind" caveat; outdated/empty -> asks
+  Michael to fill in). Hardware-gated; verify on next live
+  brainstorm.
 
 ## Tier 4 — Hardware-blocked / environment-gated
 

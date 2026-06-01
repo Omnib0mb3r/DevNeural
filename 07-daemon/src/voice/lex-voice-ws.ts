@@ -55,7 +55,9 @@ import {
   getPtyBySession,
   listPtys,
   isAwaitingSystemPrompt,
+  ptyKill,
 } from '../dashboard/pty-host.js';
+import { getLexSession, setLexSessionStatus } from '../lex/lex-session-store.js';
 import {
   getBrainstormByClaudeSessionId,
   getBrainstormByPty,
@@ -1616,7 +1618,44 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           `[voice-ws] voice-cmd matched kind=end_session source=${source} bindKey=${state.bindKey ?? 'null'} watchSessionId=${state.watchSessionId ?? 'null'} brainstormId=${state.brainstormId ?? 'null'}`,
         );
         send({ t: 'session-end', reason: 'voice-command' });
-        void fireSessionEndPipeline('voice-command');
+        /* Fix 30: voice "lex end session" must equal clicking the End
+         * button. The pipeline call distills + writes ref_summary; the
+         * follow-up tears the PTY down and flips the anchor dormant
+         * so the dashboard tile + Stream Deck slot release in the same
+         * pass. Previous behaviour ran only the pipeline and left the
+         * row "live", which broke parity with the UI affordance. */
+        void (async () => {
+          try {
+            await fireSessionEndPipeline('voice-command');
+          } catch (err) {
+            console.log(
+              `[voice-ws] end_session: pipeline threw ${(err as Error).message}`,
+            );
+          }
+          const anchorId = state.brainstormId;
+          if (!anchorId) return;
+          try {
+            const row = getLexSession(anchorId);
+            if (row?.current_pty_id) {
+              try {
+                ptyKill(row.current_pty_id);
+              } catch {
+                /* best-effort */
+              }
+            }
+            setLexSessionStatus(anchorId, {
+              status: 'dormant',
+              currentPtyId: null,
+            });
+            console.log(
+              `[voice-ws] end_session: anchor flipped dormant ${anchorId}`,
+            );
+          } catch (err) {
+            console.log(
+              `[voice-ws] end_session: anchor teardown failed ${anchorId}: ${(err as Error).message}`,
+            );
+          }
+        })();
         return true;
       }
       case 'mute': {
