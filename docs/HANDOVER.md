@@ -71,8 +71,9 @@ running daemon after the operator restarts.
 | 53  | cold-start distillation boot recovery sweep + partial verdict promoted from green OK | 9f754f4 |
 | 54  | jsonl-fallback distillation closes the chunkless-skip gap | 1b5021b |
 | 55  | context_verdict + last_child surface + Lex cold-start vetting protocol | a9779ed |
-| 56  | per-preload catchup ceiling bump (3 -> 6 refs, 5s -> 8s budget) | (this commit) |
-| 30  | voice "lex end session" = End button parity | (this commit) |
+| 56  | per-preload catchup ceiling bump (3 -> 6 refs, 5s -> 8s budget) | 9c08e4f |
+| 30  | voice "lex end session" = End button parity | 9c08e4f |
+| 57  | COALESCE Phase B (classifier + conflict push-back + AbortController) + Phase C (text-input WS frame) | (this commit) |
 
 ## Smoke status (per SMOKE-TEST.md, current cycle)
 

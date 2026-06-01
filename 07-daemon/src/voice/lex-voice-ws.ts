@@ -218,6 +218,13 @@ interface ConnState {
    * already has its own equivalent gate via awaitingResponseSince +
    * the mid-turn-no-tts queue. */
   inFlightDirectLlmReply: boolean;
+  /* Fix 57 (2026-06-01) COALESCE Phase B: AbortController bound to
+   * the in-flight callVoiceChat call. Contradiction handler aborts so
+   * ollama stops generating immediately instead of letting the
+   * cancelled instruction finish + land as one more assistant chunk
+   * that nobody asked for. Null between turns; assigned in
+   * handleDirectLlmUtterance before the await, cleared after. */
+  directLlmAbort: AbortController | null;
   /* Fix 40 (2026-05-26): speak-queue serialisation. The controller
    * drains entries one at a time, awaiting each piper's natural end
    * before spawning the next. Multi-segment Lex replies (pre-tool
@@ -541,6 +548,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     currentTtsStartedAtMs: 0,
     partialChain: [],
     pendingUserUtterances: [],
+    directLlmAbort: null,
     brainstormId: null,
     runtimeMode: null,
     inFlightDirectLlmReply: false,
@@ -1436,7 +1444,27 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         });
       }
       messages.push({ role: 'user', content: userText });
-      const reply = await callVoiceChat(messages);
+      /* COALESCE Phase B AbortController: bind a controller so a
+       * contradiction utterance arriving mid-call can cancel ollama
+       * immediately. AbortError is caught below + treated as a
+       * "cancelled mid-reply" outcome (no chunk, no speak). */
+      const controller = new AbortController();
+      state.directLlmAbort = controller;
+      let reply;
+      try {
+        reply = await callVoiceChat(messages, { signal: controller.signal });
+      } catch (err) {
+        if ((err as Error).name === 'AbortError' || controller.signal.aborted) {
+          console.log(
+            `[voice-ws] direct-llm reply aborted mid-call bs=${bsId.slice(0, 8)}`,
+          );
+          send({ t: 'direct-llm-aborted', reason: 'contradiction' });
+          return;
+        }
+        throw err;
+      } finally {
+        if (state.directLlmAbort === controller) state.directLlmAbort = null;
+      }
       /* Step 3: persist the assistant turn + speak it. */
       try {
         const replyTurnId = randomUUID();
@@ -2034,8 +2062,19 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         if (detectContradiction(result.text)) {
           const dropped = state.pendingUserUtterances.length;
           state.pendingUserUtterances = [];
+          /* COALESCE Phase B: abort the in-flight ollama call so the
+           * cancelled instruction stops generating immediately rather
+           * than landing as one more assistant chunk after the user
+           * already said "cancel". */
+          if (state.directLlmAbort) {
+            try {
+              state.directLlmAbort.abort();
+            } catch {
+              /* best-effort; controller may have completed */
+            }
+          }
           console.log(
-            `[voice-ws] direct-llm contradiction; cleared queue depth=${dropped} text=${JSON.stringify(result.text.slice(0, 80))}`,
+            `[voice-ws] direct-llm contradiction; cleared queue depth=${dropped} text=${JSON.stringify(result.text.slice(0, 80))} aborted_inflight=true`,
           );
           send({
             t: 'contradiction-cancel',
@@ -2298,6 +2337,83 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       case 'utterance-end':
         void handleUtteranceEnd();
         break;
+      case 'text-input': {
+        /* Fix 57 (2026-06-01) COALESCE Phase C: typed input flows
+         * through the same coalesce + flush pipeline voice uses. The
+         * sealed spec point 6 ("universal voice + text") says there
+         * is ONE queue per brainstorm, not two; this frame is the
+         * text half of that contract.
+         *
+         * Skips voice command matching (typing "lex panic" must not
+         * fire panic; the typed path has no wake-word convention).
+         * Skips the AEC bleed gate (typed input cannot be audio
+         * residue). Persistence to brainstorm_chunks happens via the
+         * same handleDirectLlmUtterance / brainstorm-jsonl-ingestor
+         * paths the voice transcript exercises, so the chunk row
+         * lands without a dedicated insert here. */
+        const rawText = typeof msg.text === 'string' ? msg.text.trim() : '';
+        if (!rawText) {
+          send({ t: 'error', code: 'empty-text-input', message: 'text required' });
+          break;
+        }
+        send({ t: 'transcript', text: rawText, ms: 0, source: 'text-input' });
+        if (state.runtimeMode === 'direct-llm' && state.brainstormId) {
+          if (state.inFlightDirectLlmReply) {
+            if (detectContradiction(rawText)) {
+              const dropped = state.pendingUserUtterances.length;
+              state.pendingUserUtterances = [];
+              if (state.directLlmAbort) {
+                try {
+                  state.directLlmAbort.abort();
+                } catch {
+                  /* best-effort */
+                }
+              }
+              send({
+                t: 'contradiction-cancel',
+                text: rawText,
+                dropped_count: dropped,
+              });
+              break;
+            }
+            state.pendingUserUtterances.push(rawText);
+            send({
+              t: 'queued-mid-turn',
+              text: rawText,
+              queue_depth: state.pendingUserUtterances.length,
+            });
+            break;
+          }
+          void runDirectLlmCoalesceLoop(rawText);
+          break;
+        }
+        if (!state.bindKey) {
+          send({
+            t: 'error',
+            code: 'no-bind',
+            message: 'not bound to a Lex PTY',
+          });
+          break;
+        }
+        if (isAwaitingSystemPrompt(state.bindKey)) {
+          send({
+            t: 'error',
+            code: 'cc-feedback-prompt-active',
+            message:
+              'Claude Code system prompt is open in the terminal. Text injection paused.',
+          });
+          break;
+        }
+        const ir = ptyInject(state.bindKey, rawText, true);
+        if (!ir.ok) {
+          send({ t: 'error', code: 'inject', message: ir.error });
+          break;
+        }
+        send({ t: 'injected', source: 'text-input' });
+        state.awaitingResponseSince = Date.now();
+        startJsonlWatch();
+        break;
+      }
       case 'wake-command': {
         /* Client-side always-on listener (Web Speech API or
          * keyboard hotkey) matched a Lex voice command while the

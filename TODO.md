@@ -35,14 +35,14 @@ Captured 2026-05-04. Living list. Tick when shipped.
 ## Next after Stage 0-2 smoke (LEX-AUTONOMY-PAYLOAD-SPEC)
 
 - [x] **Voice "lex end session" = End button parity (Fix 30).** Shipped 2026-05-31. `lex-voice-ws.ts:end_session` now follows `fireSessionEndPipeline('voice-command')` with `ptyKill(row.current_pty_id)` + `setLexSessionStatus(anchorId, {status:'dormant', currentPtyId:null})` so the voice command matches the End button. Direct-llm anchors no-op the ptyKill; cc-pty anchors release. The in-flight tool_use gate from the original spec was not added; current behaviour treats voice end as authoritative since the operator just said the words.
-- [~] **Utterance queue coalesce (relevance-aware single structured reply).** Phase A shipped 2026-05-26 (Fix 35, direct-llm path). cc-pty speak-queue fix shipped 2026-05-26 (Fix 40, pending daemon restart). Phase B/C deferred: code-side classifier, conflict push-back, AbortController, text-input WS frame.
-- [~] **Stages 5-12 of `docs/spec/LEX-AUTONOMY-PAYLOAD-SPEC.md`** (codex-reordered). Stage 5 shipped as Fix 36 (distillation query scope fix). Stages 6-12 remain: sync barrier + freshness metadata, stale/failure surfacing, adaptive walk-back, worker boot payload builder, first-attach path, loose-ends handoff gate, grooming/escalation, project_scope_id.
+- [x] **Utterance queue coalesce (relevance-aware single structured reply).** Phase A shipped 2026-05-26 (Fix 35, direct-llm path). cc-pty speak-queue fix shipped 2026-05-26 (Fix 40). Phase B shipped 2026-06-01 (Fix 57: classifier with follow-up/new/noise/cancel tags, conflict push-back via passed rule set, AbortController plumbing into callVoiceChat so contradiction cancels the in-flight ollama call). Phase C shipped 2026-06-01 (Fix 57: t:'text-input' WS frame flows through the same pendingUserUtterances + runDirectLlmCoalesceLoop pipeline voice uses; cc-pty path routes through ptyInject).
+- [x] **Stages 5-12 of `docs/spec/LEX-AUTONOMY-PAYLOAD-SPEC.md`** (codex-reordered). All shipped 2026-05-26 to 2026-05-29: Stage 5 (Fix 36), Stages 6-12 absorbed under Fix 41-49 (sync barrier, freshness metadata, stale/failure surfacing, adaptive walk-back, worker boot payload builder via source-graph-payload, first-attach path, loose-ends handoff gate Fix 47, grooming/escalation watch Fix 48, project_scope_id Fix 49).
 
 ## Next after project-anchors spec
 
 - [x] Global panic button shipped. `08-dashboard/components/PanicButton.tsx`, POST /panic, double-ESC, top bar next to voice stop, Ctrl+Alt+. global keybind, three visual states (idle/firing/cooldown).
 - [x] Smart compact shipped. Daemon scheduler tick + evaluateTrigger + wrap/fire path live since 2026-05-22. v2 (Fix 36) moved summary authorship to Lex 2026-05-25. Fix 40 fixed cc-pty speak-queue serialisation 2026-05-26 (pending daemon restart). Fix 41 (in-flight) moves all policy out of daemon into Lex.
-- [ ] Lex dashboard controls (queued after smart compact). Add endpoints like `POST /voice/mute`, `POST /voice/unmute`, `POST /voice/stop` that push state changes over the existing voice WS to the dashboard client. Expose as Lex tools so Lex can mute/unmute itself or stop the voice session on voice command. Reason: hands-busy control without touching the UI.
+- [x] Lex dashboard controls. Shipped: `POST /voice/mute`, `POST /voice/unmute`, `POST /voice/stop` routes wired via `handleVoiceControl` factory in `routes.ts:1772-1774`. `broadcastVoiceControl(kind, {bindKey, reason})` pushes the corresponding `t:'voice-mute' / 'voice-unmute' / 'voice-disable'` frame to every connected voice WS. System prompt API_SURFACE at `system-prompt.ts:553-558` exposes the routes to Lex as tools.
 
 ## Stream deck (virtual deck in dashboard)
 
@@ -56,17 +56,6 @@ Captured 2026-05-04. Living list. Tick when shipped.
 - Phase 5 settings audit + personalized recovery docs. Mostly documentation.
 - Audio/video binary smoke test post whisper.cpp + ffmpeg install.
 - **Phase 7 voice identity bundle** (planned 2026-05-10): pyannote-based speaker diarization so Lex distinguishes primary user voice from third-party / background speech and routes ambient utterances out of the reply path. Same enrolled voice profile doubles as a voice-unlock biometric (with liveness check) for dashboard / Lex auth, augmenting PIN. Bundled with Phase 7 Lex personality fine-tune.
-
-## Phase Two queue (2026-05-09; superseded 2026-05-10)
-
-**Authoritative plan now lives in `docs/spec/PHASE-TWO-IMPLEMENTATION.md` (3 waves over ~3 weeks, post-CODEX-REVIEW-001 + 002 adoption). Day-1 verifications in `docs/spec/PHASE-TWO-DAY-1-VERIFICATIONS.md`. Active branch: `phase-two`. Resume guidance in `docs/HANDOVER-2026-05-10-phase-two-wave-1-day-1.md` (covers Wave 1 days 1-3 + Wave 2 entry).** P2-0 through P2-5 below are superseded; the same goals are tracked under spec section 11 wave structure with concrete file paths and step ordering. P2-0 (adversarial review of FUNCTIONAL-SPEC.md) is scheduled for Wave 3 day 5 per spec section 12 step 14.
-
-- [x] **P2-0** Superseded: scheduled for Wave 3 day 5 against `docs/spec/FUNCTIONAL-SPEC.md`. Implementation-plan reviews already completed (CODEX-REVIEW-001 + 002, both adopted).
-- [x] **P2-1** Tracked as Wave 2 day 5 steps 20-23 in `PHASE-TWO-IMPLEMENTATION.md`.
-- [x] **P2-2** Tracked as Wave 3 day 3 + Appendix R (gated on Curator Health green for 7 days).
-- [x] **P2-3** Tracked as Wave 1 step 22 (in-flight on phase-two branch) + Wave 2 day 5 step 24.
-- [x] **P2-4** Tracked as Wave 2 day 2 (`/brainstorms` route) + Wave 3 day 2 (unified orb).
-- [x] **P2-5** Tracked as Wave 3 day 4 (docs + restore drill + cold-start test).
 
 ## Bugs / friction (captured 2026-05-13 brainstorm)
 
