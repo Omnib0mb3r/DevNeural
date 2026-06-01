@@ -2,10 +2,28 @@
 
 Captured 2026-05-04. Living list. Tick when shipped.
 
+**For current cycle state + recommended next move, read
+`docs/HANDOVER.md` first.** This file is the durable backlog; the
+handover doc is the live cursor.
+
+Last refreshed: 2026-06-01 after Fix 52 through Fix 60 cycle. All
+items called out as "outstanding" during that cycle are now `[x]`.
+What remains is hardware-gated smoke (see `docs/SMOKE-TEST.md`),
+pre-publish prep (docs rewrite + dead-code sweep), Tier 5
+investigations awaiting ship (Fix 24/25/26 + voice PTY paste-no-
+commit), and longer-horizon spec work (Phase 7 / Phase 8).
+
 ## Gotchas worth knowing (read before debugging restart issues)
 
 - **Three independent build steps, none chain.** `07-daemon`, `08-dashboard`, `09-bridge` each need their own `npm run build` after source edits. Restart-daemon alone covers only daemon dist. See [HOW-TO-dev-vs-prod-dashboard](docs/HOW-TO-dev-vs-prod-dashboard.md).
 - **Port 3000 vs 3747.** 3000 = next-dev (hot-reload). 3747 = prod static (frozen until `08-dashboard npm run build`). Daemon restart updates neither dashboard on its own.
+- **Daemon restart is operator-only** unless the operator has
+  explicitly authorized it in the active conversation.
+- **No em dashes anywhere.** Period. Output, code comments, test
+  fixtures, docs, commit messages.
+- **Two-commit pattern.** Investigation doc first, ship second. Per-
+  bug doc status flipped to CLOSED + SHA + FIXES pointer in the
+  same cycle as the ship.
 
 ## Polish (from agent E handover read)
 
@@ -61,15 +79,15 @@ Captured 2026-05-04. Living list. Tick when shipped.
 
 - [x] **Dashboard rebuild after panel commits is manual + invisible.** Shipped: `07-daemon/src/dashboard/dashboard-supervisor.ts` (316 lines) owns the lifecycle of `next dev -p 3000`. `runtime_config.dashboard_supervisor_enabled` gates, env `DEVNEURAL_DASHBOARD_SUPERVISOR` fallback, CI=true forces off. Backoff doubles on fast crash, resets on graceful exit. `taskkill /t` on Windows tears the next worker subtree on shutdown. Wired in daemon.ts at line 1373; shutdown closure awaits at line 1480.
 - [x] **Bridge cc_session_ids goes empty when worker idle >30s. Fix: make cc_session_id sticky, gated on bridge presence freshness not jsonl mtime.** Sticky latch shipped 602d91e. /clear stuck-phase follow-up shipped 4796aa8 (60s anti-flap window + latch-first ccSessionLookup priority so daemon /sessions cache cannot self-reinforce a stale uuid).
-- [x] **Dashboard lock state has no visible indicator. Operator can't tell when /unlock is required.** First pass shipped as Task D top-level `AuthGuard` (commit pending). Mounted at `app/layout.tsx`, polls `GET /auth/status` on 30s tick + visibility/focus events, redirects to `/unlock` on `locked=true`, and surfaces a yellow `Session expired — click to unlock.` banner the moment the state flips. Still open as polish: persistent lock pip + remaining-TTL tooltip in TopBar, explicit "Lock now" affordance, sliding-window refresh.
-- [ ] **C-4 live verify gated on daemon restart (2026-05-13).** Bind anchor `4bbafb48-bbfd-47e6-b076-e1a58a334303` (DevNeural Testing brainstorm) to project anchor `391b88f6-396c-4c46-a8d7-b656a2d5ad1d` (DevNeural) via `PATCH /lex/anchors/4bbafb48.../` body `{supervises_project_anchor_id: '391b88f6...'}`, then `POST /lex/inject-cross-session` with `caller_brainstorm_id` only (omit target_session) and confirm the inject lands in the bound project's live worker. Attempted today, blocked: live DB has no `supervises_project_anchor_id` column (migration 025 not applied) and the running daemon predates 295feff / d828762 / ae0a973, so PATCH silently no-op'd `{ok:true}` without persisting and the inject returned the legacy `400 target_session required`. Action: bounce the daemon so migration 025 + the new validate / setLexSessionSupervises / resolveSupervisedTargetSession code paths come up, then rerun. The current_session_id on the project anchor is also stale (`0d25363c` from the pre-/clear era); after Task E (4796aa8) the bridge needs to reload its VS Code extension so the latch flips the presence file onto the live jsonl before the inject can land.
-- [x] Cold-start preload SessionStart hook firing on Lex sessions. Resolved — preload pipeline ships live per `project_lex_cold_start_context_preload.md` memory; sibling index + last-2 distillations + recent turns injected via SessionStart hook. Dashboard toggle off/shadow/live working.
+- [x] **Dashboard lock state has no visible indicator. Operator can't tell when /unlock is required.** First pass shipped as Task D top-level `AuthGuard` (commit pending). Mounted at `app/layout.tsx`, polls `GET /auth/status` on 30s tick + visibility/focus events, redirects to `/unlock` on `locked=true`, and surfaces a yellow `Session expired, click to unlock.` banner the moment the state flips. Still open as polish: persistent lock pip + remaining-TTL tooltip in TopBar, explicit "Lock now" affordance, sliding-window refresh.
+- [~] **C-4 live verify** (2026-05-13). The blocker called out in the original capture (migration 025 not applied, daemon predated 295feff / d828762 / ae0a973) is resolved: the daemon has restarted many times since, migration 025 is applied, supervises_project_anchor_id is populated on 4bbafb48 -> 391b88f6 (verified 2026-05-29 + 2026-06-01). Remaining work is the actual live `POST /lex/inject-cross-session` call with `caller_brainstorm_id` only against a live worker; gated on a fresh worker spawn. Move to `docs/SMOKE-TEST.md` step 6.7 family on the next live brainstorm.
+- [x] Cold-start preload SessionStart hook firing on Lex sessions. Resolved: preload pipeline ships live per `project_lex_cold_start_context_preload.md` memory; sibling index + last-2 distillations + recent turns injected via SessionStart hook. Dashboard toggle off/shadow/live working.
 - [~] **First voice-mode response always silent (2026-05-13).** SHIPPED d977816 (2026-05-16): AudioContext now warmed inside the enable-voice click handler so first reply plays. Root cause was autoplay-policy freeze on a context created in a network callback. Pending live smoke-test on real hardware to confirm no regression; if symptom recurs, treat as regression and re-investigate.
 - [ ] **WASM/VAD mic init OOM under load (2026-05-13).** Initial fix shipped 637ae73 (pin single-thread WASM + retry button). Open follow-ups: (b) COOP/COEP headers to unlock SharedArrayBuffer + bigger heap, (d) singleton ORT init so VAD remount reuses the existing WASM module instead of re-firing initWasm(). Without (b) and (d), long-running tabs or multi-tab sessions can still accumulate heap pressure and OOM. Smoke test: open dashboard via tailscale, exercise /lex repeatedly (mode switches, page hops), open a second dashboard tab, leave running for >1 hour, watch DevTools console for new VAD init failures. If failures recur post-fix, escalate to (b) + (d). Track as ongoing memory-management concern, not single-bug closeout.
 
 ## Captured 2026-05-14 brainstorm
 
-- [ ] **Read distilled brainstorm summaries.** Distillations live in SQLite, not flat files. Storage:
+- [x] **Read distilled brainstorm summaries.** Three readers shipped: dashboard past-sessions panel renders `last_summary` per session; HTTP endpoint at `07-daemon/src/dashboard/routes.ts:3395`; CLI helper `npm run dump-distillations` (Fix 60). Storage reference retained below for future schema work. Distillations live in SQLite, not flat files. Storage:
   - DB: `C:\dev\data\skill-connections\index.db`
   - Table: `brainstorm_sessions`
   - Columns: `last_summary` (the prose distillation), `last_summary_ms` (timestamp), `distilled_at`

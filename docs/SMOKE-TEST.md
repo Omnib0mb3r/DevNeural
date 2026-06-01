@@ -5,8 +5,37 @@ end on real hardware. Refresh as items get verified or new code lands.
 Source of truth for the daily smoke gate; rolling cursor for the rest
 of the state lives in `docs/HANDOVER.md`.
 
-Last refreshed: 2026-05-29 (Fix 47 + Fix 48 + Fix 49 + Fix 50 + Fix 51
-cycle).
+Last refreshed: 2026-06-01 after Fix 59 + Fix 60 ship.
+
+## Cycle cursor (2026-06-01)
+
+Most-recent ship cycle covered Fix 52 through Fix 60 (project anchor
+seeding, cold-start distillation recovery + verdict surfacing,
+COALESCE Phase B + C, TTS sanitizer, distillation dump helper).
+
+Module-side + API-side smoke is **GREEN** across the cycle. Live
+hardware verification is the remaining gate. Highest-leverage live
+step right now is **6.7** (live brainstorm spawn + Lex first-reply
+vetting against the Fix 55 verdict envelope); it closes the loop on
+the four-fix cold-start chain (52, 53, 54, 55).
+
+Module probes already passed for the new cycle:
+
+- `POST /lex/cold-start-preload` against the bound 4bbafb48
+  brainstorm returned `context_verdict=partial last_child=DevNeural
+  Testing distillation_gap_ms=0` plus 5 sibling distillation
+  summaries inline (verifies Fix 52, 53, 54, 55 all live).
+- `[distill-scheduler:boot-recovery] processed=0 errors=0
+  skipped=11 hit_cap=false` on the post-Fix-57 boot (verifies the
+  Fix 53 boot recovery sweep fires correctly; remaining 11 rows are
+  dead data per audit).
+- `[distill-backfill] 37 chunkless brainstorms eligible via jsonl
+  fallback` and per-row `[distill-gen] using jsonl-fallback` lines
+  earlier in the cycle (verifies Fix 54 jsonl-fallback path).
+- 1123/1123 daemon tests pass after Fix 60 (was 1063 pre-cycle).
+- 138/138 dashboard unit tests pass.
+- `npm run dump-distillations -- --limit 5` wrote a clean markdown
+  file with 5 rows (verifies Fix 60).
 
 ## Recovering this checklist in a fresh Lex session
 
@@ -19,13 +48,13 @@ Lex reads this file, recreates every `[ ]` item as a task, preserves
 `[x]` marks, and resumes from wherever it was. The Markdown file is
 the source of truth; the task panel is just the live view.
 
-## ACTIVE BATCH (2026-05-29) — LEX-AUTONOMY codex 10/11/12 + PRELOAD-1 + cc-pty double-talk
+## ACTIVE BATCH (2026-05-29): LEX-AUTONOMY codex 10/11/12 + PRELOAD-1 + cc-pty double-talk
 
 Gate: all green required before the next ship cycle opens. Each step
 below has a daemon-side check that runs from any shell + an operator-
 side check that needs voice or a phone in hand.
 
-### Step 0 — Prep (one-time, before any test below)
+### Step 0: Prep (one-time, before any test below)
 
 - [x] **0.1** Daemon rebuild. `cd C:/dev/Projects/DevNeural/07-daemon
   && npm run build`. Required for every Fix 47-51 commit.
@@ -39,7 +68,7 @@ side check that needs voice or a phone in hand.
   fresh static bundle. Verify the dev server at port 3000 reloaded
   too.
 
-### Step 1 — Fix 47 codex 10 loose-ends gate
+### Step 1: Fix 47 codex 10 loose-ends gate
 
 Goal: every spawn surface (smart-compact `/clear-and-paste`, dashboard
 `/projects/:id/start-claude`, voice `lex start project ...`) blocks
@@ -62,10 +91,10 @@ on operator loose ends and auto-resolves auto-disposition ends.
   missing distillation; `stale_ref_beyond_T` informational: 24 refs
   stale). Module wired, detection correct. Live
   `caller_label='loose-ends-auto-resolve'` audit fire still needs a
-  real `/clear-and-paste` invocation post-Fix-47 (0 rows so far —
+  real `/clear-and-paste` invocation post-Fix-47 (0 rows so far;
   no spawn has tripped the wire since ship).
 
-### Step 2 — Fix 48 codex 11 grooming watch
+### Step 2: Fix 48 codex 11 grooming watch
 
 Goal: 30-min tick walks brainstorm anchors and surfaces six gap
 classes through the notifications pipeline; alert severity reaches
@@ -76,7 +105,7 @@ push, info stays bell-only.
   cancelled-tool-recovery on the post-Fix-51 boot.
 - [x] **2.2 PASS 2026-05-29** `GET /lex/grooming/recent?limit=5` →
   200 `{ok:true, rows:[]}`. Filter applied, no rows yet (no gap
-  classes tripped — anchors healthy).
+  classes tripped; anchors healthy).
 - [x] **2.3 (module probe, 2026-05-29)** Live `runGroomingTick`
   against the production DB returned `evaluated=0` because all 91
   brainstorms are `status='ended'`; `listBrainstorms({status:
@@ -88,7 +117,7 @@ push, info stays bell-only.
   notification fires (operator verifies phone buzz on subscribed
   device).
 
-### Step 3 — Fix 49 codex 12 project_scope_id
+### Step 3: Fix 49 codex 12 project_scope_id
 
 Goal: scope-vs-label predicate wins consistently; PATCH operator
 override audits.
@@ -96,7 +125,7 @@ override audits.
 - [x] **3.1 PASS 2026-05-29** Brainstorm `4bbafb48` carries
   `project_scope_id = 391b88f6-396c-4c46-a8d7-b656a2d5ad1d` (the
   DevNeural project anchor) per `GET /brainstorms/4bbafb48`. 1/91
-  brainstorm rows scoped; correct — only `lex_session 4bbafb48`
+  brainstorm rows scoped; correct: only `lex_session 4bbafb48`
   has `supervises_project_anchor_id` set.
 - [x] **3.2 PASS 2026-05-29** `PATCH /brainstorms/4bbafb48/project-
   scope` body `{"project_scope_id": "391b88f6..."}` returned 200.
@@ -111,7 +140,7 @@ override audits.
   (anchor with zero prior refs). Verification deferred to a fresh
   anchor with a scoped sibling pair.
 
-### Step 4 — Fix 50 PRELOAD-1 SessionStart hook stdout shape
+### Step 4: Fix 50 PRELOAD-1 SessionStart hook stdout shape
 
 Goal: cold-start preload + worker-handoff blocks land in CC's
 `hook_additional_context` on the first user turn.
@@ -131,7 +160,7 @@ Goal: cold-start preload + worker-handoff blocks land in CC's
 - [ ] **4.2** Fresh worker CC SessionStart bound to a project anchor.
   Same check against the worker-handoff block.
 
-### Step 5 — Fix 51 cc-pty double-talk
+### Step 5: Fix 51 cc-pty double-talk
 
 Goal: pre-tool ack + end_turn body never overlap audibly. The fix
 removes the `handle.done` early-release in `speakOne`.
@@ -203,7 +232,7 @@ section `## Seeding` at `docs/spec/PROJECT-ANCHORS.md:57`).
   Michael to fill in). Hardware-gated; verify on next live
   brainstorm.
 
-## Tier 4 — Hardware-blocked / environment-gated
+## Tier 4: Hardware-blocked / environment-gated
 
 - [ ] **9.1 iOS PWA push end-to-end** (reminder-push.ts + daemon.ts).
   Setup: iOS device, dashboard installed as PWA. Action: subscribe
@@ -216,32 +245,36 @@ section `## Seeding` at `docs/spec/PROJECT-ANCHORS.md:57`).
   reproduces, open Voice diagnostics → ring buffer → append to
   `docs/bugs/2026-05-16-voice-restart-oom-regression.md`.
 
-## Tier 5 — Diagnosed-only, NOT smoke targets
+## Tier 5: Diagnosed-only, NOT smoke targets
 
-Investigations in `docs/bugs/`; fixes not yet written:
+Investigations in `docs/bugs/`; fixes not yet written. All four
+remain open as of 2026-06-01:
 
 - **Fix 24** mid-reply TTS truncation. Watchdog `ctx_state` gate.
 - **Fix 25** mic input level + sensitivity sliders. Three root
   causes documented.
 - **Fix 26** `Lex hold up` wake-phrase kills mic permanently.
   Asymmetric cancel path.
-- **Voice PTY paste-no-commit regression** (Bug A,
-  `docs/bugs/2026-05-29-voice-pty-paste-no-commit-regression.md`).
+- **Voice PTY paste-no-commit regression**
+  (`docs/bugs/2026-05-29-voice-pty-paste-no-commit-regression.md`).
   Proposed fix: mirror Fix 32's 850ms bare-CR follow-up into the
   direct-inject path at `lex-voice-ws.ts:2147`.
 
 ## Not-built / future
 
 - [ ] Auto-discover projects under `C:/dev/Projects` filtered by
-  project-marker files. (Step 6 above lands raw enumeration; the
-  marker-file filter is a follow-up.)
+  project-marker files. (Fix 52 lands raw top-level enumeration;
+  the marker-file filter is a follow-up.)
 - [ ] Phase 7 speaker diarization (pyannote).
 - [ ] Phase 8 reliability plan (see `docs/spec/PHASE-8-RELIABILITY-
   PLAN.md`).
 - [ ] Smart-clear rename (current `smart-compact` name misleads).
-- [ ] Coalesce Phase B (classifier + conflict push-back +
-  AbortController) per the sealed roadmap in
-  `docs/spec/COALESCE-UTTERANCE-QUEUE.md`.
+- [x] **Coalesce Phase B + C shipped 2026-06-01 (Fix 57).**
+  Classifier, conflict push-back via passed rule set, AbortController
+  on contradiction, text-input WS frame, all live.
+- [ ] WASM/VAD OOM follow-ups: (b) COOP/COEP headers to unlock
+  SharedArrayBuffer; (d) singleton ORT init so VAD remount reuses
+  the existing WASM module. Hardware repro needed before tuning.
 
 ## Stop conditions
 
