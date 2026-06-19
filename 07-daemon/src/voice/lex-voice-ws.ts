@@ -98,6 +98,12 @@ import {
 } from '../lex/session-end-pipeline.js';
 import { appendUtterance as appendSessionAudio } from './audio-bundle.js';
 import { selectTtsContent, clampAck } from './select-tts-content.js';
+import {
+  shouldHeartbeat,
+  heartbeatPhrase,
+  HEARTBEAT_INTERVAL_MS,
+  HEARTBEAT_TICK_MS,
+} from './lex-voice-heartbeat.js';
 
 /* Voice modes drive whether the daemon synthesizes Lex's response
  * out loud. The browser still receives transcript + assistant-text
@@ -586,6 +592,15 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     ttsQueueRunning: false,
   };
 
+  /* Working-heartbeat state. lastSpeechMs is the epoch ms of the most
+   * recent TTS activity (start of a speak + every tts-end); the
+   * heartbeat watcher uses it as the silence clock. heartbeatCount
+   * rotates the canned phrase. heartbeatTimer is the in-flight ticker,
+   * started with the jsonl watch and torn down with it. */
+  let lastSpeechMs = 0;
+  let heartbeatCount = 0;
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
   /* Fix 40 (2026-05-26): centralise piper synth lifecycle behind a
    * controller that serialises same-turn speak() calls and cancels
    * cleanly on barge. The legacy inline speak() reassigned
@@ -599,6 +614,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     sendBinary,
     onTtsEnd: () => {
       lastTtsEndMs = Date.now();
+      lastSpeechMs = Date.now();
     },
   });
 
@@ -880,12 +896,45 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   function startJsonlWatch(): void {
     if (state.watchTimer) return;
     state.watchTimer = setInterval(() => pollJsonl(), 250);
+    startHeartbeat();
   }
 
   function stopJsonlWatch(): void {
     if (state.watchTimer) {
       clearInterval(state.watchTimer);
       state.watchTimer = null;
+    }
+    stopHeartbeat();
+  }
+
+  /* Periodic "still working" pulse while a turn is in flight. The gate
+   * (lex-voice-heartbeat.ts) only fires after a real gap of silence,
+   * never while audio is playing, and never in notes mode. The pulse
+   * routes through speak() so it serialises with real speech and resets
+   * the silence clock; it carries no answer content. */
+  function startHeartbeat(): void {
+    if (heartbeatTimer) return;
+    heartbeatTimer = setInterval(() => {
+      if (state.closed) return;
+      const fire = shouldHeartbeat({
+        awaitingSince: state.awaitingResponseSince,
+        lastSpeechMs,
+        ttsActive: Boolean(state.ttsActive),
+        mode: state.mode,
+        now: Date.now(),
+        intervalMs: HEARTBEAT_INTERVAL_MS,
+      });
+      if (fire) speak(heartbeatPhrase(heartbeatCount++));
+    }, HEARTBEAT_TICK_MS);
+    if (typeof (heartbeatTimer as { unref?: () => void }).unref === 'function') {
+      (heartbeatTimer as { unref: () => void }).unref();
+    }
+  }
+
+  function stopHeartbeat(): void {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
     }
   }
 
@@ -1394,6 +1443,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * queue and play back-to-back; barge / hold-up clears the queue
    * and cancels the in-flight ctx as one atomic boundary. */
   function speak(text: string): void {
+    /* Reset the heartbeat silence clock on any real speech (ack, body,
+     * or a heartbeat pulse itself) so a pulse only fires after a genuine
+     * gap of silence. */
+    lastSpeechMs = Date.now();
     speakCtrl.speak(text);
   }
 
