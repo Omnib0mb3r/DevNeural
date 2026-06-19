@@ -4815,6 +4815,13 @@ export async function registerDashboardRoutes(
       excludeId: bs.id,
       limit: 5,
       distillationWords: 20,
+      /* Scope isolation (2026-06-19): the cold-start preload is anchored
+       * (anchorId = bs.id always set here), so fail closed. If this
+       * anchor has no prior refs we surface nothing rather than dropping
+       * to the label-match fallback, which could pull a same-named
+       * brainstorm from a different project. An LPCC Lex session must
+       * never inherit DevNeural context. */
+      strictScope: true,
       /* Codex item 12a (Fix 49): mirror the scope-wins-over-label
        * predicate that preloadSiblingDistillations already uses.
        * When the active brainstorm carries a non-null scope, the
