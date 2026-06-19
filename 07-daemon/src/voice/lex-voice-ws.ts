@@ -97,7 +97,7 @@ import {
   runDistillationFlush,
 } from '../lex/session-end-pipeline.js';
 import { appendUtterance as appendSessionAudio } from './audio-bundle.js';
-import { selectTtsContent } from './select-tts-content.js';
+import { selectTtsContent, clampAck } from './select-tts-content.js';
 
 /* Voice modes drive whether the daemon synthesizes Lex's response
  * out loud. The browser still receives transcript + assistant-text
@@ -1157,7 +1157,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
          * record uuid) is never suppressed. */
         const speakKey = `${state.watchSessionId ?? state.jsonlPath ?? state.bindKey ?? ''}::${uuid || decision.new_hashes[0] || text.slice(0, 64)}::${isPreToolAck ? 'ack' : 'body'}`;
         if (claimSpokenRecord(speakKey)) {
-          speak(text);
+          /* Hard cap: a pre-tool ack speaks a short heard-you signal
+           * only, never the answer. The answer is spoken once, at
+           * end_turn. Structural enforcement so a fat ack can never be
+           * heard as a second response. The visual frame + chunk above
+           * still carry the full text. */
+          speak(isPreToolAck ? clampAck(text) : text);
         } else {
           send({ t: 'tts-skipped', reason: 'already-spoken' });
         }

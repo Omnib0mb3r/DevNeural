@@ -15,6 +15,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  clampAck,
   hashSegment,
   selectTtsContent,
   type AssistantJsonlRecord,
@@ -162,6 +163,30 @@ describe('selectTtsContent', () => {
     expect(r.drop).toBe(false);
     expect(r.new_text).toBe('');
     expect(r.full_text).toBe('Already spoken.');
+  });
+});
+
+describe('clampAck', () => {
+  it('keeps a short single-sentence ack as-is', () => {
+    expect(clampAck('On it.')).toBe('On it.');
+    expect(clampAck('Got it boss, looking now')).toBe('Got it boss, looking now');
+  });
+
+  it('keeps only the first sentence when an ack runs on', () => {
+    expect(clampAck('Hold on. If you pressed restart something is off. Let me check.')).toBe(
+      'Hold on.',
+    );
+  });
+
+  it('replaces a fat answer-bearing ack with a canned ack (over 10 words, no early period)', () => {
+    const fat =
+      'Right you cold-started me after the bounce that is the only reason I have context';
+    expect(clampAck(fat)).toBe('On it.');
+  });
+
+  it('falls back to canned ack on empty input', () => {
+    expect(clampAck('')).toBe('On it.');
+    expect(clampAck('   ')).toBe('On it.');
   });
 });
 

@@ -66,6 +66,24 @@ export function hashSegment(text: string): string {
   return `${text.length}:${h}`;
 }
 
+/* Hard cap on what a pre-tool ack is allowed to SPEAK. A tool_use
+ * record's spoken text is a heard-you signal only; the answer lands
+ * exactly once at end_turn and must never be pre-spoken in the ack.
+ * The model cannot be trusted to keep acks short (it repeatedly emitted
+ * paragraph acks that pre-stated the conclusion, so the answer was
+ * heard twice), so the daemon enforces it structurally at the single
+ * speak() choke point: speak at most the first sentence, and only when
+ * that sentence is a short ack-length fragment; otherwise a canned
+ * brief ack. Pure + deterministic so it is unit-testable and cannot be
+ * overridden by model output. Only the audio is clamped; the visual
+ * assistant-text frame and the brainstorm chunk keep the full text. */
+export function clampAck(text: string): string {
+  const firstSentence = (text.match(/^[^.!?]*[.!?]?/)?.[0] ?? text).trim();
+  const words = firstSentence.split(/\s+/).filter(Boolean);
+  if (words.length > 0 && words.length <= 10) return firstSentence;
+  return 'On it.';
+}
+
 export function selectTtsContent(
   rec: AssistantJsonlRecord,
   alreadySpoken: ReadonlySet<string>,
