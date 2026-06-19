@@ -37,7 +37,17 @@ export function getProjectsRoot(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 export function normalizeCwd(cwd: string): string {
-  return cwd.replace(/\\/g, '/').replace(/\/+$/, '');
+  /* Canonicalise the Windows drive letter to uppercase so the seeded
+   * anchor cwd, the project registry root, and the bridge presence cwd
+   * all compare equal. VS Code emits a lowercase drive ("c:/...") while
+   * the default projects root is uppercase ("C:/dev/Projects"); without
+   * this, a lowercase DEVNEURAL_PROJECTS_ROOT or a bridge-reported cwd
+   * would split into a second anchor / never match. Must stay identical
+   * to normalizeCwd in bridge-presence.ts. */
+  return cwd
+    .replace(/\\/g, '/')
+    .replace(/\/+$/, '')
+    .replace(/^([a-z]):/, (_m, d: string) => `${d.toUpperCase()}:`);
 }
 
 export interface SeedOptions {

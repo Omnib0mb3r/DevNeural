@@ -51,6 +51,16 @@ Last updated: 2026-05-13.
 - Stale Playwright fixtures, dead screenshots, abandoned migration scripts, dead deps, orphaned test artifacts across DevNeural subdirs.
 - Why: repo size + grep noise is creeping up.
 
+### External CC session: dashboard surfacing + bridge-paste reliability
+- Today's evidence (2026-06-04, Bridger session `9a96b53f`):
+  1. `/sessions` puts externally-launched VS Code claude.exe sessions under `idle_projects`, not `open_projects`, even when bridge presence is fresh and `cc_session_ids` is latched. Classifier in `routes.ts` is keyed on daemon PTY ownership instead of bridge reachability, so `live_state` reports `open_projects=(none)` and Lex looks blind to a working worker.
+  2. Cross-session inject via bridge-paste accepted by daemon (`transport=bridge`, queue file `<dataRoot>/session-bridge/<uuid>.in` written), but consumer side dead. Bridge VSIX writes presence ticks every 750ms (alive) yet the workspace offsets file under `.offsets/` is stale by days and does not reference the new UUID's queue file, so the paste never lands and the worker's jsonl never moves.
+- Fixes:
+  - Surface bridge-reachable sessions as `open_projects` with a transport flag (PTY vs bridge) so consumers know which features apply.
+  - Harden bridge VSIX consumption polling so a long-lived window keeps picking up new per-UUID queue files (not just the set known at activation).
+  - Write `has_terminal_for_uuid` in the current bridge build so the daemon resolver returns `deliverable` instead of `legacy-grace`.
+- Why: Lex memory `project_devneural_bridge_pty_ownership.md` says "external CC sessions hook via bridge presence files, NEVER fall back to must start through dashboard." The architecture supports it; the implementation right now does not deliver. Closing this gap is what makes that memory rule true in practice.
+
 ## Phase 7 features
 
 ### Speaker diarization

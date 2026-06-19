@@ -87,7 +87,17 @@ export interface ReconcileOptions {
 }
 
 function normalizeCwd(cwd: string): string {
-  return cwd.replace(/\\/g, '/').replace(/\/+$/, '');
+  /* Canonicalise the Windows drive letter to uppercase. VS Code reports
+   * folder fsPaths with a lowercase drive ("c:/dev/Projects/LPCC") while
+   * the anchor seed + project registry store uppercase ("C:/dev/..."),
+   * so a bridge presence cwd never matched its anchor and the project
+   * stayed dormant despite a live, correctly-written presence file.
+   * Windows paths are case-insensitive; canonicalising here keeps the
+   * presence-side and DB-side equality comparison in lockstep. */
+  return cwd
+    .replace(/\\/g, '/')
+    .replace(/\/+$/, '')
+    .replace(/^([a-z]):/, (_m, d: string) => `${d.toUpperCase()}:`);
 }
 
 function defaultClaudeProjectsDir(): string {

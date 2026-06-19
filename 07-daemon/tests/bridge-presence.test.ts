@@ -177,6 +177,17 @@ describe('readPresenceDir', () => {
     expect(r?.cwd).toBe('C:/dev/Projects/proj-a');
   });
 
+  it('canonicalises a lowercase drive letter to uppercase (VS Code fsPath)', () => {
+    const now = 1_000_000;
+    writePresence(
+      'lower.json',
+      { cwd: 'c:/dev/Projects/proj-a', bridge_id: 'b1' },
+      now,
+    );
+    const [r] = readPresenceDir(env.presenceDir, now, 30_000);
+    expect(r?.cwd).toBe('C:/dev/Projects/proj-a');
+  });
+
   it('returns empty when dir missing or unreadable', () => {
     const records = readPresenceDir(
       path.join(env.tmpDir, 'does-not-exist'),
@@ -214,6 +225,30 @@ describe('reconcileBridgePresence', () => {
     expect(row.current_bridge_id).toBe('bridge-w1');
     expect(row.current_session_id).toBe('cc-1111-1111');
     expect(row.last_seen_ms).toBe(now);
+  });
+
+  it('flips an uppercase-seeded anchor live from a lowercase-drive presence cwd (regression: VS Code emits c:/, registry stores C:/)', () => {
+    const now = 2_000_000;
+    writePresence(
+      'lowerdrive.json',
+      {
+        cwd: 'c:/dev/Projects/proj-a',
+        bridge_id: 'bridge-lower',
+        cc_session_ids: ['cc-2222-2222'],
+      },
+      now,
+    );
+
+    const result = reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => now,
+    });
+
+    expect(result.liveAnchorIds).toEqual(['anchor-A']);
+    const row = db.getProjectSession('anchor-A')!;
+    expect(row.status).toBe('live');
+    expect(row.current_session_id).toBe('cc-2222-2222');
   });
 
   it('encodes connection count when multiple bridges share a cwd', () => {
