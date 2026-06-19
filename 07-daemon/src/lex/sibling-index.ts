@@ -68,6 +68,14 @@ export interface BuildSiblingIndexOptions {
    * (legacy compat). Mirrors the predicate that already lives in
    * preloadSiblingDistillations so the two surfaces stay aligned. */
   projectScopeId?: string | null;
+  /** Fail-closed scope isolation (2026-06-19). When true and anchorId
+   * is supplied, the anchor-refs block is the ONLY source: if it is
+   * empty, buildSiblingIndex returns '' instead of dropping to the
+   * label-match fallback. The label fallback can cross projects that
+   * share a brainstorm name when scope is null on either side; the
+   * investigator/cold-start path sets strictScope so an LPCC session
+   * can never inherit DevNeural context. Empty is safe; wrong is not. */
+  strictScope?: boolean;
 }
 
 const DEFAULT_REF_LIMIT = 5;
@@ -386,6 +394,10 @@ export function buildSiblingIndex(opts: BuildSiblingIndexOptions): string {
   if (opts.anchorId) {
     const fromRefs = buildAnchorTranscriptBlock(opts);
     if (fromRefs) return fromRefs;
+    /* Fail-closed: an anchored, strict-scope caller never crosses into
+     * the label-match fallback. No anchor refs -> no context, rather
+     * than risk pulling a same-named brainstorm from another project. */
+    if (opts.strictScope) return '';
   }
   return buildLabelMatchBlock(opts);
 }

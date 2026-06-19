@@ -406,6 +406,75 @@ describe('buildSiblingIndex - anchor transcript_refs path (TODO bug 2026-05-13)'
     expect(out).toMatch(/^# Sibling sessions \(same label "Shared Topic"\)/);
     expect(out).toMatch(/- anchor-o/);
   });
+
+  it('strictScope blocks the label-match fallback when the anchor has zero refs (no cross-project bleed)', () => {
+    insertLexSession('anchor-new');
+    insertBs({
+      id: 'anchor-new',
+      user_label: 'Shared Topic',
+      started_ms: 5_000,
+    });
+    insertBs({
+      id: 'anchor-other',
+      user_label: 'Shared Topic',
+      started_ms: 1_000,
+      last_summary: 'earlier brainstorm notes from a DIFFERENT project',
+    });
+    /* Same zero-refs setup as the legacy fallback test, but strictScope
+     * forbids dropping to label-match. An LPCC session sharing a name
+     * with a DevNeural brainstorm must surface nothing, not the other
+     * project's notes. */
+    const out = buildSiblingIndex({
+      db,
+      label: 'Shared Topic',
+      anchorId: 'anchor-new',
+      excludeId: 'anchor-new',
+      strictScope: true,
+    });
+    expect(out).toBe('');
+  });
+
+  it('strictScope still renders the anchor block when the anchor HAS refs', () => {
+    insertLexSession('anchor-strict');
+    insertBs({
+      id: 'anchor-strict',
+      user_label: 'Strict Anchor',
+      started_ms: 1_000,
+      last_summary: 'a real decision / a real open item',
+    });
+    insertRef({
+      anchorId: 'anchor-strict',
+      cc: 'cc-prior',
+      transcriptPath: '/fake/strict-prior.jsonl',
+      ordering: 0,
+      startedMs: Date.now() - 7_200_000,
+      endedMs: Date.now() - 7_200_000,
+    });
+    insertRef({
+      anchorId: 'anchor-strict',
+      cc: 'cc-live',
+      transcriptPath: '/fake/strict-live.jsonl',
+      ordering: 1,
+      startedMs: Date.now() - 60_000,
+    });
+    /* strictScope must NOT break the happy path: an anchor with real
+     * refs still renders its own scoped block. */
+    const out = buildSiblingIndex({
+      db,
+      label: 'Strict Anchor',
+      anchorId: 'anchor-strict',
+      currentCcSessionId: 'cc-live',
+      strictScope: true,
+      readTranscript: (p) =>
+        p === '/fake/strict-prior.jsonl'
+          ? JSON.stringify({
+              type: 'assistant',
+              message: { role: 'assistant', content: 'prior turn body' },
+            })
+          : null,
+    });
+    expect(out).not.toBe('');
+  });
 });
 
 /* Codex item 12a (Fix 49) parallel scope swap for buildLabelMatchBlock.
