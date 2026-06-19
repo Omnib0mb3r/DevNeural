@@ -4807,7 +4807,7 @@ export async function registerDashboardRoutes(
        * brainstorm header pill can render red. */
       preamble = `Cold start: preload failed (${(err as Error).message}).`;
     }
-    const block = buildSiblingIndex({
+    let block = buildSiblingIndex({
       db: store.db,
       label,
       anchorId: bs.id,
@@ -4829,6 +4829,27 @@ export async function registerDashboardRoutes(
        * when scope is null (legacy compat). */
       projectScopeId: bs.project_scope_id ?? null,
     });
+    /* Cold-start investigator (2026-06-19): if the spawn path pre-warmed
+     * a scope-isolated primed-context block for this anchor, prepend it
+     * to the sibling-index block. One-shot read (takeInvestigatorBlock
+     * deletes on read) so a stale block is never served twice; a 10-min
+     * freshness window covers the spawn->SessionStart latency. Fail-safe:
+     * a cache miss leaves `block` exactly as buildSiblingIndex produced
+     * it, so this cannot regress the existing cold-start path. When the
+     * sibling index was empty but the investigator assembled real
+     * context (project docs + live tail), this is also what lets the
+     * route serve a primed block instead of early-outing 'no-siblings'. */
+    try {
+      const { takeInvestigatorBlock } = await import(
+        '../lex/lex-investigator.js'
+      );
+      const primed = takeInvestigatorBlock(bs.id, 10 * 60 * 1000, Date.now());
+      if (primed && primed.trim()) {
+        block = block ? `${primed}\n\n${block}` : primed;
+      }
+    } catch {
+      /* investigator serve is additive; never block cold start */
+    }
     if (!block) {
       auditEarlyOut('no-siblings', bs.id);
       return {

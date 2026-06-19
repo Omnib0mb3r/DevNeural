@@ -45,6 +45,7 @@ import type {
   LexTranscriptRefRow,
 } from '../store/index-db.js';
 import { spawnLex, type SpawnLexResult } from '../dashboard/pty-host.js';
+import { prewarmInvestigator } from './lex-investigator.js';
 
 /* Mirror of pty-host's cwdToClaudeSlug (kept private there). Replaces
  * `:`, `/`, and `\` with `-` so a windows path like
@@ -293,6 +294,30 @@ export function spawnLexSession(
     /* Read-side write-through is best-effort. Failure here just
      * means a future artifact lookup may 404 until the next run;
      * the new lex_session model is unaffected. */
+  }
+  /* Cold-start investigator pre-warm (2026-06-19). Fire-and-forget:
+   * assemble the scope-isolated primed-context block for this anchor and
+   * cache it so the SessionStart cold-start route can serve it the
+   * instant Claude Code boots. Deterministic assemble only by default
+   * (the headless Opus refinement is gated on DEVNEURAL_INVESTIGATOR_HEADLESS)
+   * so the cache is warm within ms, well before the hook fires; the
+   * headless pass is too slow for the spawn->hook window and stays
+   * opt-in. Never blocks the spawn and never throws: a confidently-empty
+   * anchor caches nothing and the cold-start route falls through to its
+   * existing path with no regression. */
+  try {
+    const headless = process.env.DEVNEURAL_INVESTIGATOR_HEADLESS === '1';
+    void prewarmInvestigator({
+      db: getStore().db,
+      anchorId: prep.lexSession.id,
+      cwd: prep.lexSession.cwd,
+      label: prep.lexSession.title,
+      enableHeadless: headless,
+    }).catch(() => {
+      /* fire-and-forget; prewarmInvestigator is fail-safe by contract */
+    });
+  } catch {
+    /* never let pre-warm wiring affect the spawn result */
   }
   return {
     ...ptyResult,
