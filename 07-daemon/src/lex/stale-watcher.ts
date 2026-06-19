@@ -46,6 +46,13 @@ export interface StaleWatchDeps {
    * module-level Map; tests pass a fresh one. */
   state?: Map<string, number>;
   log?: (msg: string) => void;
+  /** Sliver 2c: action hook fired (once per tick) with every anchor
+   * whose oldest stale ref has crossed the threshold this tick,
+   * INDEPENDENT of the bell's debounce. Production wires this to the
+   * distillation scheduler's kick() so detection triggers a bounded
+   * re-distill instead of only ringing a bell. Default undefined =
+   * bell-only, the exact prior behaviour. Never throws into the tick. */
+  onStale?: (anchorIds: string[]) => void;
 }
 
 export interface StaleWatchTickResult {
@@ -53,6 +60,11 @@ export interface StaleWatchTickResult {
   fired: string[];
   skipped_debounced: string[];
   skipped_fresh: string[];
+  /** Sliver 2c: anchors whose oldest stale ref crossed the threshold
+   * this tick, regardless of the bell's per-anchor debounce. This is
+   * the set handed to onStale (the re-distill trigger). Superset of
+   * `fired` (which the debounce can suppress). */
+  stale_past_threshold: string[];
 }
 
 const DEFAULT_THRESHOLD_MS = 600_000; // 10 minutes
@@ -79,6 +91,7 @@ export function runStaleWatchTick(
     fired: [],
     skipped_debounced: [],
     skipped_fresh: [],
+    stale_past_threshold: [],
   };
   const emit = deps.emit ?? defaultEmit;
   const tNow = now();
@@ -113,6 +126,10 @@ export function runStaleWatchTick(
       result.skipped_fresh.push(b.id);
       continue;
     }
+    /* Crossed the threshold: this anchor needs a re-distill. Recorded
+     * BEFORE the bell's debounce gate so the action trigger fires every
+     * tick staleness persists, even when the notification is debounced. */
+    result.stale_past_threshold.push(b.id);
     const lastFired = state.get(b.id) ?? 0;
     if (lastFired > 0 && tNow - lastFired < debounce) {
       result.skipped_debounced.push(b.id);
@@ -143,6 +160,16 @@ export function runStaleWatchTick(
       );
     } catch (err) {
       log(`[stale-watch] emit failed: ${(err as Error).message}`);
+    }
+  }
+  /* Sliver 2c: detection -> action. Fire the re-distill trigger once
+   * per tick with every threshold-crossed anchor. Guarded so a throwing
+   * action can never break the watch (the bell already fired above). */
+  if (deps.onStale && result.stale_past_threshold.length > 0) {
+    try {
+      deps.onStale(result.stale_past_threshold);
+    } catch (err) {
+      log(`[stale-watch] onStale failed: ${(err as Error).message}`);
     }
   }
   return result;
@@ -202,6 +229,7 @@ export function startStaleWatch(
         fired: [],
         skipped_debounced: [],
         skipped_fresh: [],
+        stale_past_threshold: [],
       };
     }
     inFlight = true;

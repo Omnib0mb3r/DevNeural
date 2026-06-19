@@ -176,6 +176,88 @@ describe('runStaleWatchTick (Fix 43)', () => {
     expect(emit).toHaveBeenCalledTimes(1);
   });
 
+  it('sliver 2c: onStale fires with threshold-crossed anchors', () => {
+    seedActiveAnchor();
+    const now = 10_000_000;
+    seedStaleRef(now - 60 * 60_000, now - 2 * 60 * 60_000);
+    const onStale = vi.fn();
+    const r = runStaleWatchTick({
+      db,
+      emit: vi.fn(() => ({ id: 'n1' })),
+      onStale,
+      now: () => now,
+      thresholdMs: 10 * 60_000,
+      debounceMs: 30 * 60_000,
+      state: new Map(),
+    });
+    expect(r.stale_past_threshold).toEqual([ANCHOR_ID]);
+    expect(onStale).toHaveBeenCalledTimes(1);
+    expect(onStale).toHaveBeenCalledWith([ANCHOR_ID]);
+  });
+
+  it('sliver 2c: onStale does NOT fire when stale within the threshold', () => {
+    seedActiveAnchor();
+    const now = 10_000_000;
+    seedStaleRef(now - 60_000, now - 5 * 60_000); // 1 min old, < 10 min threshold
+    const onStale = vi.fn();
+    const r = runStaleWatchTick({
+      db,
+      emit: vi.fn(() => ({ id: 'n1' })),
+      onStale,
+      now: () => now,
+      thresholdMs: 10 * 60_000,
+      state: new Map(),
+    });
+    expect(r.stale_past_threshold).toEqual([]);
+    expect(onStale).not.toHaveBeenCalled();
+  });
+
+  it('sliver 2c: onStale fires even when the bell is debounced', () => {
+    seedActiveAnchor();
+    const now = 10_000_000;
+    seedStaleRef(now - 60 * 60_000, now - 2 * 60 * 60_000);
+    const onStale = vi.fn();
+    const emit = vi.fn(() => ({ id: 'n1' }));
+    /* Pre-seed the debounce so the bell is suppressed this tick. */
+    const state = new Map<string, number>([[ANCHOR_ID, now - 60_000]]);
+    const r = runStaleWatchTick({
+      db,
+      emit,
+      onStale,
+      now: () => now,
+      thresholdMs: 10 * 60_000,
+      debounceMs: 30 * 60_000,
+      state,
+    });
+    expect(r.fired).toEqual([]); // bell debounced
+    expect(r.skipped_debounced).toEqual([ANCHOR_ID]);
+    expect(emit).not.toHaveBeenCalled();
+    /* ...but the action trigger still fires: staleness must be acted on
+     * regardless of how recently the bell rang. */
+    expect(onStale).toHaveBeenCalledWith([ANCHOR_ID]);
+  });
+
+  it('sliver 2c: a throwing onStale never breaks the tick', () => {
+    seedActiveAnchor();
+    const now = 10_000_000;
+    seedStaleRef(now - 60 * 60_000, now - 2 * 60 * 60_000);
+    const emit = vi.fn(() => ({ id: 'n1' }));
+    const r = runStaleWatchTick({
+      db,
+      emit,
+      onStale: () => {
+        throw new Error('scheduler exploded');
+      },
+      now: () => now,
+      thresholdMs: 10 * 60_000,
+      debounceMs: 30 * 60_000,
+      state: new Map(),
+    });
+    /* The bell still fired and the tick returned a normal result. */
+    expect(r.fired).toEqual([ANCHOR_ID]);
+    expect(emit).toHaveBeenCalledTimes(1);
+  });
+
   it('re-fires after the debounce window elapses', () => {
     seedActiveAnchor();
     const now = 10_000_000;

@@ -247,6 +247,49 @@ describe('startDistillationBackfillScheduler', () => {
     }
   });
 
+  it('sliver 2c: kick() runs an immediate bounded tick off-schedule', async () => {
+    /* Seed candidates, then kick BEFORE any timer fires (first-fire and
+     * boot-recovery are pushed far out / disabled). The kick alone must
+     * distill, proving detection->action without waiting for the poll. */
+    for (let i = 0; i < 3; i++) {
+      insertBs(`bs-${i.toString().padStart(2, '0')}`, 1_000 + i);
+    }
+    const provider = stubProvider({});
+    const logs: string[] = [];
+    const handle = startDistillationBackfillScheduler({
+      db,
+      provider,
+      log: (m) => logs.push(m),
+      firstFireDelayMs: 600_000,
+      intervalMs: 600_000,
+      bootRecoveryLimit: 0,
+    });
+    handle.kick();
+    for (let i = 0; i < 50; i++) {
+      await Promise.resolve();
+    }
+    handle.stop();
+    const populated = db
+      .listBrainstorms({ limit: 100 })
+      .filter((r) => r.last_summary && r.last_summary.length > 0);
+    expect(populated.length).toBe(3);
+    expect(logs.find((l) => l.includes('[distill-scheduler:kick]'))).toBeTruthy();
+  });
+
+  it('sliver 2c: kick() on a skip-schedule handle is a safe no-op', () => {
+    const provider = stubProvider({ configured: false });
+    const handle = startDistillationBackfillScheduler({
+      db,
+      provider,
+      log: () => undefined,
+      firstFireDelayMs: 1,
+      intervalMs: 60_000,
+    });
+    /* Must not throw even though no schedule / generator was built. */
+    expect(() => handle.kick()).not.toThrow();
+    handle.stop();
+  });
+
   it('bootRecoveryLimit=0 disables the boot recovery sweep', async () => {
     insertBs('bs-only', 1_000);
     const provider = stubProvider({});

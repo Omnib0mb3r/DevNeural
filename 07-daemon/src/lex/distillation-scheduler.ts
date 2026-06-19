@@ -64,6 +64,12 @@ export interface DistillationSchedulerOptions {
 
 export interface DistillationSchedulerHandle {
   stop(): void;
+  /** Sliver 2c: request an immediate bounded tick (e.g. from the
+   * stale-watcher when detection crosses the threshold). Reuses the
+   * scheduler's own re-entrancy guard, so a kick that lands while a
+   * tick is already running is skipped, never stacked. No-op on the
+   * skip-schedule handles (no provider / not configured / anthropic). */
+  kick(): void;
 }
 
 export function startDistillationBackfillScheduler(
@@ -97,19 +103,19 @@ export function startDistillationBackfillScheduler(
     const provider = opts.provider ?? pickProvider();
     if (!provider) {
       log(`[distill-scheduler] no LLM provider; skipping schedule`);
-      return { stop: () => undefined };
+      return { stop: () => undefined, kick: () => undefined };
     }
     if (!provider.isConfigured()) {
       log(
         `[distill-scheduler] provider ${provider.name} not configured; skipping schedule`,
       );
-      return { stop: () => undefined };
+      return { stop: () => undefined, kick: () => undefined };
     }
     if (provider.name === 'anthropic') {
       log(
         `[distill-scheduler] BF-4: anthropic blocked for brainstorm content; skipping schedule`,
       );
-      return { stop: () => undefined };
+      return { stop: () => undefined, kick: () => undefined };
     }
     generator = createLlmDistillationGenerator({
       db: opts.db,
@@ -180,5 +186,6 @@ export function startDistillationBackfillScheduler(
       if (firstTimer) clearTimeout(firstTimer);
       if (intervalTimer) clearInterval(intervalTimer);
     },
+    kick: () => void tick(limit, 'kick'),
   };
 }

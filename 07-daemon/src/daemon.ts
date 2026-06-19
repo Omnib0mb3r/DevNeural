@@ -212,7 +212,7 @@ async function main(): Promise<void> {
    * stale-ref counts on cold-start preload can sit at 20+ for over
    * an hour because the steady-state tick only handles 5 rows per
    * 10-minute interval. */
-  startDistillationBackfillScheduler({
+  const distillScheduler = startDistillationBackfillScheduler({
     db: store.db,
     log: logger,
     intervalMs: Number(
@@ -497,6 +497,19 @@ async function main(): Promise<void> {
       deps: {
         db: store.db,
         log: logger,
+        /* Sliver 2c: detection -> action. When the watch finds an
+         * anchor past the staleness threshold, kick the distillation
+         * scheduler's bounded tick so the bell is no longer the only
+         * response. The scheduler's re-entrancy guard prevents this
+         * from stacking on the periodic tick, and it runs through the
+         * scheduler's own engine (ollama by default; headless Opus only
+         * under DEVNEURAL_DISTILL_HEADLESS), so the flag is respected. */
+        onStale: (anchorIds) => {
+          logger(
+            `[stale-watch] ${anchorIds.length} stale anchor(s) past threshold; kicking distill`,
+          );
+          distillScheduler.kick();
+        },
       },
     });
     logger('stale-watcher: started');
