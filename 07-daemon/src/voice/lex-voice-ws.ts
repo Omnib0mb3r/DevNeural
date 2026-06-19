@@ -294,6 +294,36 @@ function findJsonlBySessionId(sessionId: string): string | null {
  * whenever a fresh hello binds. */
 const activeByBindKey = new Map<string, ConnState>();
 
+/* Fix 53 (2026-06-18): one voice TALKBACK per watched session.
+ * activeByBindKey only dedupes PTY-bound + direct-llm clients. A
+ * read-only TTS watcher (watchSessionId set, no PTY -> no bindKey)
+ * is invisible to that map, so two watchers tailing the same jsonl
+ * each synthesize the same assistant segment -> audible double audio.
+ * This map tracks the active watcher per watch-target (session id or
+ * jsonl path); a fresh watcher evicts the prior one. Newest wins,
+ * matching the activeByBindKey eviction contract above. */
+const activeByWatchTarget = new Map<string, ConnState>();
+
+/* Fix 53 hard guarantee: a given assistant jsonl record is synthesized
+ * to audio AT MOST ONCE across ALL connections within this window,
+ * even if two watchers briefly coexist during a reconnect race (one
+ * 250ms poll tick) before eviction lands. Pure suppression keyed by
+ * `${watch-target}::${record-uuid}::${ack|body}` — it can only stop a
+ * duplicate stream, never block the single legitimate one. This is the
+ * "never speak twice, no matter what" backstop behind the eviction. */
+const globallySpokenRecords = new Map<string, number>();
+const GLOBAL_SPOKEN_TTL_MS = 15_000;
+function claimSpokenRecord(key: string): boolean {
+  const now = Date.now();
+  for (const [k, exp] of globallySpokenRecords) {
+    if (exp <= now) globallySpokenRecords.delete(k);
+  }
+  const existing = globallySpokenRecords.get(key);
+  if (existing && existing > now) return false;
+  globallySpokenRecords.set(key, now + GLOBAL_SPOKEN_TTL_MS);
+  return true;
+}
+
 /* Last tts-end emit timestamp (epoch ms). Stamped server-side every
  * time the daemon finishes streaming TTS PCM to a client. Surfaced in
  * /health.audio.last_tts_ack_ms so an external probe can see when the
@@ -590,6 +620,38 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
   }
 
+  /* Fix 53 (2026-06-18): claim this connection as the sole talkback
+   * for its watch-target (session id, else jsonl path). Evicts any
+   * prior watcher of the same target so a read-only TTS watcher can
+   * never coexist with another watcher and double-speak. Newest wins,
+   * mirroring the activeByBindKey eviction in bind(). No-op when there
+   * is nothing to watch yet. */
+  function claimWatchTarget(): void {
+    const key = state.watchSessionId ?? state.jsonlPath;
+    if (!key) return;
+    const prior = activeByWatchTarget.get(key);
+    if (prior && prior !== state) {
+      prior.closed = true;
+      try {
+        prior.ws.send(
+          JSON.stringify({
+            t: 'evicted',
+            reason:
+              'another voice client started watching this session; only one talkback per session is allowed',
+          }),
+        );
+      } catch {
+        /* socket already gone */
+      }
+      try {
+        prior.ws.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    activeByWatchTarget.set(key, state);
+  }
+
   function bind(sessionOrPty: string | undefined): void {
     /* Resolve a jsonl to tail directly from the supplied session_id, so
      * we can speak responses from Claude Code instances that aren't
@@ -644,6 +706,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         jsonl_bound: true,
         inject_disabled: true,
       });
+      claimWatchTarget();
       startJsonlWatch();
       return;
     }
@@ -706,6 +769,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       voice_rate: piperStatus().rate,
       jsonl_bound: Boolean(state.jsonlPath),
     });
+    claimWatchTarget();
     if (state.jsonlPath) startJsonlWatch();
     /* Fix 31 (2026-05-25): migrate awaitingResponseSince from the
      * brainstorm row when binding to an in-flight turn. The race:
@@ -1083,7 +1147,20 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       if (state.mode === 'notes') {
         send({ t: 'tts-skipped', reason: 'notes-mode' });
       } else {
-        speak(text);
+        /* Fix 53 (2026-06-18): never synthesize the same assistant
+         * record twice. The eviction in claimWatchTarget already keeps
+         * a single watcher per session; this is the backstop for the
+         * one-poll-tick race where a reconnecting watcher overlaps the
+         * outgoing one. Keyed per (watch-target, record, segment-role)
+         * so a real pre-tool ack + end_turn body of the same turn both
+         * still play, and a genuinely identical later reply (different
+         * record uuid) is never suppressed. */
+        const speakKey = `${state.watchSessionId ?? state.jsonlPath ?? state.bindKey ?? ''}::${uuid || decision.new_hashes[0] || text.slice(0, 64)}::${isPreToolAck ? 'ack' : 'body'}`;
+        if (claimSpokenRecord(speakKey)) {
+          speak(text);
+        } else {
+          send({ t: 'tts-skipped', reason: 'already-spoken' });
+        }
       }
     }
     /* Pre-tool ack stops here. The follow-on end_turn record from
@@ -2574,6 +2651,13 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
     if (state.bindKey && activeByBindKey.get(state.bindKey) === state) {
       activeByBindKey.delete(state.bindKey);
+    }
+    /* Fix 53 (2026-06-18): drop this connection from the watch-target
+     * registry. Value-scan rather than key lookup because the watched
+     * target (watchSessionId / jsonlPath) can be late-resolved or
+     * re-pointed after the initial claim. */
+    for (const [k, v] of activeByWatchTarget) {
+      if (v === state) activeByWatchTarget.delete(k);
     }
     /* Fire-and-forget the end-of-session pipeline. Awaiting here would
      * block the close handler and Fastify's WS plumbing; the pipeline
