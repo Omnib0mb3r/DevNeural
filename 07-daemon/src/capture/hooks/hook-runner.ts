@@ -175,7 +175,18 @@ export async function postColdStartPreload(
   if (flag === 'off' || flag === 'false' || flag === '0') return;
   const url = `http://127.0.0.1:${DAEMON_PORT}/lex/cold-start-preload`;
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 2000);
+  /* The live route force-distills the top-N siblings + runs stale-ref
+   * catchup through the LLM generator synchronously before it answers
+   * (routes.ts /lex/cold-start-preload). Measured ~8.3s on a real
+   * brainstorm with 29 stale refs; the old 2000ms abort guaranteed the
+   * hook bailed before the block was ready, so the preamble was computed
+   * and audit-logged server-side but NEVER injected (looked like it
+   * worked; delivered nothing). 15s clears the measured cost with
+   * headroom. Daemon-down still fast-fails on connection refused, so
+   * this only extends the wait when the daemon is actually computing.
+   * The pre-launch Opus investigator (moves this work off the hook path
+   * entirely) supersedes the need for a long hook wait. */
+  const t = setTimeout(() => ctrl.abort(), 15000);
   try {
     const res = await fetch(url, {
       method: 'POST',
