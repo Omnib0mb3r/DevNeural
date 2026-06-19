@@ -165,6 +165,13 @@ interface ConnState {
    * (matchVoiceCommand returns non-null) still fire via the
    * dispatch path before this gate. */
   utteranceStartedDuringTts: boolean;
+  /* Half-duplex heartbeat gate (2026-06-18). userSpeaking is true
+   * between utterance-start and utterance-end; lastUserSpeechEndMs is
+   * the instant the user last stopped. The working-heartbeat must never
+   * pulse while either says the user holds the floor — Lex speaking
+   * mutes the mic, so a pulse over the user makes Lex deaf to them. */
+  userSpeaking: boolean;
+  lastUserSpeechEndMs: number;
   /* Mid-session compaction trigger state. Flips compactedAt the
    * moment shouldTriggerCompaction crosses 75% so a trailing
    * end_turn record in the same jsonl tail cannot re-fire the
@@ -561,6 +568,17 @@ export function _flushPendingUtterancesImpl(
   state.awaitingResponseSince = Date.now();
 }
 
+/* Single meaningful words that must reach Lex despite the wordCount<2
+ * whisper-noise floor (2026-06-18). The user steers with terse commands
+ * ("go", "stop", "proceed") and the 2-word floor was swallowing them.
+ * Deliberately excludes whisper's common noise transcriptions ("okay",
+ * "you", "thanks", "yeah") so the noise floor still holds. */
+const SHORT_COMMAND_WORDS = new Set<string>([
+  'go', 'stop', 'wait', 'yes', 'no', 'nope', 'proceed', 'continue',
+  'done', 'cancel', 'kill', 'pause', 'abort', 'retry', 'next', 'send',
+  'ship', 'build', 'hold', 'skip', 'undo', 'repeat',
+]);
+
 export function attachLexVoiceWs(socket: FastifyWS): void {
   console.log(`[voice-ws] client connected (attach)`);
   const state: ConnState = {
@@ -579,6 +597,8 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     sessionEndFired: false,
     lastVoiceCmdMs: {},
     utteranceStartedDuringTts: false,
+    userSpeaking: false,
+    lastUserSpeechEndMs: 0,
     compaction: { compactedAt: 0 },
     currentTtsText: null,
     currentTtsStartedAtMs: 0,
@@ -594,11 +614,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
 
   /* Working-heartbeat state. lastSpeechMs is the epoch ms of the most
    * recent TTS activity (start of a speak + every tts-end); the
-   * heartbeat watcher uses it as the silence clock. heartbeatCount
-   * rotates the canned phrase. heartbeatTimer is the in-flight ticker,
-   * started with the jsonl watch and torn down with it. */
+   * heartbeat watcher uses it as the silence clock. heartbeatTimer is
+   * the in-flight ticker, started with the jsonl watch and torn down
+   * with it. */
   let lastSpeechMs = 0;
-  let heartbeatCount = 0;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   /* Fix 40 (2026-05-26): centralise piper synth lifecycle behind a
@@ -642,9 +661,31 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * never coexist with another watcher and double-speak. Newest wins,
    * mirroring the activeByBindKey eviction in bind(). No-op when there
    * is nothing to watch yet. */
+  /* Fix 57 (2026-06-19): canonical talkback identity = the physical
+   * jsonl path being spoken, NOT the session UUID. Pre-fix the key was
+   * `watchSessionId ?? jsonlPath`, so a client bound by session UUID and
+   * a client bound via the global-Lex PTY fallback landed under DIFFERENT
+   * keys for the SAME physical Lex, never evicted each other, and both
+   * synthesised the same end_turn body -> audible Lex-over-Lex. Resolve
+   * the UUID to its jsonl path so the two namespaces cannot diverge. */
+  function watchTargetKey(): string | null {
+    if (state.jsonlPath) return state.jsonlPath;
+    if (state.watchSessionId) {
+      const j = findJsonlBySessionId(state.watchSessionId);
+      if (j) return j;
+    }
+    return null;
+  }
+
   function claimWatchTarget(): void {
-    const key = state.watchSessionId ?? state.jsonlPath;
+    const key = watchTargetKey();
     if (!key) return;
+    /* Drop any stale self-claim under a pre-resolution key so a late
+     * path-resolve (pollJsonl) cannot leave this conn occupying two
+     * slots and shadowing a real eviction. */
+    for (const [k, v] of activeByWatchTarget) {
+      if (v === state && k !== key) activeByWatchTarget.delete(k);
+    }
     const prior = activeByWatchTarget.get(key);
     if (prior && prior !== state) {
       prior.closed = true;
@@ -916,15 +957,20 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     if (heartbeatTimer) return;
     heartbeatTimer = setInterval(() => {
       if (state.closed) return;
+      const now = Date.now();
       const fire = shouldHeartbeat({
         awaitingSince: state.awaitingResponseSince,
         lastSpeechMs,
         ttsActive: Boolean(state.ttsActive),
+        userSpeaking: state.userSpeaking,
+        lastUserSpeechEndMs: state.lastUserSpeechEndMs,
         mode: state.mode,
-        now: Date.now(),
+        now,
         intervalMs: HEARTBEAT_INTERVAL_MS,
       });
-      if (fire) speak(heartbeatPhrase(heartbeatCount++));
+      if (fire && state.awaitingResponseSince) {
+        speak(heartbeatPhrase(now - state.awaitingResponseSince));
+      }
     }, HEARTBEAT_TICK_MS);
     if (typeof (heartbeatTimer as { unref?: () => void }).unref === 'function') {
       (heartbeatTimer as { unref: () => void }).unref();
@@ -964,6 +1010,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       if (jsonl) {
         state.jsonlPath = jsonl;
         state.jsonlOffset = 0;
+        /* Fix 57: path now known -> claim the canonical talkback slot so
+         * a late-resolved watcher cannot free-run alongside another. */
+        claimWatchTarget();
       }
     }
     if (!state.jsonlPath) {
@@ -988,6 +1037,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         if (fs.existsSync(jsonl)) {
           state.jsonlPath = jsonl;
           state.jsonlOffset = 0;
+          /* Fix 57: same canonical-slot claim on the PTY late-resolve
+           * branch so a global-Lex-fallback watcher cannot double-speak. */
+          claimWatchTarget();
         }
       }
     }
@@ -2066,7 +2118,13 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       ? trimmed.split(/\s+/).filter((w) => w.length > 0).length
       : 0;
     const isBlankMarker = trimmed === '[BLANK_AUDIO]';
-    if (!trimmed || isBlankMarker || wordCount < 2) {
+    /* A single decisive command word ("go", "stop", "proceed") bypasses
+     * the 2-word noise floor so the user can steer tersely. Strip
+     * trailing punctuation whisper tends to append ("Go.") first. */
+    const isShortCommand =
+      wordCount === 1 &&
+      SHORT_COMMAND_WORDS.has(trimmed.toLowerCase().replace(/[.!?,]+$/g, ''));
+    if (!trimmed || isBlankMarker || (wordCount < 2 && !isShortCommand)) {
       const reason = !trimmed
         ? 'empty'
         : isBlankMarker
@@ -2270,7 +2328,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         (liveHandle?.ptyId && getBrainstormByPty(liveHandle.ptyId)) ||
         null;
       snapshotBlock =
-        buildVoiceSnapshot({ activeBrainstormCwd: bsForCwd?.cwd ?? null }) +
+        buildVoiceSnapshot({
+          activeBrainstormCwd: bsForCwd?.cwd ?? null,
+          query: result.text,
+        }) +
         '\n\n';
     } catch {
       /* observability only; fall back to no snapshot rather than
@@ -2465,11 +2526,19 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
          * whether TTS was active BEFORE the kill so the AEC-bleed
          * gate downstream still sees the truth. */
         state.utteranceStartedDuringTts = state.ttsActive !== null;
+        /* User holds the floor until utterance-end; suppress any
+         * working-heartbeat pulse for the duration. */
+        state.userSpeaking = true;
         killActiveTts('utterance-start');
         state.micBuf = [];
         state.micBufBytes = 0;
         break;
       case 'utterance-end':
+        /* User released the floor. Clear the heartbeat suppression and
+         * stamp the moment so the cooldown keeps a pulse off the heels
+         * of their last word. */
+        state.userSpeaking = false;
+        state.lastUserSpeechEndMs = Date.now();
         void handleUtteranceEnd();
         break;
       case 'text-input': {

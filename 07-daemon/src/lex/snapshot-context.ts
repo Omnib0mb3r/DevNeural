@@ -61,6 +61,25 @@ export interface VoiceSnapshotOptions {
   /** Override memory index path (tests). When provided, bypasses
    * the cwd-based resolver. */
   memoryIndexPath?: string;
+  /** Current utterance / active-thread text. Threaded into the memory
+   * + docs index renders so they rank by relevance to THIS turn
+   * instead of dumping the whole table of contents every time. */
+  query?: string | null;
+}
+
+/* Bullets that must stay visible regardless of relevance score: the
+ * user's identity and the master behavioural rules. Dropping these from
+ * the per-turn table of contents would let Lex lose its own guardrails
+ * on a turn whose wording happens not to overlap them. */
+const PINNED_MEMORY_PATTERNS: RegExp[] = [
+  /\(user_/i,
+  /never_speculate/i,
+  /no_double_talk/i,
+  /lex_act_on_alignment/i,
+  /proceed_means_full_context/i,
+];
+function isPinnedMemory(bullet: string): boolean {
+  return PINNED_MEMORY_PATTERNS.some((re) => re.test(bullet));
 }
 
 function ageHuman(ms: number): string {
@@ -277,9 +296,10 @@ export function buildVoiceSnapshot(opts: VoiceSnapshotOptions = {}): string {
     if (bullets.length > 0) {
       parts.push(
         ...renderIndexSection(
-          'memory_index (use as table of contents; read the full file when relevant):',
+          'memory_index (relevance-ranked to this turn; read the full file when relevant):',
           bullets,
           'MEMORY.md',
+          { query: opts.query, limit: 30, isPinned: isPinnedMemory },
         ),
       );
     }
@@ -292,9 +312,10 @@ export function buildVoiceSnapshot(opts: VoiceSnapshotOptions = {}): string {
   if (docsBullets.length > 0) {
     parts.push(
       ...renderIndexSection(
-        'docs_index (DevNeural project docs; read the full file when relevant):',
+        'docs_index (relevance-ranked to this turn; read the full file when relevant):',
         docsBullets,
         'docs/INDEX.md',
+        { query: opts.query, limit: 14 },
       ),
     );
   }

@@ -650,6 +650,20 @@ export async function preloadColdStartSiblings(
   return out;
 }
 
+/* Fix 58 (2026-06-19): order stale refs newest-first before the bounded
+ * catchup spends its budget, so a cold start distills the ACTIVE thread
+ * first and the ancient archival tail is what gets left as partial - not
+ * the other way around. Pure ordering; touches no generation or
+ * persistence path, so it cannot regress the distillation pipeline. */
+function byNewestChunkDesc(
+  a: LexTranscriptRefRow,
+  b: LexTranscriptRefRow,
+): number {
+  const am = a.latest_chunk_ms ?? a.started_ms ?? 0;
+  const bm = b.latest_chunk_ms ?? b.started_ms ?? 0;
+  return bm - am;
+}
+
 /* Wrapper: anchor-refs path catchup. Collects every stale ref under
  * the anchor (excluding the active session), passes them through
  * runStaleRefCatchup, then accumulates the counts onto the
@@ -667,7 +681,8 @@ async function runAnchorStaleCatchup(args: {
   const currentCc = input.currentCcSessionId ?? null;
   const candidates = refs
     .filter((r) => !currentCc || r.cc_session_id !== currentCc)
-    .filter((r) => isRefStale(r));
+    .filter((r) => isRefStale(r))
+    .sort(byNewestChunkDesc);
   if (candidates.length === 0) return;
   summary.stale_refs_count = candidates.length;
   if (!input.perSessionGenerator) {
@@ -723,6 +738,7 @@ async function runLabelMatchStaleCatchup(args: {
       owner.set(r.id, row.id);
     }
   }
+  candidates.sort(byNewestChunkDesc);
   if (candidates.length === 0) return;
   summary.stale_refs_count = candidates.length;
   if (!input.perSessionGenerator) return;
