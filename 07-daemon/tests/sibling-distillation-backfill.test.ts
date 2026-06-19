@@ -248,4 +248,153 @@ describe('runDistillationBackfill', () => {
     expect(r.skipped.length).toBe(3);
     expect(r.hit_cap).toBe(false);
   });
+
+  /* Insert a lex_transcript_ref under a brainstorm and set its
+   * freshness columns directly. ref_summary_ms / latest_chunk_ms drive
+   * isRefStale (latest_chunk_ms > ref_summary_ms -> stale). */
+  function insertRef(opts: {
+    lexSessionId: string;
+    cc: string;
+    ordering: number;
+    refSummaryMs: number | null;
+    latestChunkMs: number | null;
+  }): number {
+    /* lex_transcript_ref.lex_session_id FKs lex_session(id); migration
+     * 018 gives each brainstorm a same-id lex_session row. Mirror that
+     * so the ref insert satisfies the constraint. Idempotent per id. */
+    try {
+      db.insertLexSession({
+        id: opts.lexSessionId,
+        created_ms: 1_000,
+        title: null,
+        derived_title: null,
+        status: 'dormant',
+        current_pty_id: null,
+        cwd: 'C:/p/lex',
+      });
+    } catch {
+      /* already inserted for a prior ref on the same anchor */
+    }
+    const ref = db.insertLexTranscriptRef({
+      lex_session_id: opts.lexSessionId,
+      cc_session_id: opts.cc,
+      transcript_path: `C:/x/${opts.cc}.jsonl`,
+      started_ms: 1_000 + opts.ordering,
+      ended_ms: null,
+      ordering: opts.ordering,
+    });
+    db.updateLexTranscriptRef(ref.id, {
+      ref_summary_ms: opts.refSummaryMs,
+      latest_chunk_ms: opts.latestChunkMs,
+    });
+    return ref.id;
+  }
+
+  it('re-distills a summarized row when a child ref is stale and flips ref_summary_ms fresh', async () => {
+    /* The exact production bug: the row HAS a last_summary (so the old
+     * looksLikeSelfAudit guard excluded it) but a chunk landed after
+     * the last per-ref distill, so the ref is stale. It must now be a
+     * candidate, and a successful re-distill must stamp the ref's
+     * ref_summary_ms so isRefStale flips false. */
+    insertBs({
+      id: 'anchor',
+      label: 'T',
+      started_ms: 1_000,
+      last_summary: 'stale summary',
+    });
+    insertRef({
+      lexSessionId: 'anchor',
+      cc: 'cc-1',
+      ordering: 0,
+      refSummaryMs: 100,
+      latestChunkMs: 500,
+    });
+    const generator = vi.fn().mockResolvedValue('fresh re-distillation');
+    const r = await runDistillationBackfill({
+      db,
+      generator,
+      limit: 5,
+      now: () => 9_999,
+    });
+    expect(r.processed).toEqual(['anchor']);
+    expect(generator).toHaveBeenCalledTimes(1);
+
+    const { isRefStale } = await import('../src/lex/lex-transcript-ref.js');
+    const reread = db.getLexTranscriptRefByCc('cc-1')!;
+    expect(reread.ref_summary_ms).toBe(9_999);
+    expect(reread.latest_chunk_ms).toBe(500);
+    expect(isRefStale(reread)).toBe(false);
+
+    const bs = db.getBrainstorm('anchor')!;
+    expect(bs.last_summary).toBe('fresh re-distillation');
+    expect(bs.last_summary_ms).toBe(9_999);
+  });
+
+  it('leaves a summarized row alone when all of its child refs are fresh', async () => {
+    insertBs({
+      id: 'fresh-anchor',
+      label: 'T',
+      started_ms: 1_000,
+      last_summary: 'current',
+    });
+    insertRef({
+      lexSessionId: 'fresh-anchor',
+      cc: 'cc-f',
+      ordering: 0,
+      refSummaryMs: 500,
+      latestChunkMs: 100,
+    });
+    const generator = vi.fn().mockResolvedValue('should not run');
+    const r = await runDistillationBackfill({ db, generator, limit: 5 });
+    expect(generator).not.toHaveBeenCalled();
+    expect(r.processed).toEqual([]);
+  });
+
+  it('flips every stale ref on the row in a single re-distill and leaves fresh refs untouched', async () => {
+    insertBs({
+      id: 'multi',
+      label: 'T',
+      started_ms: 1_000,
+      last_summary: 'old',
+    });
+    insertRef({
+      lexSessionId: 'multi',
+      cc: 'cc-a',
+      ordering: 0,
+      refSummaryMs: 100,
+      latestChunkMs: 500,
+    }); // stale
+    insertRef({
+      lexSessionId: 'multi',
+      cc: 'cc-b',
+      ordering: 1,
+      refSummaryMs: 200,
+      latestChunkMs: 900,
+    }); // stale
+    insertRef({
+      lexSessionId: 'multi',
+      cc: 'cc-c',
+      ordering: 2,
+      refSummaryMs: 800,
+      latestChunkMs: 100,
+    }); // fresh
+    const generator = vi.fn().mockResolvedValue('redistill');
+    const r = await runDistillationBackfill({
+      db,
+      generator,
+      limit: 5,
+      now: () => 7_000,
+    });
+    expect(generator).toHaveBeenCalledTimes(1);
+    expect(r.processed).toEqual(['multi']);
+
+    const { isRefStale } = await import('../src/lex/lex-transcript-ref.js');
+    for (const cc of ['cc-a', 'cc-b', 'cc-c']) {
+      expect(isRefStale(db.getLexTranscriptRefByCc(cc)!)).toBe(false);
+    }
+    expect(db.getLexTranscriptRefByCc('cc-a')!.ref_summary_ms).toBe(7_000);
+    expect(db.getLexTranscriptRefByCc('cc-b')!.ref_summary_ms).toBe(7_000);
+    /* Fresh ref's stamp must be left exactly as it was. */
+    expect(db.getLexTranscriptRefByCc('cc-c')!.ref_summary_ms).toBe(800);
+  });
 });

@@ -17,9 +17,11 @@
 import type {
   BrainstormSessionRow,
   IndexDb,
+  LexTranscriptRefRow,
 } from '../store/index-db.js';
 import type { DistillationGenerator } from './sibling-distillation-preload.js';
 import { hasDistillableJsonlSource } from './jsonl-transcript-reader.js';
+import { isRefStale } from './lex-transcript-ref.js';
 
 export interface BackfillOptions {
   db: IndexDb;
@@ -75,6 +77,26 @@ function looksLikeSelfAudit(row: BrainstormSessionRow): boolean {
   return !isEmpty(row.last_summary);
 }
 
+/* The child lex_transcript_ref rows for a brainstorm that are stale by
+ * the freshness barrier (latest_chunk_ms > ref_summary_ms, per
+ * isRefStale). Used for BOTH selection (a summarized row with a stale
+ * ref must re-distill) and the post-distill stamp (flip each stale
+ * ref's ref_summary_ms so isRefStale -> false). Best-effort: a missing
+ * migration / dropped table yields no stale refs rather than throwing,
+ * matching the rest of the backfill's degrade-quietly posture. */
+function staleRefsFor(
+  db: IndexDb,
+  brainstormId: string,
+): LexTranscriptRefRow[] {
+  let refs: LexTranscriptRefRow[];
+  try {
+    refs = db.listLexTranscriptRefs(brainstormId);
+  } catch {
+    return [];
+  }
+  return refs.filter(isRefStale);
+}
+
 export async function runDistillationBackfill(
   opts: BackfillOptions,
 ): Promise<BackfillResult> {
@@ -95,9 +117,18 @@ export async function runDistillationBackfill(
   const exclude = opts.excludeId ?? null;
   const candidates = rows.filter((r) => {
     if (exclude && r.id === exclude) return false;
-    if (looksLikeSelfAudit(r)) return false;
     if (target && normLabel(r.user_label) !== target) return false;
-    return true;
+    /* Unsummarized rows are candidates as before. Summarized rows used
+     * to be dropped outright (looksLikeSelfAudit), which is the bug:
+     * the writer keyed on last_summary PRESENCE while the reader
+     * (isRefStale) keys on TIMESTAMP, so a once-distilled long-running
+     * anchor whose child sessions kept appending chunks never
+     * re-distilled. Keep a summarized row when any child ref is stale
+     * so staleness, not presence, drives selection. The DB hit only
+     * happens for already-summarized rows that survived the cheap
+     * exclude/label filters. */
+    if (!looksLikeSelfAudit(r)) return true;
+    return staleRefsFor(opts.db, r.id).length > 0;
   });
 
   /* Pre-filter brainstorms with no distillable source. Chunkless
@@ -155,10 +186,22 @@ export async function runDistillationBackfill(
       threw = true;
     }
     if (distillation && distillation.trim().length > 0) {
+      const ts = now();
       opts.db.updateBrainstorm(row.id, {
         last_summary: distillation.trim(),
-        last_summary_ms: now(),
+        last_summary_ms: ts,
       });
+      /* Flip the freshness barrier alongside last_summary_ms. The
+       * re-distill above read the row's current transcript, which
+       * already includes the chunks that landed after each stale ref's
+       * last per-ref distill, so stamping ref_summary_ms here is
+       * honest. Without it the reader (isRefStale) and writer
+       * (last_summary presence) stay out of sync and the stale tag
+       * never clears. Fresh refs are left untouched; the same-`ts`
+       * stamp keeps ref_summary_ms >= latest_chunk_ms for every ref. */
+      for (const ref of staleRefsFor(opts.db, row.id)) {
+        opts.db.updateLexTranscriptRef(ref.id, { ref_summary_ms: ts });
+      }
       out.processed.push(row.id);
     } else {
       /* Real failure: the row had a transcript but the generator
