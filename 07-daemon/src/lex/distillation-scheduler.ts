@@ -19,7 +19,12 @@
 import type { IndexDb } from '../store/index-db.js';
 import type { LlmProvider } from '../llm/index.js';
 import { pickProvider } from '../llm/index.js';
-import { createLlmDistillationGenerator } from './distillation-generator.js';
+import {
+  createLlmDistillationGenerator,
+  createHeadlessDistillationGenerator,
+} from './distillation-generator.js';
+import type { DistillationGenerator } from './sibling-distillation-preload.js';
+import type { SpawnHeadlessOpus } from './headless-opus.js';
 import {
   runDistillationBackfill,
   BACKFILL_DEFAULT_LIMIT,
@@ -49,6 +54,12 @@ export interface DistillationSchedulerOptions {
    * steady-state firstFireDelayMs so cold-start preloads on early
    * brainstorm spawns see fewer stale refs. */
   bootRecoveryDelayMs?: number;
+  /** Test seam for the headless engine: injected into
+   * createHeadlessDistillationGenerator when DEVNEURAL_DISTILL_HEADLESS
+   * is on, so the scheduler can be exercised without a real claude
+   * subprocess. Prod leaves this undefined (the generator uses
+   * spawnHeadlessOpus). */
+  spawnHeadless?: SpawnHeadlessOpus;
 }
 
 export interface DistillationSchedulerHandle {
@@ -62,32 +73,55 @@ export function startDistillationBackfillScheduler(
   const intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
   const firstDelay = opts.firstFireDelayMs ?? DEFAULT_FIRST_FIRE_DELAY_MS;
   const limit = opts.limit ?? BACKFILL_DEFAULT_LIMIT;
-  const provider = opts.provider ?? pickProvider();
-  if (!provider) {
-    log(`[distill-scheduler] no LLM provider; skipping schedule`);
-    return { stop: () => undefined };
-  }
-  if (!provider.isConfigured()) {
+
+  /* Sliver 2b: DEVNEURAL_DISTILL_HEADLESS=1 routes distillation through
+   * the shared headless Opus engine (claude -p own-auth, BF-4 exempt)
+   * instead of the ollama provider. The headless path needs no provider
+   * at all, so it BYPASSES the provider guards below - it must run even
+   * when ollama is unconfigured. Default off: the ollama path stays the
+   * steady state until the live engine-swap verify lands. */
+  const headless = process.env.DEVNEURAL_DISTILL_HEADLESS === '1';
+  let generator: DistillationGenerator;
+  let engineLabel: string;
+  if (headless) {
+    generator = createHeadlessDistillationGenerator({
+      db: opts.db,
+      log,
+      ...(opts.spawnHeadless ? { spawnHeadless: opts.spawnHeadless } : {}),
+    });
+    engineLabel = 'headless-opus';
     log(
-      `[distill-scheduler] provider ${provider.name} not configured; skipping schedule`,
+      `[distill-scheduler] headless Opus engine (DEVNEURAL_DISTILL_HEADLESS=1)`,
     );
-    return { stop: () => undefined };
-  }
-  if (provider.name === 'anthropic') {
-    log(
-      `[distill-scheduler] BF-4: anthropic blocked for brainstorm content; skipping schedule`,
-    );
-    return { stop: () => undefined };
+  } else {
+    const provider = opts.provider ?? pickProvider();
+    if (!provider) {
+      log(`[distill-scheduler] no LLM provider; skipping schedule`);
+      return { stop: () => undefined };
+    }
+    if (!provider.isConfigured()) {
+      log(
+        `[distill-scheduler] provider ${provider.name} not configured; skipping schedule`,
+      );
+      return { stop: () => undefined };
+    }
+    if (provider.name === 'anthropic') {
+      log(
+        `[distill-scheduler] BF-4: anthropic blocked for brainstorm content; skipping schedule`,
+      );
+      return { stop: () => undefined };
+    }
+    generator = createLlmDistillationGenerator({
+      db: opts.db,
+      log,
+      provider,
+    });
+    engineLabel = provider.name;
   }
   const bootRecoveryLimit =
     opts.bootRecoveryLimit ?? DEFAULT_BOOT_RECOVERY_LIMIT;
   const bootRecoveryDelay =
     opts.bootRecoveryDelayMs ?? DEFAULT_BOOT_RECOVERY_DELAY_MS;
-  const generator = createLlmDistillationGenerator({
-    db: opts.db,
-    log,
-    provider,
-  });
   let bootTimer: ReturnType<typeof setTimeout> | null = null;
   let firstTimer: ReturnType<typeof setTimeout> | null = null;
   let intervalTimer: ReturnType<typeof setInterval> | null = null;
@@ -138,7 +172,7 @@ export function startDistillationBackfillScheduler(
     firstTimer.unref();
   }
   log(
-    `[distill-scheduler] up (interval=${intervalMs}ms first_fire_delay=${firstDelay}ms limit=${limit} boot_recovery_limit=${bootRecoveryLimit} boot_recovery_delay=${bootRecoveryDelay}ms provider=${provider.name})`,
+    `[distill-scheduler] up (interval=${intervalMs}ms first_fire_delay=${firstDelay}ms limit=${limit} boot_recovery_limit=${bootRecoveryLimit} boot_recovery_delay=${bootRecoveryDelay}ms provider=${engineLabel})`,
   );
   return {
     stop: () => {

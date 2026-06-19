@@ -39,6 +39,7 @@ import type { LlmProvider } from '../llm/index.js';
 import { pickProvider } from '../llm/index.js';
 import type { DistillationGenerator } from './sibling-distillation-preload.js';
 import { readTranscriptFromJsonlRefs } from './jsonl-transcript-reader.js';
+import { spawnHeadlessOpus, type SpawnHeadlessOpus } from './headless-opus.js';
 
 /* Codex item 6 (Fix 43): every null-return path in the per-session
  * generator writes a structured row to distillation_error_log so the
@@ -229,6 +230,98 @@ export function createLlmDistillationGenerator(
       );
       return null;
     }
+  };
+}
+
+export interface CreateHeadlessGeneratorOptions {
+  db: IndexDb;
+  log?: (msg: string) => void;
+  /** Cap the bytes of transcript shipped to the engine. Default 8000,
+   * matching the ollama path so the swap is content-equivalent. */
+  maxTranscriptBytes?: number;
+  /** Cap the chunks pulled per brainstorm. Default 50. */
+  chunkLimit?: number;
+  /** cwd the `claude -p` pass runs in. Default process.cwd(). Kept
+   * neutral by default so a project CLAUDE.md does not bias the
+   * summary; pass a project dir only when that context is wanted. */
+  cwd?: string;
+  /** Headless pass timeout. Default 60000. */
+  timeoutMs?: number;
+  /** Test seam; prod uses spawnHeadlessOpus. */
+  spawnHeadless?: SpawnHeadlessOpus;
+}
+
+/* Headless Opus distillation generator (sliver 2b).
+ *
+ * Same DistillationGenerator shape + same SYSTEM_BLOCK prompt as
+ * createLlmDistillationGenerator, but runs the summary through the
+ * shared headless `claude -p` engine (spawnHeadlessOpus) instead of
+ * provider.call(). This is the Hole-4 unification: distill becomes one
+ * job on the investigator's engine, so there is ONE writer on the
+ * staleness signal, not an ollama writer split from the Opus reader.
+ *
+ * BF-4: NO anthropic gate here. The headless pass is the user's own
+ * `claude` CLI subprocess on their own auth, NOT a daemon
+ * provider.call(), so brainstorm content never leaves the host via an
+ * automated off-host API call. (Contrast createLlmDistillationGenerator,
+ * which must block the anthropic provider.)
+ *
+ * Fail-safe by contract: returns null on no transcript, spawn failure,
+ * timeout, or empty reply - the backfill buckets that exactly like the
+ * ollama path so selection/stamping logic is unchanged. */
+export function createHeadlessDistillationGenerator(
+  opts: CreateHeadlessGeneratorOptions,
+): DistillationGenerator {
+  const log = opts.log ?? (() => undefined);
+  const maxTranscriptBytes = opts.maxTranscriptBytes ?? 8000;
+  const chunkLimit = opts.chunkLimit ?? 50;
+  const cwd = opts.cwd ?? process.cwd();
+  const timeoutMs = opts.timeoutMs ?? 60000;
+  const spawnHeadless = opts.spawnHeadless ?? spawnHeadlessOpus;
+  return async (row: BrainstormSessionRow): Promise<string | null> => {
+    let transcript = buildTranscript(
+      opts.db,
+      row,
+      chunkLimit,
+      maxTranscriptBytes,
+    );
+    if (transcript.length === 0) {
+      /* Chunkless brainstorm: same jsonl fallback as the ollama path. */
+      transcript = readTranscriptFromJsonlRefs(opts.db, row.id, {
+        maxBytes: maxTranscriptBytes,
+        log,
+      });
+      if (transcript.length === 0) {
+        log(
+          `[distill-headless] no chunks and no jsonl-refs for ${row.id.slice(0, 8)}`,
+        );
+        return null;
+      }
+      log(
+        `[distill-headless] using jsonl-fallback for ${row.id.slice(0, 8)} (chunkless)`,
+      );
+    }
+    const prompt = `${SYSTEM_BLOCK.text}\n\n--- TRANSCRIPT ---\n${transcript}`;
+    let raw: string | null;
+    try {
+      raw = await spawnHeadless(prompt, cwd, timeoutMs);
+    } catch (err) {
+      log(
+        `[distill-headless] spawn failed for ${row.id.slice(0, 8)}: ${(err as Error).message}`,
+      );
+      return null;
+    }
+    if (!raw || !raw.trim()) {
+      log(`[distill-headless] empty reply for ${row.id.slice(0, 8)}; skip`);
+      return null;
+    }
+    /* Same cleanup as the ollama path: strip stray wrapping quotes and
+     * any fence the prompt told it not to emit. */
+    return raw
+      .trim()
+      .replace(/^["'`]+|["'`]+$/g, '')
+      .replace(/^```\w*\n?|```$/g, '')
+      .trim();
   };
 }
 

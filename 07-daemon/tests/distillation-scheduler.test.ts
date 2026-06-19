@@ -208,6 +208,45 @@ describe('startDistillationBackfillScheduler', () => {
     expect(upLine).toMatch(/boot_recovery_limit=12/);
   });
 
+  it('headless mode distills via the claude -p engine with no provider configured', async () => {
+    /* DEVNEURAL_DISTILL_HEADLESS=1 must bypass the provider guards
+     * entirely: distill runs through the shared headless Opus engine
+     * even when ollama is absent. Inject a spawn stub so no real
+     * subprocess is launched. */
+    process.env.DEVNEURAL_DISTILL_HEADLESS = '1';
+    try {
+      for (let i = 0; i < 3; i++) {
+        insertBs(`bs-${i.toString().padStart(2, '0')}`, 1_000 + i);
+      }
+      const spawnHeadless = vi.fn(async () => 'topic\ndecision\nopen items');
+      const logs: string[] = [];
+      const handle = startDistillationBackfillScheduler({
+        db,
+        /* deliberately NO provider passed */
+        log: (m) => logs.push(m),
+        firstFireDelayMs: 10,
+        intervalMs: 60_000,
+        bootRecoveryLimit: 0,
+        spawnHeadless,
+      });
+      await vi.advanceTimersByTimeAsync(15);
+      for (let i = 0; i < 50; i++) {
+        await Promise.resolve();
+      }
+      handle.stop();
+      expect(logs.find((l) => l.includes('headless Opus engine'))).toBeTruthy();
+      expect(spawnHeadless.mock.calls.length).toBe(3);
+      const populated = db
+        .listBrainstorms({ limit: 100 })
+        .filter((r) => r.last_summary && r.last_summary.length > 0);
+      expect(populated.length).toBe(3);
+      const upLine = logs.find((l) => l.includes('[distill-scheduler] up'));
+      expect(upLine).toMatch(/provider=headless-opus/);
+    } finally {
+      delete process.env.DEVNEURAL_DISTILL_HEADLESS;
+    }
+  });
+
   it('bootRecoveryLimit=0 disables the boot recovery sweep', async () => {
     insertBs('bs-only', 1_000);
     const provider = stubProvider({});
