@@ -21,10 +21,10 @@
  * brainstorm content from automated off-host calls.
  */
 import * as nodeFs from 'node:fs';
-import { spawn } from 'node:child_process';
 import type { IndexDb } from '../store/index-db.js';
 import { buildSiblingIndex } from './sibling-index.js';
 import { readTranscriptFromJsonlRefs } from './jsonl-transcript-reader.js';
+import { spawnHeadlessOpus } from './headless-opus.js';
 
 interface BrainstormLike {
   id: string;
@@ -265,78 +265,10 @@ export async function runInvestigator(
   }
 }
 
-/* Prod headless Opus pass: `claude -p` reading the prompt from stdin
- * (avoids OS arg-length limits on a multi-KB context). Fail-safe by
- * contract - resolves null on ANY failure (missing binary, non-zero
- * exit, timeout, spawn error) so runInvestigator falls back to the
- * deterministic assembled block. windowsHide keeps no console flashing;
- * shell:true lets the Windows `claude` .cmd shim resolve on PATH.
- *
- * NOT unit-tested (it spawns a real claude process); runInvestigator's
- * fallback paths ARE tested with an injected spawnHeadless. Validate
- * live on the next daemon restart. */
-export function defaultSpawnHeadless(
-  prompt: string,
-  cwd: string,
-  timeoutMs: number,
-): Promise<string | null> {
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = (v: string | null): void => {
-      if (done) return;
-      done = true;
-      try {
-        child.kill();
-      } catch {
-        /* already gone */
-      }
-      resolve(v);
-    };
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn(
-        'claude',
-        ['-p', '--output-format', 'text', '--dangerously-skip-permissions'],
-        {
-          cwd,
-          shell: process.platform === 'win32',
-          windowsHide: true,
-        },
-      );
-    } catch {
-      resolve(null);
-      return;
-    }
-    let out = '';
-    const timer = setTimeout(() => finish(null), timeoutMs);
-    if (typeof (timer as { unref?: () => void }).unref === 'function') {
-      (timer as { unref: () => void }).unref();
-    }
-    child.stdout?.on('data', (d: Buffer) => {
-      out += d.toString();
-      /* Hard cap so a runaway reply can't balloon memory. */
-      if (out.length > 200_000) {
-        clearTimeout(timer);
-        finish(out);
-      }
-    });
-    child.on('error', () => {
-      clearTimeout(timer);
-      finish(null);
-    });
-    child.on('close', (code: number | null) => {
-      clearTimeout(timer);
-      finish(code === 0 && out.trim() ? out : null);
-    });
-    try {
-      child.stdin?.write(prompt);
-      child.stdin?.end();
-    } catch {
-      clearTimeout(timer);
-      finish(null);
-    }
-  });
-}
+/* Prod headless Opus pass. Now the shared spawnHeadlessOpus primitive
+ * (headless-opus.ts) so cold-start and distillation run on ONE engine.
+ * Re-exported under the original name to keep existing callers stable. */
+export const defaultSpawnHeadless = spawnHeadlessOpus;
 
 /* Pre-spawn cache. Keyed by anchorId (= brainstorm id), which the
  * cold-start route resolves the incoming session to. One-shot read via
