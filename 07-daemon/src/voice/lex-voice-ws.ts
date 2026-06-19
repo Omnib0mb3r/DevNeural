@@ -172,6 +172,15 @@ interface ConnState {
    * mutes the mic, so a pulse over the user makes Lex deaf to them. */
   userSpeaking: boolean;
   lastUserSpeechEndMs: number;
+  /* Talkback speak-suppression gate (2026-06-19). Set true when the
+   * turn was triggered by TYPED input (text-input frame), false when
+   * triggered by a real voice utterance. The talkback watcher and the
+   * direct-llm reply both consult it: typed input gets a text-only
+   * reply (panel frame + chunk still land) and is NEVER spoken. Last
+   * input source wins, so the user's most recent channel decides
+   * whether Lex talks back. Read at the two speak() sites only; the
+   * visual + persistence paths are unaffected. */
+  suppressSpeakForTurn: boolean;
   /* Mid-session compaction trigger state. Flips compactedAt the
    * moment shouldTriggerCompaction crosses 75% so a trailing
    * end_turn record in the same jsonl tail cannot re-fire the
@@ -599,6 +608,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     utteranceStartedDuringTts: false,
     userSpeaking: false,
     lastUserSpeechEndMs: 0,
+    suppressSpeakForTurn: false,
     compaction: { compactedAt: 0 },
     currentTtsText: null,
     currentTtsStartedAtMs: 0,
@@ -1247,6 +1257,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       }
       if (state.mode === 'notes') {
         send({ t: 'tts-skipped', reason: 'notes-mode' });
+      } else if (state.suppressSpeakForTurn) {
+        /* Typed-input turn: text-only reply. The assistant-text frame
+         * and brainstorm chunk above already landed, so the panel shows
+         * the answer; we just never synthesize audio for it. */
+        send({ t: 'tts-skipped', reason: 'text-input' });
       } else {
         /* Fix 53 (2026-06-18): never synthesize the same assistant
          * record twice. The eviction in claimWatchTarget already keeps
@@ -1671,8 +1686,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           `[voice-ws] direct-llm assistant chunk insert failed: ${(err as Error).message}`,
         );
       }
-      if (state.mode !== 'notes') {
+      if (state.mode !== 'notes' && !state.suppressSpeakForTurn) {
         await speak(reply.text);
+      } else if (state.suppressSpeakForTurn) {
+        /* Typed input to Lex-as-LLM: reply lands as text only (panel +
+         * chunk already persisted above), never spoken. */
+        send({ t: 'tts-skipped', reason: 'text-input' });
       }
       send({ t: 'injected' });
       /* Plan section M (2026-05-22): scan both the user's turn and
@@ -2137,6 +2156,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       return;
     }
     send({ t: 'transcript', text: result.text, ms: result.ms });
+    /* Real voice turn confirmed (passed the noise floor): Lex talks
+     * back. Clears any suppression a prior typed turn left set. */
+    state.suppressSpeakForTurn = false;
     console.log(
       `[voice-ws] transcript received words=${wordCount} bindKey=${state.bindKey ?? 'null'} duringTts=${state.utteranceStartedDuringTts} text=${JSON.stringify(trimmed.slice(0, 120))}`,
     );
@@ -2561,6 +2583,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           break;
         }
         send({ t: 'transcript', text: rawText, ms: 0, source: 'text-input' });
+        /* Typed turn: suppress talkback TTS for this turn (text in =
+         * text-only reply). A subsequent voice utterance flips it back. */
+        state.suppressSpeakForTurn = true;
         if (state.runtimeMode === 'direct-llm' && state.brainstormId) {
           if (state.inFlightDirectLlmReply) {
             if (detectContradiction(rawText)) {
