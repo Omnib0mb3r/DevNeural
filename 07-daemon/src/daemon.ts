@@ -229,6 +229,41 @@ async function main(): Promise<void> {
     ),
   });
 
+  /* Crash recovery (sliver 4): a crash kills the daemon mid-session and
+   * the normal end-of-session distill/handoff never runs. On boot, sweep
+   * for anchors whose activity landed past the last clean checkpoint
+   * (newest cold-start report ms / last_summary_ms) and run the missed
+   * non-terminal flush so distillations + docs catch up. Bounded +
+   * fire-and-forget so it never blocks boot; staggered after the distill
+   * boot-recovery sweep. DEVNEURAL_CRASH_RECOVERY_LIMIT=0 disables. */
+  {
+    const crashLimit = Number(
+      process.env.DEVNEURAL_CRASH_RECOVERY_LIMIT ?? 10,
+    );
+    const crashDelay = Number(
+      process.env.DEVNEURAL_CRASH_RECOVERY_DELAY_MS ?? 8_000,
+    );
+    if (crashLimit > 0) {
+      const crashTimer = setTimeout(() => {
+        void (async () => {
+          try {
+            const { recoverCrashedAnchors } = await import(
+              './lex/crash-recovery.js'
+            );
+            await recoverCrashedAnchors({
+              store,
+              log: logger,
+              limit: crashLimit,
+            });
+          } catch (err) {
+            logger(`crash-recovery sweep failed: ${(err as Error).message}`);
+          }
+        })();
+      }, crashDelay);
+      if (typeof crashTimer.unref === 'function') crashTimer.unref();
+    }
+  }
+
   /* Event-driven Lex supervision (EVENT-DRIVEN-SUPERVISION.md).
    * Subscribes to every Claude Code transcript jsonl, runs the
    * detector pipeline, routes WorkerEvents to Lex's active
