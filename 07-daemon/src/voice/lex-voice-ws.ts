@@ -99,11 +99,11 @@ import {
 import { appendUtterance as appendSessionAudio } from './audio-bundle.js';
 import { selectTtsContent, clampAck } from './select-tts-content.js';
 import {
-  shouldHeartbeat,
-  heartbeatPhrase,
   HEARTBEAT_INTERVAL_MS,
   HEARTBEAT_TICK_MS,
 } from './lex-voice-heartbeat.js';
+import { shouldSpeakHeartbeatHaiku } from './voice-heartbeat-haiku.js';
+import { renderForSpeech, heartbeatLine } from './voice-haiku-wiring.js';
 
 /* Voice modes drive whether the daemon synthesizes Lex's response
  * out loud. The browser still receives transcript + assistant-text
@@ -628,6 +628,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * the in-flight ticker, started with the jsonl watch and torn down
    * with it. */
   let lastSpeechMs = 0;
+  /* Last line actually spoken; the haiku fast lane replays it on
+   * "say that again" without an Opus round-trip. */
+  let lastSpokenText: string | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   /* Fix 40 (2026-05-26): centralise piper synth lifecycle behind a
@@ -968,7 +971,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     heartbeatTimer = setInterval(() => {
       if (state.closed) return;
       const now = Date.now();
-      const fire = shouldHeartbeat({
+      /* shouldSpeakHeartbeatHaiku === shouldHeartbeat when the flag is
+       * off; with it on it adds the single-mouth guard. */
+      const fire = shouldSpeakHeartbeatHaiku({
         awaitingSince: state.awaitingResponseSince,
         lastSpeechMs,
         ttsActive: Boolean(state.ttsActive),
@@ -979,7 +984,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         intervalMs: HEARTBEAT_INTERVAL_MS,
       });
       if (fire && state.awaitingResponseSince) {
-        speak(heartbeatPhrase(now - state.awaitingResponseSince));
+        speak(heartbeatLine(now - state.awaitingResponseSince));
       }
     }, HEARTBEAT_TICK_MS);
     if (typeof (heartbeatTimer as { unref?: () => void }).unref === 'function') {
@@ -1514,7 +1519,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * or a heartbeat pulse itself) so a pulse only fires after a genuine
      * gap of silence. */
     lastSpeechMs = Date.now();
-    speakCtrl.speak(text);
+    /* Pillar 3: route spoken output through the renderer (preserve-list
+     * verbatim guard). Passthrough when the flag is off. */
+    const spoken = renderForSpeech(text);
+    lastSpokenText = spoken;
+    speakCtrl.speak(spoken);
   }
 
   /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
