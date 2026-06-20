@@ -127,6 +127,21 @@ $logFile = Join-Path $dataRoot 'daemon.log'
 # log carry the structured stream.
 $stdoutLog = Join-Path $dataRoot 'daemon.stdout.log'
 $stderrLog = Join-Path $dataRoot 'daemon.stderr.log'
+
+# Route distillation (scheduled backfill + staleness re-distill + the
+# critical end-of-session path) through the headless Opus engine instead
+# of ollama. Set here so it inherits to the spawned node on BOTH the
+# Task Scheduler autostart path and the dashboard /admin/daemon/restart
+# (-Force) path. The child inherits this process's $env. Reversible:
+# delete this line to fall back to the ollama distiller.
+$env:DEVNEURAL_DISTILL_HEADLESS = '1'
+
+# Route inbound voice through the haiku talk-layer (front desk: control /
+# fast haiku / slow haiku+Lex). Flag-off is byte-identical to the prior
+# voice. Inherits to the spawned node. Reversible: delete this line to
+# roll back to the pre-haiku voice.
+$env:DEVNEURAL_VOICE_HAIKU = '1'
+
 $proc = Start-Process `
     -FilePath $node `
     -ArgumentList "`"$dist`"" `

@@ -27,3 +27,8 @@ skill-connections/
 # Build artifacts
 07-daemon/scripts/silent-shim/*.lscache
 08-dashboard/test-results/
+
+# Runtime cold-start seed reports (commit 6769f7e relocated these into
+# the project folder). Regenerated on every boot, with a growing archive/
+# subfolder; must never be tracked.
+investigator-reports/
