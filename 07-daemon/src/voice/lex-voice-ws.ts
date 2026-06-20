@@ -103,7 +103,13 @@ import {
   HEARTBEAT_TICK_MS,
 } from './lex-voice-heartbeat.js';
 import { shouldSpeakHeartbeatHaiku } from './voice-heartbeat-haiku.js';
-import { renderForSpeech, heartbeatLine } from './voice-haiku-wiring.js';
+import {
+  renderForSpeech,
+  heartbeatLine,
+  haikuRoute,
+  composeGlueReply,
+} from './voice-haiku-wiring.js';
+import { useVoiceHaiku } from './voice-haiku.js';
 
 /* Voice modes drive whether the daemon synthesizes Lex's response
  * out loud. The browser still receives transcript + assistant-text
@@ -2240,6 +2246,57 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       );
       state.utteranceStartedDuringTts = false;
       return;
+    }
+    /* Pillar 3 capstone: haiku front desk. When DEVNEURAL_VOICE_HAIKU is
+     * on, every inbound utterance routes through frontDeskDecision -
+     * control jumps the data lane (never queued), glue is answered alone
+     * (zero Opus), a question gets an instant bridge line then falls
+     * through to the normal Lex inject (rendered on reply by speak()).
+     * Flag off: haikuRoute returns null and this whole block is skipped,
+     * so the path below is byte-identical. lex-prefixed ops above still
+     * take precedence. assumeDigestFresh: the deterministic fast-lane
+     * glue never reads the digest, so it stays answerable; the
+     * digest-staleness gate engages when a live model answers from digest
+     * content (Lex-authored digest push is a later step). */
+    if (useVoiceHaiku()) {
+      const dec = haikuRoute(trimmed, { lastTurnMs: 0, assumeDigestFresh: true });
+      if (dec) {
+        if (dec.route.lane === 'control') {
+          const c = dec.route.control!;
+          if (c.action === 'interrupt-then-inject' && c.payload) {
+            /* redirect: free Lex, then inject the new instruction as this
+             * turn (falls through to the normal inject path below). */
+            killActiveTts('barge-in');
+            result = { text: c.payload, ms: result.ms };
+            state.utteranceStartedDuringTts = false;
+          } else {
+            if (c.action === 'kill-tts') {
+              /* quiet / ambiguous stop: silence the voice locally, zero
+               * Lex round-trip. NOT a PTY Ctrl+C - Lex keeps working. */
+              const cancelled = speakCtrl.killActive();
+              if (cancelled) send({ t: 'tts-cancel', reason: 'quiet' });
+            } else {
+              /* stop-work / abort: interrupt Lex + worker (TTS + Ctrl+C). */
+              killActiveTts('barge-in');
+            }
+            state.utteranceStartedDuringTts = false;
+            return;
+          }
+        } else if (dec.route.lane === 'fast') {
+          /* haiku alone: answer glue with zero Opus round-trip. A bare
+           * ack returns null and is absorbed silently. */
+          const reply = composeGlueReply(trimmed, lastSpokenText);
+          if (reply) speak(reply);
+          state.utteranceStartedDuringTts = false;
+          return;
+        } else {
+          /* slow: instant bridge now, Lex reasons below, reply rendered
+           * through the preserve-list when it lands. */
+          if (dec.route.bridge) speak(dec.route.bridge);
+          state.utteranceStartedDuringTts = false;
+          /* fall through to the existing inject path */
+        }
+      }
     }
     /* Wake-during-TTS gate (path 1 of the voice-cmd-blocked-during-
      * TTS audit). If this utterance began while Lex was streaming TTS

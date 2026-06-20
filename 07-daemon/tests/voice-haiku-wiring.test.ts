@@ -65,6 +65,26 @@ describe('flag ON: routes through the haiku layer', () => {
     expect(s?.route.lane).toBe('slow');
   });
 
+  it('assumeDigestFresh keeps glue on the fast lane with no digest pushed', () => {
+    /* No digest pushed (reset in beforeEach). The WS passes
+     * assumeDigestFresh so deterministic glue stays answerable. */
+    expect(
+      haikuRoute('thanks', { lastTurnMs: 0, assumeDigestFresh: true })?.route
+        .lane,
+    ).toBe('fast');
+    /* Without the override a missing digest pushes glue to slow. */
+    expect(haikuRoute('thanks', { lastTurnMs: 1 })?.route.lane).toBe('slow');
+  });
+
+  it('a project question stays slow even with assumeDigestFresh', () => {
+    expect(
+      haikuRoute('how many tests pass', {
+        lastTurnMs: 0,
+        assumeDigestFresh: true,
+      })?.route.lane,
+    ).toBe('slow');
+  });
+
   it('heartbeatLine is the grounded first-person line', () => {
     const line = heartbeatLine(5 * 60_000);
     expect(line.toLowerCase()).not.toContain('lex');

@@ -28,7 +28,7 @@ export function renderForSpeech(text: string): string {
  * lane, persona prompt, digest freshness). */
 export function haikuRoute(
   text: string,
-  ctx: { lastTurnMs: number },
+  ctx: { lastTurnMs: number; assumeDigestFresh?: boolean },
 ): FrontDeskDecision | null {
   if (!useVoiceHaiku()) return null;
   return frontDeskDecision(text, ctx);

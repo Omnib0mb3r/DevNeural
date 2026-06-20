@@ -29,9 +29,14 @@ export interface FrontDeskDecision {
 
 export function frontDeskDecision(
   text: string,
-  ctx: { lastTurnMs: number },
+  ctx: { lastTurnMs: number; assumeDigestFresh?: boolean },
 ): FrontDeskDecision {
-  const digestFresh = isDigestFresh(ctx.lastTurnMs);
+  /* assumeDigestFresh skips the digest-staleness gate. The deterministic
+   * fast-lane glue (acks / repeat / delivery) never reads the digest, so
+   * it is always safe to answer; the gate is for a live model answering
+   * from digest content. */
+  const digestFresh =
+    ctx.assumeDigestFresh === true ? true : isDigestFresh(ctx.lastTurnMs);
   const route = routeTurn(text, { digestFresh });
   const d = getDigest();
   return {
