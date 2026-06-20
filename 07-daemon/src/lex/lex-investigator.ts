@@ -25,7 +25,10 @@ import type { IndexDb } from '../store/index-db.js';
 import { buildSiblingIndex } from './sibling-index.js';
 import { readTranscriptFromJsonlRefs } from './jsonl-transcript-reader.js';
 import { spawnHeadlessOpus } from './headless-opus.js';
-import { writeColdStartReport } from './cold-start-report.js';
+import {
+  writeColdStartReport,
+  readLatestColdStartReport,
+} from './cold-start-report.js';
 
 interface BrainstormLike {
   id: string;
@@ -379,5 +382,92 @@ export async function prewarmInvestigator(
     hasContent: true,
     refined: block !== assembled.block,
     blockLength: block.length,
+  };
+}
+
+export interface GateColdStartInput {
+  db: IndexDb;
+  anchorId: string;
+  cwd: string;
+  label?: string | null;
+  projectScopeId?: string | null;
+  now?: () => number;
+  readFile?: (p: string) => string | null;
+  listDir?: (p: string) => string[];
+}
+
+export interface GateColdStartResult {
+  /** True when a block was assembled, cached, and a report persisted. */
+  seeded: boolean;
+  hasContent: boolean;
+  /** Path of the report written this gate, or null. */
+  reportPath: string | null;
+  /** A prior report existed and was treated as a PRIOR (newest-wins). */
+  hadPriorReport: boolean;
+  blockLength: number;
+}
+
+/* Cold-start boot gate (2026-06-20). The SYNCHRONOUS, deterministic step
+ * the spawn path runs to completion before Claude reaches its SessionStart
+ * hook (the seed consumption point):
+ *
+ *   1. assemble the scope-isolated block from live refs + distillations +
+ *      project docs (fail-closed; empty anchor seeds nothing).
+ *   2. validate any existing distillation: a prior cold-start report is a
+ *      PRIOR, not gospel. The fresh assemble reads CURRENT ref summaries
+ *      so it supersedes a stale prior; newest report wins on read. We note
+ *      whether a prior existed for the audit log.
+ *   3. cache + persist the block as a timestamped report so the
+ *      SessionStart cold-start route serves it as Lex's seed, durably.
+ *
+ * Cannot hang: no async wait, no subprocess. The deterministic block is
+ * the guaranteed floor / fallback. The headless Opus refinement (slow) is
+ * NOT part of this gate; the spawn path fires it as a bounded async
+ * upgrade afterward. Never throws. */
+export function gateColdStart(input: GateColdStartInput): GateColdStartResult {
+  let assembled: AssembledInvestigatorContext;
+  try {
+    assembled = assembleInvestigatorContext({
+      db: input.db,
+      anchorId: input.anchorId,
+      cwd: input.cwd,
+      label: input.label ?? null,
+      projectScopeId: input.projectScopeId ?? null,
+      ...(input.readFile ? { readFile: input.readFile } : {}),
+      ...(input.listDir ? { listDir: input.listDir } : {}),
+    });
+  } catch {
+    return {
+      seeded: false,
+      hasContent: false,
+      reportPath: null,
+      hadPriorReport: false,
+      blockLength: 0,
+    };
+  }
+  let hadPriorReport = false;
+  try {
+    hadPriorReport = readLatestColdStartReport(input.anchorId) !== null;
+  } catch {
+    hadPriorReport = false;
+  }
+  if (!assembled.hasContent) {
+    return {
+      seeded: false,
+      hasContent: false,
+      reportPath: null,
+      hadPriorReport,
+      blockLength: 0,
+    };
+  }
+  const now = input.now ? input.now() : Date.now();
+  cacheInvestigatorBlock(input.anchorId, assembled.block, now);
+  const reportPath = writeColdStartReport(input.anchorId, assembled.block, now);
+  return {
+    seeded: true,
+    hasContent: true,
+    reportPath,
+    hadPriorReport,
+    blockLength: assembled.block.length,
   };
 }

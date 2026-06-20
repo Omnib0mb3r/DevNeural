@@ -13,9 +13,13 @@ import {
   cacheInvestigatorBlock,
   takeInvestigatorBlock,
   prewarmInvestigator,
+  gateColdStart,
   _resetInvestigatorCache,
 } from '../src/lex/lex-investigator.js';
-import { readLatestColdStartReport } from '../src/lex/cold-start-report.js';
+import {
+  readLatestColdStartReport,
+  coldStartReportDir,
+} from '../src/lex/cold-start-report.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = path.resolve(HERE, '..', 'scripts', 'migrations');
@@ -404,5 +408,93 @@ describe('investigator cache', () => {
   it('ignores empty blocks', () => {
     cacheInvestigatorBlock('anchor-empty', '   ', 1_000);
     expect(takeInvestigatorBlock('anchor-empty', 60_000, 1_100)).toBeNull();
+  });
+});
+
+describe('gateColdStart (boot gate, on-disk)', () => {
+  const readFile = (p: string): string | null => {
+    if (p === '/fake/gate.jsonl') {
+      return JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: 'gate live turn' },
+      });
+    }
+    if (p.endsWith('PROJECT.md')) return 'gate project body';
+    return null;
+  };
+  const listDir = (): string[] => ['PROJECT.md'];
+
+  function liveAnchor(id: string): void {
+    insertLexSession(id);
+    insertBs({ id, user_label: 'GateProj', started_ms: 1_000 });
+    insertRef({
+      anchorId: id,
+      cc: 'cc-gate',
+      transcriptPath: '/fake/gate.jsonl',
+      ordering: 0,
+      startedMs: Date.now() - 30_000,
+    });
+  }
+
+  it('writes a real cold-start report file on disk for an anchor with content', () => {
+    liveAnchor('gate-1');
+    const res = gateColdStart({
+      db,
+      anchorId: 'gate-1',
+      cwd: 'C:/p/lex',
+      now: () => 1_700_000_000_000,
+      readFile,
+      listDir,
+    });
+    expect(res.seeded).toBe(true);
+    expect(res.reportPath).not.toBeNull();
+    /* The acceptance: a real file exists on disk under the anchor's
+     * cold-start folder. */
+    expect(fs.existsSync(res.reportPath!)).toBe(true);
+    expect(fs.existsSync(coldStartReportDir('gate-1'))).toBe(true);
+    /* And it is the seed the route will serve. */
+    const latest = readLatestColdStartReport('gate-1');
+    expect(latest?.block).toContain('gate project body');
+    expect(latest?.block).toContain('gate live turn');
+  });
+
+  it('seeds nothing (no file) for a confidently-empty anchor', () => {
+    insertBs({ id: 'gate-empty', user_label: 'Empty', started_ms: 1_000 });
+    const res = gateColdStart({
+      db,
+      anchorId: 'gate-empty',
+      cwd: 'C:/p/lex',
+      now: () => 1_700_000_000_000,
+      readFile: () => null,
+      listDir: () => [],
+    });
+    expect(res.seeded).toBe(false);
+    expect(res.reportPath).toBeNull();
+    expect(readLatestColdStartReport('gate-empty')).toBeNull();
+  });
+
+  it('treats a prior report as a PRIOR and writes a newer one (newest-wins)', () => {
+    liveAnchor('gate-prior');
+    /* First gate writes report A. */
+    const a = gateColdStart({
+      db,
+      anchorId: 'gate-prior',
+      cwd: 'C:/p/lex',
+      now: () => 1_700_000_000_000,
+      readFile,
+      listDir,
+    });
+    expect(a.hadPriorReport).toBe(false);
+    /* Second gate sees the prior and writes a newer report. */
+    const b = gateColdStart({
+      db,
+      anchorId: 'gate-prior',
+      cwd: 'C:/p/lex',
+      now: () => 1_700_000_060_000,
+      readFile,
+      listDir,
+    });
+    expect(b.hadPriorReport).toBe(true);
+    expect(readLatestColdStartReport('gate-prior')?.ms).toBe(1_700_000_060_000);
   });
 });

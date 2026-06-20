@@ -45,7 +45,7 @@ import type {
   LexTranscriptRefRow,
 } from '../store/index-db.js';
 import { spawnLex, type SpawnLexResult } from '../dashboard/pty-host.js';
-import { prewarmInvestigator } from './lex-investigator.js';
+import { gateColdStart, prewarmInvestigator } from './lex-investigator.js';
 
 /* Mirror of pty-host's cwdToClaudeSlug (kept private there). Replaces
  * `:`, `/`, and `\` with `-` so a windows path like
@@ -295,29 +295,52 @@ export function spawnLexSession(
      * means a future artifact lookup may 404 until the next run;
      * the new lex_session model is unaffected. */
   }
-  /* Cold-start investigator pre-warm (2026-06-19). Fire-and-forget:
-   * assemble the scope-isolated primed-context block for this anchor and
-   * cache it so the SessionStart cold-start route can serve it the
-   * instant Claude Code boots. Deterministic assemble only by default
-   * (the headless Opus refinement is gated on DEVNEURAL_INVESTIGATOR_HEADLESS)
-   * so the cache is warm within ms, well before the hook fires; the
-   * headless pass is too slow for the spawn->hook window and stays
-   * opt-in. Never blocks the spawn and never throws: a confidently-empty
-   * anchor caches nothing and the cold-start route falls through to its
-   * existing path with no regression. */
+  /* Cold-start investigator boot gate (2026-06-20). Replaces the prior
+   * fire-and-forget prewarm that raced the SessionStart hook and wrote no
+   * report. Synchronous + deterministic: assemble the scope-isolated block
+   * from this anchor's live refs + distillations + project docs, validate
+   * any prior report (PRIOR, not gospel; the fresh assemble supersedes a
+   * stale one, newest-wins), persist it as a timestamped cold-start
+   * report, and cache it so the SessionStart cold-start route serves it as
+   * Lex's seed. Runs to completion here, well within the seconds Claude
+   * takes to reach its hook, so the seed is guaranteed present at the
+   * consumption point. Cannot hang (no async wait); a confidently-empty
+   * anchor seeds nothing and the route falls through unchanged. */
   try {
-    const headless = process.env.DEVNEURAL_INVESTIGATOR_HEADLESS === '1';
-    void prewarmInvestigator({
+    const gate = gateColdStart({
       db: getStore().db,
       anchorId: prep.lexSession.id,
       cwd: prep.lexSession.cwd,
       label: prep.lexSession.title,
-      enableHeadless: headless,
-    }).catch(() => {
-      /* fire-and-forget; prewarmInvestigator is fail-safe by contract */
     });
+    if (gate.reportPath) {
+      console.log(
+        `[cold-start] gate seeded anchor=${prep.lexSession.id.slice(0, 8)} bytes=${gate.blockLength} prior=${gate.hadPriorReport} report=${gate.reportPath}`,
+      );
+    }
   } catch {
-    /* never let pre-warm wiring affect the spawn result */
+    /* never let the gate affect the spawn result */
+  }
+  /* Optional headless Opus upgrade (opt-in via DEVNEURAL_INVESTIGATOR_
+   * HEADLESS, bounded by runInvestigator's 60s timeout). Refines the seed
+   * in the background and rewrites a newer report when it lands; the
+   * synchronous gate above is the floor if it never finishes (the
+   * hang-guard: boot is already seeded, so a slow or dead refinement
+   * cannot stall it). Fire-and-forget + fail-safe by contract. */
+  if (process.env.DEVNEURAL_INVESTIGATOR_HEADLESS === '1') {
+    try {
+      void prewarmInvestigator({
+        db: getStore().db,
+        anchorId: prep.lexSession.id,
+        cwd: prep.lexSession.cwd,
+        label: prep.lexSession.title,
+        enableHeadless: true,
+      }).catch(() => {
+        /* fire-and-forget; prewarmInvestigator is fail-safe by contract */
+      });
+    } catch {
+      /* never let the upgrade wiring affect the spawn result */
+    }
   }
   return {
     ...ptyResult,
