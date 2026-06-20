@@ -52,6 +52,7 @@ function stubProvider(opts: {
 
 let tmpDir: string;
 let db: IndexDb;
+let priorHeadless: string | undefined;
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devneural-distill-sched-'));
@@ -63,6 +64,14 @@ beforeEach(async () => {
   process.env.DEVNEURAL_DATA_ROOT = tmpDir;
   process.env.USERPROFILE = path.join(tmpDir, 'home');
   process.env.HOME = path.join(tmpDir, 'home');
+  /* Pin the engine flag OFF by default so the provider-stub (ollama)
+   * tests are deterministic regardless of the ambient env. The
+   * switch-live gate runs with DEVNEURAL_DISTILL_HEADLESS=1 set, which
+   * would otherwise route the scheduler down the headless branch (it
+   * bypasses the provider guards + ignores the injected stub) and break
+   * these. The one headless-mode test sets the flag ON in its own body. */
+  priorHeadless = process.env.DEVNEURAL_DISTILL_HEADLESS;
+  delete process.env.DEVNEURAL_DISTILL_HEADLESS;
   const idx = new IndexDb(dbFile);
   idx.close();
   await runMigrations({ dbPath: dbFile, migrationsDir: MIGRATIONS_DIR });
@@ -74,6 +83,8 @@ afterEach(() => {
   vi.useRealTimers();
   db.close();
   fs.rmSync(tmpDir, { recursive: true, force: true });
+  if (priorHeadless === undefined) delete process.env.DEVNEURAL_DISTILL_HEADLESS;
+  else process.env.DEVNEURAL_DISTILL_HEADLESS = priorHeadless;
 });
 
 function insertBs(id: string, startedMs: number): void {
