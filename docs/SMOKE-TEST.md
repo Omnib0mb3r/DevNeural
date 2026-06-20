@@ -5,7 +5,118 @@ end on real hardware. Refresh as items get verified or new code lands.
 Source of truth for the daily smoke gate; rolling cursor for the rest
 of the state lives in `docs/HANDOVER.md`.
 
-Last refreshed: 2026-06-01 after Fix 59 + Fix 60 ship.
+Last refreshed: 2026-06-20 after all three pillars wired + committed and
+the distill-scheduler tests fixed. Switch-live pending operator restart.
+See ACTIVE BATCH below.
+
+## ACTIVE BATCH (2026-06-20): INVESTIGATOR-PIPELINE — cold-start, distillation, voice
+
+The current program. Goal (Michael, 2026-06-19): **one system** with three
+pillars — multi-agent cold start, distillation, separate-agent voice.
+Design of record: `docs/spec/INVESTIGATOR-PIPELINE-SPEC.md` +
+`C:/dev/data/skill-connections/brainstorm/INVESTIGATOR-PIPELINE-PLAN.md`.
+
+Build status as of 2026-06-20 (HEAD `af6be39`, 1273 daemon tests green,
+tsc clean; full suite verified green under BOTH `DEVNEURAL_DISTILL_HEADLESS`
+unset AND `=1`, the switch-live env):
+
+- **Pillar 1 cold start** wired: synchronous boot gate `gateColdStart` in
+  spawn-lex-session.ts (replaced the fire-and-forget that wrote nothing);
+  assembles + validates prior + persists a report + caches the seed
+  before the SessionStart hook; crash recovery on boot. Reports RELOCATED
+  to `<projectDir>/investigator-reports/<YYYY-MM-DD_HHmm-ss>.md` (+
+  archive/), e.g. `C:/dev/Projects/DevNeural/investigator-reports/`.
+- **Pillar 2 distillation** wired: staleness-driven re-distill on the
+  unified headless-Opus engine, behind `DEVNEURAL_DISTILL_HEADLESS`
+  (flipped ON in `07-daemon/scripts/start-daemon.ps1`). distill-scheduler
+  tests now isolate that flag so the gate passes under the live env.
+- **Pillar 3 voice** wired: haiku talk-layer (V1-V7) + live WS capstone
+  (CAP-1 render+heartbeat, CAP-2 inbound lane routing) behind
+  `DEVNEURAL_VOICE_HAIKU` (default OFF, flag-off byte-identical). Live
+  haiku MODEL calls + Lex-authored digest push still deferred
+  (BF-4 + latency fork); deterministic glue + safe-render in place.
+
+Both engine flags are dormant until the operator rebuild+restart. Nothing
+below is hardware-verified yet.
+
+Verification bar (non-negotiable, per `feedback_verify_outcome_metric_not_green_tests`):
+a pillar passes only when the **real metric moves on live hardware**, not
+when tests are green. Green + committed is "built", not "verified".
+
+### Step 0: Prep (Michael does on reset)
+
+- [ ] **0.1** Rebuild daemon. `cd C:/dev/Projects/DevNeural/07-daemon && npm run build`.
+- [ ] **0.2** Restart daemon (operator-only; restart kills the live Lex
+  session). Use the dashboard restart or `start-daemon.ps1 -Force`.
+- [ ] **0.3** Confirm flag is live: daemon log shows
+  `[distill-scheduler] headless Opus engine (DEVNEURAL_DISTILL_HEADLESS=1)`.
+  If it does NOT, the env didn't inherit — fix before judging distillation.
+
+### Pillar 1 — Multi-agent cold start (BUILT, verify on reset)
+
+Ephemeral headless investigator assembles + validates context, persists a
+timestamped report per anchor, seeds Lex; same engine handles crash recovery.
+
+- [ ] **1.1** After reset, Start Voice on the "DevNeural Testing" anchor
+  (`4bbafb48`). A fresh dated report file is written under the PROJECT
+  folder `C:/dev/Projects/DevNeural/investigator-reports/` (filename
+  `YYYY-MM-DD_HHmm-ss.md`), newest-wins; older reports move to
+  `investigator-reports/archive/` (never deleted).
+- [ ] **1.2** Lex's first greeting is demonstrably CURRENT without being
+  told: names the live state (all three pillars wired, HEAD `af6be39`) and
+  the open item (engine flags dormant pending this restart; live haiku
+  model + Lex digest still deferred). Pass = greeting proves it's caught
+  up. (Feel-test: LLM-judge or Michael spot-check, FLAGGED as judgment,
+  not a deterministic green.)
+- [ ] **1.3** Crash recovery: kill the daemon mid-session (no clean
+  end-of-session pass), restart. Investigator detects entries-after-last-
+  distill and backfills the docs for the gap. Pass = the gap turns is
+  reflected in the report/handover after restart, no manual prompt.
+
+### Pillar 2 — Distillation (BUILT, flag now ON, verify on reset)
+
+Staleness-triggered re-distill on the unified headless-Opus engine, one
+writer / one staleness signal (`latest_chunk_ms > ref_summary_ms`).
+
+- [ ] **2.1 INAUGURAL ACCEPTANCE TEST** — after reset with the flag live,
+  run `node C:/tmp/stale-check.js` (or query `index.db` `lex_transcript_ref`).
+  Pass = **stale ref count == 0** AND `ref_summary_ms >= latest_chunk_ms`
+  on the live DevNeural Testing anchor, under the LIVE scheduled path (not
+  a one-off backfill). This is the test that was always missing.
+- [ ] **2.2** Trigger end-of-session on a brainstorm; confirm the critical
+  end-of-session distill ran through the shared headless engine (daemon log
+  + the wiki_drafts row it feeds), not ollama. Output is coherent, not garbage.
+  (Risk note: this routes the MOST critical distill path onto the newly-live
+  engine; if output is bad, roll back by deleting the env line in start-daemon.ps1.)
+
+### Pillar 3 — Separate-agent voice (WIRED behind a flag, verify on reset)
+
+**BUILT + committed**, dormant behind `DEVNEURAL_VOICE_HAIKU` (default OFF;
+flag-off is byte-identical to current voice). Modules V1-V7 (single-mouth
+lock, control channel, deny-by-default whitelist, two-lane router,
+renderer + verbatim preserve-list, folded heartbeat, persona + digest +
+front desk) + live WS capstone (CAP-1 render/heartbeat, CAP-2 inbound lane
+routing in lex-voice-ws.ts). DEFERRED: live haiku MODEL calls + Lex-authored
+digest push (BF-4 + latency fork); deterministic glue + safe-render run for
+now. Module-level tests cover 3.1-3.5; hardware verify needs the flag ON.
+
+- [ ] **3.1** Single mouth: haiku owns ALL spoken output; two TTS streams
+  are structurally impossible (no double-talk under any stack-up).
+- [ ] **3.2** Two lanes: fast lane (haiku-only conversational glue, zero
+  Opus round-trip) vs slow lane (haiku bridging line, Lex reasons, haiku
+  speaks result). Measured latency gap between the two.
+- [ ] **3.3** Deny-by-default whitelist: haiku answers alone ONLY for
+  conversational glue (ack, repeat, slower/louder, yes-no about last line);
+  ANY project/code/state fact queues to Lex. Probe: feed a state question,
+  assert it queued, not answered by haiku.
+- [ ] **3.4** Renderer-not-rethinker: numbers / decisions / negations /
+  blockers passed through verbatim (preserve-list), never reworded.
+- [ ] **3.5** Control channel: stop / quiet / abort / redirect recognized
+  instantly by haiku, NEVER queued; "quiet" kills TTS locally with zero
+  Lex round-trip. NOTE: flip `DEVNEURAL_VOICE_HAIKU=1` to exercise 3.1-3.5
+  live; it is OFF by default so this restart does not change voice.
+
+
 
 ## Cycle cursor (2026-06-01)
 
