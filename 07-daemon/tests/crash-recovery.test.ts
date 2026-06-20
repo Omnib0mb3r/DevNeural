@@ -30,9 +30,12 @@ const MIGRATIONS_DIR = path.resolve(HERE, '..', 'scripts', 'migrations');
 let tmpDir: string;
 let db: IndexDb;
 let prior: string | undefined;
+let projectCwd: string;
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devneural-crash-'));
+  projectCwd = path.join(tmpDir, 'project').replace(/\\/g, '/');
+  fs.mkdirSync(projectCwd, { recursive: true });
   const dbFile = path.join(tmpDir, 'index.db');
   const seed = new IndexDb(dbFile);
   seed.close();
@@ -58,7 +61,7 @@ function seedAnchor(id: string): void {
     id,
     claude_session_id: `cc-${id}`,
     pty_id: null,
-    cwd: 'C:/dev/crash-test',
+    cwd: projectCwd,
     user_label: 'crash',
     derived_label: null,
     mode: 'conversation',
@@ -78,7 +81,7 @@ function seedAnchor(id: string): void {
     derived_title: null,
     status: 'live',
     current_pty_id: null,
-    cwd: 'C:/dev/crash-test',
+    cwd: projectCwd,
   });
 }
 
@@ -126,7 +129,7 @@ describe('detectCrashGap', () => {
     /* Epoch-ms scale: the report filename is the ms (>=10 digits). */
     seedRef('bs-report', 1_700_000_000_000, null);
     /* Report written after the latest chunk = a clean checkpoint. */
-    writeColdStartReport('bs-report', 'seed', 1_700_000_012_000);
+    writeColdStartReport(db, 'bs-report', 'seed', 1_700_000_012_000);
     const gap = detectCrashGap(db, 'bs-report');
     expect(gap.crashed).toBe(false);
     expect(gap.lastCleanMs).toBe(1_700_000_012_000);

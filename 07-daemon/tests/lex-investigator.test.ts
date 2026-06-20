@@ -18,7 +18,7 @@ import {
 } from '../src/lex/lex-investigator.js';
 import {
   readLatestColdStartReport,
-  coldStartReportDir,
+  investigatorReportDir,
 } from '../src/lex/cold-start-report.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -26,6 +26,10 @@ const MIGRATIONS_DIR = path.resolve(HERE, '..', 'scripts', 'migrations');
 
 let tmpDir: string;
 let db: IndexDb;
+/* Real writable project dir so cold-start report writes land in tmp, not
+ * a literal path on the host. resolveProjectDir reads the brainstorm row
+ * cwd, so this is the report location. */
+let projectCwd: string;
 
 function insertBs(opts: {
   id: string;
@@ -37,7 +41,7 @@ function insertBs(opts: {
     id: opts.id,
     claude_session_id: null,
     pty_id: null,
-    cwd: 'C:/p/lex',
+    cwd: projectCwd,
     user_label: opts.user_label,
     derived_label: null,
     mode: 'conversation',
@@ -83,6 +87,8 @@ function insertRef(opts: {
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devneural-investigator-'));
+  projectCwd = path.join(tmpDir, 'project').replace(/\\/g, '/');
+  fs.mkdirSync(projectCwd, { recursive: true });
   const dbFile = path.join(tmpDir, 'index.db');
   fs.mkdirSync(path.join(tmpDir, 'home', '.claude', 'projects'), {
     recursive: true,
@@ -365,7 +371,7 @@ describe('prewarmInvestigator', () => {
       readFile,
       listDir,
     });
-    const report = readLatestColdStartReport('pw-disk');
+    const report = readLatestColdStartReport(db, 'pw-disk');
     expect(report).not.toBeNull();
     expect(report!.ms).toBe(1_700_000_000_000);
     /* Same object as the served seed: refined briefing + live tail. */
@@ -384,7 +390,7 @@ describe('prewarmInvestigator', () => {
       readFile: () => null,
       listDir: () => [],
     });
-    expect(readLatestColdStartReport('pw-disk-empty')).toBeNull();
+    expect(readLatestColdStartReport(db, 'pw-disk-empty')).toBeNull();
   });
 });
 
@@ -451,9 +457,9 @@ describe('gateColdStart (boot gate, on-disk)', () => {
     /* The acceptance: a real file exists on disk under the anchor's
      * cold-start folder. */
     expect(fs.existsSync(res.reportPath!)).toBe(true);
-    expect(fs.existsSync(coldStartReportDir('gate-1'))).toBe(true);
+    expect(fs.existsSync(investigatorReportDir(db, 'gate-1')!)).toBe(true);
     /* And it is the seed the route will serve. */
-    const latest = readLatestColdStartReport('gate-1');
+    const latest = readLatestColdStartReport(db, 'gate-1');
     expect(latest?.block).toContain('gate project body');
     expect(latest?.block).toContain('gate live turn');
   });
@@ -470,7 +476,7 @@ describe('gateColdStart (boot gate, on-disk)', () => {
     });
     expect(res.seeded).toBe(false);
     expect(res.reportPath).toBeNull();
-    expect(readLatestColdStartReport('gate-empty')).toBeNull();
+    expect(readLatestColdStartReport(db, 'gate-empty')).toBeNull();
   });
 
   it('treats a prior report as a PRIOR and writes a newer one (newest-wins)', () => {
@@ -495,6 +501,8 @@ describe('gateColdStart (boot gate, on-disk)', () => {
       listDir,
     });
     expect(b.hadPriorReport).toBe(true);
-    expect(readLatestColdStartReport('gate-prior')?.ms).toBe(1_700_000_060_000);
+    expect(readLatestColdStartReport(db, 'gate-prior')?.ms).toBe(
+      1_700_000_060_000,
+    );
   });
 });

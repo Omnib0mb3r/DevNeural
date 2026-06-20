@@ -56,7 +56,7 @@ export function detectCrashGap(db: IndexDb, anchorId: string): CrashGap {
   }
   let reportMs = 0;
   try {
-    reportMs = readLatestColdStartReport(anchorId)?.ms ?? 0;
+    reportMs = readLatestColdStartReport(db, anchorId)?.ms ?? 0;
   } catch {
     reportMs = 0;
   }

@@ -4853,7 +4853,7 @@ export async function registerDashboardRoutes(
           const { readLatestColdStartReport } = await import(
             '../lex/cold-start-report.js'
           );
-          const report = readLatestColdStartReport(bs.id);
+          const report = readLatestColdStartReport(store.db, bs.id);
           if (report && report.block.trim()) primed = report.block;
         } catch {
           /* disk fallback is additive; never block cold start */

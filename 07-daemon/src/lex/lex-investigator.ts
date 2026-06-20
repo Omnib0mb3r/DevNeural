@@ -377,7 +377,7 @@ export async function prewarmInvestigator(
   /* Sliver 3: persist the block as a timestamped cold-start report so
    * the seed survives a daemon restart (the in-memory cache does not).
    * Best-effort; the in-memory fast path is unaffected if this fails. */
-  writeColdStartReport(input.anchorId, block, now);
+  writeColdStartReport(input.db, input.anchorId, block, now);
   return {
     hasContent: true,
     refined: block !== assembled.block,
@@ -447,7 +447,7 @@ export function gateColdStart(input: GateColdStartInput): GateColdStartResult {
   }
   let hadPriorReport = false;
   try {
-    hadPriorReport = readLatestColdStartReport(input.anchorId) !== null;
+    hadPriorReport = readLatestColdStartReport(input.db, input.anchorId) !== null;
   } catch {
     hadPriorReport = false;
   }
@@ -462,7 +462,12 @@ export function gateColdStart(input: GateColdStartInput): GateColdStartResult {
   }
   const now = input.now ? input.now() : Date.now();
   cacheInvestigatorBlock(input.anchorId, assembled.block, now);
-  const reportPath = writeColdStartReport(input.anchorId, assembled.block, now);
+  const reportPath = writeColdStartReport(
+    input.db,
+    input.anchorId,
+    assembled.block,
+    now,
+  );
   return {
     seeded: true,
     hasContent: true,
