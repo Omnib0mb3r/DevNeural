@@ -50,9 +50,10 @@ import { listProjects } from '../identity/registry.js';
 import { withSessionEndLock } from './session-end-lock.js';
 import { distillBrainstorm } from './brainstorm-distillation.js';
 import {
-  createLlmDistillationGenerator,
-  createPerSessionDistillationGenerator,
+  selectAnchorFlatGenerator,
+  selectPerSessionGenerator,
 } from './distillation-generator.js';
+import type { SpawnHeadlessOpus } from './headless-opus.js';
 import { recomputeRollingAggregate } from './rolling-aggregate.js';
 import { gpuQueue } from '../gpu/queue.js';
 import {
@@ -77,6 +78,14 @@ export interface SessionEndInput {
   /** Reason the session ended; goes into the summary chunk metadata
    * for debuggability ('voice-command' | 'pty-exit' | 'ws-close' | etc). */
   reason: string;
+}
+
+/* Sliver A: optional injection so the session-end engine swap
+ * (DEVNEURAL_DISTILL_HEADLESS) can be exercised without a real claude
+ * subprocess. Prod callers pass nothing; the selected headless
+ * generator defaults to spawnHeadlessOpus. */
+export interface SessionEndDeps {
+  spawnHeadless?: SpawnHeadlessOpus;
 }
 
 export interface SessionEndResult {
@@ -155,6 +164,7 @@ export async function runSessionEndPipeline(
   store: Store,
   input: SessionEndInput,
   log: (msg: string) => void = () => undefined,
+  deps: SessionEndDeps = {},
 ): Promise<SessionEndResult> {
   /* The whole pipeline runs under the per-session lock so concurrent
    * funnel paths (PTY exit + WS close, Stop button + spoken "end
@@ -166,7 +176,7 @@ export async function runSessionEndPipeline(
   let primaryRan = false;
   const result = await withSessionEndLock<SessionEndResult>(sessionKey, async () => {
     primaryRan = true;
-    return runOrderedPipeline(store, input, log, true);
+    return runOrderedPipeline(store, input, log, true, deps);
   });
   /* Fix 21 (2026-05-24): end-of-session report. Fires only for the
    * primary runner (concurrent funnel paths that wait on the lock
@@ -222,13 +232,14 @@ export async function runDistillationFlush(
   store: Store,
   input: SessionEndInput,
   log: (msg: string) => void = () => undefined,
+  deps: SessionEndDeps = {},
 ): Promise<SessionEndResult> {
   const sessionKey =
     input.claudeSessionId ?? `brainstorm:${input.brainstormId}`;
   let primaryRan = false;
   const result = await withSessionEndLock<SessionEndResult>(sessionKey, async () => {
     primaryRan = true;
-    return runOrderedPipeline(store, input, log, false);
+    return runOrderedPipeline(store, input, log, false, deps);
   });
   return { ...result, was_primary_runner: primaryRan };
 }
@@ -244,6 +255,7 @@ async function runOrderedPipeline(
    * or periodic chunking does not prematurely archive a still-live
    * brainstorm. See plan section F amendment. */
   markEnded: boolean,
+  deps: SessionEndDeps = {},
 ): Promise<SessionEndResult> {
   const out: SessionEndResult = {
     ingest_triggered: false,
@@ -267,7 +279,7 @@ async function runOrderedPipeline(
     log(
       `[session-end] brainstorm=${input.brainstormId} direct-llm; using brainstorm_chunks fallback`,
     );
-    await runBrainstormChunksFallback(store, input, log, markEnded, out);
+    await runBrainstormChunksFallback(store, input, log, markEnded, out, deps);
     return out;
   }
   const projectId = store.db.projectIdBySession(input.claudeSessionId);
@@ -275,7 +287,7 @@ async function runOrderedPipeline(
     log(
       `[session-end] brainstorm=${input.brainstormId} session=${input.claudeSessionId} no raw chunks; using brainstorm_chunks fallback`,
     );
-    await runBrainstormChunksFallback(store, input, log, markEnded, out);
+    await runBrainstormChunksFallback(store, input, log, markEnded, out, deps);
     return out;
   }
   const project = listProjects().find((p) => p.id === projectId);
@@ -531,9 +543,10 @@ async function runOrderedPipeline(
           `[session-end] per-session distill skipped: no_session_scoped_chunks brainstorm=${input.brainstormId.slice(0, 8)} cc=${ccId.slice(0, 8)}`,
         );
       } else {
-        const perSessionGen = createPerSessionDistillationGenerator({
+        const perSessionGen = selectPerSessionGenerator({
           db: store.db,
           log,
+          ...(deps.spawnHeadless ? { spawnHeadless: deps.spawnHeadless } : {}),
         });
         const result = await perSessionGen({
           brainstorm_id: input.brainstormId,
@@ -662,6 +675,7 @@ async function runBrainstormChunksFallback(
   log: (msg: string) => void,
   markEnded: boolean,
   out: SessionEndResult,
+  deps: SessionEndDeps = {},
 ): Promise<void> {
   const existing = store.db.getBrainstorm(input.brainstormId);
   if (!existing) {
@@ -738,7 +752,11 @@ async function runBrainstormChunksFallback(
   }
 
   try {
-    const generator = createLlmDistillationGenerator({ db: store.db, log });
+    const generator = selectAnchorFlatGenerator({
+      db: store.db,
+      log,
+      ...(deps.spawnHeadless ? { spawnHeadless: deps.spawnHeadless } : {}),
+    });
     const refreshed = store.db.getBrainstorm(input.brainstormId);
     if (refreshed) {
       const summary = await generator(refreshed);
@@ -788,9 +806,10 @@ async function runBrainstormChunksFallback(
             `[chunks-fallback] per-session distill skipped: no_session_scoped_chunks brainstorm=${input.brainstormId.slice(0, 8)} cc=${ccId.slice(0, 8)}`,
           );
         } else {
-          const perSessionGen = createPerSessionDistillationGenerator({
+          const perSessionGen = selectPerSessionGenerator({
             db: store.db,
             log,
+            ...(deps.spawnHeadless ? { spawnHeadless: deps.spawnHeadless } : {}),
           });
           const result = await perSessionGen({
             brainstorm_id: input.brainstormId,

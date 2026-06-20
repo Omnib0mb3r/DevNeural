@@ -15,7 +15,13 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { IndexDb } from '../src/store/index-db.js';
 import { runMigrations } from '../src/db/migrate.js';
-import { createHeadlessDistillationGenerator } from '../src/lex/distillation-generator.js';
+import {
+  createHeadlessDistillationGenerator,
+  createHeadlessPerSessionDistillationGenerator,
+  selectAnchorFlatGenerator,
+  selectPerSessionGenerator,
+} from '../src/lex/distillation-generator.js';
+import type { CallResult, LlmProvider } from '../src/llm/index.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = path.resolve(HERE, '..', 'scripts', 'migrations');
@@ -230,5 +236,248 @@ describe('createHeadlessDistillationGenerator', () => {
     expect(capturedPrompt.indexOf('turn-50')).toBeLessThan(
       capturedPrompt.indexOf('turn-99'),
     );
+  });
+});
+
+function insertCcChunk(opts: {
+  id: string;
+  brainstormId: string;
+  ccSessionId: string;
+  turn: number;
+  role: 'user' | 'lex';
+  text: string;
+}): void {
+  db.insertBrainstormChunk({
+    id: opts.id,
+    brainstorm_id: opts.brainstormId,
+    turn_index: opts.turn,
+    role: opts.role,
+    mode: 'conversation',
+    text: opts.text,
+    model_id: opts.role === 'lex' ? 'claude' : '',
+    no_decay: 1,
+    cc_session_id: opts.ccSessionId,
+  });
+}
+
+function stubProvider(opts: {
+  name?: string;
+  configured?: boolean;
+  respond?: (user: string) => string;
+}): LlmProvider {
+  return {
+    name: opts.name ?? 'ollama',
+    description: 'stub',
+    isConfigured: () => opts.configured ?? true,
+    configHint: () => '',
+    modelIds: () => ({
+      ingest: 'stub',
+      lint: 'stub',
+      reconcile: 'stub',
+      selfQuery: 'stub',
+      distillation: 'stub',
+    }),
+    call: vi.fn(
+      async (_role, callOpts): Promise<CallResult> => ({
+        text: (opts.respond ?? (() => 'ollama summary'))(callOpts.user),
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        modelId: 'stub',
+        providerName: opts.name ?? 'ollama',
+      }),
+    ),
+  };
+}
+
+describe('createHeadlessPerSessionDistillationGenerator', () => {
+  it('returns summary + provenance from the engine for a scoped session', async () => {
+    insertBs({ id: 'bs-ps', started_ms: 1_000 });
+    insertCcChunk({
+      id: 'cc1-0',
+      brainstormId: 'bs-ps',
+      ccSessionId: 'cc-1',
+      turn: 0,
+      role: 'user',
+      text: 'session-one content marker',
+    });
+    let capturedPrompt = '';
+    const gen = createHeadlessPerSessionDistillationGenerator({
+      db,
+      spawnHeadless: async (prompt: string) => {
+        capturedPrompt = prompt;
+        return '  "per-session summary"  ';
+      },
+    });
+    const out = await gen({
+      brainstorm_id: 'bs-ps',
+      cc_session_id: 'cc-1',
+      totalChunksInSession: 1,
+    });
+    expect(out).not.toBeNull();
+    expect(out!.summary).toBe('per-session summary');
+    expect(out!.source_chunk_count).toBe(1);
+    expect(out!.source_session_ids).toBe(JSON.stringify(['cc-1']));
+    expect(out!.coverage_score).toBe(1);
+    /* Per-session system block + transcript reach the engine. */
+    expect(capturedPrompt.toLowerCase()).toMatch(/session topic/);
+    expect(capturedPrompt).toContain('session-one content marker');
+  });
+
+  it('isolates chunks by cc_session_id (no leak across sessions)', async () => {
+    insertBs({ id: 'bs-iso', started_ms: 1_000 });
+    insertCcChunk({
+      id: 'a-0',
+      brainstormId: 'bs-iso',
+      ccSessionId: 'cc-a',
+      turn: 0,
+      role: 'user',
+      text: 'ALPHA-only-text',
+    });
+    insertCcChunk({
+      id: 'b-0',
+      brainstormId: 'bs-iso',
+      ccSessionId: 'cc-b',
+      turn: 1,
+      role: 'user',
+      text: 'BETA-only-text',
+    });
+    let capturedPrompt = '';
+    const gen = createHeadlessPerSessionDistillationGenerator({
+      db,
+      spawnHeadless: async (p: string) => {
+        capturedPrompt = p;
+        return 'ok';
+      },
+    });
+    await gen({
+      brainstorm_id: 'bs-iso',
+      cc_session_id: 'cc-a',
+      totalChunksInSession: 1,
+    });
+    expect(capturedPrompt).toContain('ALPHA-only-text');
+    expect(capturedPrompt).not.toContain('BETA-only-text');
+  });
+
+  it('returns null with no spawn when the session has no scoped chunks', async () => {
+    insertBs({ id: 'bs-empty', started_ms: 1_000 });
+    const spawnHeadless = vi.fn(async () => 'should not run');
+    const gen = createHeadlessPerSessionDistillationGenerator({
+      db,
+      spawnHeadless,
+    });
+    const out = await gen({
+      brainstorm_id: 'bs-empty',
+      cc_session_id: 'cc-none',
+      totalChunksInSession: 0,
+    });
+    expect(out).toBeNull();
+    expect(spawnHeadless).not.toHaveBeenCalled();
+  });
+
+  it('returns null when the engine yields null or throws', async () => {
+    insertBs({ id: 'bs-fail', started_ms: 1_000 });
+    insertCcChunk({
+      id: 'f-0',
+      brainstormId: 'bs-fail',
+      ccSessionId: 'cc-f',
+      turn: 0,
+      role: 'user',
+      text: 'content',
+    });
+    const nullGen = createHeadlessPerSessionDistillationGenerator({
+      db,
+      spawnHeadless: async () => null,
+    });
+    expect(
+      await nullGen({
+        brainstorm_id: 'bs-fail',
+        cc_session_id: 'cc-f',
+        totalChunksInSession: 1,
+      }),
+    ).toBeNull();
+    const throwGen = createHeadlessPerSessionDistillationGenerator({
+      db,
+      spawnHeadless: vi.fn().mockRejectedValue(new Error('claude missing')),
+    });
+    expect(
+      await throwGen({
+        brainstorm_id: 'bs-fail',
+        cc_session_id: 'cc-f',
+        totalChunksInSession: 1,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe('distill engine selection (flag routing)', () => {
+  afterEach(() => {
+    delete process.env.DEVNEURAL_DISTILL_HEADLESS;
+  });
+
+  it('flag OFF -> anchor-flat uses the ollama provider, not the headless engine', async () => {
+    delete process.env.DEVNEURAL_DISTILL_HEADLESS;
+    insertBs({ id: 'bs-sel', started_ms: 1_000 });
+    insertChunk({
+      id: 'c-0',
+      brainstormId: 'bs-sel',
+      turn: 0,
+      role: 'user',
+      text: 'content',
+    });
+    const provider = stubProvider({ respond: () => 'OLLAMA-OUT' });
+    const spawnHeadless = vi.fn(async () => 'HEADLESS-OUT');
+    const gen = selectAnchorFlatGenerator({ db, provider, spawnHeadless });
+    const row = db.listBrainstorms({ limit: 5 })[0]!;
+    const out = await gen(row);
+    expect(out).toBe('OLLAMA-OUT');
+    expect(spawnHeadless).not.toHaveBeenCalled();
+    expect(provider.call).toHaveBeenCalledTimes(1);
+  });
+
+  it('flag ON -> anchor-flat uses the headless engine, not the provider', async () => {
+    process.env.DEVNEURAL_DISTILL_HEADLESS = '1';
+    insertBs({ id: 'bs-sel', started_ms: 1_000 });
+    insertChunk({
+      id: 'c-0',
+      brainstormId: 'bs-sel',
+      turn: 0,
+      role: 'user',
+      text: 'content',
+    });
+    const provider = stubProvider({ respond: () => 'OLLAMA-OUT' });
+    const spawnHeadless = vi.fn(async () => 'HEADLESS-OUT');
+    const gen = selectAnchorFlatGenerator({ db, provider, spawnHeadless });
+    const row = db.listBrainstorms({ limit: 5 })[0]!;
+    const out = await gen(row);
+    expect(out).toBe('HEADLESS-OUT');
+    expect(spawnHeadless).toHaveBeenCalledTimes(1);
+    expect(provider.call).not.toHaveBeenCalled();
+  });
+
+  it('flag ON -> per-session uses the headless engine, not the provider', async () => {
+    process.env.DEVNEURAL_DISTILL_HEADLESS = '1';
+    insertBs({ id: 'bs-selps', started_ms: 1_000 });
+    insertCcChunk({
+      id: 'p-0',
+      brainstormId: 'bs-selps',
+      ccSessionId: 'cc-ps',
+      turn: 0,
+      role: 'user',
+      text: 'content',
+    });
+    const provider = stubProvider({ respond: () => 'OLLAMA-OUT' });
+    const spawnHeadless = vi.fn(async () => 'HEADLESS-PS');
+    const gen = selectPerSessionGenerator({ db, provider, spawnHeadless });
+    const out = await gen({
+      brainstorm_id: 'bs-selps',
+      cc_session_id: 'cc-ps',
+      totalChunksInSession: 1,
+    });
+    expect(out).not.toBeNull();
+    expect(out!.summary).toBe('HEADLESS-PS');
+    expect(spawnHeadless).toHaveBeenCalledTimes(1);
+    expect(provider.call).not.toHaveBeenCalled();
   });
 });

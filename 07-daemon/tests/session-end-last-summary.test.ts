@@ -30,11 +30,11 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = path.resolve(HERE, '..', 'scripts', 'migrations');
 
 vi.mock('../src/lex/distillation-generator.js', async () => {
-  return {
-    createLlmDistillationGenerator: () => async (row: { id: string }) => {
-      return `stub last_summary for ${row.id}`;
-    },
-    createPerSessionDistillationGenerator: () => async (input: {
+  const anchorFlat = () => async (row: { id: string }) =>
+    `stub last_summary for ${row.id}`;
+  const perSession =
+    () =>
+    async (input: {
       brainstorm_id: string;
       cc_session_id: string;
       totalChunksInSession: number;
@@ -43,7 +43,16 @@ vi.mock('../src/lex/distillation-generator.js', async () => {
       source_chunk_count: input.totalChunksInSession,
       source_session_ids: JSON.stringify([input.cc_session_id]),
       coverage_score: 1,
-    }),
+    });
+  return {
+    createLlmDistillationGenerator: anchorFlat,
+    createPerSessionDistillationGenerator: perSession,
+    /* Sliver A: session-end now selects the engine via these. With the
+     * flag off (default) the selector returns the ollama-path generator;
+     * the mock collapses both to the same stub. */
+    selectAnchorFlatGenerator: anchorFlat,
+    selectPerSessionGenerator: perSession,
+    useHeadlessDistillEngine: () => false,
     SYSTEM_BLOCK: { text: 'stub', cache: false },
     PER_SESSION_SYSTEM_BLOCK: { text: 'stub', cache: false },
   };

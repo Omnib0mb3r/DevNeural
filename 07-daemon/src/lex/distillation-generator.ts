@@ -529,3 +529,169 @@ export function createPerSessionDistillationGenerator(
     };
   };
 }
+
+export interface CreateHeadlessPerSessionGeneratorOptions {
+  db: IndexDb;
+  log?: (msg: string) => void;
+  maxTranscriptBytes?: number;
+  chunkLimit?: number;
+  /** cwd the `claude -p` pass runs in. Default process.cwd(). */
+  cwd?: string;
+  /** Headless pass timeout. Default 60000. */
+  timeoutMs?: number;
+  /** Test seam; prod uses spawnHeadlessOpus. */
+  spawnHeadless?: SpawnHeadlessOpus;
+}
+
+/* Headless Opus per-session distillation generator (sliver A: route the
+ * session-end context distill onto the shared engine).
+ *
+ * Same PerSessionGeneratorOutput shape + same PER_SESSION_SYSTEM_BLOCK
+ * prompt + same provenance + same structured skip-logging as
+ * createPerSessionDistillationGenerator, but runs through the shared
+ * headless `claude -p` engine instead of provider.call(). BF-4 exempt
+ * (own-auth subprocess, not an off-host API call), so no anthropic gate.
+ * Fail-safe: returns null on no scoped chunks, spawn failure, or empty
+ * reply, exactly like the ollama path, so session-end's "leave the prior
+ * ref_summary in place" fallback is unchanged. */
+export function createHeadlessPerSessionDistillationGenerator(
+  opts: CreateHeadlessPerSessionGeneratorOptions,
+): PerSessionDistillationGenerator {
+  const log = opts.log ?? (() => undefined);
+  const maxTranscriptBytes = opts.maxTranscriptBytes ?? 8000;
+  const chunkLimit = opts.chunkLimit ?? 50;
+  const cwd = opts.cwd ?? process.cwd();
+  const timeoutMs = opts.timeoutMs ?? 60000;
+  const spawnHeadless = opts.spawnHeadless ?? spawnHeadlessOpus;
+  return async (input) => {
+    const tag = `${input.brainstorm_id.slice(0, 8)}/${input.cc_session_id.slice(0, 8)}`;
+    const fetched = opts.db.listBrainstormChunksForSession(
+      input.brainstorm_id,
+      input.cc_session_id,
+      chunkLimit,
+      'desc',
+    );
+    if (fetched.length === 0) {
+      log(`[per-session-headless] no_session_scoped_chunks ${tag}; skip`);
+      logDistillationOutcome(opts.db, {
+        brainstormId: input.brainstorm_id,
+        ccSessionId: input.cc_session_id,
+        generator: 'per-session',
+        errorClass: 'no_session_scoped_chunks',
+      });
+      return null;
+    }
+    const ordered = fetched.slice().reverse();
+    const transcript = ordered
+      .map((c) => {
+        const role =
+          c.role === 'lex' ? 'LEX' : c.role === 'user' ? 'USER' : 'TOOL';
+        return `${role}: ${c.text}`;
+      })
+      .join('\n')
+      .slice(0, maxTranscriptBytes);
+    if (transcript.length === 0) {
+      log(`[per-session-headless] empty_transcript ${tag}; skip`);
+      logDistillationOutcome(opts.db, {
+        brainstormId: input.brainstorm_id,
+        ccSessionId: input.cc_session_id,
+        generator: 'per-session',
+        errorClass: 'empty_transcript',
+      });
+      return null;
+    }
+    const prompt = `${PER_SESSION_SYSTEM_BLOCK.text}\n\n--- TRANSCRIPT ---\n${transcript}`;
+    let raw: string | null;
+    try {
+      raw = await spawnHeadless(prompt, cwd, timeoutMs);
+    } catch (err) {
+      log(
+        `[per-session-headless] spawn failed ${tag}: ${(err as Error).message}`,
+      );
+      logDistillationOutcome(opts.db, {
+        brainstormId: input.brainstorm_id,
+        ccSessionId: input.cc_session_id,
+        generator: 'per-session',
+        errorClass: 'provider_threw',
+        errorMessage: (err as Error).message,
+      });
+      return null;
+    }
+    const text = (raw ?? '')
+      .trim()
+      .replace(/^["'`]+|["'`]+$/g, '')
+      .replace(/^```\w*\n?|```$/g, '')
+      .trim();
+    if (!text) {
+      log(`[per-session-headless] empty_llm_reply ${tag}; skip`);
+      logDistillationOutcome(opts.db, {
+        brainstormId: input.brainstorm_id,
+        ccSessionId: input.cc_session_id,
+        generator: 'per-session',
+        errorClass: 'empty_llm_reply',
+      });
+      return null;
+    }
+    const denom = Math.max(input.totalChunksInSession, fetched.length);
+    const coverage = denom > 0 ? Math.min(1, fetched.length / denom) : 0;
+    return {
+      summary: text,
+      source_chunk_count: fetched.length,
+      source_session_ids: JSON.stringify([input.cc_session_id]),
+      coverage_score: Math.max(0, coverage),
+    };
+  };
+}
+
+/* Engine selection (sliver A). One switch, read once per caller, so
+ * every distillation writer - backfill scheduler, session-end pipeline,
+ * cold-start preload - agrees on the engine. DEVNEURAL_DISTILL_HEADLESS
+ * =1 routes through the shared headless Opus engine (BF-4 exempt);
+ * default OFF keeps the ollama provider path as the steady state until
+ * the live engine-swap verify lands. */
+export function useHeadlessDistillEngine(): boolean {
+  return process.env.DEVNEURAL_DISTILL_HEADLESS === '1';
+}
+
+export interface SelectGeneratorOptions {
+  db: IndexDb;
+  log?: (msg: string) => void;
+  /** Test seam for the headless engine. */
+  spawnHeadless?: SpawnHeadlessOpus;
+  /** Test seam for the ollama path. */
+  provider?: LlmProvider | null;
+}
+
+export function selectAnchorFlatGenerator(
+  opts: SelectGeneratorOptions,
+): DistillationGenerator {
+  if (useHeadlessDistillEngine()) {
+    return createHeadlessDistillationGenerator({
+      db: opts.db,
+      ...(opts.log ? { log: opts.log } : {}),
+      ...(opts.spawnHeadless ? { spawnHeadless: opts.spawnHeadless } : {}),
+    });
+  }
+  return createLlmDistillationGenerator({
+    db: opts.db,
+    ...(opts.log ? { log: opts.log } : {}),
+    ...(opts.provider !== undefined ? { provider: opts.provider } : {}),
+  });
+}
+
+export function selectPerSessionGenerator(
+  opts: SelectGeneratorOptions,
+): PerSessionDistillationGenerator {
+  if (useHeadlessDistillEngine()) {
+    return createHeadlessPerSessionDistillationGenerator({
+      db: opts.db,
+      ...(opts.log ? { log: opts.log } : {}),
+      ...(opts.spawnHeadless ? { spawnHeadless: opts.spawnHeadless } : {}),
+    });
+  }
+  return createPerSessionDistillationGenerator({
+    db: opts.db,
+    ...(opts.log ? { log: opts.log } : {}),
+    ...(opts.provider !== undefined ? { provider: opts.provider } : {}),
+  });
+}
