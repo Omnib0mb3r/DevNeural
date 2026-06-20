@@ -52,6 +52,10 @@ export interface AssembleInvestigatorInput {
   readFile?: (p: string) => string | null;
   /** Test seam: directory lister. Defaults to fs.readdirSync. */
   listDir?: (p: string) => string[];
+  /** Test seam: file mtime accessor in ms. Defaults to fs.statSync
+   * mtimeMs. Used to sort same-pattern doc families (e.g. dated
+   * HANDOVER-*.md) newest-first so the current handover leads. */
+  statMtimeMs?: (p: string) => number;
   now?: () => number;
 }
 
@@ -94,6 +98,14 @@ function defaultListDir(p: string): string[] {
   }
 }
 
+function defaultStatMtimeMs(p: string): number {
+  try {
+    return nodeFs.statSync(p).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
 /* Read the highest-priority project/spec docs from the cwd up to a byte
  * budget. Deterministic order so the digest is stable across runs. */
 function readProjectDocs(
@@ -101,17 +113,31 @@ function readProjectDocs(
   budget: number,
   readFile: (p: string) => string | null,
   listDir: (p: string) => string[],
+  statMtimeMs: (p: string) => number,
 ): string {
   const entries = listDir(cwd);
   if (entries.length === 0) return '';
+  const sep = cwd.includes('\\') ? '\\' : '/';
   const picked: string[] = [];
   for (const pattern of PROJECT_DOC_PRIORITY) {
-    for (const name of entries) {
-      if (pattern.test(name) && !picked.includes(name)) picked.push(name);
-    }
+    /* Files matching THIS pattern, sorted newest-first by mtime. A
+     * date-stamped family (e.g. HANDOVER-2026-05-22.md AND
+     * HANDOVER-2026-06-19.md) thus leads with the CURRENT handover, which
+     * gets first claim on the byte budget; older ones follow as history
+     * until the budget exhausts. Cross-pattern priority is unchanged
+     * (PROJECT.md still before any HANDOVER, etc.) - this only breaks the
+     * within-pattern tie that previously emitted alphabetical = oldest
+     * first. */
+    const matches = entries.filter(
+      (name) => pattern.test(name) && !picked.includes(name),
+    );
+    matches.sort(
+      (a, b) =>
+        statMtimeMs(`${cwd}${sep}${b}`) - statMtimeMs(`${cwd}${sep}${a}`),
+    );
+    for (const name of matches) picked.push(name);
   }
   if (picked.length === 0) return '';
-  const sep = cwd.includes('\\') ? '\\' : '/';
   const out: string[] = [];
   let used = 0;
   for (const name of picked) {
@@ -131,6 +157,7 @@ export function assembleInvestigatorContext(
 ): AssembledInvestigatorContext {
   const readFile = input.readFile ?? defaultReadFile;
   const listDir = input.listDir ?? defaultListDir;
+  const statMtimeMs = input.statMtimeMs ?? defaultStatMtimeMs;
 
   /* Fail closed: no resolvable brainstorm row -> no context. */
   let bs: BrainstormLike | null = null;
@@ -183,6 +210,7 @@ export function assembleInvestigatorContext(
     input.projectDocsBytes ?? 6000,
     readFile,
     listDir,
+    statMtimeMs,
   );
 
   const hasContent = Boolean(

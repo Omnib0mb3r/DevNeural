@@ -192,6 +192,40 @@ describe('assembleInvestigatorContext - content', () => {
     expect(out.block).toContain('project body');
     expect(seen.some((p) => p.endsWith('README.md'))).toBe(false);
   });
+
+  it('emits the NEWEST handover first within the HANDOVER family (mtime tie-break)', () => {
+    insertBs({ id: 'a-handover', user_label: 'HO', started_ms: 1_000 });
+    /* listDir returns the dated handovers alphabetical = oldest first;
+     * the mtime sort must flip them so the current handover leads. */
+    const out = assembleInvestigatorContext({
+      db,
+      anchorId: 'a-handover',
+      cwd: 'C:/p/lex',
+      listDir: () => [
+        'HANDOVER-2026-05-22-voice-and-index.md',
+        'HANDOVER-2026-06-19.md',
+      ],
+      readFile: (p) => {
+        if (p.endsWith('HANDOVER-2026-05-22-voice-and-index.md')) {
+          return 'OLD-MAY-HANDOVER-BODY';
+        }
+        if (p.endsWith('HANDOVER-2026-06-19.md')) {
+          return 'NEW-JUNE-HANDOVER-BODY';
+        }
+        return null;
+      },
+      statMtimeMs: (p) =>
+        p.endsWith('HANDOVER-2026-06-19.md')
+          ? 1_718_800_000_000 // newer
+          : 1_716_300_000_000, // older (May)
+    });
+    const newIdx = out.block.indexOf('NEW-JUNE-HANDOVER-BODY');
+    const oldIdx = out.block.indexOf('OLD-MAY-HANDOVER-BODY');
+    expect(newIdx).toBeGreaterThanOrEqual(0);
+    expect(oldIdx).toBeGreaterThanOrEqual(0);
+    /* Freshest leads; older history follows. */
+    expect(newIdx).toBeLessThan(oldIdx);
+  });
 });
 
 describe('runInvestigator - fail safe', () => {
