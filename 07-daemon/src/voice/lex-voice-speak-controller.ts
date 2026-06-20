@@ -40,6 +40,7 @@
  * manually, so the queue lifecycle can be pinned without piper.
  */
 import type { Readable } from 'node:stream';
+import { acquireMouth } from './voice-mouth.js';
 
 export interface SynthLikeHandle {
   pcm: Readable;
@@ -70,6 +71,11 @@ export interface SpeakControllerDeps {
   onTtsEnd?: () => void;
   /** Optional log channel. */
   log?: (msg: string) => void;
+  /** Pillar 3.1: label this controller as a mouth source. Each speak
+   * source (Lex reply, heartbeat, glue, a second connection) gets a
+   * distinct id so the single-mouth lock can keep exactly one stream
+   * live. Defaults to a unique per-controller id. */
+  mouthOwnerId?: string;
 }
 
 export interface SpeakController {
@@ -102,10 +108,13 @@ function cleanForTts(text: string): string {
     .trim();
 }
 
+let mouthOwnerSeq = 0;
+
 export function createSpeakController(
   state: SpeakControllerState,
   deps: SpeakControllerDeps,
 ): SpeakController {
+  const ownerId = deps.mouthOwnerId ?? `speak-${++mouthOwnerSeq}`;
   function speak(text: string): void {
     const clean = cleanForTts(text);
     if (!clean) return;
@@ -129,10 +138,25 @@ export function createSpeakController(
   }
 
   async function speakOne(clean: string): Promise<void> {
+    /* Pillar 3.1 single mouth: only one TTS stream may be live across
+     * the whole daemon. With the haiku tier OFF this grant is a no-op
+     * (current behavior). With it ON, a null grant means another source
+     * holds the mouth - defer this segment (front of queue, never lost)
+     * and let the drain loop retry when the mouth frees. Within a single
+     * controller the queue is already sequential (Fix 51), so the defer
+     * path is only reachable cross-source. */
+    const grant = acquireMouth(ownerId);
+    if (!grant) {
+      deps.log?.(`[voice-mouth] busy (held elsewhere); deferring segment`);
+      state.ttsQueue.unshift({ cleanText: clean });
+      await new Promise<void>((r) => setTimeout(r, 25));
+      return;
+    }
     let handle: SynthLikeHandle;
     try {
       handle = deps.synthesize(clean);
     } catch (err) {
+      grant.release();
       deps.send({ t: 'error', code: 'tts', message: (err as Error).message });
       return;
     }
@@ -193,6 +217,10 @@ export function createSpeakController(
        * remains available to other consumers (debug logging,
        * tests) but is no longer a release signal. */
     });
+    /* Release the single mouth once the stream is fully drained
+     * (natural end, cancelled-end, or error all resolve the await
+     * above). No-op when the haiku tier is off. */
+    grant.release();
   }
 
   function killActive(): boolean {
