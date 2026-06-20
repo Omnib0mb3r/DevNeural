@@ -15,6 +15,7 @@ import {
   prewarmInvestigator,
   _resetInvestigatorCache,
 } from '../src/lex/lex-investigator.js';
+import { readLatestColdStartReport } from '../src/lex/cold-start-report.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = path.resolve(HERE, '..', 'scripts', 'migrations');
@@ -347,6 +348,39 @@ describe('prewarmInvestigator', () => {
     expect(takeInvestigatorBlock('pw-3', 600_000, 6_000)).toContain(
       'prewarm live turn',
     );
+  });
+
+  it('sliver 3: persists the block as a cold-start report on disk', async () => {
+    liveAnchor('pw-disk');
+    await prewarmInvestigator({
+      db,
+      anchorId: 'pw-disk',
+      cwd: 'C:/p/lex',
+      spawnHeadless: async () => 'refined briefing',
+      now: () => 1_700_000_000_000,
+      readFile,
+      listDir,
+    });
+    const report = readLatestColdStartReport('pw-disk');
+    expect(report).not.toBeNull();
+    expect(report!.ms).toBe(1_700_000_000_000);
+    /* Same object as the served seed: refined briefing + live tail. */
+    expect(report!.block).toContain('refined briefing');
+    expect(report!.block).toContain('prewarm live turn');
+  });
+
+  it('sliver 3: a confidently-empty anchor persists no report', async () => {
+    insertBs({ id: 'pw-disk-empty', user_label: 'Empty', started_ms: 1_000 });
+    await prewarmInvestigator({
+      db,
+      anchorId: 'pw-disk-empty',
+      cwd: 'C:/p/lex',
+      spawnHeadless: async () => 'should not persist',
+      now: () => 1_700_000_000_000,
+      readFile: () => null,
+      listDir: () => [],
+    });
+    expect(readLatestColdStartReport('pw-disk-empty')).toBeNull();
   });
 });
 

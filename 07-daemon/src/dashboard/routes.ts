@@ -4843,7 +4843,22 @@ export async function registerDashboardRoutes(
       const { takeInvestigatorBlock } = await import(
         '../lex/lex-investigator.js'
       );
-      const primed = takeInvestigatorBlock(bs.id, 10 * 60 * 1000, Date.now());
+      let primed = takeInvestigatorBlock(bs.id, 10 * 60 * 1000, Date.now());
+      if (!primed || !primed.trim()) {
+        /* Sliver 3: in-memory cache miss (typically a daemon restart
+         * lost the pre-warm). Fall back to the newest persisted cold-
+         * start report on disk - the durable seed. Additive: before
+         * this, a miss served nothing for the investigator block. */
+        try {
+          const { readLatestColdStartReport } = await import(
+            '../lex/cold-start-report.js'
+          );
+          const report = readLatestColdStartReport(bs.id);
+          if (report && report.block.trim()) primed = report.block;
+        } catch {
+          /* disk fallback is additive; never block cold start */
+        }
+      }
       if (primed && primed.trim()) {
         block = block ? `${primed}\n\n${block}` : primed;
       }

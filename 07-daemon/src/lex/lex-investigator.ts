@@ -25,6 +25,7 @@ import type { IndexDb } from '../store/index-db.js';
 import { buildSiblingIndex } from './sibling-index.js';
 import { readTranscriptFromJsonlRefs } from './jsonl-transcript-reader.js';
 import { spawnHeadlessOpus } from './headless-opus.js';
+import { writeColdStartReport } from './cold-start-report.js';
 
 interface BrainstormLike {
   id: string;
@@ -370,6 +371,10 @@ export async function prewarmInvestigator(
   });
   const now = input.now ? input.now() : Date.now();
   cacheInvestigatorBlock(input.anchorId, block, now);
+  /* Sliver 3: persist the block as a timestamped cold-start report so
+   * the seed survives a daemon restart (the in-memory cache does not).
+   * Best-effort; the in-memory fast path is unaffected if this fails. */
+  writeColdStartReport(input.anchorId, block, now);
   return {
     hasContent: true,
     refined: block !== assembled.block,
