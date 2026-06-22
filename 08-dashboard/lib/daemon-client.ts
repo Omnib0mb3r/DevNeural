@@ -1416,6 +1416,57 @@ export const docIndex = (projectId: string) =>
     files: [] as DocFile[],
   }));
 
+// ── project lifecycle (DRIVE-QUEUE 3) ───────────────────────────
+export interface LifecycleGate {
+  satisfied: boolean;
+  reason: string;
+}
+export interface LifecycleResponse {
+  ok: boolean;
+  project_session_id: string | null;
+  cwd: string;
+  stage: string;
+  stage_label: string;
+  gate: LifecycleGate;
+  can_advance: boolean;
+  next_stage: string | null;
+  next_label: string | null;
+  needs: string;
+  signals: Record<string, unknown>;
+}
+/** Read a project's lifecycle stage + gate. By default runs cheap fs
+ * probes; pass runTests to actually run the suite for the test gate.
+ * Returns null on failure so the rail falls back to the cold-start view. */
+export const lifecycle = (opts: {
+  cwd?: string;
+  project_session_id?: string;
+  runTests?: boolean;
+}) => {
+  const qs = new URLSearchParams();
+  if (opts.project_session_id) qs.set("project_session_id", opts.project_session_id);
+  if (opts.cwd) qs.set("cwd", opts.cwd);
+  if (opts.runTests) qs.set("run_tests", "1");
+  return request<LifecycleResponse>(`/lex/lifecycle?${qs.toString()}`).catch(
+    () => null,
+  );
+};
+/** Set a project's stage (state-machine validated server-side). */
+export const setLifecycleStage = (input: {
+  project_session_id?: string;
+  cwd?: string;
+  stage: string;
+  force?: boolean;
+}) =>
+  request<{
+    ok: boolean;
+    stage?: string;
+    stage_label?: string;
+    previous?: string;
+    error?: string;
+    from?: string;
+    allowed?: string[];
+  }>("/lex/lifecycle", { method: "POST", body: input });
+
 // ── graph (orb) ────────────────────────────────────────────────
 export type GraphNodeStatus = "canonical" | "pending" | "archived";
 export interface GraphNode {
