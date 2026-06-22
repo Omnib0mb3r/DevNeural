@@ -9,13 +9,14 @@ reflects what was true at the last update.
 The rule: anyone reading this should start cold and know where the code
 is, what is in flight, what is shippable next, and what blocks it.
 
-Last touched: 2026-06-22. Branch `master`, HEAD `f64d58c`, tree clean.
-Last verified: daemon 1294 tests green (`cd 07-daemon && npm test`;
-+9 this session for the project-doc index. First full run flaked on 9
-unrelated specs (Windows temp-dir EPERM + 5s timeouts under concurrent
-load); a clean re-run was 1294/1294). dashboard 138 unit green (2
-`e2e/*.spec.ts` are pre-existing Playwright specs vitest cannot collect,
-not a regression). This session touched daemon only.
+Last touched: 2026-06-22. Branch `master`, HEAD `11ecf2f`, tree clean.
+Last verified: daemon 1308 tests green (`cd 07-daemon && npm test`;
++14 this session: +9 project-doc index, +5 net live voice glue. Clean
+runs were 1294/1294 then 1308/1308; the project-doc run once flaked on 9
+unrelated specs under concurrent load, Windows temp-dir EPERM + 5s
+timeouts, green on re-run). dashboard 138 unit green (2 `e2e/*.spec.ts`
+are pre-existing Playwright specs vitest cannot collect, not a
+regression). This session touched daemon only.
 
 ## HARD constraint
 
@@ -54,8 +55,20 @@ Green + committed = "built", not "verified".
   preserve-list, folded heartbeat, persona + digest + front desk) + live
   WS capstone in `lex-voice-ws.ts` (CAP-1 render/heartbeat, CAP-2 inbound
   lane routing). Flag OFF = byte-identical to current voice.
-- DEFERRED: live haiku MODEL calls + Lex-authored digest push (BF-4 +
-  latency fork). Deterministic glue + safe-render run for now.
+- Fast-lane glue is now LIVE haiku (DRIVE-QUEUE 1a): `4df083c`
+  `07-daemon/src/voice/voice-haiku-glue.ts` (`generateGlueReply` ->
+  VOICE_HAIKU_MODEL in persona + live digest, warm/varied, never-twice
+  ring + avoid-list, `<none>` = absorb, fail-fast null on miss);
+  `11ecf2f` wires `composeGlueReply` async into the WS fast lane. Canned
+  strings are now the FALLBACK only (no key / call miss), byte-identical
+  to before. "say again" stays a deterministic verbatim replay; control
+  reflexes (stop/quiet/abort/redirect) never touch the model. BF-4 held:
+  the glue model only ever sees the persona+digest (Lex synthesis) + the
+  user aside, never raw content.
+- DEFERRED: Lex-authored digest push (the digest the glue model speaks
+  from is still pushed by the deterministic seam; Lex writing it live on
+  every turn boundary is the remaining BF-4/latency fork). The slow-lane
+  bridge line + the safe-render path are still deterministic.
 
 ## Follow-on builds landed this session (all ADDITIVE)
 
@@ -97,6 +110,13 @@ Green + committed = "built", not "verified".
   same rebuild: `/lex/index-docs`, `/lex/chunk-search` doc_hits,
   `/lex/recall` doc_pointers, and the project-doc exclusion in search-all
   / curator / backfill. Until then they exist only in the build.
+- live voice glue (`11ecf2f`, Rebuild: yes) goes live on the same rebuild
+  but ALSO needs both `DEVNEURAL_VOICE_HAIKU=1` and `ANTHROPIC_API_KEY`
+  set. With the flag off, or the flag on but no key, the fast lane uses
+  the deterministic fallback (= today's canned glue), so nothing changes
+  until the operator opts in. Verify: with both set, repeat an ack ("ok",
+  "nice") a few times and confirm the spoken reply varies and never
+  repeats; confirm "stop"/"quiet" still cut instantly (no model latency).
 
 ## Next up (not started)
 
@@ -108,7 +128,10 @@ Green + committed = "built", not "verified".
   `/lex/index-docs` for DevNeural, then `/lex/recall {project_docs:true}`
   and confirm `doc_pointers` resolve to real files with no cross-project
   bleed and no change to the existing `results`/`groups`.
-- Voice: live haiku model calls + Lex digest push.
+- Voice: Lex-authored digest push (live haiku glue for the fast lane is
+  done, `11ecf2f`; remaining is Lex writing the digest live on every turn
+  boundary so the glue speaks from genuinely fresh synthesis). Slow-lane
+  bridge line is still deterministic.
 - Lifecycle: wire the stage column + real gate exit criteria + stage-aware
   greeting.
 
