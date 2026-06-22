@@ -201,6 +201,13 @@ export async function registerDashboardRoutes(
   registerSmartCompactRoutes(app, store.db, smartCompactInjector, log, {
     ctxProvider: smartCompactCtxProvider,
   });
+  /* DRIVE-QUEUE 4: smart-clear trigger surface. Shares the same ctx
+   * derivation so /smart-clear/state and /smart-compact/state report
+   * identical ctx_pct. Inert until smart_clear_mode is flipped. */
+  const { registerSmartClearRoutes } = await import('./smart-clear-routes.js');
+  registerSmartClearRoutes(app, store.db, log, {
+    ctxProvider: smartCompactCtxProvider,
+  });
 
   /* Background poll that binds a daemon-owned PTY to its claude
    * session_id once the .jsonl file appears. Single global timer; no
