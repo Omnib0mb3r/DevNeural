@@ -324,3 +324,52 @@ export function assembleSmartClearReport(
     signals,
   };
 }
+
+/* ── vet gate (Lex vets the reseed before use) ──────────────────────── */
+
+export interface VetResult {
+  ok: boolean;
+  issues: string[];
+}
+
+/* The GATE between investigator output and inject: the daemon never
+ * blind-injects the draft. Objective checks the reseed must pass before
+ * /clear-and-paste ships it. Enforces adaptive sufficiency's guardrails -
+ * the LOWER bound (carries verified state + a next step) and the UPPER
+ * bound (not a dumped transcript). The lower bound is what to resume on;
+ * the upper bound is the "this is a reseed, not the old session" rule. */
+const TRANSCRIPT_MARKER_RE =
+  /"type"\s*:\s*"(assistant|user|tool_use|tool_result)"|"uuid"\s*:|"role"\s*:\s*"(user|assistant)"/;
+const VERIFIED_STATE_RE = /HEAD\s+[0-9a-f]{6,}|working tree|verified state/i;
+
+export function vetReseed(
+  reseed: string,
+  opts: { maxChars?: number; maxLines?: number } = {},
+): VetResult {
+  const issues: string[] = [];
+  const text = (reseed ?? '').trim();
+  const maxChars = opts.maxChars ?? 2400;
+  const maxLines = opts.maxLines ?? 40;
+  if (!text) {
+    return { ok: false, issues: ['empty reseed'] };
+  }
+  if (text.length > maxChars) {
+    issues.push(
+      `too long (${text.length} > ${maxChars} chars): looks like a dumped transcript, not a reseed`,
+    );
+  }
+  const lineCount = text.split(/\r?\n/).length;
+  if (lineCount > maxLines) {
+    issues.push(`too many lines (${lineCount} > ${maxLines}): not a reseed`);
+  }
+  if (!VERIFIED_STATE_RE.test(text)) {
+    issues.push('no verified state (a HEAD sha / working-tree status)');
+  }
+  if (!/\bnext\b/i.test(text)) {
+    issues.push('no next step (what to resume on)');
+  }
+  if (TRANSCRIPT_MARKER_RE.test(text)) {
+    issues.push('contains raw transcript / jsonl markers');
+  }
+  return { ok: issues.length === 0, issues };
+}
