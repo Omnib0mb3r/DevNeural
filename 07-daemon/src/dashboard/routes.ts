@@ -2215,6 +2215,79 @@ export async function registerDashboardRoutes(
     return { ok: true, ...result };
   });
 
+  /* DRIVE-QUEUE 2A: incremental knowledge-index watcher lifecycle.
+   * POST /lex/watch-docs { project_id, action: 'start'|'stop', stores? }
+   * start: (re)create an fs.watch-backed watcher that re-indexes a
+   * changed / added / deleted markdown file within seconds (debounced),
+   * reusing the per-file reindex path so "where is X" stays current
+   * without a full manual /lex/index-docs run. Idempotent: starting
+   * again replaces the prior watcher for that project. stop: tear it
+   * down. Caller passes the same explicit store-set as /lex/index-docs
+   * (the auto-resolver is a later piece). */
+  const docWatchers = new Map<
+    string,
+    import('../lex/project-doc-watcher.js').DocWatchCoordinator
+  >();
+  app.post('/lex/watch-docs', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      project_id?: string;
+      action?: string;
+      stores?: Array<{ store?: string; dir?: string; recursive?: boolean }>;
+    };
+    const projectId = body.project_id?.trim();
+    if (!projectId) {
+      reply.code(400);
+      return { ok: false, error: 'project_id required' };
+    }
+    const action = (body.action ?? 'start').toLowerCase();
+    if (action === 'stop') {
+      const existing = docWatchers.get(projectId);
+      if (existing) {
+        existing.close();
+        docWatchers.delete(projectId);
+      }
+      return { ok: true, project_id: projectId, watching: false };
+    }
+    if (action !== 'start') {
+      reply.code(400);
+      return { ok: false, error: "action must be 'start' or 'stop'" };
+    }
+    if (!Array.isArray(body.stores) || body.stores.length === 0) {
+      reply.code(400);
+      return { ok: false, error: 'stores required (non-empty array) to start' };
+    }
+    const stores = body.stores
+      .filter(
+        (s) => s && typeof s.store === 'string' && typeof s.dir === 'string',
+      )
+      .map((s) => ({
+        store: s.store as string,
+        dir: s.dir as string,
+        ...(s.recursive ? { recursive: true } : {}),
+      }));
+    if (stores.length === 0) {
+      reply.code(400);
+      return { ok: false, error: 'stores must each have {store, dir}' };
+    }
+    /* Idempotent (re)start: replace any prior watcher for this project. */
+    const prior = docWatchers.get(projectId);
+    if (prior) prior.close();
+    const { startProjectDocWatch } = await import(
+      '../lex/project-doc-watcher.js'
+    );
+    const coord = startProjectDocWatch(store, {
+      project_id: projectId,
+      stores,
+    });
+    docWatchers.set(projectId, coord);
+    return {
+      ok: true,
+      project_id: projectId,
+      watching: true,
+      stores: stores.length,
+    };
+  });
+
   /* Slice E: Lex supervisor primitives. /lex/steer wraps ptyInject
    * so Lex can direct a worker session by either session_id or
    * pty_id without going through the lower-level /sessions or /pty
