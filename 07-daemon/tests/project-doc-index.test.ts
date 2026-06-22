@@ -17,6 +17,7 @@ import {
   projectDocSearch,
   reindexDocFile,
   removeDocFile,
+  listProjectDocs,
   type DocIndexDeps,
 } from '../src/lex/project-doc-index.js';
 import type { CorpusDeps } from '../src/lex/markdown-corpus.js';
@@ -348,5 +349,50 @@ describe('incremental re-index (DRIVE-QUEUE 2 watcher core)', () => {
     expect(vs.size()).toBe(2);
     expect(vs.has(docChunkId('A', p, 1))).toBe(true);
     expect(vs.has(docChunkId('B', p, 1))).toBe(true);
+  });
+});
+
+describe('listProjectDocs (DRIVE-QUEUE 2B browse)', () => {
+  it('groups a project index by file with chunk pointers, strict-scoped', async () => {
+    const corpus = fakeFs({
+      '/A/docs/a.md': '# Haiku\nhaiku one\n## Voice\nvoice two',
+      '/A/memory/m.md': '# Recall\nrecall corpus',
+      '/B/docs/b.md': '# B\nhaiku in B',
+    });
+    await indexProjectDocs(
+      store,
+      {
+        project_id: 'A',
+        stores: [
+          { store: 'docs', dir: '/A/docs' },
+          { store: 'memory', dir: '/A/memory' },
+        ],
+      },
+      { ...fakeDeps, corpus },
+    );
+    await indexProjectDocs(
+      store,
+      { project_id: 'B', stores: [{ store: 'docs', dir: '/B/docs' }] },
+      { ...fakeDeps, corpus },
+    );
+
+    const files = listProjectDocs(store, 'A');
+    /* Two files for A; none from B. */
+    expect(files.map((f) => f.path).sort()).toEqual([
+      '/A/docs/a.md',
+      '/A/memory/m.md',
+    ]);
+    expect(files.some((f) => f.path.startsWith('/B/'))).toBe(false);
+
+    const a = files.find((f) => f.path === '/A/docs/a.md')!;
+    expect(a.store).toBe('docs');
+    expect(a.name).toBe('a.md');
+    expect(a.chunks.map((c) => c.heading)).toEqual(['Haiku', 'Voice']);
+    expect(a.chunks.map((c) => c.line)).toEqual([1, 3]); // sorted by line
+    expect(a.chunks[0]!.snippet).toContain('haiku one');
+  });
+
+  it('returns nothing for an empty project_id', () => {
+    expect(listProjectDocs(store, '')).toEqual([]);
   });
 });

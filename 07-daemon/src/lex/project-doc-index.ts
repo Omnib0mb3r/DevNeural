@@ -245,6 +245,57 @@ function defaultReadFile(p: string): string | null {
   }
 }
 
+export interface DocChunkPointer {
+  heading: string;
+  line: number;
+  snippet: string;
+}
+
+export interface DocFile {
+  store: string;
+  path: string;
+  /** Basename for a compact node label. */
+  name: string;
+  chunks: DocChunkPointer[];
+}
+
+/* Browse the whole project-doc index for ONE project, grouped by file.
+ * Powers the orb's visual browse front (part 2B): nodes = files grouped
+ * by store, clicking a file shows its chunk pointers. Strict project
+ * scope by construction - an empty project_id returns nothing and another
+ * project's chunks are never included, matching projectDocSearch. Pure
+ * read over the in-memory vector store; no embedding. */
+export function listProjectDocs(store: Store, projectId: string): DocFile[] {
+  if (!projectId) return [];
+  const byPath = new Map<string, DocFile>();
+  for (const { metadata: m } of store.rawChunks.all()) {
+    if (m.kind !== PROJECT_DOC_KIND || m.project_id !== projectId) continue;
+    const path = m.doc_path ?? '';
+    if (!path) continue;
+    let file = byPath.get(path);
+    if (!file) {
+      file = {
+        store: m.doc_store ?? '',
+        path,
+        name: path.split(/[\\/]/).pop() ?? path,
+        chunks: [],
+      };
+      byPath.set(path, file);
+    }
+    file.chunks.push({
+      heading: m.doc_heading ?? '',
+      line: m.doc_line ?? 1,
+      snippet: m.text_preview ?? '',
+    });
+  }
+  const files = [...byPath.values()];
+  for (const f of files) f.chunks.sort((a, b) => a.line - b.line);
+  files.sort(
+    (a, b) => a.store.localeCompare(b.store) || a.name.localeCompare(b.name),
+  );
+  return files;
+}
+
 /* Strictly project-scoped semantic search over project-doc chunks.
  * Returns precise file pointers. A missing/empty project_id returns no
  * hits (never falls back to an unscoped scan) so cross-project leakage

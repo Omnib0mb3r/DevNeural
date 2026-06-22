@@ -2288,6 +2288,31 @@ export async function registerDashboardRoutes(
     };
   });
 
+  /* DRIVE-QUEUE 2B: browse the project-doc index for the orb's visual
+   * front. GET /lex/doc-index?project_id=... returns the project's
+   * indexed files grouped by store, each with its chunk pointers
+   * (heading / line / snippet). Strict project scope: another project's
+   * chunks are never included. Read-only; no embedding. */
+  app.get('/lex/doc-index', async (req, reply) => {
+    const projectId = String(
+      (req.query as { project_id?: string }).project_id ?? '',
+    ).trim();
+    if (!projectId) {
+      reply.code(400);
+      return { ok: false, error: 'project_id required' };
+    }
+    const { listProjectDocs } = await import('../lex/project-doc-index.js');
+    const files = listProjectDocs(store, projectId);
+    const totalChunks = files.reduce((n, f) => n + f.chunks.length, 0);
+    return {
+      ok: true,
+      project_id: projectId,
+      total_files: files.length,
+      total_chunks: totalChunks,
+      files,
+    };
+  });
+
   /* Slice E: Lex supervisor primitives. /lex/steer wraps ptyInject
    * so Lex can direct a worker session by either session_id or
    * pty_id without going through the lower-level /sessions or /pty
