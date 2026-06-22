@@ -92,20 +92,74 @@ describe('flag ON: routes through the haiku layer', () => {
   });
 });
 
-describe('composeGlueReply (fast lane, deterministic)', () => {
-  it('repeat replays the last spoken line', () => {
-    expect(composeGlueReply('say that again', 'the build is green')).toBe(
-      'the build is green',
+describe('composeGlueReply fallback (no model: byte-identical to prior canned glue)', () => {
+  const off = { modelEnabled: false } as const;
+
+  it('repeat replays the last spoken line verbatim', async () => {
+    expect(
+      await composeGlueReply('say that again', 'the build is green', off),
+    ).toBe('the build is green');
+  });
+
+  it('empty replay returns the canned line', async () => {
+    expect(await composeGlueReply('say that again', null, off)).toBe(
+      'I had not said anything yet.',
     );
   });
 
-  it('delivery tweaks ack', () => {
-    expect(composeGlueReply('slower', null)).toBe('Slowing down.');
-    expect(composeGlueReply('louder', null)).toBe('Speaking up.');
+  it('delivery tweaks ack', async () => {
+    expect(await composeGlueReply('slower', null, off)).toBe('Slowing down.');
+    expect(await composeGlueReply('louder', null, off)).toBe('Speaking up.');
+    expect(await composeGlueReply('quieter', null, off)).toBe('Quieter.');
   });
 
-  it('bare acknowledgments are absorbed (null = nothing spoken)', () => {
-    expect(composeGlueReply('thanks', 'x')).toBeNull();
-    expect(composeGlueReply('yes', 'x')).toBeNull();
+  it('bare acknowledgments are absorbed (null = nothing spoken)', async () => {
+    expect(await composeGlueReply('thanks', 'x', off)).toBeNull();
+    expect(await composeGlueReply('yes', 'x', off)).toBeNull();
+  });
+});
+
+describe('composeGlueReply live model path', () => {
+  it('delivery tweak comes from the model, not the canned line', async () => {
+    const seen: string[] = [];
+    const reply = await composeGlueReply('slow down', null, {
+      generate: async ({ hint }) => {
+        seen.push(hint);
+        return "sure, I'll ease off the pace";
+      },
+    });
+    expect(reply).toBe("sure, I'll ease off the pace");
+    expect(reply).not.toBe('Slowing down.');
+    expect(seen).toEqual(['slower']);
+  });
+
+  it('bare ack can now get a warm reply instead of silence', async () => {
+    const reply = await composeGlueReply('thanks', 'x', {
+      generate: async ({ hint }) => {
+        expect(hint).toBe('ack');
+        return 'anytime';
+      },
+    });
+    expect(reply).toBe('anytime');
+  });
+
+  it('model <none>/null on a tweak falls back to the deterministic line', async () => {
+    const reply = await composeGlueReply('louder', null, {
+      modelEnabled: true,
+      generate: async () => null,
+    });
+    expect(reply).toBe('Speaking up.');
+  });
+
+  it('repeat stays a verbatim replay and never calls the model', async () => {
+    let called = false;
+    const reply = await composeGlueReply('say that again', 'forty two', {
+      generate: async () => {
+        called = true;
+        return 'paraphrased';
+      },
+    });
+    expect(reply).toBe('forty two');
+    expect(called).toBe(false);
   });
 });

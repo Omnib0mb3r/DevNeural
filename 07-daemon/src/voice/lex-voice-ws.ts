@@ -2283,9 +2283,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
             return;
           }
         } else if (dec.route.lane === 'fast') {
-          /* haiku alone: answer glue with zero Opus round-trip. A bare
-           * ack returns null and is absorbed silently. */
-          const reply = composeGlueReply(trimmed, lastSpokenText);
+          /* haiku alone: answer glue with zero Opus round-trip. The reply
+           * is LIVE haiku in persona (warm + varied) when a key is set,
+           * else the deterministic fallback. A bare ack returns null and
+           * is absorbed silently. */
+          const reply = await composeGlueReply(trimmed, lastSpokenText);
           if (reply) speak(reply);
           state.utteranceStartedDuringTts = false;
           return;
