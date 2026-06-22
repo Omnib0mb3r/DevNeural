@@ -25,6 +25,7 @@
  *     Slower (~1-2s on local), tighter relevance.
  */
 import { embedOne } from '../embedder/index.js';
+import { PROJECT_DOC_KIND } from '../store/index.js';
 import type { Store, WikiPageMetadata } from '../store/index.js';
 import { matchTerms, readGlossary, type GlossaryEntry } from './glossary.js';
 import { readSummary } from './session-summarizer.js';
@@ -230,6 +231,9 @@ export async function curate(
       topK: 3,
       filter: (m) => {
         const meta = m as unknown as Record<string, unknown>;
+        /* Knowledge-index chunks are not transcript fallbacks; never
+         * inject one as if it were prior conversation. */
+        if (meta.kind === PROJECT_DOC_KIND) return false;
         return !input.projectId || meta.project_id === input.projectId;
       },
     });

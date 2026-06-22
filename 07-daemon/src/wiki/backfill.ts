@@ -27,6 +27,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { PROJECT_DOC_KIND } from '../store/index.js';
 import type { Store } from '../store/index.js';
 import { DATA_ROOT } from '../paths.js';
 import { ingestTranscriptFile } from '../capture/transcript-watcher.js';
@@ -341,7 +342,12 @@ async function verifyRawSearchable(
   const VERIFY_THRESHOLD = 0.5;
   try {
     const vec = await embedOne(queryText);
-    const hits = store.rawChunks.search(vec, { topK: 1 });
+    /* Verify against transcript chunks only; knowledge-index chunks
+     * share the collection but are not what backfill wrote. */
+    const hits = store.rawChunks.search(vec, {
+      topK: 1,
+      filter: (m) => (m as { kind?: string }).kind !== PROJECT_DOC_KIND,
+    });
     if (hits.length === 0) {
       log('[backfill-raw] verify FAIL: no hits at all from rawChunks');
       return {

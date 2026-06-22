@@ -21,6 +21,7 @@
  * brainstorm instead of N orphan transcript rows.
  */
 import { embedOne } from '../embedder/index.js';
+import { PROJECT_DOC_KIND } from '../store/index.js';
 import type { Store } from '../store/index.js';
 import type { ReferenceStore } from '../reference/store.js';
 import type { BrainstormSessionRow } from '../store/index-db.js';
@@ -239,6 +240,11 @@ export async function searchAll(
       topK: candidatePerCollection,
       filter: (m) => {
         const meta = m as Record<string, unknown>;
+        /* project-doc chunks share raw_chunks but belong to the Unified
+         * Knowledge Index, not transcript recall. Exclude them here so
+         * /search/all + /lex/recall stay byte-identical to pre-index
+         * behavior; the index has its own scoped query path. */
+        if (meta.kind === PROJECT_DOC_KIND) return false;
         if (options.project_id && meta.project_id !== options.project_id) {
           return false;
         }

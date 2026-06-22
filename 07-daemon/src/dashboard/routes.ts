@@ -2059,6 +2059,7 @@ export async function registerDashboardRoutes(
       scope?: 'recent' | 'all';
       project_id?: string;
       limit?: number;
+      project_docs?: boolean;
     };
     if (!body.q) {
       reply.code(400);
@@ -2084,6 +2085,21 @@ export async function registerDashboardRoutes(
     );
     const hasBrainstorm = (page.groups?.length ?? 0) > 0;
     const conflictCheckRequired = hasCanonical && hasBrainstorm;
+    /* Additive Unified-Knowledge-Index branch: when project_docs is
+     * requested with a project_id, attach strictly scoped doc pointers
+     * alongside the existing recall envelope. Every pre-existing field
+     * is unchanged; callers that don't ask for docs see no difference. */
+    let docPointers:
+      | import('../lex/project-doc-index.js').DocPointerHit[]
+      | undefined;
+    if (body.project_docs && body.project_id) {
+      const { projectDocSearch } = await import('../lex/project-doc-index.js');
+      const docs = await projectDocSearch(store, body.q, {
+        project_id: body.project_id,
+        limit: typeof body.limit === 'number' ? body.limit : 5,
+      });
+      docPointers = docs.hits;
+    }
     return {
       ok: true,
       scope: body.scope ?? 'all',
@@ -2091,6 +2107,7 @@ export async function registerDashboardRoutes(
       groups: page.groups ?? [],
       total: page.total,
       limit: page.limit,
+      ...(docPointers !== undefined ? { doc_pointers: docPointers } : {}),
       conflict_check_required: conflictCheckRequired,
       conflict_overlap: conflictCheckRequired
         ? {
@@ -2123,16 +2140,78 @@ export async function registerDashboardRoutes(
       q?: string;
       limit?: number;
       brainstorm_id?: string;
+      project_id?: string;
+      docs?: boolean;
     };
     if (!body.q || !body.q.trim()) {
       reply.code(400);
       return { ok: false, error: 'q required' };
     }
+    const q = body.q.trim();
     const { chunkSearch } = await import('../lex/chunk-retrieval.js');
-    const result = await chunkSearch(store, body.q.trim(), {
+    const result = await chunkSearch(store, q, {
       limit: typeof body.limit === 'number' ? body.limit : 3,
       brainstorm_id: body.brainstorm_id,
     });
+    /* Additive Unified-Knowledge-Index branch: when docs is requested
+     * with a project_id, also return strictly project-scoped doc
+     * pointers under a separate doc_hits field. The brainstorm-chunk
+     * `hits` array (and every other field) is untouched. */
+    let docHits: import('../lex/project-doc-index.js').DocPointerHit[] | undefined;
+    if (body.docs && body.project_id) {
+      const { projectDocSearch } = await import('../lex/project-doc-index.js');
+      const docs = await projectDocSearch(store, q, {
+        project_id: body.project_id,
+        limit: typeof body.limit === 'number' ? body.limit : 5,
+      });
+      docHits = docs.hits;
+    }
+    return {
+      ok: true,
+      ...result,
+      ...(docHits !== undefined ? { doc_hits: docHits } : {}),
+    };
+  });
+
+  /* Knowledge Index piece 2: build/refresh the project-doc index for
+   * one project. Accepts an explicit store-set ({store, dir,
+   * recursive?}) so the caller owns the disjoint dir layout (the
+   * auto-resolver + file-watcher land with a later piece). Embeds the
+   * markdown corpus into raw_chunks under PROJECT_DOC_KIND with
+   * deterministic ids (re-run = in-place update) and flushes so the
+   * vectors survive a restart. */
+  app.post('/lex/index-docs', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      project_id?: string;
+      stores?: Array<{ store?: string; dir?: string; recursive?: boolean }>;
+    };
+    if (!body.project_id || !body.project_id.trim()) {
+      reply.code(400);
+      return { ok: false, error: 'project_id required' };
+    }
+    if (!Array.isArray(body.stores) || body.stores.length === 0) {
+      reply.code(400);
+      return { ok: false, error: 'stores required (non-empty array)' };
+    }
+    const stores = body.stores
+      .filter(
+        (s) => s && typeof s.store === 'string' && typeof s.dir === 'string',
+      )
+      .map((s) => ({
+        store: s.store as string,
+        dir: s.dir as string,
+        ...(s.recursive ? { recursive: true } : {}),
+      }));
+    if (stores.length === 0) {
+      reply.code(400);
+      return { ok: false, error: 'stores must each have {store, dir}' };
+    }
+    const { indexProjectDocs } = await import('../lex/project-doc-index.js');
+    const result = await indexProjectDocs(store, {
+      project_id: body.project_id.trim(),
+      stores,
+    });
+    await store.rawChunks.flush();
     return { ok: true, ...result };
   });
 
