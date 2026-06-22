@@ -9,16 +9,16 @@ reflects what was true at the last update.
 The rule: anyone reading this should start cold and know where the code
 is, what is in flight, what is shippable next, and what blocks it.
 
-Last touched: 2026-06-22. Branch `master`, HEAD `d516b00`, tree clean.
-Last verified: daemon 1342 tests green (`cd 07-daemon && npm test`; +10
-knowledge-index 2A: +4 incremental reindex primitives, +6 watcher
-coordinator; clean run 1342/1342). The full suite still flakes on a
-cluster of timing/temp-dir specs under concurrent load (auto-advance-
-supervisor, stale-watcher, smart-compact-injector, loose-ends-gate,
-grooming-watch, etc., none touched here; the failing set changes run-to-
-run); all pass in isolation. dashboard 138 unit green (2 `e2e/*.spec.ts`
-are pre-existing Playwright specs vitest cannot collect, not a
-regression). This session touched daemon only.
+Last touched: 2026-06-22. Branch `master`, HEAD `fa2788b`, tree clean.
+Last verified: daemon 1344 green (`cd 07-daemon && npm test`; +2 for the
+doc-index browse endpoint; clean run 1344/1344) and dashboard 143 unit
+green (`cd 08-dashboard && npm test`; +5 buildKnowledgeGraph; the 2
+`e2e/*.spec.ts` Playwright files vitest cannot collect are pre-existing,
+not a regression). The daemon full suite still flakes on a cluster of
+timing/temp-dir specs under concurrent load (sessions-anchor-liveness,
+stale-watcher, smart-compact-injector, loose-ends-gate, etc., none
+touched here; the failing set changes run-to-run); all pass in isolation.
+This session touched daemon + dashboard.
 
 ## HARD constraint
 
@@ -136,9 +136,19 @@ Green + committed = "built", not "verified".
   750ms, longest-dir store resolution, exists -> reindex vs gone ->
   remove) + `startProjectDocWatch` (fs.watch shell). Live via `POST
   /lex/watch-docs {project_id, action:'start'|'stop', stores[]}`. Strict
-  project scope preserved on every incremental op. Still out: orb UI, and
-  the DevNeural store-set auto-resolver (callers still pass explicit
-  store dirs to both index-docs and watch-docs).
+  project scope preserved on every incremental op.
+- Unified Knowledge Index, part 2B orb (`7a00770` endpoint + `fa2788b`
+  view): the visual browse front. Daemon `listProjectDocs` + `GET
+  /lex/doc-index?project_id=...` return the project's index grouped by
+  file (store, path, chunk pointers), strict-scoped. Dashboard route
+  `/knowledge` (`08-dashboard/src/knowledge/`): a project-scoped
+  force-graph orb (store-hub + file nodes), per-store filter CHIPS,
+  project selector (defaults DevNeural), side panel showing a clicked
+  file's path + chunk headings/lines/snippets. Pure `buildKnowledgeGraph`
+  shaper is unit-tested. Additive: a new route + TopBar "Knowledge index"
+  entry; the global `/orb` graph and all panels are untouched. Still out:
+  the DevNeural store-set auto-resolver (callers still pass explicit store
+  dirs to index-docs / watch-docs).
 
 ## Pending the operator daemon rebuild + restart
 
@@ -159,6 +169,12 @@ Green + committed = "built", not "verified".
   `/lex/index-docs`, then verify: edit a watched .md, wait a few seconds,
   and `/lex/recall {project_docs:true}` reflects the change without a
   manual re-index; delete a file and its pointers stop appearing.
+- part 2B orb: daemon `GET /lex/doc-index` (`7a00770`, Rebuild: yes) goes
+  live on the same rebuild. The dashboard `/knowledge` view (`fa2788b`)
+  needs a DASHBOARD build (`cd 08-dashboard && npm run build`), not a
+  daemon rebuild, to ship (the daemon serves the static export). Verify:
+  open /knowledge, pick DevNeural, see store-grouped file nodes, toggle a
+  store chip, click a file -> path + chunk pointers in the side panel.
 - live voice (glue 1a `11ecf2f` + digest push & body render 1b `a1d139d`
   / `6a732b2` + truncation fix 1c `4d409c1`, all Rebuild: yes) goes live
   on the same rebuild but ALSO needs both `DEVNEURAL_VOICE_HAIKU=1` and
@@ -174,15 +190,15 @@ Green + committed = "built", not "verified".
 
 ## Next up (not started)
 
-- Knowledge Index remainder (2A incremental watcher DONE): next is the
-  ORB UI (the part 2B the directive flagged), plus the DevNeural store-set
-  auto-resolver (map a project to its disjoint memory/docs/spec/bugs/
-  brainstorm dirs so /lex/index-docs + /lex/watch-docs are callable
-  without hand-passing absolute dirs). Live-verify piece 2 + 2A first
-  after the operator rebuild: POST `/lex/index-docs` for DevNeural, start
-  `/lex/watch-docs`, edit a doc, and confirm `/lex/recall
-  {project_docs:true}` reflects it within seconds with no cross-project
-  bleed and no change to the existing `results`/`groups`.
+- Knowledge Index remainder (2A watcher + 2B orb now DONE): the only
+  piece left is the DevNeural store-set auto-resolver - map a project to
+  its disjoint memory/docs/spec/bugs/brainstorm dirs so /lex/index-docs,
+  /lex/watch-docs, and the /knowledge orb work without the caller (or the
+  view's implicit defaults) hand-passing absolute dirs. Live-verify 2 +
+  2A + 2B after the operator rebuild + dashboard build: POST
+  `/lex/index-docs` for DevNeural, start `/lex/watch-docs`, edit a doc,
+  confirm `/lex/recall {project_docs:true}` reflects it within seconds,
+  and the /knowledge orb shows the store-grouped files.
 - Voice (1a + 1b done: live glue, digest push, body render). Remaining:
   live-haiku slow-lane BRIDGE line (still the deterministic hash pick in
   `pickBridgeLine`), and a richer Lex-authored structured digest (the
