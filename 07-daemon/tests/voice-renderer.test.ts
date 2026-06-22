@@ -12,6 +12,7 @@ import {
   verifyVerbatim,
   safeRender,
   renderSpoken,
+  renderSpokenAsync,
 } from '../src/voice/voice-renderer.js';
 
 describe('preserve-list extraction', () => {
@@ -97,5 +98,49 @@ describe('renderSpoken', () => {
     });
     expect(r.usedFallback).toBe(true);
     expect(r.spoken).toContain('1205');
+  });
+});
+
+describe('renderSpokenAsync (live-haiku render, DRIVE-QUEUE 1b)', () => {
+  it('keeps a faithful warm render that preserves numbers + negations', async () => {
+    const r = await renderSpokenAsync('**1205** tests pass, do `not` ship.', {
+      haikuRender: async () => '1205 tests pass, but do not ship yet.',
+    });
+    expect(r.usedFallback).toBe(false);
+    expect(r.spoken).toBe('1205 tests pass, but do not ship yet.');
+  });
+
+  it('falls back to the safe render when the model drops a number', async () => {
+    const r = await renderSpokenAsync('1205 tests pass.', {
+      haikuRender: async () => 'all the tests pass.',
+    });
+    expect(r.usedFallback).toBe(true);
+    expect(r.spoken).toContain('1205');
+  });
+
+  it('falls back when the model flips a negation', async () => {
+    const r = await renderSpokenAsync('do not ship the build.', {
+      haikuRender: async () => 'ship the build.',
+    });
+    expect(r.usedFallback).toBe(true);
+    expect(r.spoken).toMatch(/\bnot\b/);
+  });
+
+  it('falls back to the safe render when the model throws', async () => {
+    const r = await renderSpokenAsync('1205 tests pass.', {
+      haikuRender: async () => {
+        throw new Error('timeout');
+      },
+    });
+    expect(r.usedFallback).toBe(true);
+    expect(r.spoken).toContain('1205');
+  });
+
+  it('falls back on an empty render', async () => {
+    const r = await renderSpokenAsync('hello there.', {
+      haikuRender: async () => '',
+    });
+    expect(r.usedFallback).toBe(true);
+    expect(r.spoken).toBe('hello there.');
   });
 });

@@ -8,13 +8,14 @@
  * 2000-line WS handler) makes "flag-off is unchanged" unit-testable.
  */
 import { useVoiceHaiku } from './voice-haiku.js';
-import { renderSpoken } from './voice-renderer.js';
+import { renderSpoken, renderSpokenAsync } from './voice-renderer.js';
 import { frontDeskDecision, type FrontDeskDecision } from './voice-frontdesk.js';
 import { composeHeartbeat } from './voice-heartbeat-haiku.js';
 import { heartbeatPhrase } from './lex-voice-heartbeat.js';
 import {
   generateGlueReply,
   glueModelAvailable,
+  renderReplyLive,
   type GenerateGlueDeps,
   type GlueHint,
 } from './voice-haiku-glue.js';
@@ -27,6 +28,37 @@ import {
 export function renderForSpeech(text: string): string {
   if (!useVoiceHaiku()) return text;
   return renderSpoken(text).spoken;
+}
+
+export interface RenderReplyForSpeechDeps {
+  /** Injected live render (tests). Default: renderReplyLive. */
+  render?: (text: string, preserve: string[]) => Promise<string>;
+  /** Force the live-model path on/off (tests). Default: key present. */
+  modelEnabled?: boolean;
+}
+
+/* LIVE-haiku render of Lex's reply body for warm spoken delivery
+ * (DRIVE-QUEUE 1b). Flag OFF: identity (byte-identical - the WS skips the
+ * haiku block anyway). Flag ON + key: route through renderSpokenAsync
+ * with the live model, verbatim-guarded (a paraphrase that drops a
+ * number/decision/negation is rejected for the safe render). Flag ON, no
+ * key: the safe markdown-strip render, exactly as renderForSpeech does
+ * today. Async; the live call is the only added latency and only on the
+ * reply body, never on acks/glue/heartbeats. */
+export async function renderReplyForSpeech(
+  text: string,
+  deps?: RenderReplyForSpeechDeps,
+): Promise<string> {
+  if (!useVoiceHaiku()) return text;
+  const modelEnabled = deps?.modelEnabled ?? glueModelAvailable();
+  const render = deps?.render ?? renderReplyLive;
+  if (!modelEnabled && !deps?.render) {
+    return renderSpoken(text).spoken;
+  }
+  const res = await renderSpokenAsync(text, {
+    haikuRender: (t, preserve) => render(t, preserve),
+  });
+  return res.spoken;
 }
 
 /* Inbound routing gate. OFF: null, so the WS runs its existing inject

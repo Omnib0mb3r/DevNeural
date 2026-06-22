@@ -145,3 +145,44 @@ export function renderSpoken(
    * ship the safe render. Renderer, not re-thinker. */
   return { spoken: fallback, preserved: true, usedFallback: true };
 }
+
+export interface AsyncRenderOptions {
+  /** Spans Lex explicitly marked critical, on top of auto-extracted
+   * numbers/SHAs/negations. */
+  preserve?: string[];
+  /** Async live-haiku style+brevity render. The same verbatim guard as
+   * renderSpoken applies: a candidate that drops or rewords a preserve
+   * span is rejected for the safe render. */
+  haikuRender: (text: string, preserve: string[]) => Promise<string>;
+}
+
+/* Async twin of renderSpoken for the LIVE haiku render of Lex's reply
+ * body (DRIVE-QUEUE 1b). Same verbatim contract: warm phrasing is kept
+ * only if every preserve span survived, else the safe markdown-strip
+ * render ships. A throwing/empty render also falls back. Pure: the model
+ * call is the injected haikuRender. */
+export async function renderSpokenAsync(
+  text: string,
+  opts: AsyncRenderOptions,
+): Promise<RenderResult> {
+  const spans: PreserveSpan[] = [
+    ...(opts.preserve ?? []).map(
+      (t): PreserveSpan => ({ text: t, kind: 'marked' }),
+    ),
+    ...extractPreserveSpans(text),
+  ];
+  const fallback = safeRender(text);
+  let candidate: string;
+  try {
+    candidate = await opts.haikuRender(
+      text,
+      spans.map((s) => s.text),
+    );
+  } catch {
+    return { spoken: fallback, preserved: true, usedFallback: true };
+  }
+  if (candidate && candidate.trim() && verifyVerbatim(spans, candidate).ok) {
+    return { spoken: candidate.trim(), preserved: true, usedFallback: false };
+  }
+  return { spoken: fallback, preserved: true, usedFallback: true };
+}

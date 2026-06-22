@@ -11,6 +11,7 @@ import {
   haikuRoute,
   heartbeatLine,
   composeGlueReply,
+  renderReplyForSpeech,
 } from '../src/voice/voice-haiku-wiring.js';
 import { heartbeatPhrase } from '../src/voice/lex-voice-heartbeat.js';
 import { _resetDigest } from '../src/voice/voice-digest.js';
@@ -161,5 +162,29 @@ describe('composeGlueReply live model path', () => {
     });
     expect(reply).toBe('forty two');
     expect(called).toBe(false);
+  });
+});
+
+describe('renderReplyForSpeech (live-haiku reply render)', () => {
+  it('flag OFF: returns the reply verbatim (byte-identical)', async () => {
+    delete process.env.DEVNEURAL_VOICE_HAIKU;
+    const raw = '**1205** tests pass, do `not` ship';
+    expect(await renderReplyForSpeech(raw)).toBe(raw);
+  });
+
+  it('flag ON + injected render: warms the reply, preserving numbers', async () => {
+    process.env.DEVNEURAL_VOICE_HAIKU = '1';
+    const r = await renderReplyForSpeech('1205 tests pass.', {
+      render: async () => '1205 tests are green.',
+    });
+    expect(r).toBe('1205 tests are green.');
+  });
+
+  it('flag ON + a render that drops a number falls back to the safe render', async () => {
+    process.env.DEVNEURAL_VOICE_HAIKU = '1';
+    const r = await renderReplyForSpeech('1205 tests pass.', {
+      render: async () => 'everything is green.',
+    });
+    expect(r).toContain('1205');
   });
 });

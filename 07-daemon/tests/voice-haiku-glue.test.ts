@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   generateGlueReply,
   glueModelAvailable,
+  renderReplyLive,
   _resetGlueHistory,
   type GlueModelCall,
 } from '../src/voice/voice-haiku-glue.js';
@@ -140,5 +141,47 @@ describe('generateGlueReply', () => {
       { call },
     );
     expect(system.toLowerCase()).toContain('slow down');
+  });
+});
+
+describe('renderReplyLive', () => {
+  it('returns the restyled text and is BF-4 (persona + preserve + body only)', async () => {
+    pushDigest(
+      {
+        currentTask: 'voice render wiring',
+        lastDecision: 'live render',
+        openQuestion: 'none',
+        workerStatus: 'idle',
+        nextSteps: 'ship',
+      },
+      1,
+    );
+    let system = '';
+    let user = '';
+    const call: GlueModelCall = async (i) => {
+      system = i.system;
+      user = i.user;
+      return '1205 are green; holding off shipping.';
+    };
+    const out = await renderReplyLive(
+      '1205 tests pass. Do not ship.',
+      ['1205', 'not'],
+      { call },
+    );
+    expect(out).toBe('1205 are green; holding off shipping.');
+    expect(system).toContain('conscious voice of Lex');
+    expect(system).toContain('SPOKEN RENDER');
+    expect(system).toContain('voice render wiring');
+    expect(system).toContain('1205');
+    expect(system).toContain('renderer, not a re-thinker');
+    /* the user message is exactly Lex's reply body - no raw transcript */
+    expect(user).toBe('1205 tests pass. Do not ship.');
+  });
+
+  it('returns empty string when the call throws (caller ships safe render)', async () => {
+    const call: GlueModelCall = async () => {
+      throw new Error('timeout');
+    };
+    expect(await renderReplyLive('x', [], { call })).toBe('');
   });
 });

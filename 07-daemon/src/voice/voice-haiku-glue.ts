@@ -179,3 +179,63 @@ export async function generateGlueReply(
   remember(cleaned);
   return cleaned;
 }
+
+/* Live-haiku RENDER of Lex's already-synthesized reply body (DRIVE-QUEUE
+ * 1b). Restyles for warm spoken delivery; the verbatim guard lives in
+ * renderSpokenAsync, which rejects any candidate that drops a preserve
+ * span and ships the safe render instead. Lower temperature than glue:
+ * render is faithful restyling, not free invention.
+ *
+ * BF-4 (preserved): the only inputs are the persona prompt (which carries
+ * ONLY Lex's synthesized digest) + Lex's reply body. No raw content. */
+const VOICE_RENDER_MAX_TOKENS = 512;
+const VOICE_RENDER_TEMPERATURE = 0.4;
+
+function renderInstruction(preserve: string[]): string {
+  const lines = [
+    '--- SPOKEN RENDER (you are about to say this out loud) ---',
+    'Restyle the message below into warm, natural spoken delivery in your',
+    'own voice: trim connective prose, drop markdown, keep it brief. You',
+    'are a renderer, not a re-thinker - do not add facts, opinions, or',
+    'questions, and do not change meaning. Output ONLY the spoken text.',
+  ];
+  if (preserve.length > 0) {
+    lines.push(
+      'You MUST keep these exact spans verbatim (numbers, ids, and',
+      'negations must survive unchanged):',
+    );
+    for (const p of preserve) lines.push(`- ${p}`);
+  }
+  return lines.join('\n');
+}
+
+export interface RenderReplyDeps {
+  call?: GlueModelCall;
+  personaPrompt?: string;
+}
+
+/* Returns the restyled spoken text, or '' on unavailable/empty (the
+ * caller's renderSpokenAsync then ships the safe render). */
+export async function renderReplyLive(
+  text: string,
+  preserve: string[],
+  deps?: RenderReplyDeps,
+): Promise<string> {
+  const call = deps?.call ?? defaultCall;
+  const persona =
+    deps?.personaPrompt ??
+    buildHaikuPersonaPrompt(getDigest()?.digest ?? null);
+  const system = `${persona}\n\n${renderInstruction(preserve)}`;
+  let out: string | null;
+  try {
+    out = await call({
+      system,
+      user: text,
+      maxTokens: VOICE_RENDER_MAX_TOKENS,
+      temperature: VOICE_RENDER_TEMPERATURE,
+    });
+  } catch {
+    return '';
+  }
+  return out ?? '';
+}
