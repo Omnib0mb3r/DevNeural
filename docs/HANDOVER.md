@@ -9,16 +9,17 @@ reflects what was true at the last update.
 The rule: anyone reading this should start cold and know where the code
 is, what is in flight, what is shippable next, and what blocks it.
 
-Last touched: 2026-06-22. Branch `master`, HEAD `fa2788b`, tree clean.
-Last verified: daemon 1344 green (`cd 07-daemon && npm test`; +2 for the
-doc-index browse endpoint; clean run 1344/1344) and dashboard 143 unit
-green (`cd 08-dashboard && npm test`; +5 buildKnowledgeGraph; the 2
-`e2e/*.spec.ts` Playwright files vitest cannot collect are pre-existing,
-not a regression). The daemon full suite still flakes on a cluster of
-timing/temp-dir specs under concurrent load (sessions-anchor-liveness,
-stale-watcher, smart-compact-injector, loose-ends-gate, etc., none
-touched here; the failing set changes run-to-run); all pass in isolation.
-This session touched daemon + dashboard.
+Last touched: 2026-06-22. Branch `master`, HEAD `3752ef0`, tree clean.
+Last verified: daemon 1362 green (`cd 07-daemon && npm test`; +18 for the
+lifecycle wire: gate probes, stage persistence, routes; clean run
+1362/1362) and dashboard 146 unit green (`cd 08-dashboard && npm test`;
++3 lifecycle-stages; the 2 `e2e/*.spec.ts` Playwright files vitest cannot
+collect are pre-existing, not a regression). The daemon full suite still
+flakes on a cluster of timing/temp-dir specs under concurrent load
+(sessions-anchor-liveness, stale-watcher, smart-compact-injector,
+loose-ends-gate, etc., none touched here; the failing set changes
+run-to-run); all pass in isolation. This session touched daemon +
+dashboard.
 
 ## HARD constraint
 
@@ -104,12 +105,21 @@ Green + committed = "built", not "verified".
 
 ## Follow-on builds landed this session (all ADDITIVE)
 
-- Lifecycle dashboard scaffold (spec item 8): `27b92b8` stage model
-  `07-daemon/src/lex/project-lifecycle.ts`; `630e2a9` migration
-  `045-project-session-stage.sql` (nullable `stage`, NULL on all rows);
-  `4e4c193` static route `08-dashboard/app/projects/lifecycle/page.tsx` +
-  `components/LifecycleRail.tsx`. Stubs only; ProjectsGrid + open-sessions
-  untouched.
+- Lifecycle dashboard, WIRED to real data (DRIVE-QUEUE 3): scaffold was
+  `27b92b8`/`630e2a9`/`4e4c193`. Now: `eeed6c4` runnable gates - the
+  always-false stub replaced by `gateProbe(stage, GateSignals)` (intake /
+  spec doc / tests / test runner / suite green / open bugs),
+  `effectiveStage` (NULL default: live -> execution, else new_project),
+  `gateNeeds` + `lifecycleGreetingLine`, and `project-lifecycle-probes.ts`
+  `gatherGateSignals` (bounded fs walk; suite run is OPT-IN). `c1a141c`
+  routes `GET /lex/lifecycle` (stage + gate + can_advance) and `POST
+  /lex/lifecycle` (state-machine-validated SET, persists the migration-045
+  `stage` column). `c68085e` stage-aware cold-start greeting (appends the
+  supervised project's stage + gate-needs to the first-reply preamble,
+  resolved by the brainstorm anchor's cwd). `3752ef0` dashboard rail wired
+  to `GET /lex/lifecycle` via a project selector; marks the live stage +
+  gate, cold start renders New Project. ProjectsGrid + open-sessions +
+  Stream Deck + KPI strip untouched.
 - Unified Knowledge Index, first slice: `5bea58c` markdown corpus chunker
   `07-daemon/src/lex/markdown-corpus.ts` (walks memory/docs**/brainstorm/
   spec/bugs, chunks by heading, tags {store, path, heading, line, snippet,
@@ -175,6 +185,14 @@ Green + committed = "built", not "verified".
   daemon rebuild, to ship (the daemon serves the static export). Verify:
   open /knowledge, pick DevNeural, see store-grouped file nodes, toggle a
   store chip, click a file -> path + chunk pointers in the side panel.
+- lifecycle (DRIVE-QUEUE 3): daemon `GET/POST /lex/lifecycle` + the
+  stage-aware greeting (`c1a141c`/`c68085e`, Rebuild: yes) go live on the
+  same rebuild; the dashboard rail (`3752ef0`) needs the DASHBOARD build.
+  Verify: open /projects/lifecycle, pick DevNeural -> rail marks the live
+  stage with the gate status (NULL rows default live -> Execution); GET
+  `/lex/lifecycle?cwd=...&run_tests=1` confirms the suite-green gate; a new
+  Lex cold start that supervises a project states the stage on its first
+  reply.
 - live voice (glue 1a `11ecf2f` + digest push & body render 1b `a1d139d`
   / `6a732b2` + truncation fix 1c `4d409c1`, all Rebuild: yes) goes live
   on the same rebuild but ALSO needs both `DEVNEURAL_VOICE_HAIKU=1` and
@@ -203,8 +221,11 @@ Green + committed = "built", not "verified".
   live-haiku slow-lane BRIDGE line (still the deterministic hash pick in
   `pickBridgeLine`), and a richer Lex-authored structured digest (the
   deriver is heuristic first-sentence today).
-- Lifecycle: wire the stage column + real gate exit criteria + stage-aware
-  greeting.
+- Lifecycle (DRIVE-QUEUE 3 DONE: stage persistence, runnable gates,
+  GET/SET routes, stage-aware greeting, live rail). Remaining: auto-advance
+  (a supervisor that advances a stage when can_advance flips true), and
+  richer per-gate probes (execution "plan done" is currently approximated
+  by "a test runner exists"; spec/tdd probes are filesystem heuristics).
 
 ## Working constraints
 
