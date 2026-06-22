@@ -11,6 +11,7 @@ import {
   pushDigest,
   getDigest,
   isDigestFresh,
+  buildVoiceDigest,
   _resetDigest,
   type LexDigest,
 } from '../src/voice/voice-digest.js';
@@ -50,6 +51,50 @@ describe('Lex -> haiku digest', () => {
     expect(isDigestFresh(5_000)).toBe(true);
     expect(isDigestFresh(4_000)).toBe(true);
     expect(isDigestFresh(6_000)).toBe(false); // digest older than last turn
+  });
+});
+
+describe('buildVoiceDigest (DRIVE-QUEUE 1b deriver)', () => {
+  it('derives lastDecision from the first sentence of the reply', () => {
+    const d = buildVoiceDigest(
+      'I landed the live glue. It varies every time now.',
+    );
+    expect(d.lastDecision).toBe('I landed the live glue.');
+  });
+
+  it('extracts the open question when the reply asks one', () => {
+    const d = buildVoiceDigest('Did that build pass? I think so.');
+    expect(d.openQuestion).toBe('Did that build pass?');
+  });
+
+  it('carries prior stable context forward across turns', () => {
+    const prev: LexDigest = {
+      currentTask: 'voice pillar',
+      lastDecision: 'old',
+      openQuestion: 'old q',
+      workerStatus: 'worker mid-build',
+      nextSteps: 'ship it',
+    };
+    const d = buildVoiceDigest('Renderer is wired.', prev);
+    expect(d.currentTask).toBe('voice pillar');
+    expect(d.workerStatus).toBe('worker mid-build');
+    expect(d.nextSteps).toBe('ship it');
+    expect(d.lastDecision).toBe('Renderer is wired.');
+  });
+
+  it('invents nothing without a prior digest (BF-4: reply text is the only input)', () => {
+    const d = buildVoiceDigest('On it.');
+    expect(d.currentTask).toBe('');
+    expect(d.workerStatus).toBe('');
+    expect(d.nextSteps).toBe('');
+  });
+
+  it('feeds the fast lane: pushed deriver output is fresh and in the persona', () => {
+    pushDigest(buildVoiceDigest('Shipped the digest push.'), 2_000);
+    expect(isDigestFresh(2_000)).toBe(true);
+    const d = frontDeskDecision('nice', { lastTurnMs: 2_000 });
+    expect(d.route.lane).toBe('fast');
+    expect(d.personaPrompt).toContain('Shipped the digest push.');
   });
 });
 

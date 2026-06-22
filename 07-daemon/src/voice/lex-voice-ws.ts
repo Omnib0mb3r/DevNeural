@@ -110,6 +110,7 @@ import {
   composeGlueReply,
 } from './voice-haiku-wiring.js';
 import { useVoiceHaiku } from './voice-haiku.js';
+import { pushDigest, getDigest, buildVoiceDigest } from './voice-digest.js';
 
 /* Voice modes drive whether the daemon synthesizes Lex's response
  * out loud. The browser still receives transcript + assistant-text
@@ -637,6 +638,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   /* Last line actually spoken; the haiku fast lane replays it on
    * "say that again" without an Opus round-trip. */
   let lastSpokenText: string | null = null;
+  /* DRIVE-QUEUE 1b: timestamp of Lex's last turn boundary. The live
+   * digest is pushed with this same ms, so isDigestFresh() is true while
+   * the digest tracks the latest turn and goes stale (forcing the fast
+   * lane to queue to Lex) the moment a turn boundary advances without a
+   * matching push. */
+  let lastLexTurnMs = 0;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   /* Fix 40 (2026-05-26): centralise piper synth lifecycle behind a
@@ -1299,6 +1306,24 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * the same Lex turn will run artifacts / attention / large-fs /
      * compaction on the full message text. */
     if (isPreToolAck) return;
+    /* DRIVE-QUEUE 1b: this IS Lex's turn boundary (awaitingResponseSince
+     * was just cleared above). Push a fresh small digest derived from
+     * Lex's synthesized reply so the haiku fast lane / persona speak from
+     * the current moment. BF-4: the only input is fullText, which is
+     * Lex's user-facing reply, never raw transcript. Stamp lastLexTurnMs
+     * first so a push failure leaves the digest stale (fast lane then
+     * queues to Lex rather than answering off a stale digest). Gated +
+     * best-effort: with the flag off nothing here runs, and a throw never
+     * blocks the turn pipeline below. */
+    if (useVoiceHaiku() && fullText && fullText.trim()) {
+      try {
+        const nowMs = Date.now();
+        lastLexTurnMs = nowMs;
+        pushDigest(buildVoiceDigest(fullText, getDigest()?.digest ?? null), nowMs);
+      } catch {
+        /* digest push is best-effort; never block the turn */
+      }
+    }
     /* Slice C: scan the assistant turn for fenced artifact blocks
      * (research-note / wiki-draft / project-intent / notes-summary),
      * persist them, and link the artifact ids into the brainstorm
@@ -2070,6 +2095,23 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         return;
       }
       void speak(`Starting ${projectLabel}.`);
+      /* DRIVE-QUEUE 1b: state change. Push a fresh digest so the fast
+       * lane knows the moment (which project just started) instead of
+       * speaking from a prior turn's stale context. */
+      if (useVoiceHaiku()) {
+        const nowMs = Date.now();
+        lastLexTurnMs = nowMs;
+        pushDigest(
+          {
+            currentTask: `starting ${projectLabel}`,
+            lastDecision: `starting ${projectLabel}`,
+            openQuestion: '',
+            workerStatus: '',
+            nextSteps: '',
+          },
+          nowMs,
+        );
+      }
     } catch (err) {
       void speak(
         `Could not reach the daemon to start ${projectLabel}: ${(err as Error).message}.`,
@@ -2254,12 +2296,14 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * through to the normal Lex inject (rendered on reply by speak()).
      * Flag off: haikuRoute returns null and this whole block is skipped,
      * so the path below is byte-identical. lex-prefixed ops above still
-     * take precedence. assumeDigestFresh: the deterministic fast-lane
-     * glue never reads the digest, so it stays answerable; the
-     * digest-staleness gate engages when a live model answers from digest
-     * content (Lex-authored digest push is a later step). */
+     * take precedence. DRIVE-QUEUE 1b: the fast-lane glue now answers
+     * from the LIVE digest (1a made it model-backed), so the WS no longer
+     * assumes freshness - it passes the real last-turn timestamp. A
+     * digest at/after that boundary is fresh and glue stays on the fast
+     * lane; a stale or absent digest (e.g. before Lex's first reply)
+     * forces the turn to queue to Lex rather than answer off stale facts. */
     if (useVoiceHaiku()) {
-      const dec = haikuRoute(trimmed, { lastTurnMs: 0, assumeDigestFresh: true });
+      const dec = haikuRoute(trimmed, { lastTurnMs: lastLexTurnMs });
       if (dec) {
         if (dec.route.lane === 'control') {
           const c = dec.route.control!;
