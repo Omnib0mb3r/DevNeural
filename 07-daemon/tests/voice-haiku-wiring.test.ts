@@ -187,4 +187,23 @@ describe('renderReplyForSpeech (live-haiku reply render)', () => {
     });
     expect(r).toContain('1205');
   });
+
+  /* DRIVE-QUEUE 1c regression: a long reply must speak to completion. When
+   * the render signals a cut (returns ''), the FULL safe render ships, not
+   * a truncated sentence. */
+  it('flag ON: a long reply speaks in full when the render is cut', async () => {
+    process.env.DEVNEURAL_VOICE_HAIKU = '1';
+    const longReply =
+      'First, the migration landed and the daemon picked it up. ' +
+      'Second, the retrieval layer returns pointer results for every doc. ' +
+      'Third, the voice tier now speaks from the live digest each turn. ' +
+      'Finally, the remaining work is the slow-lane bridge and a richer digest.';
+    const r = await renderReplyForSpeech(longReply, {
+      /* renderReplyLive returns '' on a detected cut; emulate that. */
+      render: async () => '',
+    });
+    /* The whole reply is spoken (safe render), tail included. */
+    expect(r).toContain('slow-lane bridge');
+    expect(r).toContain('First, the migration landed');
+  });
 });

@@ -188,16 +188,50 @@ export async function generateGlueReply(
  *
  * BF-4 (preserved): the only inputs are the persona prompt (which carries
  * ONLY Lex's synthesized digest) + Lex's reply body. No raw content. */
-const VOICE_RENDER_MAX_TOKENS = 512;
 const VOICE_RENDER_TEMPERATURE = 0.4;
+/* DRIVE-QUEUE 1c truncation fix: the cap must never CUT a long reply.
+ * Size max_tokens to the input so the model is not told to stop mid-
+ * reply (a fixed 512 cut long replies off mid-sentence, the "cuts off /
+ * like a timeout" symptom). A spoken restyle is roughly the same length
+ * as the input or shorter; ~chars/4 tokens + a generous margin covers
+ * it. Bounded so a runaway input cannot request an unbounded generation;
+ * past the ceiling the render simply times out and the full safe render
+ * ships (still complete, never truncated). */
+const VOICE_RENDER_MIN_TOKENS = 96;
+const VOICE_RENDER_MAX_TOKENS_CEIL = 2048;
+/* Below this input length truncation is not a risk, so a restyle that
+ * does not end on a sentence boundary is accepted as-is (a short reply
+ * may legitimately have no terminal punctuation). At/above it, an
+ * unterminated restyle is treated as a cut and the full safe render is
+ * shipped instead. */
+const VOICE_RENDER_COMPLETENESS_MIN_CHARS = 280;
+
+function renderMaxTokens(text: string): number {
+  const est = Math.round((Math.ceil(text.length / 4) + 64) * 1.3);
+  return Math.max(
+    VOICE_RENDER_MIN_TOKENS,
+    Math.min(VOICE_RENDER_MAX_TOKENS_CEIL, est),
+  );
+}
+
+/* A complete restyle of a complete reply ends on a sentence boundary.
+ * One that does not (and whose input was long enough for truncation to
+ * matter) was cut by the token cap / an early stop; ship nothing so the
+ * caller falls back to the FULL safe render rather than speak a sentence
+ * that never finishes. */
+function looksTruncated(input: string, out: string): boolean {
+  if (input.trim().length < VOICE_RENDER_COMPLETENESS_MIN_CHARS) return false;
+  return !/[.!?"'’)\]]\s*$/.test(out);
+}
 
 function renderInstruction(preserve: string[]): string {
   const lines = [
     '--- SPOKEN RENDER (you are about to say this out loud) ---',
     'Restyle the message below into warm, natural spoken delivery in your',
-    'own voice: trim connective prose, drop markdown, keep it brief. You',
-    'are a renderer, not a re-thinker - do not add facts, opinions, or',
-    'questions, and do not change meaning. Output ONLY the spoken text.',
+    'own voice: drop markdown, smooth the connective prose. You are a',
+    'renderer, not a re-thinker - say ALL of it, do not summarize, omit,',
+    'or cut it short; do not add facts, opinions, or questions, and do not',
+    'change meaning. Output ONLY the spoken text, in full.',
   ];
   if (preserve.length > 0) {
     lines.push(
@@ -231,11 +265,17 @@ export async function renderReplyLive(
     out = await call({
       system,
       user: text,
-      maxTokens: VOICE_RENDER_MAX_TOKENS,
+      maxTokens: renderMaxTokens(text),
       temperature: VOICE_RENDER_TEMPERATURE,
     });
   } catch {
     return '';
   }
-  return out ?? '';
+  const trimmed = (out ?? '').trim();
+  if (!trimmed) return '';
+  /* Truncation backstop: never speak a long reply that was cut short.
+   * If it does not end on a sentence boundary, fall back to the full
+   * safe render. */
+  if (looksTruncated(text, trimmed)) return '';
+  return trimmed;
 }

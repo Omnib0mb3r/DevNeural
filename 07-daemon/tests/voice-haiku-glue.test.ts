@@ -184,4 +184,46 @@ describe('renderReplyLive', () => {
     };
     expect(await renderReplyLive('x', [], { call })).toBe('');
   });
+
+  /* DRIVE-QUEUE 1c: the render must never CUT a long reply. A genuinely
+   * long reply (~2.5k chars) is what the old fixed 512-token cap cut off
+   * mid-sentence. */
+  const LONG = (
+    'Here is the full status of the build. The migration landed and the ' +
+    'daemon picked it up cleanly. The retrieval layer now returns pointer ' +
+    'results for every project doc, and the voice tier speaks from the live ' +
+    'digest on each turn. '
+  ).repeat(7).trim();
+
+  it('sizes max_tokens to the input so a long reply is not told to stop early', async () => {
+    let seenMax = 0;
+    const call: GlueModelCall = async (i) => {
+      seenMax = i.maxTokens;
+      return `${LONG} It is done.`;
+    };
+    await renderReplyLive(LONG, [], { call });
+    /* Old fixed cap was 512 and cut this off; the cap must now exceed it
+     * and comfortably cover the input's own token estimate. */
+    expect(seenMax).toBeGreaterThan(512);
+    expect(seenMax).toBeGreaterThanOrEqual(Math.ceil(LONG.length / 4));
+  });
+
+  it('drops a long restyle that does not end on a sentence boundary (cut)', async () => {
+    /* Simulate a max_tokens cut: a long input, output stops mid-sentence. */
+    const call: GlueModelCall = async () => `${LONG} and then it sudden`;
+    const out = await renderReplyLive(LONG, [], { call });
+    expect(out).toBe(''); // signals the caller to ship the full safe render
+  });
+
+  it('keeps a long restyle that completes on a sentence boundary', async () => {
+    const call: GlueModelCall = async () => `${LONG} That is everything.`;
+    const out = await renderReplyLive(LONG, [], { call });
+    expect(out).toBe(`${LONG} That is everything.`);
+  });
+
+  it('does not over-trigger the completeness guard on short replies', async () => {
+    /* A short reply may legitimately lack terminal punctuation. */
+    const call: GlueModelCall = async () => 'on it';
+    expect(await renderReplyLive('ok', [], { call })).toBe('on it');
+  });
 });
