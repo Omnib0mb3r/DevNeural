@@ -7,6 +7,14 @@ import { VectorStore } from './vector-store.js';
 import { IndexDb } from './index-db.js';
 import { getEmbedDim } from '../embedder/index.js';
 
+/* Unified Knowledge Index marker. Markdown-corpus chunks share the
+ * raw_chunks collection but carry this kind so every pre-existing
+ * raw_chunks consumer (search-all, curator fallback, backfill verify)
+ * can opt OUT of them. project-doc chunks never enter raw_chunks_meta
+ * (SQL), so the cull job and the brainstorm session-id join never see
+ * them; isolation is purely via this kind + project_id. */
+export const PROJECT_DOC_KIND = 'project-doc';
+
 export interface RawChunkMetadata {
   project_id: string;
   session_id: string;
@@ -24,6 +32,15 @@ export interface RawChunkMetadata {
   brainstorm_id?: string;
   brainstorm_mode?: string;
   end_reason?: string;
+  /* Project-doc (Unified Knowledge Index) pointer fields, populated
+   * only on chunks of kind PROJECT_DOC_KIND. doc_store is the logical
+   * store label (memory/docs/brainstorm/spec/bugs/global); the rest
+   * reconstruct a precise file pointer for recall results. The chunk's
+   * snippet rides on the shared text_preview field. */
+  doc_store?: string;
+  doc_path?: string;
+  doc_heading?: string;
+  doc_line?: number;
 }
 
 export interface WikiPageMetadata {
