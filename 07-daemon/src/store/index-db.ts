@@ -422,6 +422,12 @@ export interface ProjectSessionRow {
    * tries to act on a session another instance is already owning. */
   auto_advance_owner?: string | null;
   auto_advance_epoch?: number;
+  /* Lifecycle stage (migration 045). NULL = unset; the lifecycle module
+   * (07-daemon/src/lex/project-lifecycle.ts) resolves an effective stage
+   * for NULL rows (live -> execution, else new_project). Validated values:
+   * new_project | spec | tdd | execution | test | bug_handling. Read via
+   * SELECT *, written via updateProjectSession({ stage }). */
+  stage?: string | null;
 }
 
 export interface AutoAdvanceLogRow {
