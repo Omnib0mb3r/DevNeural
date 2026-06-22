@@ -9,17 +9,13 @@ reflects what was true at the last update.
 The rule: anyone reading this should start cold and know where the code
 is, what is in flight, what is shippable next, and what blocks it.
 
-Last touched: 2026-06-22. Branch `master`, HEAD `3752ef0`, tree clean.
-Last verified: daemon 1362 green (`cd 07-daemon && npm test`; +18 for the
-lifecycle wire: gate probes, stage persistence, routes; clean run
-1362/1362) and dashboard 146 unit green (`cd 08-dashboard && npm test`;
-+3 lifecycle-stages; the 2 `e2e/*.spec.ts` Playwright files vitest cannot
-collect are pre-existing, not a regression). The daemon full suite still
-flakes on a cluster of timing/temp-dir specs under concurrent load
-(sessions-anchor-liveness, stale-watcher, smart-compact-injector,
-loose-ends-gate, etc., none touched here; the failing set changes
-run-to-run); all pass in isolation. This session touched daemon +
-dashboard.
+Last touched: 2026-06-22. Branch `master`, HEAD `6dc14d2`, tree clean.
+Last verified: daemon 1388 green (`cd 07-daemon && npm test`; +26 for
+smart-clear: trigger, report+artifacts, vet gate, trail-confirm; one run
+flaked only on sessions-anchor-liveness, which passes 4/4 in isolation -
+the known timing/temp-dir cluster, none touched here). dashboard 146 unit
+green (the 2 `e2e/*.spec.ts` Playwright files vitest cannot collect are
+pre-existing, not a regression). This session touched daemon only.
 
 ## HARD constraint
 
@@ -120,6 +116,22 @@ Green + committed = "built", not "verified".
   to `GET /lex/lifecycle` via a project selector; marks the live stage +
   gate, cold start renders New Project. ProjectsGrid + open-sessions +
   Stream Deck + KPI strip untouched.
+- Smart-clear automation (DRIVE-QUEUE 4, spec 2b): auto context-full
+  wind-down on the investigator engine. `f990f2c` trigger
+  (`07-daemon/src/lex/smart-clear.ts` config: `smart_clear_mode`
+  off|shadow|live default off, threshold 40% / ceiling 60% adjustable;
+  `evaluateSmartClearTrigger` idle/wind-down/force-stop; GET
+  `/lex/smart-clear/state` + GET/POST `/config`). `d401563`
+  `assembleSmartClearReport` (broad sweep via `assembleInvestigatorContext`
+  + the two artifacts: `draftStoppingPoint` commit-first-when-dirty /
+  after-commit-never-mid-edit, `draftReseed` adaptive sufficiency = HEAD +
+  doing/next/decisions, not a transcript). `b4f2f3f` `vetReseed` gate
+  (verified state + next + not-a-dump; the daemon never blind-injects).
+  `6dc14d2` `confirmResumeOnTask` trail probe + POST `/lex/smart-clear/plan`
+  (assemble + vet, never inject) + POST `/confirm` + audit rows. Division
+  of labor: daemon ASSEMBLES/LOGS/gates, Lex DECIDES/FIRES (stop -> worker
+  commits + /clears -> Lex /lex/smart-compact/clear-and-paste with the
+  VETTED reseed -> trail-confirm). Inert until `smart_clear_mode` flipped.
 - Unified Knowledge Index, first slice: `5bea58c` markdown corpus chunker
   `07-daemon/src/lex/markdown-corpus.ts` (walks memory/docs**/brainstorm/
   spec/bugs, chunks by heading, tags {store, path, heading, line, snippet,
@@ -205,6 +217,14 @@ Green + committed = "built", not "verified".
   completion (no mid-sentence cut, the 1c symptom); (4) "stop"/"quiet"
   still cut instantly with no model latency, including a barge while a
   body is mid-render.
+- smart-clear (DRIVE-QUEUE 4, `f990f2c`/`d401563`/`b4f2f3f`/`6dc14d2`, all
+  Rebuild: yes for the routes) goes live on the same rebuild but stays
+  inert until `POST /lex/smart-clear/config {mode:'live'}`. Default off =
+  no behavior change. The actual stop/clear/reseed/trail loop is LEX'S job
+  at runtime (poll /state -> /plan -> vet -> drive stop -> clear-and-paste
+  -> /confirm); the daemon only assembles/gates/logs. Verify with mode
+  live: at ~40% worker ctx /state returns wind-down; /plan returns a
+  commit-first stop when dirty + a vetting reseed.
 
 ## Next up (not started)
 
@@ -226,6 +246,14 @@ Green + committed = "built", not "verified".
   (a supervisor that advances a stage when can_advance flips true), and
   richer per-gate probes (execution "plan done" is currently approximated
   by "a test runner exists"; spec/tdd probes are filesystem heuristics).
+- Smart-clear (DRIVE-QUEUE 4 DONE: trigger, report+artifacts, vet gate,
+  trail-confirm, routes - the daemon primitives). Remaining: the LIVE Lex
+  driver loop (Lex polling /state, calling /plan, vetting, driving stop ->
+  clear-and-paste -> /confirm) is Lex's runtime prompt/skill, not built
+  here; plus the optional Opus refinement of the reseed draft (the deter-
+  ministic draft + Lex's vet/tighten is the floor) and a dashboard panel.
+  Rename smart-compact -> smart-clear across the old surface is still
+  queued (the new module is additive alongside it).
 
 ## Working constraints
 
