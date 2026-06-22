@@ -5077,6 +5077,24 @@ export async function registerDashboardRoutes(
         perSessionGenerator,
       });
       preamble = formatColdStartPreamble(preloadSummary);
+      /* DRIVE-QUEUE 3: stage-aware greeting. When this brainstorm anchor
+       * supervises a project, append the project's current lifecycle
+       * stage + what the gate needs next so Lex states it on its first
+       * reply. Additive + observational: a missing anchor / project / any
+       * throw leaves the preamble exactly as the distillation built it. */
+      try {
+        /* cwd is the documented unique join key between a brainstorm
+         * anchor and its project_session row. */
+        const ps = bs.cwd ? store.db.getProjectSessionByCwd(bs.cwd) : null;
+        if (ps) {
+          const { lifecycleGreetingLine } = await import(
+            '../lex/project-lifecycle.js'
+          );
+          preamble = `${preamble}\n${lifecycleGreetingLine(ps)}`;
+        }
+      } catch {
+        /* observational; never block the cold-start path */
+      }
       recordPreloadEvent(
         buildPreloadEventLogRow({
           brainstormId: bs.id,
