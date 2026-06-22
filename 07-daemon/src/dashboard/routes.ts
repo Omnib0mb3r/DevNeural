@@ -2313,6 +2313,114 @@ export async function registerDashboardRoutes(
     };
   });
 
+  /* DRIVE-QUEUE 3: project lifecycle stage. GET resolves a project's
+   * effective stage (NULL rows default: live -> execution, else
+   * new_project) + the RUNNABLE gate probe for that stage. Cheap fs
+   * probes by default; pass run_tests=1 to actually run the suite for
+   * the test / bug_handling gate (skipped otherwise so a GET never kicks
+   * off a multi-minute build). Resolve by project_session_id or by cwd
+   * (an unregistered cwd is treated as a dormant cold start). */
+  app.get('/lex/lifecycle', async (req, reply) => {
+    const qp = req.query as {
+      project_session_id?: string;
+      cwd?: string;
+      run_tests?: string;
+    };
+    const lifecycle = await import('../lex/project-lifecycle.js');
+    const { gatherGateSignals } = await import(
+      '../lex/project-lifecycle-probes.js'
+    );
+    let row = null as ReturnType<typeof store.db.getProjectSession>;
+    if (qp.project_session_id) {
+      row = store.db.getProjectSession(qp.project_session_id);
+    } else if (qp.cwd) {
+      row = store.db.getProjectSessionByCwd(qp.cwd.replace(/\\/g, '/'));
+    }
+    const cwd = (row?.cwd ?? qp.cwd ?? '').replace(/\\/g, '/');
+    if (!row && !cwd) {
+      reply.code(400);
+      return { ok: false, error: 'project_session_id or cwd required' };
+    }
+    const stageRow = row ?? { stage: null, status: 'dormant', cwd };
+    const stage = lifecycle.effectiveStage(stageRow);
+    const signals = cwd
+      ? gatherGateSignals(cwd, { runTests: qp.run_tests === '1' })
+      : {
+          hasIntake: false,
+          hasSpecDoc: false,
+          hasTests: false,
+          hasTestRunner: false,
+          suiteGreen: null,
+          openBugs: null,
+        };
+    const gate = lifecycle.gateProbe(stage, signals);
+    const next = lifecycle.nextStage(stage);
+    return {
+      ok: true,
+      project_session_id: row?.id ?? null,
+      cwd,
+      stage,
+      stage_label: lifecycle.STAGE_LABEL[stage],
+      gate,
+      can_advance: gate.satisfied && next !== null,
+      next_stage: next,
+      next_label: next ? lifecycle.STAGE_LABEL[next] : null,
+      needs: lifecycle.gateNeeds(stage),
+      signals,
+    };
+  });
+
+  /* SET a project's stage. POST /lex/lifecycle { project_session_id |
+   * cwd, stage, force? }. The state machine validates the transition:
+   * setting the current effective stage is idempotent (initializes a
+   * NULL row); any other change must be a legal forward / rework
+   * transition unless force=true (operator override). Persists via the
+   * existing project_session.stage column. */
+  app.post('/lex/lifecycle', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      project_session_id?: string;
+      cwd?: string;
+      stage?: string;
+      force?: boolean;
+    };
+    const lifecycle = await import('../lex/project-lifecycle.js');
+    if (!lifecycle.isProjectStage(body.stage)) {
+      reply.code(400);
+      return { ok: false, error: 'valid stage required' };
+    }
+    const row = body.project_session_id
+      ? store.db.getProjectSession(body.project_session_id)
+      : body.cwd
+        ? store.db.getProjectSessionByCwd(body.cwd.replace(/\\/g, '/'))
+        : null;
+    if (!row) {
+      reply.code(404);
+      return {
+        ok: false,
+        error: 'no project_session for the given id / cwd',
+      };
+    }
+    const from = lifecycle.effectiveStage(row);
+    const to = body.stage;
+    if (to !== from && !body.force && !lifecycle.canTransition(from, to)) {
+      reply.code(409);
+      return {
+        ok: false,
+        error: `illegal transition ${from} -> ${to}`,
+        from,
+        allowed: lifecycle.STAGE_TRANSITIONS[from],
+      };
+    }
+    store.db.updateProjectSession(row.id, { stage: to });
+    return {
+      ok: true,
+      project_session_id: row.id,
+      stage: to,
+      stage_label: lifecycle.STAGE_LABEL[to],
+      previous: from,
+    };
+  });
+
   /* Slice E: Lex supervisor primitives. /lex/steer wraps ptyInject
    * so Lex can direct a worker session by either session_id or
    * pty_id without going through the lower-level /sessions or /pty
