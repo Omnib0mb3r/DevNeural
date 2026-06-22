@@ -1383,6 +1383,39 @@ export const createProject = (input: {
     { method: "POST", body: input },
   );
 
+// ── knowledge index (doc browse, DRIVE-QUEUE 2B) ────────────────
+export interface DocChunkPointer {
+  heading: string;
+  line: number;
+  snippet: string;
+}
+export interface DocFile {
+  store: string;
+  path: string;
+  name: string;
+  chunks: DocChunkPointer[];
+}
+export interface DocIndexResponse {
+  ok: boolean;
+  project_id: string;
+  total_files: number;
+  total_chunks: number;
+  files: DocFile[];
+}
+/** Browse the project-doc knowledge index for one project (strict-scoped
+ * by the daemon). Returns an empty payload on any failure so the orb
+ * renders an empty state instead of throwing. */
+export const docIndex = (projectId: string) =>
+  request<DocIndexResponse>(
+    `/lex/doc-index?project_id=${encodeURIComponent(projectId)}`,
+  ).catch(() => ({
+    ok: false,
+    project_id: projectId,
+    total_files: 0,
+    total_chunks: 0,
+    files: [] as DocFile[],
+  }));
+
 // ── graph (orb) ────────────────────────────────────────────────
 export type GraphNodeStatus = "canonical" | "pending" | "archived";
 export interface GraphNode {

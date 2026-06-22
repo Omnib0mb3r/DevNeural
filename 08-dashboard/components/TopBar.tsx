@@ -27,6 +27,7 @@ const TABS = [
   { href: "/reminders",   label: "Reminders",      icon: "BellRing" as const },
   { href: "/system",      label: "System",         icon: "Cpu" as const },
   { href: "/orb",         label: "Knowledge map",  icon: "Brain" as const },
+  { href: "/knowledge",   label: "Knowledge index", icon: "Library" as const },
   { href: "/lex",         label: "Lex",            icon: "Bot" as const },
   { href: "/help",        label: "Help",           icon: "BookOpen" as const },
 ];
