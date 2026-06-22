@@ -343,6 +343,47 @@ export class VectorStore<M = Record<string, unknown>> {
   }
 
   /**
+   * Remove every record whose metadata matches `pred`. Returns the count
+   * removed. Single O(n) filtering pass that rebuilds the id index, so a
+   * bulk delete (e.g. all chunks of one file) is one rebuild, not N
+   * splices. Marks the store dirty; the next flush rewrites .vec +
+   * .meta.jsonl from the surviving in-memory state, so the deletion is
+   * durable (the append-only meta sidecar is reconciled on flush). Used
+   * by the incremental knowledge-index re-indexer to drop a changed or
+   * deleted file's stale chunks before re-adding fresh ones.
+   */
+  deleteWhere(pred: (metadata: M, id: string) => boolean): number {
+    const keepVectors: Float32Array[] = [];
+    const keepMetadata: M[] = [];
+    const keepIds: string[] = [];
+    let removed = 0;
+    for (let i = 0; i < this.ids.length; i++) {
+      const id = this.ids[i] ?? '';
+      const m = this.metadata[i] as M;
+      const v = this.vectors[i];
+      if (!v) continue;
+      if (pred(m, id)) {
+        removed += 1;
+        continue;
+      }
+      keepVectors.push(v);
+      keepMetadata.push(m);
+      keepIds.push(id);
+    }
+    if (removed > 0) {
+      this.vectors = keepVectors;
+      this.metadata = keepMetadata;
+      this.ids = keepIds;
+      this.idToIndex.clear();
+      for (let i = 0; i < keepIds.length; i++) {
+        this.idToIndex.set(keepIds[i]!, i);
+      }
+      this.dirty = true;
+    }
+    return removed;
+  }
+
+  /**
    * Iterate metadata. Useful for SQLite reindexing.
    */
   *all(): IterableIterator<{ id: string; metadata: M }> {

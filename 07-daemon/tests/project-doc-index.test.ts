@@ -15,6 +15,8 @@ import {
   docChunkId,
   indexProjectDocs,
   projectDocSearch,
+  reindexDocFile,
+  removeDocFile,
   type DocIndexDeps,
 } from '../src/lex/project-doc-index.js';
 import type { CorpusDeps } from '../src/lex/markdown-corpus.js';
@@ -251,5 +253,100 @@ describe('projectDocSearch', () => {
       },
     );
     expect(res.hits).toEqual([]);
+  });
+});
+
+describe('incremental re-index (DRIVE-QUEUE 2 watcher core)', () => {
+  it('a changed file re-indexes: stale chunks gone, fresh chunks present', async () => {
+    const p = '/proj/docs/a.md';
+    /* v1: two sections (lines 1 and 3). */
+    let body = '# Haiku\nhaiku one\n## Voice\nvoice two';
+    const deps = {
+      ...fakeDeps,
+      readFile: (q: string) => (q === p ? body : null),
+    };
+    await reindexDocFile(store, { project_id: 'proj', store: 'docs', path: p }, deps);
+    expect(vs.size()).toBe(2);
+    expect(vs.has(docChunkId('proj', p, 1))).toBe(true);
+    expect(vs.has(docChunkId('proj', p, 3))).toBe(true);
+
+    /* v2: file shrank to a single section. The old line-3 chunk must be
+     * dropped, not left dangling. */
+    body = '# Haiku\nhaiku rewritten and longer now';
+    const r = await reindexDocFile(
+      store,
+      { project_id: 'proj', store: 'docs', path: p },
+      deps,
+    );
+    expect(r.removed).toBe(2);
+    expect(r.added).toBe(1);
+    expect(vs.size()).toBe(1);
+    expect(vs.has(docChunkId('proj', p, 1))).toBe(true);
+    expect(vs.has(docChunkId('proj', p, 3))).toBe(false); // stale chunk gone
+  });
+
+  it("a deleted file's chunks are removed", async () => {
+    const p = '/proj/docs/gone.md';
+    let body: string | null = '# Recall\nrecall corpus to be deleted';
+    const deps = {
+      ...fakeDeps,
+      readFile: (q: string) => (q === p ? body : null),
+    };
+    await reindexDocFile(store, { project_id: 'proj', store: 'docs', path: p }, deps);
+    expect(vs.size()).toBe(1);
+
+    body = null; // file deleted
+    const r = await reindexDocFile(
+      store,
+      { project_id: 'proj', store: 'docs', path: p },
+      deps,
+    );
+    expect(r.removed).toBe(1);
+    expect(r.added).toBe(0);
+    expect(vs.size()).toBe(0);
+    const hits = await projectDocSearch(store, 'recall', { project_id: 'proj' }, fakeDeps);
+    expect(hits.hits).toEqual([]);
+  });
+
+  it('removeDocFile is strictly project + path scoped', async () => {
+    const shared = fakeFs({
+      '/A/docs/x.md': '# A\nhaiku in A',
+      '/B/docs/y.md': '# B\nhaiku in B',
+    });
+    await indexProjectDocs(
+      store,
+      { project_id: 'A', stores: [{ store: 'docs', dir: '/A/docs' }] },
+      { ...fakeDeps, corpus: shared },
+    );
+    await indexProjectDocs(
+      store,
+      { project_id: 'B', stores: [{ store: 'docs', dir: '/B/docs' }] },
+      { ...fakeDeps, corpus: shared },
+    );
+    expect(vs.size()).toBe(2);
+    /* Removing A's file leaves B untouched. */
+    const removed = removeDocFile(store, 'A', '/A/docs/x.md');
+    expect(removed).toBe(1);
+    expect(vs.size()).toBe(1);
+    const aHits = await projectDocSearch(store, 'haiku', { project_id: 'A' }, fakeDeps);
+    expect(aHits.hits).toEqual([]);
+    const bHits = await projectDocSearch(store, 'haiku', { project_id: 'B' }, fakeDeps);
+    expect(bHits.hits.length).toBe(1);
+    expect(bHits.hits[0]!.path).toBe('/B/docs/y.md');
+  });
+
+  it('re-indexing a path for project A never removes project B chunks at the same path', async () => {
+    const p = '/shared/docs/same.md';
+    const body = '# Title\nhaiku shared path';
+    const deps = { ...fakeDeps, readFile: (q: string) => (q === p ? body : null) };
+    await reindexDocFile(store, { project_id: 'A', store: 'docs', path: p }, deps);
+    await reindexDocFile(store, { project_id: 'B', store: 'docs', path: p }, deps);
+    expect(vs.size()).toBe(2); // one per project, same path
+    /* Re-index A's copy: B's copy at the same path must survive. */
+    const r = await reindexDocFile(store, { project_id: 'A', store: 'docs', path: p }, deps);
+    expect(r.removed).toBe(1); // only A's
+    expect(vs.size()).toBe(2);
+    expect(vs.has(docChunkId('A', p, 1))).toBe(true);
+    expect(vs.has(docChunkId('B', p, 1))).toBe(true);
   });
 });

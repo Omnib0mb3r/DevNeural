@@ -24,10 +24,12 @@
  * the indexer + query can be unit-tested against a fake embedder and an
  * in-memory VectorStore, with no Xenova model load.
  */
+import * as nodeFs from 'node:fs';
 import { embedOne, embedMany } from '../embedder/index.js';
 import { PROJECT_DOC_KIND } from '../store/index.js';
 import type { Store } from '../store/index.js';
 import {
+  chunkMarkdown,
   collectMarkdownCorpus,
   type CorpusChunk,
   type CorpusDeps,
@@ -90,6 +92,51 @@ export interface DocPointerSearchResult {
   total_scanned: number;
 }
 
+/* Embed a set of corpus chunks and write them to raw_chunks under
+ * PROJECT_DOC_KIND with deterministic ids (add upserts by id). Shared by
+ * the full indexer and the incremental per-file re-indexer. Returns the
+ * count written + the distinct file set touched. */
+async function embedAndAddChunks(
+  store: Store,
+  projectId: string,
+  chunks: CorpusChunk[],
+  embedManyFn: (texts: string[]) => Promise<Float32Array[]>,
+): Promise<{ indexed: number; files: Set<string> }> {
+  const files = new Set<string>();
+  let indexed = 0;
+  for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
+    const batch = chunks.slice(i, i + EMBED_BATCH);
+    const vecs = await embedManyFn(
+      batch.map((c) => c.text.slice(0, EMBED_TEXT_CAP)),
+    );
+    for (let j = 0; j < batch.length; j++) {
+      const chunk = batch[j]!;
+      const vec = vecs[j];
+      if (!vec) continue;
+      files.add(chunk.path);
+      await store.rawChunks.add({
+        id: docChunkId(projectId, chunk.path, chunk.line),
+        vector: vec,
+        metadata: {
+          project_id: projectId,
+          session_id: `${PROJECT_DOC_KIND}:${projectId}`,
+          timestamp_ms: Date.now(),
+          kind: PROJECT_DOC_KIND,
+          role: 'doc',
+          byte_length: chunk.text.length,
+          text_preview: chunk.snippet,
+          doc_store: chunk.store,
+          doc_path: chunk.path,
+          doc_heading: chunk.heading,
+          doc_line: chunk.line,
+        },
+      });
+      indexed += 1;
+    }
+  }
+  return { indexed, files };
+}
+
 /* Embed corpus chunks for ONE project and write them to raw_chunks under
  * PROJECT_DOC_KIND. Returns the count written. Idempotent: deterministic
  * ids mean a second run over an unchanged corpus rewrites in place. */
@@ -114,39 +161,12 @@ export async function indexProjectDocs(
     };
   }
 
-  const files = new Set<string>();
-  let indexed = 0;
-
-  for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
-    const batch = chunks.slice(i, i + EMBED_BATCH);
-    const vecs = await embedManyFn(
-      batch.map((c) => c.text.slice(0, EMBED_TEXT_CAP)),
-    );
-    for (let j = 0; j < batch.length; j++) {
-      const chunk = batch[j]!;
-      const vec = vecs[j];
-      if (!vec) continue;
-      files.add(chunk.path);
-      await store.rawChunks.add({
-        id: docChunkId(params.project_id, chunk.path, chunk.line),
-        vector: vec,
-        metadata: {
-          project_id: params.project_id,
-          session_id: `${PROJECT_DOC_KIND}:${params.project_id}`,
-          timestamp_ms: Date.now(),
-          kind: PROJECT_DOC_KIND,
-          role: 'doc',
-          byte_length: chunk.text.length,
-          text_preview: chunk.snippet,
-          doc_store: chunk.store,
-          doc_path: chunk.path,
-          doc_heading: chunk.heading,
-          doc_line: chunk.line,
-        },
-      });
-      indexed += 1;
-    }
-  }
+  const { indexed, files } = await embedAndAddChunks(
+    store,
+    params.project_id,
+    chunks,
+    embedManyFn,
+  );
 
   return {
     project_id: params.project_id,
@@ -154,6 +174,75 @@ export async function indexProjectDocs(
     files: files.size,
     embed_ms: Date.now() - t0,
   };
+}
+
+/* Drop every indexed chunk for one file path, project-scoped. Returns the
+ * count removed. Strict scope: only this project's chunks for this exact
+ * path are touched. */
+export function removeDocFile(
+  store: Store,
+  projectId: string,
+  path: string,
+): number {
+  return store.rawChunks.deleteWhere(
+    (m) =>
+      m.kind === PROJECT_DOC_KIND &&
+      m.project_id === projectId &&
+      m.doc_path === path,
+  );
+}
+
+export interface ReindexDocFileResult {
+  project_id: string;
+  path: string;
+  /** Stale chunks dropped (old line-keyed ids that may no longer exist). */
+  removed: number;
+  /** Fresh chunks embedded + added. 0 when the file was deleted/empty. */
+  added: number;
+}
+
+/* Incrementally re-index ONE markdown file: delete its old chunks, then
+ * (if it still exists with content) re-chunk + embed + add fresh. A
+ * deleted or emptied file just removes. Deleting first then re-adding by
+ * line-keyed id is what clears stale chunks for lines that disappeared
+ * when the file shrank. Strict project scope is preserved by stamping
+ * params.project_id on every fresh chunk. */
+export async function reindexDocFile(
+  store: Store,
+  params: { project_id: string; store: string; path: string },
+  deps?: Partial<DocIndexDeps> & { readFile?: (p: string) => string | null },
+): Promise<ReindexDocFileResult> {
+  const embedManyFn = deps?.embedMany ?? embedMany;
+  const readFile =
+    deps?.readFile ?? deps?.corpus?.readFile ?? defaultReadFile;
+
+  const removed = removeDocFile(store, params.project_id, params.path);
+
+  const body = readFile(params.path);
+  if (!body || !body.trim()) {
+    return { project_id: params.project_id, path: params.path, removed, added: 0 };
+  }
+  const chunks = chunkMarkdown(params.store, params.path, body);
+  const { indexed } = await embedAndAddChunks(
+    store,
+    params.project_id,
+    chunks,
+    embedManyFn,
+  );
+  return {
+    project_id: params.project_id,
+    path: params.path,
+    removed,
+    added: indexed,
+  };
+}
+
+function defaultReadFile(p: string): string | null {
+  try {
+    return nodeFs.readFileSync(p, 'utf8');
+  } catch {
+    return null;
+  }
 }
 
 /* Strictly project-scoped semantic search over project-doc chunks.
