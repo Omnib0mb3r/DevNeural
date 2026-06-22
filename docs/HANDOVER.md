@@ -9,13 +9,13 @@ reflects what was true at the last update.
 The rule: anyone reading this should start cold and know where the code
 is, what is in flight, what is shippable next, and what blocks it.
 
-Last touched: 2026-06-22. Branch `master`, HEAD `6dc14d2`, tree clean.
-Last verified: daemon 1388 green (`cd 07-daemon && npm test`; +26 for
-smart-clear: trigger, report+artifacts, vet gate, trail-confirm; one run
-flaked only on sessions-anchor-liveness, which passes 4/4 in isolation -
-the known timing/temp-dir cluster, none touched here). dashboard 146 unit
-green (the 2 `e2e/*.spec.ts` Playwright files vitest cannot collect are
-pre-existing, not a regression). This session touched daemon only.
+Last touched: 2026-06-22. Branch `master`, HEAD `baa4c53`, tree clean.
+Last verified: daemon 1407 green (`cd 07-daemon && npm test`; clean
+1407/1407, +19 for the intelligence-pillar first slices). dashboard 146
+unit green (the 2 `e2e/*.spec.ts` Playwright files vitest cannot collect
+are pre-existing, not a regression). DRIVE-QUEUE complete (items 1-5 all
+shipped); the only remaining step is the operator's daemon rebuild +
+restart + verify. This session touched daemon only.
 
 ## HARD constraint
 
@@ -132,6 +132,19 @@ Green + committed = "built", not "verified".
   of labor: daemon ASSEMBLES/LOGS/gates, Lex DECIDES/FIRES (stop -> worker
   commits + /clears -> Lex /lex/smart-compact/clear-and-paste with the
   VETTED reseed -> trail-confirm). Inert until `smart_clear_mode` flipped.
+- Intelligence pillars, first slices (DRIVE-QUEUE 5, EXPLORATORY): all
+  PURE + additive, no caller yet (zero live behavior change, no flag
+  needed). `111723c` (a) `07-daemon/src/lex/standards-store.ts` -
+  proposeStandards emits CANDIDATE meta-rules (same trade-off chosen >= 3x)
+  + contradiction flags from memory records; never auto-applied
+  (Lex/human confirm). `f0df95b` (b) `trajectory-check.ts`
+  predictNextObstacle at a commit boundary -> stuck-loop /
+  schema-needs-migration / approaching-unresolved-decision, surfaced only.
+  `baa4c53` (c) `confidence-gate.ts` tagConfidence + gateClaim: a
+  below-threshold claim routes to VERIFY via the fact-validator (cited SHA
+  exists / count matches) before asserting. Each is one small module + its
+  own tests; live wiring (investigator pass, supervision boundary,
+  speak-path gate) is future work.
 - Unified Knowledge Index, first slice: `5bea58c` markdown corpus chunker
   `07-daemon/src/lex/markdown-corpus.ts` (walks memory/docs**/brainstorm/
   spec/bugs, chunks by heading, tags {store, path, heading, line, snippet,
