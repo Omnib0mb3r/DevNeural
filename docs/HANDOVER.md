@@ -9,15 +9,15 @@ reflects what was true at the last update.
 The rule: anyone reading this should start cold and know where the code
 is, what is in flight, what is shippable next, and what blocks it.
 
-Last touched: 2026-06-22. Branch `master`, HEAD `6a732b2`, tree clean.
-Last verified: daemon 1327 tests green (`cd 07-daemon && npm test`;
-+19 voice 1b: +5 digest deriver, +10 render primitive, +4 controller
-render hook). The full suite flakes on a cluster of timing/temp-dir specs
-under concurrent load (auto-advance-supervisor, stale-watcher, smart-
-compact-injector, loose-ends-gate, etc., none touched here); both this
-session's runs went green on re-run (1327/1327). dashboard 138 unit green
-(2 `e2e/*.spec.ts` are pre-existing Playwright specs vitest cannot
-collect, not a regression). This session touched daemon only.
+Last touched: 2026-06-22. Branch `master`, HEAD `1ec8aab`, tree clean.
+Last verified: daemon 1332 tests green (`cd 07-daemon && npm test`; +5
+voice 1c truncation fix). The full suite flakes on a cluster of timing/
+temp-dir specs under concurrent load (auto-advance-supervisor, stale-
+watcher, smart-compact-injector, loose-ends-gate, grooming-watch, etc.,
+none touched here; the failing set changes run-to-run); all 10 pass in
+isolation (90/90) and the suite is 1332/1332 uncontended. dashboard 138
+unit green (2 `e2e/*.spec.ts` are pre-existing Playwright specs vitest
+cannot collect, not a regression). This session touched daemon only.
 
 ## HARD constraint
 
@@ -83,6 +83,17 @@ Green + committed = "built", not "verified".
     preserve span (number/decision/negation) or any miss ships the safe
     markdown-strip render, so meaning can never change and audio is never
     lost.
+- Mid-reply truncation FIXED (DRIVE-QUEUE 1c, `4d409c1` + doc `1ec8aab`):
+  the 1b render called the model with a fixed `max_tokens: 512`, cutting
+  long replies off mid-sentence (the verbatim guard only catches dropped
+  preserve spans, so a truncated prose tail shipped). `renderReplyLive`
+  now sizes `max_tokens` to the input and adds a completeness backstop
+  (an unterminated long restyle returns '' -> full safe render). Verified
+  it is the ONLY length-bounding step in the speak path (piper / sanitize
+  / selectTtsContent body / Fix-51 controller are all unbounded). Doc:
+  `docs/bugs/2026-06-22-mid-reply-tts-truncation.md` (canonical entry; no
+  prior doc existed). Net: spoken body is a complete warm restyle or the
+  complete safe render, never truncated.
 - DEFERRED: slow-lane bridge line is still the deterministic `pickBridgeLine`
   hash pick (not yet a live-haiku bridge). Digest deriver is heuristic
   (first-sentence); a richer Lex-authored structured digest (real
@@ -131,15 +142,17 @@ Green + committed = "built", not "verified".
   `/lex/recall` doc_pointers, and the project-doc exclusion in search-all
   / curator / backfill. Until then they exist only in the build.
 - live voice (glue 1a `11ecf2f` + digest push & body render 1b `a1d139d`
-  / `6a732b2`, all Rebuild: yes) goes live on the same rebuild but ALSO
-  needs both `DEVNEURAL_VOICE_HAIKU=1` and `ANTHROPIC_API_KEY`. Flag off,
-  or flag on but no key: deterministic fallback (= today's behavior),
-  nothing changes until the operator opts in. Verify with both set: (1)
-  repeat an ack ("ok"/"nice") a few times, the spoken reply varies and
-  never repeats; (2) Lex's reply body sounds warm/spoken yet every
-  number/decision/negation survives verbatim (the verbatim guard ships
-  the safe render if not); (3) "stop"/"quiet" still cut instantly with no
-  model latency, including a barge while a body is mid-render.
+  / `6a732b2` + truncation fix 1c `4d409c1`, all Rebuild: yes) goes live
+  on the same rebuild but ALSO needs both `DEVNEURAL_VOICE_HAIKU=1` and
+  `ANTHROPIC_API_KEY`. Flag off, or flag on but no key: deterministic
+  fallback (= today's behavior), nothing changes until the operator opts
+  in. Verify with both set: (1) repeat an ack ("ok"/"nice") a few times,
+  the spoken reply varies and never repeats; (2) Lex's reply body sounds
+  warm/spoken yet every number/decision/negation survives verbatim (the
+  verbatim guard ships the safe render if not); (3) a LONG reply speaks to
+  completion (no mid-sentence cut, the 1c symptom); (4) "stop"/"quiet"
+  still cut instantly with no model latency, including a barge while a
+  body is mid-render.
 
 ## Next up (not started)
 
