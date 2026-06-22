@@ -373,3 +373,96 @@ export function vetReseed(
   }
   return { ok: issues.length === 0, issues };
 }
+
+/* ── trail-confirm (Lex confirms the worker resumed on task) ────────── */
+
+export interface ConfirmResumeInput {
+  /** The worker's NEW session jsonl (found by mtime after the /clear). */
+  newJsonl: string;
+  /** The reseed that was injected; we confirm it landed + got a reply. */
+  reseed: string;
+  readFile?: (p: string) => string | null;
+}
+
+export interface ConfirmResumeResult {
+  onTask: boolean;
+  reason: string;
+  sawReseedEcho: boolean;
+  sawAssistant: boolean;
+}
+
+function reseedMarker(reseed: string): string {
+  const head = /HEAD\s+([0-9a-f]{6,})/i.exec(reseed);
+  if (head) return head[1]!.toLowerCase();
+  const firstLine = reseed.split(/\r?\n/).find((l) => l.trim()) ?? '';
+  return firstLine.trim().slice(0, 40).toLowerCase();
+}
+
+function userTextOf(msg: unknown): string {
+  const m = msg as { content?: unknown } | undefined;
+  if (!m) return '';
+  if (typeof m.content === 'string') return m.content;
+  if (Array.isArray(m.content)) {
+    return m.content
+      .map((c) => {
+        const block = c as { type?: string; text?: string };
+        return block?.type === 'text' && typeof block.text === 'string'
+          ? block.text
+          : '';
+      })
+      .join(' ');
+  }
+  return '';
+}
+
+/* Trail the worker's new jsonl: confirm the injected reseed actually
+ * landed as a user turn AND the worker replied (it resumed on task), not
+ * that the /clear left it idle or the inject got swallowed. Pure over an
+ * injected file reader. */
+export function confirmResumeOnTask(
+  input: ConfirmResumeInput,
+): ConfirmResumeResult {
+  const readFile = input.readFile ?? defaultReadFileSc;
+  const body = readFile(input.newJsonl);
+  if (!body) {
+    return {
+      onTask: false,
+      reason: 'new jsonl unreadable / empty',
+      sawReseedEcho: false,
+      sawAssistant: false,
+    };
+  }
+  const marker = reseedMarker(input.reseed);
+  let sawReseedEcho = false;
+  let sawAssistant = false;
+  for (const line of body.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t) continue;
+    let rec: { type?: string; message?: unknown };
+    try {
+      rec = JSON.parse(t) as { type?: string; message?: unknown };
+    } catch {
+      continue;
+    }
+    if (rec.type === 'assistant') sawAssistant = true;
+    if (rec.type === 'user') {
+      const text = userTextOf(rec.message).toLowerCase();
+      if (marker && text.includes(marker)) sawReseedEcho = true;
+    }
+  }
+  const onTask = sawReseedEcho && sawAssistant;
+  const reason = onTask
+    ? 'reseed landed and the worker replied'
+    : !sawReseedEcho
+      ? 'reseed not found in the new session (inject may have been swallowed)'
+      : 'reseed landed but no worker reply yet';
+  return { onTask, reason, sawReseedEcho, sawAssistant };
+}
+
+function defaultReadFileSc(p: string): string | null {
+  try {
+    return nodeFs.readFileSync(p, 'utf8');
+  } catch {
+    return null;
+  }
+}
