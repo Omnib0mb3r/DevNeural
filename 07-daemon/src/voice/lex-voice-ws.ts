@@ -108,6 +108,7 @@ import {
   heartbeatLine,
   haikuRoute,
   composeGlueReply,
+  renderReplyForSpeech,
 } from './voice-haiku-wiring.js';
 import { useVoiceHaiku } from './voice-haiku.js';
 import { pushDigest, getDigest, buildVoiceDigest } from './voice-digest.js';
@@ -661,6 +662,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       lastTtsEndMs = Date.now();
       lastSpeechMs = Date.now();
     },
+    /* DRIVE-QUEUE 1b: live-haiku spoken render for body segments. Flag
+     * off / no key -> renderReplyForSpeech returns the text unchanged, so
+     * this is inert until the operator opts in. */
+    renderSegment: (t) => renderReplyForSpeech(t),
   });
 
   function send(msg: Record<string, unknown>): void {
@@ -1295,8 +1300,14 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
            * only, never the answer. The answer is spoken once, at
            * end_turn. Structural enforcement so a fat ack can never be
            * heard as a second response. The visual frame + chunk above
-           * still carry the full text. */
-          speak(isPreToolAck ? clampAck(text) : text);
+           * still carry the full text. DRIVE-QUEUE 1b: the end_turn body
+           * (not the ack) gets the live-haiku spoken render; gated on the
+           * flag so the flag-off path is byte-identical. */
+          const renderBody = !isPreToolAck && useVoiceHaiku();
+          speak(
+            isPreToolAck ? clampAck(text) : text,
+            renderBody ? { render: true } : undefined,
+          );
         } else {
           send({ t: 'tts-skipped', reason: 'already-spoken' });
         }
@@ -1545,16 +1556,18 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * contract. Same-turn segments (pre-tool ack + end_turn body)
    * queue and play back-to-back; barge / hold-up clears the queue
    * and cancels the in-flight ctx as one atomic boundary. */
-  function speak(text: string): void {
+  function speak(text: string, opts?: { render?: boolean }): void {
     /* Reset the heartbeat silence clock on any real speech (ack, body,
      * or a heartbeat pulse itself) so a pulse only fires after a genuine
      * gap of silence. */
     lastSpeechMs = Date.now();
     /* Pillar 3: route spoken output through the renderer (preserve-list
-     * verbatim guard). Passthrough when the flag is off. */
+     * verbatim guard). Passthrough when the flag is off. opts.render asks
+     * the controller for the live-haiku warm render (Lex's reply body
+     * only); the markdown strip here still runs as the safe base. */
     const spoken = renderForSpeech(text);
     lastSpokenText = spoken;
-    speakCtrl.speak(spoken);
+    speakCtrl.speak(spoken, opts);
   }
 
   /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).

@@ -58,7 +58,7 @@ export interface SpeakControllerState {
     started_at_ms: number;
     cancelled_at_ms: number;
   }>;
-  ttsQueue: Array<{ cleanText: string }>;
+  ttsQueue: Array<{ cleanText: string; render?: boolean }>;
   ttsQueueRunning: boolean;
 }
 
@@ -71,6 +71,11 @@ export interface SpeakControllerDeps {
   onTtsEnd?: () => void;
   /** Optional log channel. */
   log?: (msg: string) => void;
+  /** DRIVE-QUEUE 1b: live-haiku spoken render for segments flagged
+   * render:true (Lex's reply body only). Returns the restyled spoken
+   * text; on any miss it must return the input unchanged so playback is
+   * never lost. Omitted (or flag off) = no render, current behavior. */
+  renderSegment?: (text: string) => Promise<string>;
   /** Pillar 3.1: label this controller as a mouth source. Each speak
    * source (Lex reply, heartbeat, glue, a second connection) gets a
    * distinct id so the single-mouth lock can keep exactly one stream
@@ -82,8 +87,9 @@ export interface SpeakController {
   /** Push text onto the speak queue. Idempotent on empty input.
    * The first call kicks off the drain loop; subsequent calls land
    * onto the same queue and are serialized after the in-flight ctx
-   * finishes naturally. */
-  speak(text: string): void;
+   * finishes naturally. opts.render flags a segment for the live-haiku
+   * spoken render (Lex's reply body); default false = no render. */
+  speak(text: string, opts?: { render?: boolean }): void;
   /** Cancel any in-flight ctx + clear the queue. Returns true if a
    * ctx was actually cancelled (so the caller can decide whether to
    * fire the tts-cancel WS frame + the PTY Ctrl+C). Partial-chain
@@ -115,10 +121,14 @@ export function createSpeakController(
   deps: SpeakControllerDeps,
 ): SpeakController {
   const ownerId = deps.mouthOwnerId ?? `speak-${++mouthOwnerSeq}`;
-  function speak(text: string): void {
+  /* Bumped on every killActive (barge / turn boundary). speakOne captures
+   * it before the live render await and bails if it changed, so a body
+   * segment barged mid-render is never synthesized. */
+  let killGen = 0;
+  function speak(text: string, opts?: { render?: boolean }): void {
     const clean = cleanForTts(text);
     if (!clean) return;
-    state.ttsQueue.push({ cleanText: clean });
+    state.ttsQueue.push({ cleanText: clean, render: opts?.render === true });
     if (!state.ttsQueueRunning) {
       void runQueue();
     }
@@ -130,14 +140,14 @@ export function createSpeakController(
     try {
       while (state.ttsQueue.length > 0) {
         const seg = state.ttsQueue.shift()!;
-        await speakOne(seg.cleanText);
+        await speakOne(seg.cleanText, seg.render === true);
       }
     } finally {
       state.ttsQueueRunning = false;
     }
   }
 
-  async function speakOne(clean: string): Promise<void> {
+  async function speakOne(clean: string, render: boolean): Promise<void> {
     /* Pillar 3.1 single mouth: only one TTS stream may be live across
      * the whole daemon. With the haiku tier OFF this grant is a no-op
      * (current behavior). With it ON, a null grant means another source
@@ -148,9 +158,31 @@ export function createSpeakController(
     const grant = acquireMouth(ownerId);
     if (!grant) {
       deps.log?.(`[voice-mouth] busy (held elsewhere); deferring segment`);
-      state.ttsQueue.unshift({ cleanText: clean });
+      state.ttsQueue.unshift({ cleanText: clean, render });
       await new Promise<void>((r) => setTimeout(r, 25));
       return;
+    }
+    /* DRIVE-QUEUE 1b: live-haiku spoken render of Lex's reply body. Only
+     * render:true segments (never acks / glue / heartbeats). The mouth is
+     * already granted; if the user barges during the render await, killGen
+     * advances and we drop this segment rather than speak stale content.
+     * renderSegment returns the input unchanged on any miss, so playback
+     * is never lost. */
+    if (render && deps.renderSegment) {
+      const gen = killGen;
+      let rendered = clean;
+      try {
+        rendered = await deps.renderSegment(clean);
+      } catch {
+        rendered = clean;
+      }
+      if (killGen !== gen) {
+        /* Barged mid-render: release the mouth and skip synthesis. The
+         * queue was already cleared by killActive. */
+        grant.release();
+        return;
+      }
+      clean = rendered && rendered.trim() ? rendered : clean;
     }
     let handle: SynthLikeHandle;
     try {
@@ -224,6 +256,10 @@ export function createSpeakController(
   }
 
   function killActive(): boolean {
+    /* Advance the kill generation so a body segment that is mid live-
+     * render (between shift and synthesize) is dropped instead of spoken
+     * after the barge. */
+    killGen += 1;
     /* Clear the queue regardless of whether a ctx is in flight. The
      * queued segments belong to the same logical turn that just got
      * barged; they must not replay after the barge resolves. */
