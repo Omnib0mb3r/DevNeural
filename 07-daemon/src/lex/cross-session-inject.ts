@@ -112,6 +112,14 @@ export interface InjectRequest {
   signed_anchor_id?: string;
   /** Fix 15 — anchor id stamped onto the audit row when known. */
   anchor_id?: string;
+  /** Worker scope (2026-07-08). The Lex anchor the CALLER speaks
+   * for. When present, the inject may only target the worker that
+   * anchor supervises (current/previous session id or PTY of the
+   * supervised project_session) or the anchor's own brainstorm
+   * session/PTY. Anything else is rejected with
+   * decision='rejected_scope'. Absent = legacy behavior for
+   * daemon-internal supervisors, cron, and the dashboard. */
+  from_lex_anchor_id?: string;
 }
 
 export interface InjectResult {
@@ -124,6 +132,10 @@ export interface InjectResult {
     | 'redirected'
     | 'dispatched_dead_session'
     | 'rejected_anchor_dormant'
+    /* Worker scope (2026-07-08). The caller declared which Lex
+     * anchor it speaks for (from_lex_anchor_id) and the target is
+     * not that anchor's supervised worker or its own brainstorm. */
+    | 'rejected_scope'
     /* Bug 3e (2026-05-22). Daemon refuses to queue a bridge marker
      * when no fresh presence file claims the target uuid AT ALL
      * (verdict='not_claimed') or claims it without owning a terminal
@@ -182,6 +194,99 @@ function defaultScheduleCommit(fn: () => void, delayMs: number): void {
   }
 }
 
+export interface LexScopeCheck {
+  allowed: boolean;
+  /** Human-readable reason when rejected; audit + caller feedback. */
+  reason: string | null;
+  /** Slug of the supervised worker, for caller feedback. */
+  supervised_slug: string | null;
+}
+
+/**
+ * Worker-scope membership check (2026-07-08). Answers: may the Lex
+ * anchor `fromLexAnchorId` target `target`? Allowed targets:
+ *   - the supervised project_session's current_session_id,
+ *     previous_session_id, or current_pty_id,
+ *   - the anchor's own brainstorm claude_session_id or pty_id.
+ * Prefix matching mirrors the bridge path's uuid-prefix resolution:
+ * a target qualifies when it equals an allowed id or is a prefix of
+ * one (>= 8 chars, the same shape sessions.ts resolves).
+ * Exported for the /lex/steer route so both control surfaces enforce
+ * the identical scope.
+ */
+/** Supervised project anchor id for a Lex anchor, with the SAME
+ * fallback chain as snapshot-context's resolveLexScope: canonical
+ * lex_session.supervises_project_anchor_id first, then the legacy
+ * brainstorm project_scope_id mirror. Keeping the enforcement
+ * surfaces on the identical resolution prevents a legacy-scoped
+ * anchor from seeing worker X in its snapshot while being rejected
+ * (or worse, allowed elsewhere) on inject. */
+export function supervisedAnchorIdFor(
+  db: IndexDb,
+  lexAnchorId: string,
+): string | null {
+  const lex = db.getLexSession(lexAnchorId);
+  if (lex?.supervises_project_anchor_id) {
+    return lex.supervises_project_anchor_id;
+  }
+  try {
+    const bs = db.getBrainstorm(lexAnchorId) as
+      | ({ project_scope_id?: string | null } & Record<string, unknown>)
+      | null;
+    return bs?.project_scope_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export function checkLexScope(
+  db: IndexDb,
+  fromLexAnchorId: string,
+  target: string,
+): LexScopeCheck {
+  const lex = db.getLexSession(fromLexAnchorId);
+  if (!lex) {
+    return {
+      allowed: false,
+      reason: `unknown lex anchor "${fromLexAnchorId}"`,
+      supervised_slug: null,
+    };
+  }
+  const allowed = new Set<string>();
+  let slug: string | null = null;
+  try {
+    const own = db.getBrainstorm(fromLexAnchorId);
+    if (own?.claude_session_id) allowed.add(own.claude_session_id);
+    if (own?.pty_id) allowed.add(own.pty_id);
+  } catch {
+    /* legacy mirror row is optional */
+  }
+  if (lex.current_pty_id) allowed.add(lex.current_pty_id);
+  const supervisedId = supervisedAnchorIdFor(db, fromLexAnchorId);
+  if (supervisedId) {
+    const proj = db.getProjectSession(supervisedId);
+    if (proj) {
+      slug = proj.project_slug;
+      if (proj.current_session_id) allowed.add(proj.current_session_id);
+      if (proj.previous_session_id) allowed.add(proj.previous_session_id);
+      if (proj.current_pty_id) allowed.add(proj.current_pty_id);
+    }
+  }
+  const t = target.trim();
+  const match =
+    t.length >= 8 &&
+    [...allowed].some((id) => id === t || id.startsWith(t));
+  if (match) return { allowed: true, reason: null, supervised_slug: slug };
+  const scopeDesc = slug
+    ? `this brainstorm supervises only "${slug}"`
+    : 'this brainstorm supervises no worker';
+  return {
+    allowed: false,
+    reason: `target "${target}" is outside the scope of lex anchor "${fromLexAnchorId}" (${scopeDesc})`,
+    supervised_slug: slug,
+  };
+}
+
 /**
  * Attempt a cross-session injection.  Always writes an audit row to db.
  * Never throws; errors are returned in InjectResult.
@@ -207,6 +312,7 @@ export function crossSessionInject(
     signed_session,
     signed_anchor_id,
     anchor_id,
+    from_lex_anchor_id,
   } = req;
   const text_preview = text.slice(0, 120);
   const text_length = text.length;
@@ -268,6 +374,25 @@ export function crossSessionInject(
         ok: false,
         decision: 'rejected_allowlist',
         error: `target_session "${target_session}" is not in the configured allowlist`,
+      };
+    }
+  }
+
+  /* 2b. Worker scope (2026-07-08). A caller that declares which Lex
+   * anchor it speaks for may only reach that anchor's supervised
+   * worker or its own brainstorm. This is the daemon-side backstop
+   * for the prompt-side scope contract: even a drifting Lex cannot
+   * control another brainstorm's worker. */
+  if (from_lex_anchor_id) {
+    const scope = checkLexScope(db, from_lex_anchor_id, target_session);
+    if (!scope.allowed) {
+      audit('rejected_scope', scope.reason ?? 'out of scope');
+      return {
+        ok: false,
+        decision: 'rejected_scope',
+        error:
+          scope.reason ??
+          `target "${target_session}" is outside this brainstorm's worker scope`,
       };
     }
   }

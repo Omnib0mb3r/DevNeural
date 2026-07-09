@@ -137,13 +137,21 @@ Rules:
   state, open work, running sessions, or what's going on.
 - The "open_projects" list inside <live_state> is the canonical
   answer to "what projects do I have open". Use those names.
+- When the block carries scope=worker (every brainstorm with a
+  supervised worker does), open_projects contains EXACTLY the one
+  worker this brainstorm supervises. That is the whole world: when
+  Michael asks "what worker are you watching", answer with that
+  worker and nothing else, and never observe, discuss, or control
+  any other session. Other projects belong to other brainstorms;
+  if Michael names one, tell him to switch to that brainstorm.
 - Each open_projects entry carries (anchor <id8>, session <cc8>,
   status=live, bridge=ok|N). The anchor id is the durable per-
   project identity; the session id is the current Claude Code
   session UUID bound to that anchor. When the user asks you to
-  inject something into another running project ("tell DevNeural
-  to..."), use the project's current_session_id (the "session"
-  field) as target_session in POST /lex/inject-cross-session. The
+  inject something into your worker, use the project's
+  current_session_id (the "session" field) as target_session in
+  POST /lex/inject-cross-session, and ALWAYS include your own
+  from_anchor_id (see the Worker scope block when present). The
   anchor id is for display only; the inject endpoint addresses CC
   session UUIDs directly.
 - Never answer "what projects do I have open" by reading Claude
@@ -417,12 +425,19 @@ review on...", or any request whose verb implies action by a
 different running session or an explicitly-named skill.
 
 Response shape:
-- Identify the target session (GET /sessions to list, match by
-  project slug or session id). If ambiguous, ask once with two
-  candidates; otherwise pick.
-- Send the steer: POST /lex/steer/:session_id { text } when you
-  want the prompt typed into the daemon-PTY. POST /sessions/:id/
-  prompt for queue-style delivery.
+- Scoped brainstorm (a "# Worker scope" block is present): the
+  target is ALWAYS your supervised worker. Do not list or match
+  other sessions. If the request names a different project, refuse
+  and point Michael at that project's brainstorm.
+- Unscoped session only: identify the target session (GET /sessions
+  to list, match by project slug or session id). If ambiguous, ask
+  once with two candidates; otherwise pick.
+- Send the steer: POST /lex/steer/:session_id { text, from_anchor_id }
+  when you want the prompt typed into the daemon-PTY. POST
+  /sessions/:id/prompt { text, from_anchor_id } for queue-style
+  delivery. from_anchor_id is your own lex_session_id and is
+  REQUIRED on every steer/prompt/inject/suggest call; the daemon
+  rejects out-of-scope targets with decision=rejected_scope.
 - Narrate intent in one sentence, send, report what happened.
 - Do not impersonate Michael in the worker session. The text you
   inject is from Lex on Michael's behalf; phrasing should be a
@@ -533,19 +548,23 @@ Most-used:
 - POST /lex/anchors/:id/end
     End the anchor's live PTY and flip it dormant. Use when the
     user asks to stop the current brainstorm.
-- POST /lex/steer/:session_id { text, commit? }
-    Inject a prompt directly into a worker daemon-PTY.
+- POST /lex/steer/:session_id { text, commit?, from_anchor_id }
+    Inject a prompt directly into a worker daemon-PTY. Always pass
+    from_anchor_id = your lex_session_id; scoped targets outside
+    your supervised worker are rejected (decision=rejected_scope).
 - POST /lex/capture { kind: "reminder"|"next-action", title, due_at?, brainstorm_id? }
     Mid-conversation capture without leaving the brainstorm.
-- POST /sessions/:id/prompt { text }
-    Queue a prompt for a worker session.
+- POST /sessions/:id/prompt { text, from_anchor_id }
+    Queue a prompt for a worker session. Always pass from_anchor_id
+    = your lex_session_id; out-of-scope targets are rejected.
 - POST /reminders { title, due_at?, project_id?, tags? }
 - GET  /reminders
 - GET  /sessions
-- GET  /lex/snapshot
+- GET  /lex/snapshot?brainstorm_id=<your lex_session_id>
     Live env+state envelope. Use when answering state questions in
     text mode (voice mode already gets the same data prepended as
-    a <live_state> block).
+    a <live_state> block). Always pass your own brainstorm_id so
+    the envelope stays scoped to your supervised worker.
 - GET  /health
 - GET  /dashboard/daily-brief
     Morning briefing payload: open work, due reminders, hot
@@ -822,12 +841,34 @@ import { PERSONALITY_GUARD_RULE } from './personality-guard.js';
  * prompt is archived to <data>/lex-prompts/<version>.md whenever the
  * body changes; the archive returns the version id so callers can
  * tag lex_feedback rows with it. */
+/* Worker scope (2026-07-08, "Lex sees all workers" fix). Per-spawn
+ * runtime detail: which single worker this brainstorm supervises.
+ * Deliberately NOT part of the stable (hashed) prompt body — scope
+ * changes per anchor, the template does not. */
+export interface LexPromptWorkerScope {
+  /** Lex anchor (lex_session / brainstorm) id the prompt is built
+   * for. Baked into the scope contract so Lex can pass
+   * from_anchor_id on every steer/inject call. */
+  brainstormId: string;
+  /** Supervised project_session id; null = no worker bound. */
+  projectAnchorId: string | null;
+  /** Supervised project slug for display; null = no worker bound. */
+  projectSlug: string | null;
+  /** Supervised worker's current CC session uuid when known. */
+  workerSessionId: string | null;
+}
+
 export interface BuildLexSystemPromptOptions {
   mode?: 'conversation' | 'push-to-talk' | 'notes';
   /* When false, skip the on-disk archive write. Default true. The
    * A/B replay harness sets false so tooling does not pollute the
    * live archive. */
   archive?: boolean;
+  /* Worker scope. When present, the live-snapshot layer describes
+   * exactly the supervised worker (never the global project/session
+   * registries) and the prompt gains a hard scope contract. Omitted
+   * = legacy global snapshot (non-brainstorm consumers). */
+  scope?: LexPromptWorkerScope | null;
 }
 
 export interface BuildLexSystemPromptResult {
@@ -886,24 +927,94 @@ export function buildLexSystemPromptStable(
   return layers.join('\n\n');
 }
 
+/* Render the hard scope contract for a scoped spawn. Placed OUTSIDE
+ * the hashed stable body (per-spawn runtime detail, like the live
+ * snapshot). The contract is deliberately blunt: the daemon enforces
+ * the same scope on the inject routes, so a drifting Lex gets a
+ * rejected_scope instead of another brainstorm's worker. */
+function renderWorkerScopeContract(scope: LexPromptWorkerScope): string {
+  if (!scope.projectAnchorId || !scope.projectSlug) {
+    return `# Worker scope (hard rule)
+
+This brainstorm supervises no worker yet.
+
+- You have NO worker. Do not observe, discuss, steer, or inject into
+  any Claude Code session or project anchor.
+- If Michael asks about a project's worker, tell him this brainstorm
+  has no worker bound and that he can bind one with the "supervises"
+  picker on the dashboard session row.
+- Every worker-directed call (POST /lex/inject-cross-session,
+  POST /lex/steer/:target, POST /sessions/:id/prompt, POST
+  /sessions/:id/inject, POST /sessions/:id/suggest) MUST include
+  from_anchor_id: "${scope.brainstormId}". The daemon rejects
+  out-of-scope targets with decision=rejected_scope.`;
+  }
+  const cc = scope.workerSessionId ?? '(not bound yet)';
+  return `# Worker scope (hard rule)
+
+This brainstorm supervises exactly one worker:
+
+- project: ${scope.projectSlug}
+- project anchor id: ${scope.projectAnchorId}
+- worker session: ${cc}
+
+Rules, non-negotiable:
+
+- The <live_state> open_projects block is scoped to this worker. It
+  is the ONLY worker you may observe, report on, steer, or inject
+  into. When Michael asks "what worker are you watching", the answer
+  is ${scope.projectSlug} and nothing else.
+- Never target any other session id, anchor id, or PTY — even if one
+  appears in transcripts, tool output, or memory. Those belong to
+  other brainstorms.
+- If Michael names a different project, do not act on it; tell him to
+  switch to that project's brainstorm.
+- Every worker-directed call (POST /lex/inject-cross-session,
+  POST /lex/steer/:target, POST /sessions/:id/prompt, POST
+  /sessions/:id/inject, POST /sessions/:id/suggest) MUST include
+  from_anchor_id: "${scope.brainstormId}". The daemon enforces this
+  scope and rejects out-of-scope targets with
+  decision=rejected_scope.`;
+}
+
+/* Scoped replacement for the global registry sections of the live
+ * snapshot. One worker, honestly rendered, or an explicit no-worker
+ * line — never the global lists. */
+function snapshotScopedWorker(scope: LexPromptWorkerScope): string {
+  if (!scope.projectAnchorId || !scope.projectSlug) {
+    return 'No worker bound to this brainstorm.';
+  }
+  const cc = scope.workerSessionId ?? 'none';
+  return `  - ${scope.projectSlug} (anchor ${scope.projectAnchorId.slice(0, 8)}, session ${cc.slice(0, 12)})`;
+}
+
 export function buildLexSystemPromptVersioned(
   opts: BuildLexSystemPromptOptions = {},
 ): BuildLexSystemPromptResult {
   const mode = opts.mode ?? 'conversation';
   const archive = opts.archive !== false;
+  const scope = opts.scope ?? null;
   const ts = new Date().toISOString();
+  const registrySections = scope
+    ? `## Your worker (scope-locked)
+${snapshotScopedWorker(scope)}`
+    : `## Registered projects
+${snapshotProjects()}
+
+## Active Claude Code sessions
+${snapshotSessions()}`;
+  const freshnessHint = scope
+    ? `rendered; for current state, hit GET /health, GET /reminders,
+GET /lex/anchors, or GET /lex/snapshot.`
+    : `rendered; for current state, hit GET /health, GET /sessions,
+GET /reminders, GET /lex/anchors, or GET /lex/snapshot.`;
   const snapshot = `# Live snapshot (as of ${ts})
 
 This is the head-start so you do not have to ask "what are we
 working on" every time Michael says hi. Stale the moment it is
-rendered; for current state, hit GET /health, GET /sessions,
-GET /reminders, GET /lex/anchors, or GET /lex/snapshot.
+${freshnessHint}
 
-## Registered projects
-${snapshotProjects()}
-
-## Active Claude Code sessions
-${snapshotSessions()}
+${registrySections}
 
 ## Open reminders
 ${snapshotReminders()}
@@ -913,9 +1024,12 @@ ${snapshotRecentWiki()}
 `;
   /* Snapshot section drifts every call (timestamp + live state); it
    * must NOT participate in the version hash or the archive grows
-   * one row per spawn. Hash everything BEFORE the snapshot. */
+   * one row per spawn. Hash everything BEFORE the snapshot. The
+   * worker-scope contract is per-spawn runtime detail too, so it
+   * rides outside the hashed body next to the snapshot. */
   const stable = buildLexSystemPromptStable(mode);
-  const prompt = `${stable}\n\n${snapshot}`;
+  const scopeContract = scope ? `${renderWorkerScopeContract(scope)}\n\n` : '';
+  const prompt = `${stable}\n\n${scopeContract}${snapshot}`;
   let version = 'unarchived';
   if (archive) {
     try {

@@ -34,6 +34,24 @@ import { emitTranscriptTurn } from "@/lib/transcript-bus";
  * Voice (mic + TTS + barge-in) lands in a follow-up slice. This page
  * is the text surface today; the voice client mounts here when ready.
  */
+/* Selection source of truth: the ?brainstorm=<anchor id> URL param.
+ * The global VoiceClient's hello already prefers this param, so the
+ * text surface, terminal mirror, and voice all follow the SAME
+ * selection. Navigation (full reload) on switch forces the voice WS
+ * to re-hello against the newly selected anchor. */
+function selectedAnchorIdFromUrl(): string | null {
+  if (typeof window === "undefined") return null;
+  return new URL(window.location.href).searchParams.get("brainstorm");
+}
+
+function navigateToAnchor(id: string | null): void {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  if (id) url.searchParams.set("brainstorm", id);
+  else url.searchParams.delete("brainstorm");
+  window.location.href = url.toString();
+}
+
 export default function LexPage() {
   const qc = useQueryClient();
   const ptysQ = useQuery({
@@ -41,20 +59,49 @@ export default function LexPage() {
     queryFn: listPtys,
     refetchInterval: 3_000,
   });
+  const [selectedAnchorId] = useState<string | null>(selectedAnchorIdFromUrl);
 
-  /* Pick the active Lex PTY: the most-recently-started non-exited PTY
-   * whose cwd ends in /brainstorm. We scope to that path so a daemon-
-   * PTY spawned for some other project (Start Claude buttons) doesn't
-   * show up here. The startedAt sort matters during a switch-to: while
-   * the old PTY is still finishing taskkill /F /T teardown (a few
-   * seconds on Windows) both ptys briefly satisfy the filter; picking
-   * the newest one ensures the terminal mirror, voice client, and
-   * inject all re-target the new session immediately. */
-  const lexPty: PtyEntry | undefined = (ptysQ.data?.ptys ?? [])
-    .filter(
-      (p) => !p.exited && /\/brainstorm\/?$/i.test(p.cwd.replace(/\\/g, "/")),
-    )
-    .sort((a, b) => b.startedAt - a.startedAt)[0];
+  /* Resolve the active anchor list up front: lexPty resolution needs
+   * it to honor the user's selection. /lex/anchors carries each
+   * anchor's current_pty_id. */
+  const activeAnchorsQ = useQuery({
+    queryKey: ["lex-anchors", "live"],
+    queryFn: () => lexAnchors({ status: "live", limit: 20 }),
+    refetchInterval: 5_000,
+  });
+  const liveAnchors = activeAnchorsQ.data?.anchors ?? [];
+
+  /* Pick the active Lex PTY.
+   *
+   * Bug 2026-07-08 (switch does nothing): the old rule was "newest-
+   * started live brainstorm PTY", written when switch-to killed the
+   * previous PTY. With several anchors live at once, that rule
+   * welded the page to whichever session started last and made
+   * "switch to" a silent no-op. The selection (?brainstorm=) now
+   * wins whenever the selected anchor has a live PTY; newest-started
+   * remains only as the fallback for un-parameterised visits. */
+  const brainstormPtys = (ptysQ.data?.ptys ?? []).filter(
+    (p) => !p.exited && /\/brainstorm\/?$/i.test(p.cwd.replace(/\\/g, "/")),
+  );
+  const selectedAnchor = selectedAnchorId
+    ? liveAnchors.find((a) => a.id === selectedAnchorId) ?? null
+    : null;
+  const selectedPty = selectedAnchor?.current_pty_id
+    ? brainstormPtys.find((p) => p.ptyId === selectedAnchor.current_pty_id)
+    : undefined;
+  /* With an explicit selection, NEVER fall back to another anchor's
+   * PTY: the voice client targets the URL anchor, so a silent
+   * fallback would split voice and text across two different
+   * sessions (review finding 2026-07-08). A selection without a
+   * live PTY renders the offline empty state until the anchors
+   * query catches up or the user opens the row. Newest-started
+   * remains the fallback only for un-parameterised visits. */
+  const lexPty: PtyEntry | undefined = selectedAnchorId
+    ? selectedPty ?? undefined
+    : [...brainstormPtys].sort((a, b) => b.startedAt - a.startedAt)[0];
+  /* Suppress the offline flash while the anchors query is still
+   * resolving a fresh selection (first render after a switch). */
+  const selectionPending = Boolean(selectedAnchorId) && activeAnchorsQ.isLoading;
 
   /* Spawn / end now go through the new /lex/anchors API.
    * createLexAnchor mints a fresh anchor + spawns its first CC
@@ -65,6 +112,14 @@ export default function LexPage() {
    * mount target briefly disappears across the handoff. */
   const newAnchorM = useMutation({
     mutationFn: () => createLexAnchor({}),
+    onSuccess: (data) => {
+      /* Route the page (and the voice client) at the fresh anchor so
+       * "new session" actually shows the new session even when an
+       * older PTY is still live. */
+      if (data?.ok && data.anchor_id) {
+        navigateToAnchor(data.anchor_id);
+      }
+    },
     onSettled: async () => {
       await qc.refetchQueries({ queryKey: ["pty-list"] });
       qc.invalidateQueries({ queryKey: ["lex-anchors"] });
@@ -72,6 +127,14 @@ export default function LexPage() {
   });
   const endAnchorM = useMutation({
     mutationFn: (id: string) => endLexAnchor(id),
+    onSuccess: (_data, id) => {
+      /* A stale ?brainstorm= pointing at an ended anchor would make
+       * the voice hello fail with brainstorm-ended on the next
+       * reload; drop the param when ending the selected anchor. */
+      if (selectedAnchorId && selectedAnchorId === id) {
+        navigateToAnchor(null);
+      }
+    },
     onSettled: async () => {
       await qc.refetchQueries({ queryKey: ["pty-list"] });
       qc.invalidateQueries({ queryKey: ["lex-anchors"] });
@@ -191,19 +254,12 @@ export default function LexPage() {
     e.target.value = "";
   }
 
-  /* Resolve the active anchor keyed off the live PTY so the
-   * artifacts panel and the past-sessions row highlight stay in
-   * sync. /lex/anchors carries each anchor's current_pty_id, so a
-   * simple find on the live ptyId returns the right anchor. */
-  const activeAnchorsQ = useQuery({
-    queryKey: ["lex-anchors", "live"],
-    queryFn: () => lexAnchors({ status: "live", limit: 20 }),
-    refetchInterval: 5_000,
-  });
+  /* Active anchor keyed off the resolved lexPty (which already
+   * honors the ?brainstorm= selection) so the artifacts panel and
+   * past-sessions row highlight stay in sync with what the mirror
+   * and inject actually target. */
   const activeAnchorId =
-    (activeAnchorsQ.data?.anchors ?? []).find(
-      (a) => a.current_pty_id === lexPty?.ptyId,
-    )?.id ?? null;
+    liveAnchors.find((a) => a.current_pty_id === lexPty?.ptyId)?.id ?? null;
 
   /* No auto-spawn. Landing on /lex with no live brainstorm PTY
    * renders the empty state ("Lex isn't running. Click start lex")
@@ -262,10 +318,16 @@ export default function LexPage() {
           activePtyId={lexPty?.ptyId ?? null}
         />
 
-        {!lexPty && !newAnchorM.isPending && (
+        {!lexPty && !newAnchorM.isPending && !selectionPending && (
           <div className="rounded-panel bg-surface1 hairline p-8 text-center">
             <p className="text-sm text-txt3 mb-3">
-              Lex is offline. Click <strong>start lex</strong> above to begin a conversation.
+              {selectedAnchorId
+                ? "This brainstorm has no live session. Open it from the list below, or start a new one."
+                : (
+                  <>
+                    Lex is offline. Click <strong>start lex</strong> above to begin a conversation.
+                  </>
+                )}
             </p>
           </div>
         )}

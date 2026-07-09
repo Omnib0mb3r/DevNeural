@@ -19,6 +19,7 @@
 import {
   buildLexSystemPromptVersioned,
   type BuildLexSystemPromptResult,
+  type LexPromptWorkerScope,
 } from './system-prompt.js';
 import {
   loadFeedbackMemories,
@@ -47,6 +48,11 @@ export interface BuildLexSpawnPromptOptions {
    * brainstorms. Omitted = no hard rules block (back-compat for
    * call sites that have not threaded the cwd through yet). */
   cwd?: string;
+  /** Worker scope (2026-07-08). Forwarded to
+   * buildLexSystemPromptVersioned so the spawn prompt carries the
+   * scope-locked snapshot + hard scope contract. Omitted = legacy
+   * global snapshot. */
+  scope?: LexPromptWorkerScope | null;
 }
 
 export interface BuildLexSpawnPromptResult extends BuildLexSystemPromptResult {
@@ -110,6 +116,7 @@ export function buildLexSpawnPrompt(
   const base = buildLexSystemPromptVersioned({
     mode: opts.mode,
     archive: opts.archive,
+    scope: opts.scope,
   });
   const paths = opts.transcriptPaths ?? [];
   const variant: LexSpawnVariant = paths.length === 0 ? 'new' : 'reopen';

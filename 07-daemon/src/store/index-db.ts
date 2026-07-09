@@ -2648,7 +2648,10 @@ export class IndexDb {
       | 'redirected'
       | 'dispatched_dead_session'
       | 'rejected_anchor_dormant'
-      | 'no_deliverable_bridge';
+      | 'no_deliverable_bridge'
+      /* Worker scope (2026-07-08): caller declared a Lex anchor and
+       * the target was outside that anchor's supervised worker. */
+      | 'rejected_scope';
     reject_reason?: string | null;
     brainstorm_id?: string | null;
     /* Fix 15 C3 — full inject text, populated only when the audit

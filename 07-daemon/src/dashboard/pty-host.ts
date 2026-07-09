@@ -24,6 +24,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { spawn as ptySpawn, type IPty } from 'node-pty';
 import { pushTerminalData } from './terminal-stream.js';
+import { pickDiscoveryJsonl, type JsonlCandidate } from './jsonl-discovery.js';
 import {
   bindBrainstormSessionId,
   isBrainstormCwd,
@@ -221,6 +222,13 @@ export interface SpawnLexOptions {
    * legacy table is only ever written through the lex_session
    * code path (single source of truth for new spawns). */
   skipLegacyBrainstormRegister?: boolean;
+  /** Pre-minted claude session id (2026-07-08 cross-bind fix). Spawns
+   * that pass `--session-id <uuid>` to claude KNOW the session id up
+   * front; stamping it here binds the handle deterministically at
+   * spawn time and skips filesystem discovery entirely — discovery
+   * in a shared cwd can (and did) bind another live session's jsonl
+   * to this PTY. spawn-lex-session.ts always passes this. */
+  sessionId?: string;
 }
 
 export interface SpawnLexResult {
@@ -258,26 +266,37 @@ function tryDiscoverSession(handle: PtyHandle): void {
   } catch {
     return;
   }
-  /* Pick the .jsonl created after we spawned (mtimeMs > startedAt
-   * with a small slack for clock skew). claude creates the file once
-   * the first turn writes; before that there's nothing here. */
-  const fresh = entries
+  /* Pick the .jsonl CREATED after we spawned. Creation time, not
+   * ctime: on Windows libuv maps ctime to the last write time, so a
+   * pre-existing still-active session's jsonl "qualified" the moment
+   * it received a write — and this PTY bound to another session's
+   * transcript (bug 2026-07-08, brainstorm cross-bind). Session ids
+   * already claimed by another live PTY are excluded outright. */
+  const claimed = new Set<string>();
+  for (const other of ptys.values()) {
+    if (other.ptyId !== handle.ptyId && other.sessionId) {
+      claimed.add(other.sessionId);
+    }
+  }
+  const candidates = entries
     .filter((e) => e.isFile() && e.name.endsWith('.jsonl'))
     .map((e) => {
       const file = path.posix.join(slugDir, e.name);
       try {
         const stat = fs.statSync(file);
-        return { name: e.name, ctimeMs: stat.ctimeMs, mtimeMs: stat.mtimeMs };
+        return {
+          name: e.name,
+          birthtimeMs: stat.birthtimeMs,
+          ctimeMs: stat.ctimeMs,
+          mtimeMs: stat.mtimeMs,
+        };
       } catch {
         return null;
       }
     })
-    .filter((x): x is { name: string; ctimeMs: number; mtimeMs: number } => Boolean(x))
-    .filter((x) => x.ctimeMs >= handle.startedAt - 2_000)
-    .sort((a, b) => a.ctimeMs - b.ctimeMs);
-  if (fresh.length === 0) return;
-  const first = fresh[0]!;
-  const sessionId = first.name.replace(/\.jsonl$/, '');
+    .filter((x): x is JsonlCandidate => Boolean(x));
+  const sessionId = pickDiscoveryJsonl(candidates, handle.startedAt, claimed);
+  if (!sessionId) return;
   handle.sessionId = sessionId;
   sessionToPty.set(sessionId, handle.ptyId);
   /* Flush pre-binding buffer into the ring. */
@@ -399,6 +418,17 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
     lastErrorClass: null,
   };
   ptys.set(ptyId, handle);
+
+  /* Deterministic session binding (2026-07-08 cross-bind fix). When
+   * the caller pre-minted the claude session id (spawn-lex-session
+   * passes `--session-id <uuid>` to claude), stamp it now. The
+   * handle never enters filesystem discovery, so a sibling
+   * brainstorm's jsonl can no longer be mis-bound to this PTY, and
+   * the sessionToPty route map is correct from the first byte. */
+  if (opts.sessionId) {
+    handle.sessionId = opts.sessionId;
+    sessionToPty.set(opts.sessionId, ptyId);
+  }
 
   /* Stamp the brainstorm/lex_session id on the handle so the
    * onExit handler can flip the right anchor dormant. New spawns

@@ -50,6 +50,80 @@ export function resolveBrainstormMemoryIndexPath(
   return path.posix.join(projDir, 'memory', 'MEMORY.md');
 }
 
+/* Worker scope (2026-07-08, "Lex sees all workers" fix). A brainstorm
+ * anchor supervises AT MOST one project anchor
+ * (lex_session.supervises_project_anchor_id). When a snapshot is
+ * built FOR a brainstorm, the block must carry only that worker and
+ * the brainstorm's own row — never the global registry. Resolution
+ * happens at the call site (voice WS / routes) via resolveLexScope so
+ * this module stays free of caller-specific lookups. */
+export interface LexWorkerScope {
+  /** Lex anchor (lex_session / brainstorm_sessions) id the snapshot
+   * is being built for. */
+  brainstormId: string;
+  /** project_session id this anchor supervises; null = no worker
+   * bound, which renders as "no worker" rather than falling back to
+   * the global list. */
+  superviseProjectAnchorId: string | null;
+}
+
+/** Resolve a brainstorm id to its worker scope. Reads the lex_session
+ * supervises binding first (canonical), then the legacy brainstorm
+ * project_scope_id mirror. Never throws; a missing row resolves to a
+ * scope with no worker so the caller still gets a scoped (empty)
+ * view instead of silently reverting to the global one. */
+export function resolveLexScope(brainstormId: string): LexWorkerScope {
+  try {
+    const db = getStore().db;
+    const lex = db.getLexSession(brainstormId);
+    if (lex && lex.supervises_project_anchor_id) {
+      return {
+        brainstormId,
+        superviseProjectAnchorId: lex.supervises_project_anchor_id,
+      };
+    }
+    const bs = db.getBrainstorm(brainstormId);
+    return {
+      brainstormId,
+      superviseProjectAnchorId: bs?.project_scope_id ?? null,
+    };
+  } catch {
+    return { brainstormId, superviseProjectAnchorId: null };
+  }
+}
+
+/** Scope plus the display fields the system-prompt contract needs.
+ * Structurally compatible with system-prompt's LexPromptWorkerScope
+ * so call sites can pass it straight through. */
+export interface ResolvedLexScope extends LexWorkerScope {
+  projectAnchorId: string | null;
+  projectSlug: string | null;
+  workerSessionId: string | null;
+}
+
+/** resolveLexScope + the supervised project's slug and current CC
+ * session id. One extra read; never throws. */
+export function resolveLexScopeDetailed(brainstormId: string): ResolvedLexScope {
+  const base = resolveLexScope(brainstormId);
+  const empty: ResolvedLexScope = {
+    ...base,
+    projectAnchorId: base.superviseProjectAnchorId,
+    projectSlug: null,
+    workerSessionId: null,
+  };
+  if (!base.superviseProjectAnchorId) return empty;
+  try {
+    const proj = getStore().db.getProjectSession(base.superviseProjectAnchorId);
+    return {
+      ...empty,
+      projectSlug: proj?.project_slug ?? null,
+      workerSessionId: proj?.current_session_id ?? null,
+    };
+  } catch {
+    return empty;
+  }
+}
+
 export interface VoiceSnapshotOptions {
   /** Active brainstorm cwd; used to locate the per-brainstorm
    * MEMORY.md so the per-turn block can pass through its bullets.
@@ -65,6 +139,11 @@ export interface VoiceSnapshotOptions {
    * + docs index renders so they rank by relevance to THIS turn
    * instead of dumping the whole table of contents every time. */
   query?: string | null;
+  /** Worker scope. When present, open_projects lists ONLY the
+   * supervised worker (or an explicit "no worker bound" line) and
+   * active_brainstorms lists ONLY the scoped brainstorm. Omitted =
+   * legacy global view (dashboard, daemon-internal consumers). */
+  scope?: LexWorkerScope | null;
 }
 
 /* Bullets that must stay visible regardless of relevance score: the
@@ -97,12 +176,26 @@ function ageHuman(ms: number): string {
  */
 export function buildVoiceSnapshot(opts: VoiceSnapshotOptions = {}): string {
   const ts = new Date().toISOString();
+  const scope = opts.scope ?? null;
   /* Project anchor surface from docs/spec/PROJECT-ANCHORS.md step 5
    * / 6. project_session WHERE status='live' is the authoritative
    * source for "what projects are open". Step 6 retired the legacy
-   * listSessions() identity-file path entirely. */
+   * listSessions() identity-file path entirely.
+   *
+   * Worker scope (2026-07-08): when the snapshot is built FOR a
+   * brainstorm, the list collapses to the single supervised anchor
+   * (any status, so an offline worker still renders as offline
+   * instead of leaking the global registry) or to nothing when the
+   * brainstorm supervises no worker. */
   const projectAnchors = (() => {
     try {
+      if (scope) {
+        if (!scope.superviseProjectAnchorId) return [] as ProjectSessionRow[];
+        const row = getStore().db.getProjectSession(
+          scope.superviseProjectAnchorId,
+        );
+        return row ? [row] : ([] as ProjectSessionRow[]);
+      }
       return getStore().db.listProjectSessions({ status: 'live', limit: 200 });
     } catch {
       return [] as ProjectSessionRow[];
@@ -110,6 +203,10 @@ export function buildVoiceSnapshot(opts: VoiceSnapshotOptions = {}): string {
   })();
   const brainstorms = (() => {
     try {
+      if (scope) {
+        const own = getStore().db.getBrainstorm(scope.brainstormId);
+        return own && own.status === 'active' ? [own] : [];
+      }
       return listBrainstorms({ status: 'active', limit: 8 });
     } catch {
       return [];
@@ -146,10 +243,19 @@ export function buildVoiceSnapshot(opts: VoiceSnapshotOptions = {}): string {
           const decoded = decodeBridgeMarker(a.current_bridge_id);
           const bridge =
             decoded.count > 1 ? `bridge=${decoded.count}` : 'bridge=ok';
-          return `  - ${a.project_slug} (anchor ${anchorShort}, session ${ccShort}, status=live, ${bridge})`;
+          /* Scoped snapshots include non-live rows so an offline
+           * worker renders honestly instead of vanishing (and the
+           * global list never fills the gap). */
+          const statusTag =
+            a.status === 'live'
+              ? 'status=live'
+              : `status=${a.status}, offline`;
+          return `  - ${a.project_slug} (anchor ${anchorShort}, session ${ccShort}, ${statusTag}, ${bridge})`;
         })
         .join('\n')
-    : '  (none)';
+    : scope
+      ? '  (no worker bound to this brainstorm; bind one via the dashboard supervises picker)'
+      : '  (none)';
 
   const brainstormLines = brainstorms.length
     ? brainstorms
@@ -261,17 +367,28 @@ export function buildVoiceSnapshot(opts: VoiceSnapshotOptions = {}): string {
   const hostLine = `host: ${os.hostname()} (${process.platform})`;
   const dataLine = `data_root_separator: backslash on Windows (C:\\dev\\data)`;
 
-  const parts = [
-    `<live_state ts="${ts}">`,
-    'open_projects (live Claude Code sessions, this is the answer to "what projects do I have open"):',
-    sessionLines,
-    'active_brainstorms (Lex conversations in progress):',
-    brainstormLines,
-    ptyLine,
-    remLine,
-    hostLine,
-    dataLine,
-  ];
+  const parts = scope
+    ? [
+        `<live_state ts="${ts}" scope=worker>`,
+        'open_projects (scoped: the only worker this brainstorm may observe or control; other projects belong to other brainstorms and are OUT OF SCOPE):',
+        sessionLines,
+        'active_brainstorms (this brainstorm only):',
+        brainstormLines,
+        remLine,
+        hostLine,
+        dataLine,
+      ]
+    : [
+        `<live_state ts="${ts}">`,
+        'open_projects (live Claude Code sessions, this is the answer to "what projects do I have open"):',
+        sessionLines,
+        'active_brainstorms (Lex conversations in progress):',
+        brainstormLines,
+        ptyLine,
+        remLine,
+        hostLine,
+        dataLine,
+      ];
   if (curatorFlags) {
     parts.push('curator_flags (actionable - surface if asked about system health):');
     parts.push(curatorFlags);

@@ -75,7 +75,11 @@ import {
 import { spawnLexSession } from '../lex/spawn-lex-session.js';
 import { buildLexSpawnPrompt } from '../lex/spawn-prompt.js';
 import { buildLexSystemPromptVersioned } from '../lex/system-prompt.js';
-import { buildVoiceSnapshot } from '../lex/snapshot-context.js';
+import {
+  buildVoiceSnapshot,
+  resolveLexScope,
+  resolveLexScopeDetailed,
+} from '../lex/snapshot-context.js';
 import { callVoiceChat } from '../llm/voice-chat.js';
 import { detectDeferral } from '../lex/deferral-detector.js';
 import { randomUUID } from 'node:crypto';
@@ -1450,9 +1454,17 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
                 ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
                 : undefined;
               const restartCwd = handle?.cwd;
+              /* Worker scope (2026-07-08 review finding): the
+               * compaction restart was the one spawn path that
+               * rebuilt the prompt WITHOUT scope, so a scoped
+               * brainstorm crossing 75% context came back with the
+               * global registry snapshot and no scope contract.
+               * Same resolution as the anchor open/reopen routes. */
+              const restartScope = resolveLexScopeDetailed(brainstormAnchorId);
               const built = buildLexSpawnPrompt({
                 lexSessionId: brainstormAnchorId,
                 transcriptPaths: [],
+                scope: restartScope,
                 ...(restartCwd ? { cwd: restartCwd } : {}),
               });
               if (built.feedback_memories.kept.length > 0) {
@@ -1666,8 +1678,18 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       last_user_utterance_at: new Date().toISOString(),
     });
     try {
-      const sysVersion = buildLexSystemPromptVersioned({ mode: state.mode });
-      const snapshot = buildVoiceSnapshot({ activeBrainstormCwd: bs.cwd ?? null });
+      /* Worker scope (2026-07-08): the direct-llm brainstorm sees
+       * exactly its supervised worker — system prompt contract +
+       * per-turn snapshot both collapse to that scope. */
+      const scope = resolveLexScopeDetailed(bsId);
+      const sysVersion = buildLexSystemPromptVersioned({
+        mode: state.mode,
+        scope,
+      });
+      const snapshot = buildVoiceSnapshot({
+        activeBrainstormCwd: bs.cwd ?? null,
+        scope,
+      });
       /* Replay the last N user/assistant pairs into the chat history
        * so qwen carries multi-turn context. The chunks table already
        * has the freshly-inserted user turn; pull the prior N before
@@ -2478,6 +2500,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         buildVoiceSnapshot({
           activeBrainstormCwd: bsForCwd?.cwd ?? null,
           query: result.text,
+          /* Worker scope (2026-07-08): a turn routed to a known
+           * brainstorm sees only that brainstorm's supervised
+           * worker. Unresolvable rows keep the legacy global view
+           * (a non-brainstorm PTY mirror is not a Lex turn). */
+          scope: bsForCwd ? resolveLexScope(bsForCwd.id) : null,
         }) +
         '\n\n';
     } catch {

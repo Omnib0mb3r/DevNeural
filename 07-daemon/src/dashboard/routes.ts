@@ -750,10 +750,26 @@ export async function registerDashboardRoutes(
 
   app.post('/sessions/:id/prompt', async (req, reply) => {
     const id = (req.params as { id: string }).id;
-    const body = req.body as { text?: string };
+    const body = req.body as { text?: string; from_anchor_id?: string };
     if (!body.text || typeof body.text !== 'string') {
       reply.code(400);
       return { ok: false, error: 'text required' };
+    }
+    /* Worker scope (2026-07-08 review finding): this queue route was
+     * the taught alternative to /lex/steer and skipped the scope
+     * check entirely. Same contract as steer: a caller declaring a
+     * Lex anchor only reaches that anchor's supervised worker. */
+    if (typeof body.from_anchor_id === 'string' && body.from_anchor_id) {
+      const { checkLexScope } = await import('../lex/cross-session-inject.js');
+      const scope = checkLexScope(store.db, body.from_anchor_id, id);
+      if (!scope.allowed) {
+        reply.code(403);
+        return {
+          ok: false,
+          decision: 'rejected_scope',
+          error: scope.reason ?? 'target outside this brainstorm worker scope',
+        };
+      }
     }
     const r = queueSessionPrompt(id, body.text);
     if (!r.ok) {
@@ -777,10 +793,23 @@ export async function registerDashboardRoutes(
    * claiming the next prompt outright. */
   app.post('/sessions/:id/suggest', async (req, reply) => {
     const id = (req.params as { id: string }).id;
-    const body = req.body as { text?: string };
+    const body = req.body as { text?: string; from_anchor_id?: string };
     if (!body.text || typeof body.text !== 'string') {
       reply.code(400);
       return { ok: false, error: 'text required' };
+    }
+    /* Worker scope (2026-07-08): same gate as /sessions/:id/prompt. */
+    if (typeof body.from_anchor_id === 'string' && body.from_anchor_id) {
+      const { checkLexScope } = await import('../lex/cross-session-inject.js');
+      const scope = checkLexScope(store.db, body.from_anchor_id, id);
+      if (!scope.allowed) {
+        reply.code(403);
+        return {
+          ok: false,
+          decision: 'rejected_scope',
+          error: scope.reason ?? 'target outside this brainstorm worker scope',
+        };
+      }
     }
     const r = queueSessionSuggestion(id, body.text);
     if (!r.ok) {
@@ -1147,18 +1176,40 @@ export async function registerDashboardRoutes(
       }
     }
     try {
-      const built = buildLexSpawnPrompt({
-        /* lexSessionId not yet known — anchor row is created inside
-         * spawnLexSession via prepareLexSpawn. Fill it in after the
-         * spawn returns by re-rendering with the real id. The PTY is
-         * launched with the placeholder, but the prompt template is
-         * identical for any new anchor (no lex_session_id substitution
-         * is used in the new variant header beyond display), so the
-         * placeholder vs real id doesn't change behaviour. */
-        lexSessionId: 'pending-new-anchor',
-        transcriptPaths: [],
+      /* Worker scope (2026-07-08): the scope contract needs the REAL
+       * anchor id (from_anchor_id) inside the prompt, but the row is
+       * only minted inside spawnLexSession. Late-bind the prompt via
+       * the buildSystemPrompt factory, which receives the prepared
+       * anchor. The supervises target is known from the body up
+       * front, so the scoped worker block resolves here. */
+      let built: ReturnType<typeof buildLexSpawnPrompt> | null = null;
+      const supervisesId = body.supervises_project_anchor_id ?? null;
+      const supervisedProj = supervisesId
+        ? store.db.getProjectSession(supervisesId)
+        : null;
+      const r = spawnLexSession({
         cwd,
+        title: body.title,
+        extraArgs: ['--dangerously-skip-permissions'],
+        buildSystemPrompt: (prep) => {
+          built = buildLexSpawnPrompt({
+            lexSessionId: prep.lexSession.id,
+            transcriptPaths: [],
+            cwd,
+            scope: {
+              brainstormId: prep.lexSession.id,
+              projectAnchorId: supervisesId,
+              projectSlug: supervisedProj?.project_slug ?? null,
+              workerSessionId: supervisedProj?.current_session_id ?? null,
+            },
+          });
+          return built.prompt;
+        },
       });
+      if (!built) {
+        throw new Error('system prompt factory did not run');
+      }
+      built = built as ReturnType<typeof buildLexSpawnPrompt>;
       /* Fix 12 audit: log which feedback rules were baked into the
        * system prompt for this anchor at session start. Reads
        * cleanly off the brainstorm CWD so two anchors in different
@@ -1173,12 +1224,6 @@ export async function registerDashboardRoutes(
           `[lex-anchor] WARN hard-rules over cap; truncated ${built.feedback_memories.dropped.length} oldest rules`,
         );
       }
-      const r = spawnLexSession({
-        cwd,
-        title: body.title,
-        extraArgs: ['--dangerously-skip-permissions'],
-        systemPrompt: built.prompt,
-      });
       log(
         `[lex-anchor] new anchor=${r.lexSessionId} cc=${r.ccSessionId} pty=${r.ptyId} cwd=${cwd}`,
       );
@@ -1243,10 +1288,28 @@ export async function registerDashboardRoutes(
     const inflight = (async () => {
       try {
         const refs = listTranscriptRefs(id);
+        /* Worker scope (2026-07-08): reopen rebuilds the prompt with
+         * the anchor's current supervises binding so a rebound anchor
+         * comes back scope-locked to the right worker. Same fallback
+         * chain as every other scope surface (supervisedAnchorIdFor:
+         * lex_session first, legacy project_scope_id mirror second). */
+        const { supervisedAnchorIdFor } = await import(
+          '../lex/cross-session-inject.js'
+        );
+        const supervisedId = supervisedAnchorIdFor(store.db, id);
+        const supervisedProj = supervisedId
+          ? store.db.getProjectSession(supervisedId)
+          : null;
         const built = buildLexSpawnPrompt({
           lexSessionId: id,
           transcriptPaths: refs.map((r) => r.transcript_path),
           cwd: row.cwd,
+          scope: {
+            brainstormId: id,
+            projectAnchorId: supervisedId,
+            projectSlug: supervisedProj?.project_slug ?? null,
+            workerSessionId: supervisedProj?.current_session_id ?? null,
+          },
         });
         /* Fix 12 audit on reopen path. Same logging shape as the
          * new-anchor route above so /admin/logs can grep both. */
@@ -1990,10 +2053,27 @@ export async function registerDashboardRoutes(
    * instead of dropping a marker for the bridge to pick up. */
   app.post('/sessions/:id/inject', async (req, reply) => {
     const id = (req.params as { id: string }).id;
-    const body = (req.body ?? {}) as { text?: string; commit?: boolean };
+    const body = (req.body ?? {}) as {
+      text?: string;
+      commit?: boolean;
+      from_anchor_id?: string;
+    };
     if (typeof body.text !== 'string' || body.text.length === 0) {
       reply.code(400);
       return { ok: false, error: 'text required' };
+    }
+    /* Worker scope (2026-07-08): same gate as /lex/steer. */
+    if (typeof body.from_anchor_id === 'string' && body.from_anchor_id) {
+      const { checkLexScope } = await import('../lex/cross-session-inject.js');
+      const scope = checkLexScope(store.db, body.from_anchor_id, id);
+      if (!scope.allowed) {
+        reply.code(403);
+        return {
+          ok: false,
+          decision: 'rejected_scope',
+          error: scope.reason ?? 'target outside this brainstorm worker scope',
+        };
+      }
     }
     const commit = body.commit !== false;
     const r = ptyInject(id, body.text, commit);
@@ -2439,10 +2519,29 @@ export async function registerDashboardRoutes(
    * facts that drift over time. */
   app.post('/lex/steer/:sessionOrPty', async (req, reply) => {
     const target = (req.params as { sessionOrPty: string }).sessionOrPty;
-    const body = (req.body ?? {}) as { text?: string; commit?: boolean };
+    const body = (req.body ?? {}) as {
+      text?: string;
+      commit?: boolean;
+      /* Worker scope (2026-07-08). Scoped Lex spawns must declare
+       * which anchor they speak for; the steer then only reaches
+       * that anchor's supervised worker or its own brainstorm. */
+      from_anchor_id?: string;
+    };
     if (typeof body.text !== 'string' || !body.text.trim()) {
       reply.code(400);
       return { ok: false, error: 'text required' };
+    }
+    if (typeof body.from_anchor_id === 'string' && body.from_anchor_id) {
+      const { checkLexScope } = await import('../lex/cross-session-inject.js');
+      const scope = checkLexScope(store.db, body.from_anchor_id, target);
+      if (!scope.allowed) {
+        reply.code(403);
+        return {
+          ok: false,
+          decision: 'rejected_scope',
+          error: scope.reason ?? 'target outside this brainstorm worker scope',
+        };
+      }
     }
     const result = ptyInject(
       target,
@@ -2495,10 +2594,66 @@ export async function registerDashboardRoutes(
     return { ok: true, reminder };
   });
 
-  app.get('/lex/snapshot', async () => {
-    const sessions = listSessions().filter((s) => s.active);
-    const brainstorms = listBrainstorms({ status: 'active', limit: 20 });
-    const ptyInfo = listPtys();
+  app.get('/lex/snapshot', async (req, reply) => {
+    /* Worker scope (2026-07-08): ?brainstorm_id=<anchor> collapses
+     * the envelope to that brainstorm's supervised worker + its own
+     * row. Scoped Lex spawns are contractually required to pass it
+     * (their text-mode fallback for state questions); the dashboard
+     * and daemon-internal consumers keep the global view. */
+    const q = (req.query ?? {}) as { brainstorm_id?: string };
+    const scopeBrainstormId =
+      typeof q.brainstorm_id === 'string' && q.brainstorm_id
+        ? q.brainstorm_id
+        : null;
+    const scopeLex = scopeBrainstormId
+      ? store.db.getLexSession(scopeBrainstormId)
+      : null;
+    const scopeBs = scopeBrainstormId
+      ? store.db.getBrainstorm(scopeBrainstormId)
+      : null;
+    /* Unknown id = hard 404, not a silently empty world; a typoed
+     * brainstorm_id otherwise reads as "nothing is running". */
+    if (scopeBrainstormId && !scopeLex && !scopeBs) {
+      reply.code(404);
+      return {
+        ok: false,
+        error: `brainstorm "${scopeBrainstormId}" not found`,
+      };
+    }
+    const { supervisedAnchorIdFor } = await import(
+      '../lex/cross-session-inject.js'
+    );
+    const scopedSupervisedId = scopeBrainstormId
+      ? supervisedAnchorIdFor(store.db, scopeBrainstormId)
+      : null;
+    const scopedProj = scopedSupervisedId
+      ? store.db.getProjectSession(scopedSupervisedId)
+      : null;
+    const scopedIds = new Set(
+      [
+        scopedProj?.current_session_id,
+        scopedProj?.previous_session_id,
+        scopedProj?.current_pty_id,
+        scopeLex?.current_pty_id,
+        scopeBs?.claude_session_id,
+        scopeBs?.pty_id,
+      ].filter((x): x is string => Boolean(x)),
+    );
+    const sessions = scopeBrainstormId
+      ? listSessions().filter((s) => s.active && scopedIds.has(s.session_id))
+      : listSessions().filter((s) => s.active);
+    const brainstorms = scopeBrainstormId
+      ? scopeBs && scopeBs.status === 'active'
+        ? [scopeBs]
+        : []
+      : listBrainstorms({ status: 'active', limit: 20 });
+    const ptyInfo = scopeBrainstormId
+      ? listPtys().filter(
+          (p) =>
+            scopedIds.has(p.ptyId) ||
+            (p.sessionId ? scopedIds.has(p.sessionId) : false),
+        )
+      : listPtys();
     const env = process.env;
     /* open_projects mirrors the JSON shape of the voice-snapshot text
      * block built in lex/snapshot-context.ts. Sourced from project_session
@@ -2506,10 +2661,14 @@ export async function registerDashboardRoutes(
      * flips on every tick a fresh presence file lands for the anchor's
      * cwd. bridge=ok for the single-window case, bridge=N when more than
      * one VS Code window is reporting presence for the same cwd. */
-    const liveAnchors = store.db.listProjectSessions({
-      status: 'live',
-      limit: 200,
-    });
+    const liveAnchors = scopeBrainstormId
+      ? scopedProj
+        ? [scopedProj]
+        : []
+      : store.db.listProjectSessions({
+          status: 'live',
+          limit: 200,
+        });
     const openProjects = liveAnchors.map((a) => {
       const decoded = decodeBridgeMarker(a.current_bridge_id);
       return {
@@ -2517,6 +2676,10 @@ export async function registerDashboardRoutes(
         project_slug: a.project_slug,
         cwd: a.cwd,
         cc_session_id: a.current_session_id,
+        /* Scoped envelopes include the supervised anchor even when it
+         * is dormant (an offline worker must render as offline, not
+         * vanish); status makes that honest for every consumer. */
+        status: a.status,
         bridge: decoded.count > 1 ? `bridge=${decoded.count}` : 'bridge=ok',
         bridge_connections: decoded.count,
         last_seen_ms: a.last_seen_ms,
@@ -4629,6 +4792,11 @@ export async function registerDashboardRoutes(
        * right subject. Omitted = auto: the daemon also tries the
        * resolved anchor id when it knows one. */
       signed_anchor_id?: string;
+      /* Worker scope (2026-07-08). The Lex anchor the caller speaks
+       * for. Scoped Lex spawns are contractually required to send
+       * this on every inject; the daemon then only dispatches to
+       * that anchor's supervised worker or its own brainstorm. */
+      from_anchor_id?: string;
     };
     /* Phase C fallback: when Lex omits target_session and identifies
      * itself with caller_brainstorm_id, resolve the bound project
@@ -4774,6 +4942,16 @@ export async function registerDashboardRoutes(
       typeof body.signed_anchor_id === 'string' && body.signed_anchor_id
         ? body.signed_anchor_id
         : undefined;
+    /* Worker scope (2026-07-08): a caller that declares which Lex
+     * anchor it speaks for (from_anchor_id, or the Phase C
+     * caller_brainstorm_id identity) is scope-checked against that
+     * anchor's supervised worker. Daemon-internal supervisors that
+     * pass neither keep the legacy behavior. */
+    const fromLexAnchorId =
+      (typeof body.from_anchor_id === 'string' && body.from_anchor_id) ||
+      (typeof body.caller_brainstorm_id === 'string' &&
+        body.caller_brainstorm_id) ||
+      undefined;
     const result = crossSessionInject(
       {
         target_session: dispatchSession,
@@ -4784,6 +4962,7 @@ export async function registerDashboardRoutes(
         signed_session: signedSession,
         signed_anchor_id: explicitSignedAnchor ?? resolvedAnchorId,
         anchor_id: resolvedAnchorId,
+        from_lex_anchor_id: fromLexAnchorId,
       },
       store.db,
     );
@@ -4797,7 +4976,8 @@ export async function registerDashboardRoutes(
       const code =
         result.decision === 'rejected_auth'
           ? 401
-          : result.decision === 'rejected_allowlist'
+          : result.decision === 'rejected_allowlist' ||
+              result.decision === 'rejected_scope'
             ? 403
             : 422;
       reply.code(code);

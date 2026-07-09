@@ -175,6 +175,13 @@ export interface SpawnLexSessionOptions extends PrepareLexSpawnOptions {
   /** Forwarded to pty-host.spawnLex unchanged. */
   command?: string;
   systemPrompt?: string;
+  /** Late-bound system prompt (2026-07-08 worker scope). The new-
+   * anchor route needs the REAL lex_session id inside the prompt
+   * (scope contract, from_anchor_id) but the row is only minted by
+   * prepareLexSpawn. When systemPrompt is absent and this factory is
+   * present, it runs after prepare and receives the full prep result
+   * (anchor id, cc session id, transcript path). */
+  buildSystemPrompt?: (prep: PrepareLexSpawnResult) => string;
   cols?: number;
   rows?: number;
   env?: Record<string, string>;
@@ -249,16 +256,26 @@ export function spawnLexSession(
   const args = [...prep.args, ...(opts.extraArgs ?? [])];
   let ptyResult: SpawnLexResult;
   try {
+    /* Late-bound prompt wins only when no eager prompt was passed.
+     * Inside the try so a factory throw rolls back the
+     * optimistically-inserted rows exactly like a spawn throw. */
+    const systemPrompt =
+      opts.systemPrompt ??
+      (opts.buildSystemPrompt ? opts.buildSystemPrompt(prep) : undefined);
     ptyResult = spawnLex({
       cwd: prep.lexSession.cwd,
       command: opts.command,
       args,
       cols: opts.cols,
       rows: opts.rows,
-      systemPrompt: opts.systemPrompt,
+      systemPrompt,
       env: opts.env,
       brainstormId: prep.lexSession.id,
       skipLegacyBrainstormRegister: true,
+      /* Deterministic binding (2026-07-08): claude launches with
+       * --session-id <this uuid>, so the PTY handle is bound up
+       * front and never enters shared-cwd jsonl discovery. */
+      sessionId: prep.ccSessionId,
     });
   } catch (err) {
     /* Rollback. The transcript ref was inserted before the spawn;

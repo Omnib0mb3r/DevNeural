@@ -121,6 +121,19 @@ export function LexSessionList({
    * extra client wiring. */
   const openM = useMutation({
     mutationFn: (id: string) => openLexAnchor(id),
+    /* Hook-level onSuccess so navigation fires immediately after the
+     * spawn-or-bind resolves, before the awaited onSettled refetch
+     * (per-mutate callbacks run after it, which delayed the reload
+     * and flashed the button label back). Navigating with
+     * ?brainstorm=<id> re-points the page, inject target, and the
+     * voice hello at THIS anchor (bug 2026-07-08: switch was a
+     * silent no-op while another PTY was live). */
+    onSuccess: (data, id) => {
+      if (!data?.ok || typeof window === "undefined") return;
+      const url = new URL(window.location.href);
+      url.searchParams.set("brainstorm", id);
+      window.location.href = url.toString();
+    },
     onSettled: async () => {
       setPendingRowId(null);
       await qc.refetchQueries({ queryKey: ["pty-list"] });
@@ -130,6 +143,20 @@ export function LexSessionList({
 
   const endM = useMutation({
     mutationFn: (id: string) => endLexAnchor(id),
+    onSuccess: (_data, id) => {
+      /* Ending the anchor the URL currently selects would leave a
+       * stale ?brainstorm= that fails the voice hello with
+       * brainstorm-ended on the next reload. Drop the param in
+       * place; no reload needed (the row flips dormant via the
+       * invalidations below). */
+      if (typeof window !== "undefined") {
+        const url = new URL(window.location.href);
+        if (url.searchParams.get("brainstorm") === id) {
+          url.searchParams.delete("brainstorm");
+          window.location.href = url.toString();
+        }
+      }
+    },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ["lex-anchors"] });
       qc.invalidateQueries({ queryKey: ["pty-list"] });
@@ -387,15 +414,18 @@ export function LexSessionList({
                              * brainstorm to status=ended, do NOT
                              * spawn a new CC. Navigate the URL so
                              * the global VoiceClient's hello picks
-                             * up ?brainstorm=<id> on its next open.
-                             * cc-pty rows keep the existing kill-
-                             * then-spawn dance via openLexAnchor. */
+                             * up ?brainstorm=<id> on its next open. */
                             if (row.runtime_mode === "direct-llm") {
                               const url = new URL(window.location.href);
                               url.searchParams.set("brainstorm", row.id);
                               window.location.href = url.toString();
                               return;
                             }
+                            /* cc-pty rows: spawn-or-bind first (a
+                             * dormant anchor needs its PTY before the
+                             * page can mirror it); the hook-level
+                             * onSuccess then navigates with
+                             * ?brainstorm=<id>. */
                             setPendingRowId(row.id);
                             openM.mutate(row.id);
                           }}
