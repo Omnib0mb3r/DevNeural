@@ -9,17 +9,57 @@ reflects what was true at the last update.
 The rule: anyone reading this should start cold and know where the code
 is, what is in flight, what is shippable next, and what blocks it.
 
-Last touched: 2026-06-22. Branch `master`, HEAD `baa4c53`, tree clean.
-Last verified: daemon 1407 green (`cd 07-daemon && npm test`; clean
-1407/1407, +19 for the intelligence-pillar first slices). dashboard 146
-unit green (the 2 `e2e/*.spec.ts` Playwright files vitest cannot collect
-are pre-existing, not a regression). DRIVE-QUEUE complete (items 1-5 all
-shipped); the only remaining step is the operator's daemon rebuild +
-restart + verify. This session touched daemon only.
+Last touched: 2026-07-09. Branch `master`, tree clean. Daemon suite
+1448 green (1 pre-existing grooming-routes failure, present on clean
+baseline). Dashboard 146 unit green. The operator rebuild + restart
+HAPPENED (multiple times 2026-07-09, operator-directed): everything in
+the old "Pending the operator daemon rebuild + restart" list is LIVE
+and was spot-verified (headless distill ticking, lifecycle route with
+real gate probes, /knowledge orb data, knowledge-index routes).
+
+### 2026-07-09 session: worker-scoped brainstorms + switch + binding
+
+- Worker scope, fully wired, no flags: every Lex brainstorm anchor
+  supervises at most one project anchor and sees/controls ONLY that
+  worker. `resolveLexScope`/`buildVoiceSnapshot(scope)` (per-turn),
+  `buildLexSystemPromptVersioned(scope)` + "# Worker scope" contract
+  (spawn + reopen + compaction restart), `checkLexScope` enforcement
+  on inject/steer/prompt/suggest routes (`from_anchor_id`,
+  decision=rejected_scope, 403), scoped `GET
+  /lex/snapshot?brainstorm_id=`. Live-verified: MHA anchor's snapshot
+  shows only Material-Handling-Academy; cross-scope steer 403s.
+- Deterministic session binding: spawn-lex-session passes the
+  pre-minted `--session-id` into spawnLex which stamps the handle at
+  spawn; shared-cwd jsonl discovery replaced by `pickDiscoveryJsonl`
+  (creation-time based + claimed-set; Windows ctime=last-write was
+  cross-binding sibling brainstorms). Live-verified with two
+  concurrent spawns.
+- Dashboard switch: /lex honors `?brainstorm=<anchor id>` (page PTY
+  resolution, voice hello, inject target); switch/open/new/end all
+  maintain the param; a selected anchor without a live PTY renders
+  offline instead of silently mirroring another session.
+- Data repair (backed up first): two cross-bound rows repointed,
+  19 mis-attributed chunks moved home, 82 unnamed brainstorm sessions
+  deleted, labels mirrored from lex_session titles.
+- Gates unflipped per operator directive: smart_clear_mode=live
+  (runtime config), DEVNEURAL_INVESTIGATOR_HEADLESS=1 in
+  start-daemon.ps1. smart-compact + auto-advance were already live.
+- Knowledge-index store-set auto-resolver SHIPPED
+  (`lex/doc-store-resolver.ts`): /lex/index-docs + /lex/watch-docs
+  resolve root/memory/docs/spec/bugs from the anchor cwd when stores
+  are omitted. Live-verified: DevNeural indexed 120 files / 2036
+  chunks across all five stores; watcher running.
+- Deliberately NOT flipped (operator decisions): DEVNEURAL_CURATOR_LLM
+  (inline qwen3 polish would exceed the hook's 1500ms budget on every
+  prompt; needs an offline-polish design), DEVNEURAL_HEARTBEAT_URL
+  (needs an external watcher endpoint provisioned),
+  DEVNEURAL_PASS2_FALLBACK=anthropic + voice live-haiku
+  (ANTHROPIC_API_KEY not set anywhere; cost/privacy call).
 
 ## HARD constraint
 
-Do NOT restart the daemon (it kills the supervising Lex session). The
+Do NOT restart the daemon (it kills the supervising Lex session)
+unless the operator has directed it in the active conversation. The
 operator owns every daemon restart + flag flip.
 
 ## The program: Investigator Pipeline (3 pillars) + follow-ons
