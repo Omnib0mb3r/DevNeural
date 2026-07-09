@@ -2267,6 +2267,56 @@ export async function registerDashboardRoutes(
    * markdown corpus into raw_chunks under PROJECT_DOC_KIND with
    * deterministic ids (re-run = in-place update) and flushes so the
    * vectors survive a restart. */
+  /* Store-set auto-resolver (Knowledge Index final piece). When the
+   * caller omits stores, resolve them from the project's cwd so Lex
+   * and the dashboard never hand-pass absolute dirs. Explicit stores
+   * still win (the brainstorm dir, custom layouts). */
+  async function resolveStoresOrError(
+    projectId: string,
+    bodyStores:
+      | Array<{ store?: string; dir?: string; recursive?: boolean }>
+      | undefined,
+  ): Promise<
+    | { ok: true; stores: Array<{ store: string; dir: string; recursive?: boolean }> }
+    | { ok: false; code: number; error: string }
+  > {
+    if (Array.isArray(bodyStores) && bodyStores.length > 0) {
+      const stores = bodyStores
+        .filter(
+          (s) => s && typeof s.store === 'string' && typeof s.dir === 'string',
+        )
+        .map((s) => ({
+          store: s.store as string,
+          dir: s.dir as string,
+          ...(s.recursive ? { recursive: true } : {}),
+        }));
+      if (stores.length === 0) {
+        return { ok: false, code: 400, error: 'stores must each have {store, dir}' };
+      }
+      return { ok: true, stores };
+    }
+    const anchor = store.db.getProjectSession(projectId);
+    if (!anchor) {
+      return {
+        ok: false,
+        code: 404,
+        error: `project_session ${projectId} not found (pass explicit stores for non-anchor projects)`,
+      };
+    }
+    const { resolveProjectDocStores } = await import(
+      '../lex/doc-store-resolver.js'
+    );
+    const stores = resolveProjectDocStores({ cwd: anchor.cwd });
+    if (stores.length === 0) {
+      return {
+        ok: false,
+        code: 422,
+        error: `no markdown stores found under ${anchor.cwd}`,
+      };
+    }
+    return { ok: true, stores };
+  }
+
   app.post('/lex/index-docs', async (req, reply) => {
     const body = (req.body ?? {}) as {
       project_id?: string;
@@ -2276,23 +2326,15 @@ export async function registerDashboardRoutes(
       reply.code(400);
       return { ok: false, error: 'project_id required' };
     }
-    if (!Array.isArray(body.stores) || body.stores.length === 0) {
-      reply.code(400);
-      return { ok: false, error: 'stores required (non-empty array)' };
+    const resolved = await resolveStoresOrError(
+      body.project_id.trim(),
+      body.stores,
+    );
+    if (!resolved.ok) {
+      reply.code(resolved.code);
+      return { ok: false, error: resolved.error };
     }
-    const stores = body.stores
-      .filter(
-        (s) => s && typeof s.store === 'string' && typeof s.dir === 'string',
-      )
-      .map((s) => ({
-        store: s.store as string,
-        dir: s.dir as string,
-        ...(s.recursive ? { recursive: true } : {}),
-      }));
-    if (stores.length === 0) {
-      reply.code(400);
-      return { ok: false, error: 'stores must each have {store, dir}' };
-    }
+    const stores = resolved.stores;
     const { indexProjectDocs } = await import('../lex/project-doc-index.js');
     const result = await indexProjectDocs(store, {
       project_id: body.project_id.trim(),
@@ -2309,8 +2351,8 @@ export async function registerDashboardRoutes(
    * reusing the per-file reindex path so "where is X" stays current
    * without a full manual /lex/index-docs run. Idempotent: starting
    * again replaces the prior watcher for that project. stop: tear it
-   * down. Caller passes the same explicit store-set as /lex/index-docs
-   * (the auto-resolver is a later piece). */
+   * down. stores may be omitted: the store-set auto-resolver derives
+   * root/memory/docs/spec/bugs from the project anchor's cwd. */
   const docWatchers = new Map<
     string,
     import('../lex/project-doc-watcher.js').DocWatchCoordinator
@@ -2339,23 +2381,14 @@ export async function registerDashboardRoutes(
       reply.code(400);
       return { ok: false, error: "action must be 'start' or 'stop'" };
     }
-    if (!Array.isArray(body.stores) || body.stores.length === 0) {
-      reply.code(400);
-      return { ok: false, error: 'stores required (non-empty array) to start' };
+    /* Same auto-resolution as /lex/index-docs: omitted stores resolve
+     * from the project anchor's cwd. */
+    const resolved = await resolveStoresOrError(projectId, body.stores);
+    if (!resolved.ok) {
+      reply.code(resolved.code);
+      return { ok: false, error: resolved.error };
     }
-    const stores = body.stores
-      .filter(
-        (s) => s && typeof s.store === 'string' && typeof s.dir === 'string',
-      )
-      .map((s) => ({
-        store: s.store as string,
-        dir: s.dir as string,
-        ...(s.recursive ? { recursive: true } : {}),
-      }));
-    if (stores.length === 0) {
-      reply.code(400);
-      return { ok: false, error: 'stores must each have {store, dir}' };
-    }
+    const stores = resolved.stores;
     /* Idempotent (re)start: replace any prior watcher for this project. */
     const prior = docWatchers.get(projectId);
     if (prior) prior.close();

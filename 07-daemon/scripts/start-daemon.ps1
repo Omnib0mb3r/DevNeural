@@ -142,6 +142,14 @@ $env:DEVNEURAL_DISTILL_HEADLESS = '1'
 # roll back to the pre-haiku voice.
 $env:DEVNEURAL_VOICE_HAIKU = '1'
 
+# Headless Opus refinement of the Lex cold-start seed. The synchronous
+# gateColdStart floor always runs; this only enables the bounded async
+# upgrade pass (prewarmInvestigator, 60s timeout, fail-safe by
+# contract). Same shared engine already proven by DISTILL_HEADLESS
+# above. Reversible: delete this line to keep the deterministic floor
+# only. Enabled 2026-07-09 (operator directive: no gates).
+$env:DEVNEURAL_INVESTIGATOR_HEADLESS = '1'
+
 $proc = Start-Process `
     -FilePath $node `
     -ArgumentList "`"$dist`"" `
