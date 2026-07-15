@@ -811,6 +811,37 @@ export async function decayInactivePages(
   lastDecayWasPaused = false;
   let decayed = 0;
   let archived = 0;
+  /* Meta-sync fix (2026-07-15, found by the wiki reconcile pass):
+   * decay wrote the new weight to DISK via writePage but never to
+   * wiki_pages_meta, so SQL drifted from disk on every decay cycle
+   * (167 of 167 rows disagreed, almost all on weight). Each decayed
+   * page now upserts its meta row too. created/last_touched are
+   * preserved from the existing row: decay is maintenance, not a
+   * touch, and must not make every page look freshly active. */
+  const metaById = new Map(store.db.allWikiPages().map((r) => [r.id, r]));
+  const syncMeta = (
+    fm: ReturnType<typeof parsePage>['frontmatter'],
+    body: string,
+  ): void => {
+    const prev = metaById.get(fm.id);
+    store.db.upsertWikiPage(
+      {
+        id: fm.id,
+        title: fm.title,
+        trigger: fm.trigger,
+        insight: fm.insight,
+        status: fm.status,
+        weight: fm.weight,
+        hits: fm.hits,
+        corrections: fm.corrections,
+        created_ms: prev?.created_ms ?? (new Date(fm.created).getTime() || Date.now()),
+        last_touched_ms: prev?.last_touched_ms ?? Date.now(),
+        projects_json: JSON.stringify(fm.projects),
+        human_edited: fm.human_edited ? 1 : 0,
+      },
+      body,
+    );
+  };
   const dirs = [wikiPagesDir(), wikiPendingDir()];
   for (const dir of dirs) {
     if (!fs.existsSync(dir)) continue;
@@ -832,6 +863,7 @@ export async function decayInactivePages(
       const newWeight = fm.weight * DECAY_PER_SESSION;
       fm.weight = newWeight;
       writePage(dir, { frontmatter: fm, sections: parsed.sections });
+      syncMeta(fm, parsed.sections.pattern);
       decayed++;
 
       if (newWeight < ARCHIVE_FLOOR && fm.status !== 'archived') {
@@ -845,6 +877,7 @@ export async function decayInactivePages(
           frontmatter: fm,
           sections: targetParsed.sections,
         });
+        syncMeta(fm, targetParsed.sections.pattern);
         archived++;
         appendReinforcementLog({
           kind: 'decay-archive',

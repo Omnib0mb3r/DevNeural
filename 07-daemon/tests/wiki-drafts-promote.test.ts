@@ -11,15 +11,12 @@
  * these primitives; the higher-level fastify wiring is covered by
  * the existing integration tests under tests/integration.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { IndexDb, type WikiDraftRow } from '../src/store/index-db.js';
-import { runMigrations } from '../src/db/migrate.js';
-import { writePage } from '../src/wiki/schema.js';
-import { wikiPagesDir } from '../src/paths.js';
+import type { IndexDb, WikiDraftRow } from '../src/store/index-db.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = path.resolve(HERE, '..', 'scripts', 'migrations');
@@ -29,16 +26,42 @@ let dbFile: string;
 let db: IndexDb;
 let priorRoot: string | undefined;
 
+/* LEAK FIX (2026-07-15): paths.ts freezes DATA_ROOT at module load,
+ * so the old static imports of index-db/schema/paths resolved the
+ * REAL production data root before beforeEach ever set
+ * DEVNEURAL_DATA_ROOT. makePage() then wrote its fixture pages
+ * (alpha/beta/gamma/frozen/rerun/pricing-rethink) straight into the
+ * live wiki, twice in production history. Everything paths-dependent
+ * is now imported dynamically AFTER the env var is set, with a hard
+ * assertion that the resolved pages dir lives under the temp root.
+ * Same pattern as transcript-watcher-catchup.test.ts. */
+let IndexDbCtor: typeof import('../src/store/index-db.js').IndexDb;
+let runMigrations: typeof import('../src/db/migrate.js').runMigrations;
+let writePage: typeof import('../src/wiki/schema.js').writePage;
+let wikiPagesDir: typeof import('../src/paths.js').wikiPagesDir;
+
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devneural-drafts-'));
   dbFile = path.join(tmpDir, 'index.db');
   fs.mkdirSync(path.join(tmpDir, 'wiki'), { recursive: true });
   priorRoot = process.env.DEVNEURAL_DATA_ROOT;
   process.env.DEVNEURAL_DATA_ROOT = tmpDir;
-  db = new IndexDb(dbFile);
+  vi.resetModules();
+  ({ IndexDb: IndexDbCtor } = await import('../src/store/index-db.js'));
+  ({ runMigrations } = await import('../src/db/migrate.js'));
+  ({ writePage } = await import('../src/wiki/schema.js'));
+  ({ wikiPagesDir } = await import('../src/paths.js'));
+  const resolvedPages = wikiPagesDir().replace(/\\/g, '/');
+  const normalizedTmp = tmpDir.replace(/\\/g, '/');
+  if (!resolvedPages.startsWith(normalizedTmp)) {
+    throw new Error(
+      `test data root did not isolate: pages dir ${resolvedPages} is outside ${normalizedTmp}`,
+    );
+  }
+  db = new IndexDbCtor(dbFile);
   db.close();
   await runMigrations({ dbPath: dbFile, migrationsDir: MIGRATIONS_DIR });
-  db = new IndexDb(dbFile);
+  db = new IndexDbCtor(dbFile);
   /* Every test starts with one brainstorm row + one pending draft so
    * the conflict assertions stay focused on the promote path itself. */
   db.insertBrainstorm({
