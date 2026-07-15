@@ -48,6 +48,7 @@ import {
 import {
   deriveExpectedOutcome,
   recordExpectation,
+  recordExpectationWithPolicy,
   runExpectationTick,
   startExpectationSupervisor,
 } from '../src/lex/expectation-supervisor.js';
@@ -224,6 +225,35 @@ function seedWorkerJsonl(
   fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), content, 'utf-8');
 }
 
+/* Raw row reader, including CLOSED rows -- listOpenWorkerExpectations
+ * filters closed_at IS NULL by design, so the supersede-policy tests
+ * below need a direct query to assert closed_reason='superseded'
+ * landed on the prior row. Mirrors expectation-dispatch-routes.int
+ * .test.ts's expectationRows() helper. */
+function allExpectationRows(db: IndexDb): Array<{
+  id: string;
+  brainstorm_id: string;
+  anchor_id: string;
+  expected_outcome: string;
+  closed_at: string | null;
+  closed_reason: string | null;
+}> {
+  return (
+    db as unknown as {
+      db: { prepare: (sql: string) => { all: (...a: unknown[]) => unknown[] } };
+    }
+  ).db
+    .prepare('SELECT * FROM lex_worker_expectation ORDER BY created_at ASC')
+    .all() as Array<{
+    id: string;
+    brainstorm_id: string;
+    anchor_id: string;
+    expected_outcome: string;
+    closed_at: string | null;
+    closed_reason: string | null;
+  }>;
+}
+
 describe('runExpectationTick evaluation outcomes', () => {
   let tmpDir: string;
   let db: IndexDb;
@@ -349,5 +379,334 @@ describe('runExpectationTick evaluation outcomes', () => {
 
     const open = db.listOpenWorkerExpectations({ brainstormId: BRAINSTORM });
     expect(open.length).toBe(0);
+  });
+});
+
+/**
+ * Operator's expectation-supersede policy (2026-07-15). Verbatim
+ * intent: "if it's a contradictory instruction, supersede; or else a
+ * new command should be heard and the replies combined if they
+ * respond at the right time, just like a human would do."
+ *
+ * recordExpectationWithPolicy classifies a new dispatch against every
+ * open row on the same anchor before recording it. These tests pin:
+ *   - the cheap pre-filter (no open rows -> judge never called),
+ *   - 'contradicts' -> prior row closes as 'superseded',
+ *   - 'independent' -> prior row stays open, new row also recorded,
+ *   - timeout / provider error -> fail-open to 'independent',
+ *   - a superseded row is genuinely excluded from the next tick
+ *     (closed_at is set, so listOpenWorkerExpectations drops it),
+ *   - task-3 verification: runExpectationTick already evaluates every
+ *     open row on an anchor independently against the same jsonl
+ *     tail, so two INDEPENDENT open rows can both close in the same
+ *     tick off one activity slice -- the "replies combined... just
+ *     like a human would do" half of the policy needed no change to
+ *     the tick loop itself.
+ */
+describe('recordExpectationWithPolicy (supersede policy)', () => {
+  let tmpDir: string;
+  let db: IndexDb;
+  const ANCHOR = 'anchor-policy';
+  const BRAINSTORM = 'bs-policy';
+
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devneural-expect-policy-'));
+    const dbFile = path.join(tmpDir, 'index.db');
+    const seed = new IndexDb(dbFile);
+    seed.close();
+    await runMigrations({ dbPath: dbFile, migrationsDir: MIGRATIONS_DIR });
+    db = new IndexDb(dbFile);
+    setBrainstormStore({ db } as never);
+    vi.mocked(callVoiceChat).mockReset();
+    vi.mocked(emitNotification).mockClear();
+    setSharedWorkerEventGate(new WorkerEventGate());
+  });
+
+  afterEach(() => {
+    try {
+      db.close();
+    } catch {
+      /* */
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    setSharedWorkerEventGate(null);
+  });
+
+  it('no open rows on the anchor: records the new row and never calls the judge', async () => {
+    const id = await recordExpectationWithPolicy(
+      {},
+      {
+        brainstormId: BRAINSTORM,
+        anchorId: ANCHOR,
+        expectedOutcome: 'do the thing',
+      },
+    );
+
+    expect(callVoiceChat).not.toHaveBeenCalled();
+    const open = db.listOpenWorkerExpectations({ brainstormId: BRAINSTORM });
+    expect(open.length).toBe(1);
+    expect(open[0]!.id).toBe(id);
+    expect(open[0]!.expected_outcome).toBe('do the thing');
+  });
+
+  it("'contradicts' verdict closes the prior open row as superseded and still records the new one", async () => {
+    const priorId = recordExpectation({
+      brainstormId: BRAINSTORM,
+      anchorId: ANCHOR,
+      expectedOutcome: 'refactor payments to use stripe',
+    });
+    vi.mocked(callVoiceChat).mockResolvedValue({
+      text: JSON.stringify({ verdict: 'contradicts' }),
+      modelId: 'test-model',
+      inputTokens: 5,
+      outputTokens: 5,
+    });
+
+    const newId = await recordExpectationWithPolicy(
+      {},
+      {
+        brainstormId: BRAINSTORM,
+        anchorId: ANCHOR,
+        expectedOutcome: 'stop refactoring payments, revert to the old gateway',
+      },
+    );
+
+    const rows = allExpectationRows(db);
+    expect(rows.length).toBe(2);
+    const prior = rows.find((r) => r.id === priorId)!;
+    expect(prior.closed_reason).toBe('superseded');
+    expect(prior.closed_at).not.toBeNull();
+    const fresh = rows.find((r) => r.id === newId)!;
+    expect(fresh.closed_at).toBeNull();
+    expect(fresh.expected_outcome).toBe(
+      'stop refactoring payments, revert to the old gateway',
+    );
+
+    const open = db.listOpenWorkerExpectations({ brainstormId: BRAINSTORM });
+    expect(open.length).toBe(1);
+    expect(open[0]!.id).toBe(newId);
+  });
+
+  it("'independent' verdict leaves the prior row open and records the new one alongside it", async () => {
+    const priorId = recordExpectation({
+      brainstormId: BRAINSTORM,
+      anchorId: ANCHOR,
+      expectedOutcome: 'write unit tests for checkout',
+    });
+    vi.mocked(callVoiceChat).mockResolvedValue({
+      text: JSON.stringify({ verdict: 'independent' }),
+      modelId: 'test-model',
+      inputTokens: 5,
+      outputTokens: 5,
+    });
+
+    const newId = await recordExpectationWithPolicy(
+      {},
+      {
+        brainstormId: BRAINSTORM,
+        anchorId: ANCHOR,
+        expectedOutcome: 'also update the README',
+      },
+    );
+
+    const open = db.listOpenWorkerExpectations({ brainstormId: BRAINSTORM });
+    expect(open.length).toBe(2);
+    expect(open.map((r) => r.id).sort()).toEqual([priorId, newId].sort());
+  });
+
+  it('a hard timeout fails open to independent: keeps both rows open within the bound', async () => {
+    recordExpectation({
+      brainstormId: BRAINSTORM,
+      anchorId: ANCHOR,
+      expectedOutcome: 'ship the release',
+    });
+    vi.mocked(callVoiceChat).mockImplementation(
+      () =>
+        new Promise(() => {
+          /* never resolves: forces the internal timeout branch to win */
+        }),
+    );
+
+    const start = Date.now();
+    await recordExpectationWithPolicy(
+      { timeoutMs: 40 },
+      {
+        brainstormId: BRAINSTORM,
+        anchorId: ANCHOR,
+        expectedOutcome: 'also ping the release channel',
+      },
+    );
+    const elapsed = Date.now() - start;
+
+    // Generous upper bound: proves the hard timeout actually gates the
+    // call rather than falling through to the mock's real (infinite) latency.
+    expect(elapsed).toBeLessThan(2000);
+    const open = db.listOpenWorkerExpectations({ brainstormId: BRAINSTORM });
+    expect(open.length).toBe(2);
+  }, 10000);
+
+  it('a provider error fails open to independent: keeps both rows open', async () => {
+    recordExpectation({
+      brainstormId: BRAINSTORM,
+      anchorId: ANCHOR,
+      expectedOutcome: 'ship the release',
+    });
+    vi.mocked(callVoiceChat).mockRejectedValue(new Error('ollama unreachable'));
+
+    await recordExpectationWithPolicy(
+      {},
+      {
+        brainstormId: BRAINSTORM,
+        anchorId: ANCHOR,
+        expectedOutcome: 'also ping the release channel',
+      },
+    );
+
+    const open = db.listOpenWorkerExpectations({ brainstormId: BRAINSTORM });
+    expect(open.length).toBe(2);
+  });
+
+  it('a superseded row is excluded from the next tick, even though a second open row on the same anchor is still evaluated', async () => {
+    const cwd = path.join(tmpDir, 'Projects', 'policy-proj');
+    const sessionId = '55555555-5555-5555-5555-555555555555';
+    seedWorkerJsonl(
+      tmpDir,
+      cwd,
+      sessionId,
+      'the worker shipped the release and pinged the channel as requested, quite a lot of unrelated padding text here to clear the 80-char floor',
+    );
+    db.insertProjectSession({
+      id: ANCHOR,
+      project_slug: 'policy-proj',
+      cwd,
+      title: null,
+      status: 'live',
+      current_session_id: sessionId,
+      current_bridge_id: null,
+      current_pty_id: null,
+      created_ms: 1,
+      last_seen_ms: 1,
+    });
+
+    const priorId = recordExpectation({
+      brainstormId: BRAINSTORM,
+      anchorId: ANCHOR,
+      expectedOutcome: 'refactor payments to use stripe',
+    });
+    vi.mocked(callVoiceChat).mockResolvedValueOnce({
+      text: JSON.stringify({ verdict: 'contradicts' }),
+      modelId: 'test-model',
+      inputTokens: 5,
+      outputTokens: 5,
+    });
+    const newId = await recordExpectationWithPolicy(
+      {},
+      {
+        brainstormId: BRAINSTORM,
+        anchorId: ANCHOR,
+        expectedOutcome: 'ship the release and ping the channel',
+      },
+    );
+
+    vi.mocked(callVoiceChat).mockReset();
+    vi.mocked(callVoiceChat).mockResolvedValue({
+      text: JSON.stringify({
+        aligned: true,
+        alignment_score: 0.9,
+        drift_summary: '',
+        suggested_correction: '',
+      }),
+      modelId: 'test-model',
+      inputTokens: 5,
+      outputTokens: 5,
+    });
+
+    const result = await runExpectationTick();
+
+    // Only the surviving row reaches the judge; the superseded row's
+    // closed_at excludes it from listOpenWorkerExpectations entirely.
+    expect(result.evaluated).toBe(1);
+    expect(callVoiceChat).toHaveBeenCalledTimes(1);
+    const rows = allExpectationRows(db);
+    expect(rows.find((r) => r.id === priorId)!.closed_reason).toBe(
+      'superseded',
+    );
+    expect(rows.find((r) => r.id === newId)!.closed_reason).toBe('completed');
+  });
+
+  it('task-3 verification: one activity slice can close two independent open rows on the same anchor in a single tick', async () => {
+    const cwd = path.join(tmpDir, 'Projects', 'combine-proj');
+    const sessionId = '66666666-6666-6666-6666-666666666666';
+    seedWorkerJsonl(
+      tmpDir,
+      cwd,
+      sessionId,
+      'the worker wrote the checkout unit tests and also updated the README in the same commit, quite a lot of unrelated padding text to clear the floor',
+    );
+    db.insertProjectSession({
+      id: ANCHOR,
+      project_slug: 'combine-proj',
+      cwd,
+      title: null,
+      status: 'live',
+      current_session_id: sessionId,
+      current_bridge_id: null,
+      current_pty_id: null,
+      created_ms: 1,
+      last_seen_ms: 1,
+    });
+
+    const firstId = recordExpectation({
+      brainstormId: BRAINSTORM,
+      anchorId: ANCHOR,
+      expectedOutcome: 'write unit tests for checkout',
+    });
+    vi.mocked(callVoiceChat).mockResolvedValue({
+      text: JSON.stringify({ verdict: 'independent' }),
+      modelId: 'test-model',
+      inputTokens: 5,
+      outputTokens: 5,
+    });
+    const secondId = await recordExpectationWithPolicy(
+      {},
+      {
+        brainstormId: BRAINSTORM,
+        anchorId: ANCHOR,
+        expectedOutcome: 'also update the README',
+      },
+    );
+    expect(db.listOpenWorkerExpectations({ brainstormId: BRAINSTORM }).length).toBe(
+      2,
+    );
+
+    // Same activity slice judged aligned for both open rows -- this is
+    // the "replies combined... just like a human would do" behavior.
+    vi.mocked(callVoiceChat).mockReset();
+    vi.mocked(callVoiceChat).mockResolvedValue({
+      text: JSON.stringify({
+        aligned: true,
+        alignment_score: 0.95,
+        drift_summary: '',
+        suggested_correction: '',
+      }),
+      modelId: 'test-model',
+      inputTokens: 5,
+      outputTokens: 5,
+    });
+
+    const result = await runExpectationTick();
+
+    expect(result.evaluated).toBe(2);
+    expect(callVoiceChat).toHaveBeenCalledTimes(2);
+    expect(db.listOpenWorkerExpectations({ brainstormId: BRAINSTORM }).length).toBe(
+      0,
+    );
+    const rows = allExpectationRows(db);
+    expect(rows.find((r) => r.id === firstId)!.closed_reason).toBe(
+      'completed',
+    );
+    expect(rows.find((r) => r.id === secondId)!.closed_reason).toBe(
+      'completed',
+    );
   });
 });

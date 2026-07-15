@@ -60,6 +60,165 @@ export function recordExpectation(input: RecordExpectationInput): string {
   return id;
 }
 
+/* Operator's expectation-supersede policy (2026-07-15). Verbatim
+ * intent: "if it's a contradictory instruction, supersede; or else a
+ * new command should be heard and the replies combined if they
+ * respond at the right time, just like a human would do."
+ *
+ * Before a new dispatch is recorded, classify it against every OPEN
+ * expectation already sitting on the same worker anchor:
+ *   - 'contradicts' -> close the prior row as 'superseded'. The
+ *     worker was told to do X; a contradictory Y makes X's row stale
+ *     supervision noise (it would otherwise sit open until the 90s
+ *     tick eventually judges it "drifted" against activity that was
+ *     never wrong, just superseded).
+ *   - 'independent' -> leave the prior row open. runExpectationTick
+ *     already evaluates every open row for an anchor independently
+ *     against the same jsonl tail each tick (see that function): a
+ *     single worker reply that satisfies two open, unrelated asks
+ *     shows up as two independently-'aligned' verdicts in the same
+ *     tick and both close together. That is the "replies combined...
+ *     just like a human would do" half of the policy; it needed no
+ *     change to the tick loop, only verification (see
+ *     expectation-supervisor.test.ts).
+ *
+ * BF-4: routed through callVoiceChat, same local-only ollama plumbing
+ * runExpectationTick's evaluator uses -- the new instruction text is
+ * brainstorm content same as the jsonl tail is.
+ *
+ * FAIL-OPEN by design: a timeout, provider error, or missing provider
+ * classifies as 'independent' (never blind-close a real expectation
+ * because ollama hiccuped). Cheap pre-filter: an anchor with no open
+ * rows never reaches the LLM at all. */
+const DEFAULT_POLICY_TIMEOUT_MS = Number(
+  process.env.DEVNEURAL_EXPECTATION_POLICY_TIMEOUT_MS ?? 3000,
+);
+
+const EXPECTATION_POLICY_SYSTEM_PROMPT = `You are a dispatch-policy judge for a coding supervisor. The supervisor is about to record a NEW instruction it just sent to a worker. One OPEN instruction sent earlier to the SAME worker is still outstanding (not yet resolved). Decide whether the NEW instruction contradicts the OPEN one.
+
+Return STRICT JSON only, no prose:
+{ "verdict": "contradicts" | "independent" }
+
+Hard rules:
+- "contradicts" means the new instruction reverses, cancels, or replaces the open one for the same piece of work, so pursuing both literally would be wasteful or impossible (e.g. "stop refactoring X" after "refactor X", or "use approach B" after "use approach A" for the same goal).
+- "independent" means the new instruction is a separate ask that can be pursued alongside the open one, even if unrelated, and even if a single worker reply could end up satisfying both at once.
+- When genuinely uncertain, answer "independent": closing a live expectation on a wrong guess loses supervision coverage, while keeping two open only costs a second evaluation on the next tick.`;
+
+export type SupersedeVerdict = 'contradicts' | 'independent';
+
+/* Two-label judge call, one open row at a time. Mirrors
+ * judgeInjectionUse's AbortController + Promise.race hard-timeout
+ * shape (src/reinforcement/inject-verdict.ts) rather than inventing a
+ * fourth timeout dance in this codebase. Never throws: any error,
+ * timeout, or malformed reply resolves to 'independent' per the
+ * fail-open contract above. */
+async function classifySupersede(
+  callChat: typeof callVoiceChat,
+  openInstruction: string,
+  newInstruction: string,
+  timeoutMs: number,
+  log: (msg: string) => void,
+): Promise<SupersedeVerdict> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<SupersedeVerdict>((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve('independent');
+    }, timeoutMs);
+  });
+
+  const call = (async (): Promise<SupersedeVerdict> => {
+    try {
+      const reply = await callChat(
+        [
+          { role: 'system', content: EXPECTATION_POLICY_SYSTEM_PROMPT },
+          {
+            role: 'user',
+            content: `Open instruction: ${openInstruction}\nNew instruction: ${newInstruction}\n\nDoes the new instruction contradict the open one?`,
+          },
+        ],
+        { maxTokens: 60, temperature: 0.1, signal: controller.signal },
+      );
+      const match = reply.text.match(/\{[\s\S]*\}/);
+      if (!match) return 'independent';
+      const parsed = JSON.parse(match[0]) as { verdict?: unknown };
+      return parsed.verdict === 'contradicts' ? 'contradicts' : 'independent';
+    } catch (err) {
+      log(
+        `[expectation-policy] classify failed, fail-open independent: ${(err as Error).message}`,
+      );
+      return 'independent';
+    }
+  })();
+
+  try {
+    return await Promise.race([call, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export interface RecordExpectationPolicyDeps {
+  /** Injectable seam so tests can fake the classification call
+   * without hitting real ollama. Defaults to callVoiceChat. */
+  callVoiceChat?: typeof callVoiceChat;
+  /** Daemon logger; defaults to a no-op like ExpectationTickDeps.log. */
+  log?: (msg: string) => void;
+  /** Overrides DEVNEURAL_EXPECTATION_POLICY_TIMEOUT_MS. Mainly for
+   * tests so they don't have to wait out the real default. */
+  timeoutMs?: number;
+}
+
+/**
+ * Dispatcher-facing entry point: classify `input` against every open
+ * expectation already on `input.anchorId`, supersede the ones that
+ * contradict it, then record the new expectation exactly as
+ * recordExpectation would. Both dispatcher call sites
+ * (cross-session-inject.ts, dashboard/routes.ts) should call this
+ * instead of recordExpectation directly.
+ */
+export async function recordExpectationWithPolicy(
+  deps: RecordExpectationPolicyDeps,
+  input: RecordExpectationInput,
+): Promise<string> {
+  const log = deps.log ?? ((): void => undefined);
+  const callChat = deps.callVoiceChat ?? callVoiceChat;
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_POLICY_TIMEOUT_MS;
+
+  const db = getStore().db;
+  /* listOpenWorkerExpectations has no anchor-scoped query today (only
+   * brainstormId / global); a global pull + in-memory filter keeps
+   * this anchor-scoped without widening index-db.ts's surface for a
+   * filter this narrow. Cheap pre-filter per the operator's policy:
+   * an anchor with zero open rows never reaches the loop below, so
+   * the LLM is never called. */
+  const openForAnchor = db
+    .listOpenWorkerExpectations({ limit: 500 })
+    .filter((row) => row.anchor_id === input.anchorId);
+
+  for (const row of openForAnchor) {
+    const verdict = await classifySupersede(
+      callChat,
+      row.expected_outcome,
+      input.expectedOutcome,
+      timeoutMs,
+      log,
+    );
+    if (verdict === 'contradicts') {
+      db.closeWorkerExpectation(row.id, 'superseded');
+      log(
+        `[expectation-policy] superseded id=${row.id} open="${row.expected_outcome}" new="${input.expectedOutcome}"`,
+      );
+    }
+    /* 'independent': leave the prior row open. See the module-level
+     * comment above this section for why that alone reproduces the
+     * "combined replies" half of the policy. */
+  }
+
+  return recordExpectation(input);
+}
+
 /* Dispatcher-facing derivation (goal-audit fix wave, 2026-07-15).
  * recordExpectation's only writer was, until this wave, nothing at
  * all -- see the 2026-07-15 goal audit. The dispatcher call sites

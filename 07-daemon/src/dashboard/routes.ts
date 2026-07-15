@@ -88,7 +88,7 @@ import {
   detachWorkerSession,
 } from '../lex/brainstorm-store.js';
 import {
-  recordExpectation,
+  recordExpectationWithPolicy,
   deriveExpectedOutcome,
 } from '../lex/expectation-supervisor.js';
 import {
@@ -638,7 +638,17 @@ export async function registerDashboardRoutes(
    * anchor are deliberately excluded -- only judge alignment against
    * instructions that actually landed on a worker Lex supervises.
    * Best-effort: must never turn an already-successful delivery
-   * response into a caller-visible error. */
+   * response into a caller-visible error.
+   *
+   * Supersede policy (2026-07-15): recordExpectationWithPolicy is
+   * async (it may classify the new instruction against the anchor's
+   * open rows via an LLM call before writing). This closure's five
+   * call sites are unawaited today (recordDispatchExpectation(...);
+   * with no await, same as before this wave), so the fire stays
+   * unawaited here too rather than widening every call site's control
+   * flow -- that keeps this edit scoped to the closure body. The
+   * .catch keeps a rejected policy promise from becoming an unhandled
+   * rejection; it never reaches the already-sent response. */
   function recordDispatchExpectation(opts: {
     fromAnchorId: string | undefined;
     targetAnchorId: string | null;
@@ -647,15 +657,16 @@ export async function registerDashboardRoutes(
   }): void {
     if (!opts.commit) return;
     if (!opts.fromAnchorId || !opts.targetAnchorId) return;
-    try {
-      recordExpectation({
+    void recordExpectationWithPolicy(
+      { log },
+      {
         brainstormId: opts.fromAnchorId,
         anchorId: opts.targetAnchorId,
         expectedOutcome: deriveExpectedOutcome(opts.text),
-      });
-    } catch {
+      },
+    ).catch(() => {
       /* best-effort; see comment above */
-    }
+    });
   }
 
   // ── Dashboard surface ─────────────────────────────────────────────

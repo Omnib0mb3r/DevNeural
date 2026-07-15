@@ -91,11 +91,27 @@ function livePty(sessionId: string): PtyEntry {
 }
 
 let insertWorkerExpectation: ReturnType<typeof vi.fn>;
+let listOpenWorkerExpectations: ReturnType<typeof vi.fn>;
+let closeWorkerExpectation: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   insertWorkerExpectation = vi.fn();
+  /* Supersede policy (2026-07-15): recordExpectationWithPolicy reads
+   * open rows off this same store singleton before writing. No test
+   * in this file seeds a prior open expectation, so an empty array
+   * keeps the policy's pre-filter on the cheap "no open rows, skip
+   * the LLM" path and every assertion below still lands on a plain
+   * insertWorkerExpectation call, same as before this wave.
+   * closeWorkerExpectation is stubbed defensively; nothing here
+   * exercises the 'contradicts' branch that would call it. */
+  listOpenWorkerExpectations = vi.fn(() => []);
+  closeWorkerExpectation = vi.fn();
   setBrainstormStore({
-    db: { insertWorkerExpectation } as unknown as IndexDbType,
+    db: {
+      insertWorkerExpectation,
+      listOpenWorkerExpectations,
+      closeWorkerExpectation,
+    } as unknown as IndexDbType,
   } as never);
 });
 

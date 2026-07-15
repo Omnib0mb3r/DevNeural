@@ -37,7 +37,10 @@ import {
   resolveDeliverableBridgeForSession,
   type DeliverabilityResult,
 } from '../dashboard/bridge-presence.js';
-import { recordExpectation, deriveExpectedOutcome } from './expectation-supervisor.js';
+import {
+  recordExpectationWithPolicy,
+  deriveExpectedOutcome,
+} from './expectation-supervisor.js';
 import type { IndexDb } from '../store/index-db.js';
 
 /* Allowlist env var. Comma-separated name/id prefixes. Empty = allow all. */
@@ -410,22 +413,34 @@ export function crossSessionInject(
    *     cron, and the dashboard's own operator-typed injects are not
    *     "Lex dispatched a task" events.
    *
-   * Best-effort by design: recordExpectation reaches through the
-   * brainstorm-store's getStore() singleton, not the `db` handle
+   * Best-effort by design: recordExpectationWithPolicy reaches through
+   * the brainstorm-store's getStore() singleton, not the `db` handle
    * this function was called with, so a store not yet initialised
    * (or any other write failure) must not turn an already-successful
-   * inject into a caller-visible error. */
+   * inject into a caller-visible error.
+   *
+   * Supersede policy (2026-07-15): crossSessionInject is synchronous
+   * end to end (see the function signature above), and stays that way
+   * here -- widening it to return a Promise is out of scope for this
+   * closure. recordExpectationWithPolicy is async (it may classify
+   * against open rows via an LLM call before writing), so this fires
+   * it without awaiting, exactly like the CR nudge a few lines below
+   * fires setTimeout without awaiting. The .catch keeps a rejected
+   * policy promise from becoming an unhandled rejection; it does not
+   * (and must not) affect the InjectResult already returned to the
+   * caller. */
   function recordDispatchExpectation(): void {
     if (!commit || !from_lex_anchor_id || !anchor_id) return;
-    try {
-      recordExpectation({
+    void recordExpectationWithPolicy(
+      {},
+      {
         brainstormId: from_lex_anchor_id,
         anchorId: anchor_id,
         expectedOutcome: deriveExpectedOutcome(text),
-      });
-    } catch {
+      },
+    ).catch(() => {
       /* best-effort; see comment above */
-    }
+    });
   }
 
   /* 1. Token auth. Fix 15 — accept tokens signed against the legacy
