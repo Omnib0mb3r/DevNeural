@@ -22,6 +22,7 @@ import { logWake } from "@/lib/wake-log";
 import { logVoice, computeReconnectBackoffMs } from "@/lib/voice-log";
 import { getVadModule, resetVadModuleCache } from "@/lib/voice-ort-config";
 import { warmAudioContext } from "@/lib/voice-audio-warm";
+import { buildVadOptionSet, type VadOptionSet } from "@/lib/voice-vad-options";
 import {
   runWatchdogChecks,
   postVoiceHealth,
@@ -217,17 +218,16 @@ const MIC_GAIN_DEFAULT = 1.0;
 
 /* VAD end-of-utterance redemption window in ms. Higher = more
  * tolerance for mid-sentence pauses before silero declares end-of-
- * utterance and Lex starts thinking. Was hardcoded as 24 frames
- * (~768ms); now user-tunable from the voice panel. Server-persisted
- * in voice-preferences.json; localStorage seeds the slider so it
- * doesn't snap on remount. The slider's value is converted to silero
- * frames (32ms each at 16kHz) at VAD init time, so changing it
- * requires a voice-off / voice-on cycle to take effect. */
+ * utterance and Lex starts thinking. Server-persisted in
+ * voice-preferences.json; localStorage seeds the slider so it doesn't
+ * snap on remount. Passed straight through as vad-web's ms-based
+ * redemptionMs option (see lib/voice-vad-options.ts); applies live via
+ * vad.setOptions() on a running instance, with a fresh VAD init as the
+ * value used going forward if setOptions is ever unavailable. */
 const VAD_REDEMPTION_STORAGE_KEY = "lex-vad-redemption-ms";
 const VAD_REDEMPTION_MIN = 200;
 const VAD_REDEMPTION_MAX = 6000;
 const VAD_REDEMPTION_DEFAULT = 768;
-const SILERO_FRAME_MS = 32;
 
 /* Rolling probability floor for stuck-open VAD recovery. While the
  * listener is open we average silero's per-frame isSpeech probability
@@ -241,20 +241,13 @@ const SILERO_FRAME_MS = 32;
  * keeps speaking above the floor. */
 const VAD_PROB_FLOOR = 0.4;
 const VAD_PROB_WINDOW_MS = 1500;
-
-/* Map a 0-1 sensitivity knob to silero positive/negative speech
- * thresholds. Higher knob = more sensitive = lower threshold. The
- * 0.1 delta between positive and negative matches the legacy tuning
- * (positive 0.5 / negative 0.4 at sensitivity 0.5). */
-function vadThresholds(sensitivity: number): {
-  positive: number;
-  negative: number;
-} {
-  const s = Math.max(0, Math.min(1, sensitivity));
-  const positive = 0.7 - 0.4 * s;
-  const negative = positive - 0.1;
-  return { positive, negative };
-}
+/* Tolerance for the "do we have a full window yet" check below.
+ * onFrameProcessed firing cadence is an internal vad-web detail (it
+ * varies by model; the default "legacy" model processes ~96ms frames,
+ * not a fixed 32ms), so we no longer assume a frame duration here.
+ * This is just slop so quantized frame timing doesn't delay the
+ * floor check by an extra callback or two. */
+const VAD_PROB_WINDOW_SLOP_MS = 100;
 
 /* Cap on a single utterance. After this many milliseconds of
  * continuous speech we force an utterance-end so the user gets a
@@ -504,10 +497,12 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   });
   const bargeCooldownRef = useRef<number>(BARGE_DEFAULT);
   bargeCooldownRef.current = bargeCooldownMs;
-  /* Mic VAD sensitivity. Read at VAD init via the ref so that re-
-   * enabling voice after the user moves the slider picks up the new
-   * value without re-rendering the VAD itself (silero VAD does not
-   * support live threshold updates). */
+  /* Mic VAD sensitivity. Read at VAD init via the ref, and reapplied
+   * live to a running VAD instance through vad.setOptions() (see the
+   * vad_sensitivity case in the settings-bus subscription below). The
+   * ref is also what a fresh VAD init reads, so re-enabling voice
+   * after a slider move always picks up the current value regardless
+   * of whether the live path succeeded. */
   const [vadSensitivity, setVadSensitivity] = useState<number>(() => {
     if (typeof window === "undefined") return VAD_SENSITIVITY_DEFAULT;
     const raw = window.localStorage.getItem(VAD_SENSITIVITY_STORAGE_KEY);
@@ -533,10 +528,22 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   });
   const micGainRef = useRef<number>(MIC_GAIN_DEFAULT);
   micGainRef.current = micGain;
-  /* VAD redemption window. Read at VAD init via the ref; silero does
-   * not accept live updates so changes only take effect after a
-   * voice-off / voice-on cycle. The slider is wired to a debounced
-   * server write so dragging doesn't fire 20 POSTs. */
+  /* Keep the shared GainNode (micGainNodeRef, wired up in
+   * initParallelCapture) in sync with the live micGain value. Web
+   * Audio gain changes apply at audio-graph rate with no restart
+   * needed, so this is what makes the mic-gain slider affect VAD
+   * triggering live instead of only the next utterance's transcribed
+   * bytes. No-op while voice is off (ref is null between sessions). */
+  useEffect(() => {
+    if (micGainNodeRef.current) {
+      micGainNodeRef.current.gain.value = micGain;
+    }
+  }, [micGain]);
+  /* VAD redemption window. Read at VAD init via the ref, and reapplied
+   * live to a running VAD instance through vad.setOptions() (see the
+   * vad_redemption_ms case in the settings-bus subscription below).
+   * The slider is wired to a debounced server write so dragging
+   * doesn't fire 20 POSTs. */
   const [vadRedemptionMs, setVadRedemptionMs] = useState<number>(() => {
     if (typeof window === "undefined") return VAD_REDEMPTION_DEFAULT;
     const raw = window.localStorage.getItem(VAD_REDEMPTION_STORAGE_KEY);
@@ -868,6 +875,18 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   );
   const captureBufRef = useRef<Int16Array[]>([]);
   const captureCapturingRef = useRef<boolean>(false);
+  /* Shared gain stage feeding silero VAD. captureStreamRef above is the
+   * single raw getUserMedia grant (opened once, shared between the
+   * parallel-capture worklet and silero) so conversation mode never
+   * double-opens the mic. micGainNodeRef is a GainNode tapped off that
+   * same MediaStreamAudioSourceNode; its output feeds a
+   * MediaStreamAudioDestinationNode whose synthetic stream
+   * (micVadStreamRef) is injected into MicVAD via getStream so the mic
+   * gain slider actually tames what triggers listening, not just what
+   * gets shipped to whisper. gain.value is kept in sync with micGain
+   * live (see the micGain effect below) so it needs no VAD restart. */
+  const micGainNodeRef = useRef<GainNode | null>(null);
+  const micVadStreamRef = useRef<MediaStream | null>(null);
   /* Stuck-open VAD recovery state. vadListenerOpenRef is true between
    * onSpeechStart and onSpeechEnd (or any forced close); the rolling
    * probability window only accumulates while it's true so silence
@@ -1428,6 +1447,31 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       .catch(() => undefined);
   }, []);
 
+  /* Push a live ms-based option update to a running VAD instance. R2 of
+   * the mic-slider-wiring audit: vad-web's MicVAD exposes setOptions()
+   * on top of its internal FrameProcessor, which recomputes redemption
+   * / pad / min-speech state on the very next frame, even mid-
+   * utterance, so vad_sensitivity and vad_redemption_ms no longer need
+   * a voice off/on cycle to take effect. Guarded: if setOptions throws
+   * or isn't present on whatever vadRef.current currently holds
+   * (unexpected vad-web shape, instance mid-teardown, push-to-talk
+   * mode's stub {destroy} object, etc.) we swallow it and fall back to
+   * the existing behavior, where the new value is picked up by the
+   * next VAD init regardless (state + refs are always updated first).
+   */
+  function applyLiveVadOptions(sensitivity: number, redemptionMs: number): void {
+    const vad = vadRef.current as
+      | { setOptions?: (update: VadOptionSet) => void }
+      | null;
+    if (!vad || typeof vad.setOptions !== "function") return;
+    try {
+      vad.setOptions(buildVadOptionSet(sensitivity, redemptionMs));
+    } catch {
+      /* Fall back silently; the new value is still stored in
+       * state/ref and will apply on the next voice off/on cycle. */
+    }
+  }
+
   /* Listen for slider updates from VoiceSettingsPanel (/settings route).
    * The settings panel and the engine are separate components: the
    * engine is mounted once at app/providers root and persists across
@@ -1436,9 +1480,9 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * after persisting to the daemon; the engine mirrors the value into
    * its own React state, which the refs (micGainRef, vadSensitivityRef,
    * etc.) pick up on the next render so the live capture path uses the
-   * fresh value. Gain applies immediately. VAD threshold / redemption
-   * only take effect on the next VAD start (silero ignores live
-   * threshold updates, documented elsewhere). */
+   * fresh value. Gain and VAD threshold / redemption all apply live;
+   * see applyLiveVadOptions above and the micGain effect for the gain
+   * node. */
   useEffect(() => {
     const unsubscribe = onVoiceSettingUpdate((u) => {
       switch (u.key) {
@@ -1451,12 +1495,12 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           break;
         case "vad_sensitivity":
           if (typeof u.value === "number" && Number.isFinite(u.value)) {
-            setVadSensitivity(
-              Math.max(
-                VAD_SENSITIVITY_MIN,
-                Math.min(VAD_SENSITIVITY_MAX, u.value),
-              ),
+            const clamped = Math.max(
+              VAD_SENSITIVITY_MIN,
+              Math.min(VAD_SENSITIVITY_MAX, u.value),
             );
+            setVadSensitivity(clamped);
+            applyLiveVadOptions(clamped, vadRedemptionRef.current);
           }
           break;
         case "barge_cooldown_ms":
@@ -1468,12 +1512,12 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           break;
         case "vad_redemption_ms":
           if (typeof u.value === "number" && Number.isFinite(u.value)) {
-            setVadRedemptionMs(
-              Math.max(
-                VAD_REDEMPTION_MIN,
-                Math.min(VAD_REDEMPTION_MAX, u.value),
-              ),
+            const clamped = Math.max(
+              VAD_REDEMPTION_MIN,
+              Math.min(VAD_REDEMPTION_MAX, u.value),
             );
+            setVadRedemptionMs(clamped);
+            applyLiveVadOptions(vadSensitivityRef.current, clamped);
           }
           break;
         case "speed":
@@ -1515,15 +1559,20 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   /* User-tunable end-of-utterance redemption window. Updates
    * localStorage immediately for cheap optimistic UI; debounced
    * server write so dragging the slider doesn't fire 20 POSTs.
-   * silero VAD does not accept live updates, so the user must
-   * toggle voice off then on for a new value to take effect; the
-   * slider tooltip mentions this. */
+   * Applies live to a running VAD instance via applyLiveVadOptions
+   * (falls back to the next voice off/on cycle if that throws). This
+   * is the pause-tolerance slider embedded directly in the voice
+   * pill; VoiceSettingsPanel's copy of the same slider goes through
+   * the settings bus instead (see the vad_redemption_ms case above),
+   * but both end up mutating the same vadRedemptionMs state so both
+   * need the live-apply call. */
   function changeVadRedemption(next: number): void {
     const clamped = Math.max(
       VAD_REDEMPTION_MIN,
       Math.min(VAD_REDEMPTION_MAX, next),
     );
     setVadRedemptionMs(clamped);
+    applyLiveVadOptions(vadSensitivityRef.current, clamped);
     if (typeof window !== "undefined") {
       window.localStorage.setItem(VAD_REDEMPTION_STORAGE_KEY, String(clamped));
     }
@@ -1610,6 +1659,12 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       captureCtxRef.current = null;
       captureCapturingRef.current = false;
       captureBufRef.current = [];
+      /* Shared VAD gain stage: cctx.close() above already tears down
+       * the GainNode + MediaStreamAudioDestinationNode graph; just
+       * drop the refs so a stale gain node / stream can't leak into
+       * the next session. */
+      micGainNodeRef.current = null;
+      micVadStreamRef.current = null;
       if (finalizeTimeoutRef.current) {
         clearTimeout(finalizeTimeoutRef.current);
         finalizeTimeoutRef.current = null;
@@ -2186,12 +2241,35 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           const ctx = new Cls({ sampleRate: 16000 });
           captureCtxRef.current = ctx;
           const src = ctx.createMediaStreamSource(stream);
+          /* Gain stage for silero VAD's injected stream (R3 of the
+           * mic-slider-wiring audit). Tapped off the same source node
+           * as the worklet below so we open exactly one raw mic
+           * stream for the whole conversation-mode pipeline instead
+           * of MicVAD separately calling getUserMedia a second time.
+           * gain.value is kept live-synced to micGain by the effect
+           * near the micGain state declaration. Built BEFORE the
+           * worklet addModule call below so a worklet load failure
+           * (missing /vad-tap.worklet.js, unsupported browser, etc.)
+           * cannot take the VAD-triggering path down with it; only
+           * the transcription-buffer rig degrades in that case,
+           * matching the pre-existing "VAD path keeps working"
+           * resilience of this function. */
+          const gainNode = ctx.createGain();
+          gainNode.gain.value = micGainRef.current;
+          micGainNodeRef.current = gainNode;
+          src.connect(gainNode);
+          const vadDest = ctx.createMediaStreamDestination();
+          gainNode.connect(vadDest);
+          micVadStreamRef.current = vadDest.stream;
           /* AudioWorklet replaces the deprecated ScriptProcessorNode
            * (bug 2026-05-14-vad-scriptprocessornode-deprecation). The
            * worklet module posts Float32 mono frames over its port;
            * gain + Int16 conversion stays on the main thread so the
            * downstream consumer (captureBufRef) is byte-for-byte
-           * equivalent to the prior onaudioprocess callback. */
+           * equivalent to the prior onaudioprocess callback. This tap
+           * runs on the raw (pre-gain-node) signal; gain is applied
+           * per-sample below exactly as before, so the outbound
+           * transcription buffer's gain handling is unchanged. */
           await ctx.audioWorklet.addModule("/vad-tap.worklet.js");
           if (cancelled) {
             stream.getTracks().forEach((t) => t.stop());
@@ -2279,10 +2357,53 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           let vadInstance: any = null;
 
+          /* Inject the shared gain-adjusted stream built in
+           * initParallelCapture (R3 of the mic-slider-wiring audit)
+           * so mic gain actually tames what triggers listening, not
+           * just what gets transcribed. vad-web has no plain `stream`
+           * option; the real injection point is the getStream /
+           * pauseStream / resumeStream callback triad on
+           * RealTimeVADOptions (node_modules/@ricky0123/vad-web/dist/
+           * real-time-vad.d.ts):
+           *   getStream: () => Promise<MediaStream>
+           *   pauseStream: (stream: MediaStream) => Promise<void>
+           *   resumeStream: (stream: MediaStream) => Promise<MediaStream>
+           * MicVAD.start() calls getStream() once, then on every
+           * subsequent pause()/start() cycle calls pauseStream() then
+           * resumeStream() instead of getStream() again. Overriding
+           * getStream alone is not enough: the default pauseStream
+           * calls stream.getTracks().forEach(t => t.stop()), which
+           * would permanently end our synthetic (GainNode ->
+           * MediaStreamAudioDestinationNode) stream's tracks the
+           * first time vad.pause() runs (stuck-open recovery and the
+           * MAX_UTTERANCE_MS cap both call pause()+start() routinely),
+           * and the default resumeStream would then silently reopen a
+           * brand new raw getUserMedia stream that bypasses the gain
+           * node entirely. All three are overridden together so the
+           * injected stream survives pause/resume cycles. Falls back
+           * to vad-web's own default getUserMedia grant (no gain
+           * applied to triggering) when the shared rig failed to come
+           * up, matching this function's existing "VAD path keeps
+           * working" resilience when initParallelCapture fails. */
+          const sharedVadStream = micVadStreamRef.current;
+          const vadStreamOverrides = sharedVadStream
+            ? {
+                getStream: async () => sharedVadStream,
+                pauseStream: async () => {
+                  /* No-op: do not stop the shared stream's tracks.
+                   * Its lifecycle is owned by teardown()/
+                   * captureCtxRef, not by this VAD instance's own
+                   * pause/resume cycling. */
+                },
+                resumeStream: async () => sharedVadStream,
+              }
+            : {};
+
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const vad: any = await (mod as any).MicVAD.new({
             baseAssetPath: "/vad/",
             onnxWASMBasePath: "/vad/",
+            ...vadStreamOverrides,
             onSpeechStart: () => {
               if (mutedRef.current) return;
               /* No more micGated early-return here. Path 1 of the
@@ -2423,7 +2544,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                * 1.5s of an utterance can't trip the floor before
                * we've actually heard the speaker. */
               if (w.length === 0) return;
-              if (now - w[0]!.t < VAD_PROB_WINDOW_MS - SILERO_FRAME_MS) {
+              if (now - w[0]!.t < VAD_PROB_WINDOW_MS - VAD_PROB_WINDOW_SLOP_MS) {
                 return;
               }
               let sum = 0;
@@ -2459,32 +2580,27 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                 }
               }, 250);
             },
-            /* VAD thresholds derived from the user-tunable mic
-             * sensitivity (0=ignore noise, 1=fire easily; 0.5 matches
-             * the legacy 0.5/0.4 pair). Edited on /settings, persisted
-             * server-side. silero VAD does not accept live threshold
-             * updates, so the slider only takes effect on the next
-             * VAD start (toggle the mic off and back on).
-             * - redemptionFrames 24: roughly 768ms of post-pause
-             *   tolerance before declaring end-of-utterance. Picks
-             *   up natural pacing; the MAX_UTTERANCE_MS cap above
-             *   guarantees Lex eventually gets to talk.
-             * - minSpeechFrames 8: needs ~256ms of confirmed speech
-             *   before counting as a barge-in. Cuts false barge-ins
-             *   from coughs / one-syllable sounds. */
-            ...(() => {
-              const t = vadThresholds(vadSensitivityRef.current);
-              return {
-                positiveSpeechThreshold: t.positive,
-                negativeSpeechThreshold: t.negative,
-              };
-            })(),
-            redemptionFrames: Math.max(
-              1,
-              Math.round(vadRedemptionRef.current / SILERO_FRAME_MS),
+            /* ms-based option set: positive/negativeSpeechThreshold
+             * derived from the user-tunable mic sensitivity (0=ignore
+             * noise, 1=fire easily; 0.5 matches the legacy 0.5/0.4
+             * pair), redemptionMs from the pause-tolerance slider,
+             * preSpeechPadMs/minSpeechMs fixed at 256ms. These are the
+             * ONLY keys the installed vad-web (0.0.30) actually reads
+             * off this options object; it builds its internal
+             * FrameProcessor from an explicit
+             * {positiveSpeechThreshold, negativeSpeechThreshold,
+             * redemptionMs, preSpeechPadMs, minSpeechMs,
+             * submitUserSpeechOnPause} literal, not a spread of the
+             * full options (node_modules/@ricky0123/vad-web/dist/
+             * real-time-vad.js). The legacy redemptionFrames /
+             * preSpeechPadFrames / minSpeechFrames keys this used to
+             * pass here were silently dropped and did nothing; see
+             * lib/voice-vad-options.ts for the shared builder also
+             * used by the live setOptions() path below. */
+            ...buildVadOptionSet(
+              vadSensitivityRef.current,
+              vadRedemptionRef.current,
             ),
-            preSpeechPadFrames: 8,
-            minSpeechFrames: 8,
           });
           vadInstance = vad;
           vadRef.current = vad;
@@ -2915,7 +3031,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       <div className="px-5 py-3 border-b border-border1 flex items-center gap-3">
         <label
           className="flex items-center gap-2 text-nano font-mono text-txt3 flex-1"
-          title="Pause tolerance after you stop talking before Lex starts thinking. Higher = more time to breathe mid-sentence without losing words. Takes effect on the next voice off / on cycle."
+          title="Pause tolerance after you stop talking before Lex starts thinking. Higher = more time to breathe mid-sentence without losing words. Applies live to a running voice session."
         >
           <span>pause tolerance</span>
           <input

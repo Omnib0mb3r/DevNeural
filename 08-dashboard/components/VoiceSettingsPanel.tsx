@@ -320,11 +320,8 @@ export function VoiceSettingsPanel() {
             background noise (better for loud rooms or open offices);
             higher values pick up softer speech but also catch more
             ambient sound. 50 is the default; drop to 20-30 in noisy
-            environments.{" "}
-            <span className="text-attn">
-              Toggle voice off and back on to apply: silero VAD does
-              not accept threshold updates on a running instance.
-            </span>
+            environments. Applies live to a running voice session; no
+            need to toggle voice off and back on.
           </p>
         </div>
 
