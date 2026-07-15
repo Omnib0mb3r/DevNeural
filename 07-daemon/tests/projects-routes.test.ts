@@ -191,6 +191,15 @@ describe('listProjectAnchors / getProjectAnchorDetail', () => {
 describe('openProjectAnchor', () => {
   let bootstrapCalls: Array<{ cwd: string; command: string }>;
   let bootstrap: (cwd: string, command: string) => void;
+  /* Spawn delivery confirmation (openProjectAnchor now also polls
+   * pollInjectResult, mirroring /projects/:id/start-claude) defaults
+   * to a real 12s/250ms poll against real disk. Every spawn-path test
+   * below queues a marker, so without an override each of these tests
+   * would block on that real timeout. timeoutMs:0 + a stub reader
+   * settles the poll to 'unconfirmed' on the first check with no real
+   * wait -- delivery outcome itself is exercised by the dedicated
+   * 'spawn delivery confirmation' describe block further down. */
+  const FAST_POLL_INJECT = { timeoutMs: 0, readResultFile: (): string | null => null };
   beforeEach(() => {
     bootstrapCalls = [];
     bootstrap = (cwd, command) => {
@@ -223,7 +232,14 @@ describe('openProjectAnchor', () => {
     const res = await openProjectAnchor(
       db,
       'anchor-A',
-      { launchVsCode: false, waitMs: 50, pollMs: 25, bootstrapQueue: bootstrap },
+      {
+        launchVsCode: false,
+        waitMs: 50,
+        pollMs: 25,
+        bootstrapQueue: bootstrap,
+        bridgeAlive: () => true,
+        pollInjectOptions: FAST_POLL_INJECT,
+      },
       inflight,
     );
     expect(res.ok).toBe(true);
@@ -253,6 +269,8 @@ describe('openProjectAnchor', () => {
         pollMs: 0,
         dangerous: true,
         bootstrapQueue: bootstrap,
+        bridgeAlive: () => true,
+        pollInjectOptions: FAST_POLL_INJECT,
       },
       inflight,
     );
@@ -282,6 +300,8 @@ describe('openProjectAnchor', () => {
         waitMs: 500,
         pollMs: 25,
         bootstrapQueue: bootstrap,
+        bridgeAlive: () => true,
+        pollInjectOptions: FAST_POLL_INJECT,
       },
       inflight,
     );
@@ -293,25 +313,18 @@ describe('openProjectAnchor', () => {
 
   it('openInFlight collapses concurrent calls into one queued marker', async () => {
     const inflight = createOpenInFlightMap();
+    const openOpts = {
+      launchVsCode: false,
+      waitMs: 100,
+      pollMs: 25,
+      bootstrapQueue: bootstrap,
+      bridgeAlive: () => true,
+      pollInjectOptions: FAST_POLL_INJECT,
+    };
     const [a, b, c] = await Promise.all([
-      openProjectAnchor(
-        db,
-        'anchor-A',
-        { launchVsCode: false, waitMs: 100, pollMs: 25, bootstrapQueue: bootstrap },
-        inflight,
-      ),
-      openProjectAnchor(
-        db,
-        'anchor-A',
-        { launchVsCode: false, waitMs: 100, pollMs: 25, bootstrapQueue: bootstrap },
-        inflight,
-      ),
-      openProjectAnchor(
-        db,
-        'anchor-A',
-        { launchVsCode: false, waitMs: 100, pollMs: 25, bootstrapQueue: bootstrap },
-        inflight,
-      ),
+      openProjectAnchor(db, 'anchor-A', openOpts, inflight),
+      openProjectAnchor(db, 'anchor-A', openOpts, inflight),
+      openProjectAnchor(db, 'anchor-A', openOpts, inflight),
     ]);
     for (const r of [a, b, c]) expect(r.ok).toBe(true);
     expect(bootstrapCalls.length).toBe(1);
@@ -328,6 +341,167 @@ describe('openProjectAnchor', () => {
     expect(res.ok).toBe(false);
     if (res.ok) return;
     expect(res.error).toBe('anchor not found');
+  });
+});
+
+describe('openProjectAnchor spawn delivery confirmation (wired to pollInjectResult)', () => {
+  /* Mirrors the fake-clock pattern from tests/poll-inject-result.test.ts
+   * so the delivery poll (default 12s/250ms in projects-new.ts) never
+   * waits on a real timer here. pollAnchorLive gets waitMs/pollMs=0 so
+   * both polls settle immediately -- the anchor stays dormant (no test
+   * flips status='live'), so mode is always 'spawning' in this block;
+   * the point under test is the `delivery` / `bridge_error` fields the
+   * route now carries alongside it. */
+  let bootstrapCalls: Array<{ cwd: string; command: string }>;
+  let bootstrap: (cwd: string, command: string) => void;
+
+  function fakeClock(startMs = 0): { now: () => number; sleep: (ms: number) => Promise<void> } {
+    let current = startMs;
+    return {
+      now: () => current,
+      sleep: async (ms: number) => {
+        current += ms;
+      },
+    };
+  }
+
+  beforeEach(() => {
+    bootstrapCalls = [];
+    bootstrap = (cwd, command) => {
+      bootstrapCalls.push({ cwd, command });
+    };
+  });
+
+  it('confirmed: result file reports ok:true -> delivery=confirmed, no bridge_error', async () => {
+    const clock = fakeClock();
+    const inflight = createOpenInFlightMap();
+    const res = await openProjectAnchor(
+      db,
+      'anchor-A',
+      {
+        launchVsCode: false,
+        waitMs: 0,
+        pollMs: 0,
+        bootstrapQueue: bootstrap,
+        bridgeAlive: () => true,
+        pollInjectOptions: {
+          now: clock.now,
+          sleep: clock.sleep,
+          readResultFile: () =>
+            JSON.stringify({ ok: true, at: '2026-07-15T00:00:00.000Z', workspace: 'x' }),
+        },
+      },
+      inflight,
+    );
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.mode).toBe('spawning');
+    expect(res.delivery).toBe('confirmed');
+    expect(res.bridge_error).toBeUndefined();
+    expect(res.warnings ?? []).not.toContain('bridge_offline');
+    expect(bootstrapCalls.length).toBe(1);
+  });
+
+  it('failed: result file reports ok:false -> delivery=failed, bridge_error carries the bridge detail', async () => {
+    const clock = fakeClock();
+    const inflight = createOpenInFlightMap();
+    const res = await openProjectAnchor(
+      db,
+      'anchor-A',
+      {
+        launchVsCode: false,
+        waitMs: 0,
+        pollMs: 0,
+        bootstrapQueue: bootstrap,
+        bridgeAlive: () => true,
+        pollInjectOptions: {
+          now: clock.now,
+          sleep: clock.sleep,
+          readResultFile: () =>
+            JSON.stringify({ ok: false, error: 'no active terminal', at: 'x', workspace: 'x' }),
+        },
+      },
+      inflight,
+    );
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.delivery).toBe('failed');
+    expect(res.bridge_error).toBe('no active terminal');
+  });
+
+  it('timeout: no result file ever appears -> delivery=unconfirmed, no bridge_error', async () => {
+    const clock = fakeClock();
+    const inflight = createOpenInFlightMap();
+    const res = await openProjectAnchor(
+      db,
+      'anchor-A',
+      {
+        launchVsCode: false,
+        waitMs: 0,
+        pollMs: 0,
+        bootstrapQueue: bootstrap,
+        bridgeAlive: () => true,
+        pollInjectOptions: {
+          now: clock.now,
+          sleep: clock.sleep,
+          timeoutMs: 500,
+          intervalMs: 100,
+          readResultFile: () => null,
+        },
+      },
+      inflight,
+    );
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.delivery).toBe('unconfirmed');
+    expect(res.bridge_error).toBeUndefined();
+  });
+
+  it('bridge-liveness precheck: no live bridge -> warnings contains bridge_offline alongside the delivery fields', async () => {
+    const clock = fakeClock();
+    const inflight = createOpenInFlightMap();
+    const res = await openProjectAnchor(
+      db,
+      'anchor-A',
+      {
+        launchVsCode: false,
+        waitMs: 0,
+        pollMs: 0,
+        bootstrapQueue: bootstrap,
+        bridgeAlive: () => false,
+        pollInjectOptions: {
+          now: clock.now,
+          sleep: clock.sleep,
+          timeoutMs: 0,
+          readResultFile: () => null,
+        },
+      },
+      inflight,
+    );
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.warnings ?? []).toContain('bridge_offline');
+    expect(res.delivery).toBe('unconfirmed');
+  });
+
+  it('bind path never calls pollInjectResult: delivery is absent when an already-live anchor short-circuits to mode=bind', async () => {
+    db.updateProjectSession('anchor-A', {
+      status: 'live',
+      current_bridge_id: 'bridge-w1',
+      current_session_id: 'cc-1',
+    });
+    const inflight = createOpenInFlightMap();
+    const res = await openProjectAnchor(
+      db,
+      'anchor-A',
+      { launchVsCode: false, waitMs: 0, pollMs: 0, bootstrapQueue: bootstrap },
+      inflight,
+    );
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.mode).toBe('bind');
+    expect(res.delivery).toBeUndefined();
+    expect(bootstrapCalls).toEqual([]);
   });
 });
 

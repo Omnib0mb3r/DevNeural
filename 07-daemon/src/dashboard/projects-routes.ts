@@ -21,13 +21,39 @@
  * still returns ok=true with mode='spawning' so the dashboard knows
  * the workspace-inject was queued; subsequent /projects/:id polls
  * will see status='live' as soon as the bridge reports presence.
+ *
+ * Spawn delivery confirmation: wired in alongside the DB-status poll
+ * above. Mirrors /projects/:id/start-claude in routes.ts --
+ *   1. a coarse bridge-liveness precheck (readPresenceDir /
+ *      defaultPresenceDir / DEFAULT_BRIDGE_TIMEOUT_MS from
+ *      bridge-presence.js) pushes a 'bridge_offline' warning up front
+ *      when no bridge window anywhere has a fresh presence heartbeat,
+ *      so the caller does not have to wait out the full delivery poll
+ *      to learn the marker has nothing to claim it;
+ *   2. pollInjectResult(row.cwd) (projects-new.js) runs alongside
+ *      pollAnchorLive so the response also carries `delivery`
+ *      ('confirmed' | 'failed' | 'unconfirmed') and, on a bridge-
+ *      reported failure, `bridge_error`. Both fields are additive --
+ *      OpenResult.ok stays true regardless of delivery outcome so the
+ *      response shape stays backward compatible with callers that
+ *      only look at mode/anchor.
  */
 import type { FastifyInstance } from 'fastify';
 import * as fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import type { IndexDb, ProjectSessionRow } from '../store/index-db.js';
-import { decodeBridgeMarker } from './bridge-presence.js';
-import { queueProjectBootstrap } from './projects-new.js';
+import {
+  decodeBridgeMarker,
+  readPresenceDir,
+  defaultPresenceDir,
+  DEFAULT_BRIDGE_TIMEOUT_MS,
+} from './bridge-presence.js';
+import {
+  queueProjectBootstrap,
+  pollInjectResult,
+  type InjectDeliveryResult,
+  type PollInjectResultOptions,
+} from './projects-new.js';
 import { listProjectAnchorTiles } from './projects-anchor-tiles.js';
 
 const DEFAULT_OPEN_WAIT_MS = 5_000;
@@ -123,6 +149,24 @@ export interface OpenOptions {
    * after the daemon imports it, doesn't leak production marker
    * writes into the test temp dir. */
   bootstrapQueue?: (cwd: string, command: string) => void;
+  /** Injectable bridge-liveness check for the spawn-delivery precheck
+   * (see openProjectAnchor). Defaults to the real readPresenceDir /
+   * defaultPresenceDir check, matching /projects/:id/start-claude in
+   * routes.ts exactly. Tests pass a stub for the same DATA_ROOT-freeze
+   * reason bootstrapQueue above is injectable: defaultPresenceDir()
+   * resolves off paths.ts's DATA_ROOT, which is captured at first
+   * import and would otherwise point at this machine's real
+   * session-bridge/.bridge-presence dir instead of the test temp
+   * dir. */
+  bridgeAlive?: () => boolean;
+  /** Options forwarded verbatim to pollInjectResult (projects-new.js)
+   * for the spawn-delivery-confirmation poll: timeoutMs, intervalMs,
+   * now, sleep, readResultFile. Tests use these the same way
+   * poll-inject-result.test.ts does (fake clock, injected reader) so
+   * the delivery poll never waits on real timers/disk. Defaults to
+   * pollInjectResult's own defaults (12s timeout / 250ms interval /
+   * real fs) when omitted, matching /projects/:id/start-claude. */
+  pollInjectOptions?: PollInjectResultOptions;
 }
 
 export interface OpenResult {
@@ -131,6 +175,12 @@ export interface OpenResult {
   anchor: ProjectAnchorView;
   command?: string;
   warnings?: string[];
+  /** Spawn delivery confirmation (additive, mirrors start-claude).
+   * Absent on the bind path since no marker was queued there. */
+  delivery?: InjectDeliveryResult['delivery'];
+  /** Present only when delivery === 'failed' and the bridge reported
+   * an error detail. */
+  bridge_error?: string;
 }
 
 export interface OpenError {
@@ -204,6 +254,27 @@ export async function openProjectAnchor(
         'skip-permissions ignored: workers no longer accept --dangerously-skip-permissions per architectural rule (2026-05-26)',
       );
     }
+    /* Spawn delivery confirmation: coarse bridge-liveness precheck,
+     * mirrored from /projects/:id/start-claude in routes.ts. If NOT
+     * ONE bridge window anywhere has posted a fresh presence
+     * heartbeat, no VS Code window can possibly be running to claim
+     * the marker we're about to write, so warn immediately instead of
+     * making the caller wait out the full delivery poll below just to
+     * learn the same thing. Deliberately NOT scoped to row.cwd's own
+     * presence for the same reason routes.ts documents: this call
+     * usually opens a BRAND NEW window for a project with no presence
+     * file yet, so a per-workspace check would false-positive on
+     * every legitimate cold-start spawn. */
+    const bridgeAlive =
+      opts.bridgeAlive ??
+      (() =>
+        readPresenceDir(defaultPresenceDir(), now(), DEFAULT_BRIDGE_TIMEOUT_MS)
+          .length > 0);
+    try {
+      if (!bridgeAlive()) warnings.push('bridge_offline');
+    } catch {
+      warnings.push('bridge_offline');
+    }
     const bootstrap = opts.bootstrapQueue ?? queueProjectBootstrap;
     try {
       bootstrap(row.cwd, command);
@@ -238,13 +309,24 @@ export async function openProjectAnchor(
 
     const waitMs = opts.waitMs ?? DEFAULT_OPEN_WAIT_MS;
     const pollMs = opts.pollMs ?? DEFAULT_OPEN_POLL_MS;
-    const final = await pollAnchorLive(db, id, waitMs, pollMs, now);
+    /* Run the DB-status poll (pollAnchorLive) and the spawn-delivery
+     * poll (pollInjectResult) concurrently rather than back to back --
+     * they watch two independent signals (bridge presence flipping
+     * the anchor live vs. the bridge's own result-file write) for the
+     * same marker, and serializing them would add the two timeouts
+     * together (up to ~17s) for no benefit. */
+    const [final, delivery] = await Promise.all([
+      pollAnchorLive(db, id, waitMs, pollMs, now),
+      pollInjectResult(row.cwd, opts.pollInjectOptions),
+    ]);
     const mode: OpenResult['mode'] = final.status === 'live' ? 'spawn' : 'spawning';
     return {
       ok: true,
       mode,
       anchor: toAnchorView(final, db.getDefaultSupervisionMode()),
       command,
+      delivery: delivery.delivery,
+      ...(delivery.error ? { bridge_error: delivery.error } : {}),
       warnings: warnings.length ? warnings : undefined,
     };
   })();
