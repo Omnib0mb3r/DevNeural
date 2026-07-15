@@ -7,21 +7,19 @@
  * is the existing phrase. Keeping the flag logic here (not inline in the
  * 2000-line WS handler) makes "flag-off is unchanged" unit-testable.
  */
-import { useVoiceHaiku, daypartOf, type Daypart } from './voice-haiku.js';
+import { useVoiceHaiku, daypartOf, buildLocalContext } from './voice-haiku.js';
 import { renderSpoken, renderSpokenAsync } from './voice-renderer.js';
 import { frontDeskDecision, type FrontDeskDecision } from './voice-frontdesk.js';
 import { composeHeartbeat } from './voice-heartbeat-haiku.js';
 import { heartbeatPhrase } from './lex-voice-heartbeat.js';
 import {
-  generateGlueReply,
-  generateBridgeReply,
   glueModelAvailable,
   renderReplyLive,
   wasLastSpoken,
   rememberSpokenLine,
-  type GenerateGlueDeps,
-  type GlueHint,
 } from './voice-haiku-glue.js';
+import { getDigest } from './voice-digest.js';
+import { askText } from '../lex/judge-session.js';
 
 /* Spoken-output gate. OFF: the text is returned verbatim (the speak
  * controller's own cleanForTts then runs exactly as today). ON: route
@@ -101,23 +99,22 @@ export function heartbeatLine(elapsedMs: number): string {
   return composeHeartbeat({ lexElapsedMs: elapsedMs });
 }
 
-/* Fast-lane glue responder (haiku alone, zero Opus). BF-4 safe.
+/* Fast-lane glue responder. BF-4 safe.
  *
- * Live path (DRIVE-QUEUE 1a): when the haiku tier owns the mouth AND a
- * key is configured, the warm/varied/in-persona reply comes from the LIVE
- * VOICE_HAIKU_MODEL grounded in the digest (generateGlueReply). The
- * deterministic lines below are the FALLBACK only - taken when no model /
- * key is available or the call misses - and are byte-identical to the
- * prior canned behavior, so flag-off and no-key paths do not change.
+ * Live path (2026-07-15 rework, see the fuller doc comment further down):
+ * the warm/varied/in-persona reply comes from askText on the persistent
+ * Max-plan judge session, grounded in the digest. The deterministic lines
+ * further down are the SILENCE GUARD only - taken when the session is
+ * disabled, unavailable, or the ask times out - never the primary path.
  *
  * Repeat / "say again" stays a deterministic VERBATIM replay of the last
  * spoken line: repeating must not be paraphrased (it would risk the V5
  * preserve-list). Only the empty-replay case (nothing said yet) and the
- * acks / delivery tweaks go to the live model.
+ * acks / delivery tweaks go to askText.
  *
- * async: the live path awaits one short Haiku call - that IS the fast
- * lane (haiku alone). It is fail-fast; a miss returns the deterministic
- * line, never a hang. */
+ * async: the live path awaits one askText call, bounded to
+ * DEVNEURAL_GLUE_ASK_TIMEOUT_MS (default 4000ms). It is fail-fast; a miss
+ * returns the deterministic guard line, never a hang. */
 const REPEAT_RE =
   /^(say (that )?again|repeat( that)?|come again|what did you say|pardon|one more time|can you repeat( that)?)$/;
 
@@ -128,14 +125,16 @@ function deliveryHintOf(t: string): 'slower' | 'louder' | 'quieter' | null {
   return null;
 }
 
-/* Time-aware greeting handling (2026-07-14). Operator complaint: "good
- * morning" / "good afternoon" landed a canned "on it" or a bridge filler
- * ("checking now") because greetings were not in the deny-by-default
- * whitelist at all - they always queued to Lex, digest-fresh or not, cold
- * start or not. Fixed here (owned files only): a small whole-utterance
- * greeting matcher, a route override so a greeting always answers on the
- * fast lane (see haikuRoute below), and a deterministic time-aware canned
- * pool so even a no-key / call-miss reply is never a bare "on it". */
+/* Greeting handling (2026-07-14, reworked 2026-07-15). Operator
+ * complaint: "good morning" / "good afternoon" landed a canned "on it" or
+ * a bridge filler ("checking now") because greetings were not in the
+ * deny-by-default whitelist at all - they always queued to Lex,
+ * digest-fresh or not, cold start or not. Fixed here (owned files only):
+ * a small whole-utterance greeting matcher and a route override so a
+ * greeting always answers on the fast lane (see haikuRoute below). The
+ * reply itself is now the persistent session's askText (see the doc
+ * comment further down); the two-line neutral pool immediately below is
+ * only the silence guard for when that call is unavailable. */
 
 export type GreetingClaim = 'morning' | 'afternoon' | 'evening' | 'generic';
 
@@ -163,86 +162,165 @@ export function isGreetingAside(text: string): boolean {
   return greetingClaimOf(normalize(text)) !== null;
 }
 
-/* Does the claimed time of day cover the real daypart? 'morning' spans
- * both early-morning and morning (nobody minds "good morning" at 6:30);
- * afternoon/evening are exact. Anything not covered - including every
- * specific claim during 'late night' - is a mismatch and gets the light
- * correction pool instead of the plain one. */
-function claimMatchesDaypart(claim: GreetingClaim, daypart: Daypart): boolean {
-  if (claim === 'generic') return true;
-  if (claim === 'morning') return daypart === 'early morning' || daypart === 'morning';
-  return claim === daypart;
-}
+/* 2026-07-15 rework: voice small talk onto the persistent judge session.
+ *
+ * Operator directives, verbatim intent: "nobody asked for canned
+ * greetings, we have AI, it should be a smart thoughtful greeting, just
+ * prompt it to do that" + "keep the child sessions open, I'm not paying
+ * every time" + "what human cares about time of day when somebody greets
+ * them" - goal is Claude voice chat speed and feel.
+ *
+ * ONE smart path: every greeting AND general glue aside (acks, delivery
+ * tweaks, an empty "say again") is answered by askText on the persistent
+ * Max-plan judge session (src/lex/judge-session.ts, committed 8d36e93) -
+ * the same session that already answers the async judges, kept open for
+ * exactly this reason, so there is no per-call metered cost. The metered
+ * live Haiku path (generateGlueReply/generateBridgeReply below) is
+ * retired from this file; see the deprecation notes on those functions
+ * in voice-haiku-glue.ts.
+ *
+ * ONE tiny silence guard: askGlue returning null (flag off, session
+ * unavailable, or the 4s timeout) falls back to a small deterministic
+ * pool so the fast lane is never actually silent. For greetings that
+ * pool is now just two neutral lines (guardGreeting below) - the
+ * operator's point is that nobody cares about a precisely-worded time of
+ * day, they care that something warm was said back. Non-greeting glue
+ * keeps its existing deterministic lines (Slowing down. / Speaking up. /
+ * Going quieter. / "I haven't said anything yet." / null-absorb for a
+ * bare ack) as the same kind of guard, unchanged.
+ *
+ * BF-4 (unchanged boundary): the persistent session is Claude Code, the
+ * same trust class as Lex herself, but the input contract does not
+ * loosen - persona + digest + the user's aside verbatim is still the
+ * FULL input; no raw transcript content is ever added to the prompt. */
 
-/* Plain daypart-correct greeting. Two natural, warm, contraction-friendly
- * variants per daypart - short spoken lines, no name-tacking, no robotic
- * fragments. */
-const GREETING_LINES: Record<Daypart, [string, string]> = {
-  'early morning': ["You're up early - good morning.", 'Morning. Early start today.'],
-  morning: ['Good morning.', 'Morning.'],
-  afternoon: ['Good afternoon.', 'Afternoon.'],
-  evening: ['Good evening.', 'Evening.'],
-  'late night': ["Hey - it's late, but good to hear from you.", 'Still up. Hi.'],
-};
+const GREETING_GUARD_MORNING = 'Morning.';
+const GREETING_GUARD_OTHER = 'Hey.';
 
-/* Light correction when the greeting's claimed time of day does not match
- * the real one (e.g. "good morning" said at 2am). States the real daypart
- * without mirroring the wrong word back. */
-const GREETING_CORRECTION_LINES: Record<Daypart, [string, string]> = {
-  'early morning': ["It's actually early morning here, still dark out - but hey.", 'Early morning on my end - hi.'],
-  morning: ["It's morning here too, just later than that sounded - hey.", 'Morning here as well.'],
-  afternoon: ["It's actually afternoon here - but good to hear from you.", 'Afternoon on my end - hey.'],
-  evening: ["It's evening here, not that - good to hear from you though.", 'Evening on my end - hi.'],
-  'late night': ["It's actually the middle of the night here - but good to hear from you.", 'Pretty late on my end, still around though.'],
-};
-
-/* Deterministic time-aware canned greeting (requirement 3/4 fallback).
- * Shares the live-model never-twice ring (voice-haiku-glue.ts) so a
- * canned pick and a live pick never read the same back-to-back, and the
- * pool itself still alternates call over call instead of freezing on its
- * first candidate. */
-function cannedGreeting(claim: GreetingClaim, now: Date): string {
+/* Silence-guard-only greeting fallback (askGlue null/timeout). No
+ * correction logic, no per-daypart pool - "what human cares about time
+ * of day when somebody greets them" - just one of two neutral lines,
+ * picked by a coarse morning/not-morning split, sharing the never-twice
+ * ring with everything else so it does not echo back-to-back. */
+function guardGreeting(now: Date): string {
   const daypart = daypartOf(now.getHours());
-  const pool = claimMatchesDaypart(claim, daypart)
-    ? GREETING_LINES[daypart]
-    : GREETING_CORRECTION_LINES[daypart];
-  const pick = pool.find((line) => !wasLastSpoken(line)) ?? pool[0];
+  const primary: string =
+    daypart === 'morning' || daypart === 'early morning'
+      ? GREETING_GUARD_MORNING
+      : GREETING_GUARD_OTHER;
+  const other = primary === GREETING_GUARD_MORNING ? GREETING_GUARD_OTHER : GREETING_GUARD_MORNING;
+  const pick = wasLastSpoken(primary) ? other : primary;
   rememberSpokenLine(pick);
   return pick;
 }
 
-export interface ComposeGlueDeps extends GenerateGlueDeps {
-  /** Force the live model path on/off (tests). Default: flag on AND key
-   * present. */
-  modelEnabled?: boolean;
-  generate?: typeof generateGlueReply;
+export interface ComposeGlueDeps {
+  /** Per-ask timeout override (tests). Default:
+   * DEVNEURAL_GLUE_ASK_TIMEOUT_MS env var, else 4000ms. */
+  timeoutMs?: number;
+  /** Test seam: pin the local-context / guard clock. Default: real time,
+   * read fresh at call time. */
+  now?: () => Date;
 }
 
-/* Slow-lane BRIDGE line. OFF / no key / call miss: returns the
- * deterministic fallback (the caller's pickBridgeLine hash pick), so the
- * behavior is byte-identical to before. ON + key: a warm, request-
- * specific line from the live model. Always resolves to a spoken line
- * (never null) - the bridge must never be silent, unlike glue which can
- * absorb. The caller fires this WITHOUT awaiting before injecting Lex, so
- * Lex starts reasoning immediately and the bridge speaks the moment it
- * lands (well before an Opus reply). */
-export interface ComposeBridgeDeps extends GenerateGlueDeps {
-  /** Force the live model path on/off (tests). Default: flag on AND key. */
-  modelEnabled?: boolean;
-  generate?: typeof generateBridgeReply;
+const DEFAULT_GLUE_ASK_TIMEOUT_MS = 4000;
+
+function glueAskTimeoutMs(deps: ComposeGlueDeps | undefined): number {
+  if (deps?.timeoutMs !== undefined) return deps.timeoutMs;
+  return Number(
+    process.env.DEVNEURAL_GLUE_ASK_TIMEOUT_MS ?? DEFAULT_GLUE_ASK_TIMEOUT_MS,
+  );
 }
 
+/* Persona line for the persistent session's ask. Short: the session
+ * already carries its own daemon-utility system prompt
+ * (JUDGE_SESSION_SYSTEM_PROMPT); this is the [text]-turn framing that
+ * puts it in Lex's first-person voice for this one spoken line. */
+function glueAskSystem(): string {
+  return (
+    'You are Lex, speaking out loud on a live voice call with the operator ' +
+    'right now - the same identity as your persistent session, just using ' +
+    'your voice for this one line.'
+  );
+}
+
+/* The full askText prompt body: digest (lastDecision/openQuestion when
+ * present), local time as calibration ONLY, and the aside verbatim - see
+ * the module doc comment above for the BF-4 boundary this holds to. */
+function glueAskPrompt(aside: string, lastSpoken: string | null, now: Date): string {
+  const digest = getDigest()?.digest ?? null;
+  const digestLines: string[] = [];
+  if (digest?.lastDecision) digestLines.push(`Last decision: ${digest.lastDecision}`);
+  if (digest?.openQuestion) digestLines.push(`Open question: ${digest.openQuestion}`);
+  const ctx = buildLocalContext(now);
+  const lines = [
+    '--- LIVE DIGEST (what you were just doing, if anything) ---',
+    digestLines.length > 0
+      ? digestLines.join('\n')
+      : '(nothing yet - no digest has landed)',
+    '',
+    '--- LOCAL TIME (calibration only) ---',
+    `It is ${ctx.timeLabel} on ${ctx.weekday}, ${ctx.dateLabel} - ${ctx.daypart}.`,
+    'Use the clock ONLY to avoid a mismatched greeting (for example, do not',
+    'say "good morning" late at night). Never mention the time, the date,',
+    'or the day of week out loud - nobody asked what time it is.',
+    '',
+    `The operator just said, verbatim: "${aside}"`,
+    '',
+    'Reply the way a colleague would: if there is anything meaningful in',
+    'the digest above (what the worker or the brainstorm was doing), lead',
+    'with that naturally, in your own words. Speak in ONE short spoken',
+    'sentence - warm, natural, no preamble, no throat-clearing lead-in.',
+  ];
+  if (lastSpoken && lastSpoken.trim()) {
+    lines.push('', `Never repeat this line - you just said it: "${lastSpoken}"`);
+  }
+  return lines.join('\n');
+}
+
+/* The one smart path. Returns null on disabled/unavailable/timeout/empty
+ * (the caller then uses its own tiny deterministic guard) or on an exact
+ * back-to-back repeat of the last spoken line (never-twice ring, shared
+ * with the guard via wasLastSpoken/rememberSpokenLine). Never throws. */
+async function askGlue(
+  aside: string,
+  lastSpoken: string | null,
+  deps: ComposeGlueDeps | undefined,
+): Promise<string | null> {
+  const now = deps?.now?.() ?? new Date();
+  try {
+    const reply = await askText({
+      system: glueAskSystem(),
+      prompt: glueAskPrompt(aside, lastSpoken, now),
+      timeoutMs: glueAskTimeoutMs(deps),
+    });
+    const cleaned = reply?.trim();
+    if (!cleaned) return null;
+    if (wasLastSpoken(cleaned)) return null;
+    rememberSpokenLine(cleaned);
+    return cleaned;
+  } catch {
+    return null;
+  }
+}
+
+/* Slow-lane BRIDGE line. The bridge's entire purpose is to fill the
+ * silence the INSTANT Lex starts reasoning, well before her real reply
+ * lands - it must fire immediately. A judge-session askText round trip
+ * (2-4s, even though it costs nothing extra to call) would BE the delay
+ * the bridge exists to hide, so this stays the caller's own instant
+ * deterministic pick (dec.route.bridge, built by voice-lane-router.ts's
+ * pickBridgeLine) with no model call of any kind, live or persistent.
+ * generateBridgeReply (voice-haiku-glue.ts) stays exported and tested,
+ * marked deprecated, but is no longer called from here. Kept as an async
+ * function (not inlined at the call site) so lex-voice-ws.ts's
+ * `.then(...)` call shape needs no change and a model path could be
+ * re-added here later without touching the WS again. */
 export async function composeBridgeReply(
-  utterance: string,
+  _utterance: string,
   fallback: string,
-  deps?: ComposeBridgeDeps,
 ): Promise<string> {
-  const modelEnabled =
-    deps?.modelEnabled ?? (useVoiceHaiku() && glueModelAvailable());
-  if (!modelEnabled && !deps?.generate) return fallback;
-  const gen = deps?.generate ?? generateBridgeReply;
-  const reply = await gen({ utterance }, deps);
-  return reply ?? fallback;
+  return fallback;
 }
 
 export async function composeGlueReply(
@@ -253,39 +331,34 @@ export async function composeGlueReply(
   const t = text.toLowerCase().replace(/\s+/g, ' ').trim().replace(/[.!?,]+$/, '');
   const delivery = deliveryHintOf(t);
   const claim = greetingClaimOf(t);
-  const modelEnabled =
-    deps?.modelEnabled ?? (useVoiceHaiku() && glueModelAvailable());
-  const generate = deps?.generate ?? generateGlueReply;
-  const live = async (hint: GlueHint): Promise<string | null> => {
-    if (!modelEnabled && !deps?.generate) return null;
-    return generate({ utterance: text, hint }, deps);
-  };
 
   if (REPEAT_RE.test(t)) {
     /* Verbatim replay of what was actually said; never the model. */
     if (lastSpoken && lastSpoken.trim()) return lastSpoken;
-    return (await live('nothing-said')) ?? "I haven't said anything yet.";
+    const reply = await askGlue(text, lastSpoken, deps);
+    return reply ?? "I haven't said anything yet.";
   }
 
   if (claim !== null) {
-    /* Greeting-shaped aside (requirement 3/4): prefer the live in-persona
-     * line - it can weave the moment/digest in naturally - and fall back
-     * to the deterministic time-aware canned pool rather than a bare-ack
-     * absorb, so a greeting is never met with silence or a stale filler,
-     * even with no key or a call miss, even right after a cold start. */
-    const reply = await live('greeting');
+    /* Greeting-shaped aside: the persistent session is primary - it can
+     * weave the digest / moment in naturally, in Lex's own voice, the
+     * way a human colleague would. The two-line neutral guard fires ONLY
+     * on null/timeout (guardGreeting above), so a greeting is never met
+     * with silence, even with the session unavailable or right after a
+     * cold start. */
+    const reply = await askGlue(text, lastSpoken, deps);
     if (reply) return reply;
-    return cannedGreeting(claim, deps?.now?.() ?? new Date());
+    return guardGreeting(deps?.now?.() ?? new Date());
   }
 
-  const reply = await live(delivery ?? 'ack');
+  const reply = await askGlue(text, lastSpoken, deps);
   if (reply) return reply;
 
-  /* Deterministic fallback for delivery tweaks. */
+  /* Deterministic fallback for delivery tweaks (guard only, unchanged). */
   if (delivery === 'slower') return 'Slowing down.';
   if (delivery === 'louder') return 'Speaking up.';
   if (delivery === 'quieter') return 'Going quieter.';
-  /* Pure ack / yes-no: absorb, no spoken reply, no Lex round-trip. */
+  /* Pure ack / yes-no: absorb, no spoken reply, no round-trip. */
   return null;
 }
 

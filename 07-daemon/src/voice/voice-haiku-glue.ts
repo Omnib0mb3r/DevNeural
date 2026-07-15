@@ -1,5 +1,24 @@
 /* Live haiku glue generation (pillar 3, DRIVE-QUEUE 1a).
  *
+ * DEPRECATED as the production path (2026-07-15): generateGlueReply and
+ * generateBridgeReply below are no longer called from
+ * voice-haiku-wiring.ts's composeGlueReply/composeBridgeReply. The voice
+ * fast lane's smart replies now come from askText on the persistent
+ * Max-plan judge session (src/lex/judge-session.ts) instead of a metered
+ * per-call Anthropic API request - the operator's Max subscription
+ * already pays a flat rate for a kept-open Claude Code session, so a
+ * second, separate metered model call for the same job was pure waste.
+ * See the deprecation note on each function below for specifics. This
+ * module (the model seam, the never-twice ring helpers still used by the
+ * new path, and renderReplyLive which stays live) is left in place and
+ * still exercised by tests/voice-haiku-glue.test.ts and
+ * tests/voice-bridge-reply.test.ts so the metered path is not lost and
+ * could be re-enabled without rebuilding it.
+ *
+ * The rest of this doc comment describes the ORIGINAL design and still
+ * applies to generateGlueReply/generateBridgeReply as implemented, just
+ * not as called in production anymore:
+ *
  * The voice fast lane used to answer conversational glue (acks, delivery
  * tweaks, "say again") with hardcoded strings ("Slowing down.", etc).
  * They read cold and robotic. This module replaces them with a live
@@ -174,7 +193,19 @@ export interface GenerateGlueDeps {
   now?: () => Date;
 }
 
-/* Generate one warm, varied, in-persona glue reply. Returns null to mean
+/**
+ * @deprecated 2026-07-15: no longer called from composeGlueReply
+ * (voice-haiku-wiring.ts). The fast lane's smart path is now askText on
+ * the persistent Max-plan judge session (src/lex/judge-session.ts) - a
+ * kept-open Claude Code session paid for by the flat Max subscription
+ * rather than a metered per-call Anthropic API charge (operator
+ * directive: "keep the child sessions open, I'm not paying every time").
+ * Left in place, exported, and still covered by
+ * tests/voice-haiku-glue.test.ts so this metered path is not lost and can
+ * be re-enabled without rebuilding it, but nothing in production calls it
+ * anymore.
+ *
+ * Generate one warm, varied, in-persona glue reply. Returns null to mean
  * "absorb silently" (the model emitted <none>) or "unavailable / failed"
  * (caller then uses the deterministic fallback). */
 export async function generateGlueReply(
@@ -237,7 +268,18 @@ function bridgeInstruction(): string {
   return lines.join('\n');
 }
 
-/* Generate one warm, specific, in-persona BRIDGE line for the slow lane.
+/**
+ * @deprecated 2026-07-15: no longer called from composeBridgeReply
+ * (voice-haiku-wiring.ts). The slow-lane bridge line must fire the
+ * INSTANT Lex starts reasoning - any model round trip here, live or on
+ * the persistent judge session, would be the delay the bridge exists to
+ * hide, so composeBridgeReply went back to the caller's own instant
+ * deterministic pickBridgeLine pick only. Left in place, exported, and
+ * still covered by tests/voice-bridge-reply.test.ts so this path is not
+ * lost and can be re-enabled without rebuilding it, but nothing in
+ * production calls it anymore.
+ *
+ * Generate one warm, specific, in-persona BRIDGE line for the slow lane.
  * Returns null on unavailable/failed/empty (caller uses the deterministic
  * bridge). Shares the never-twice ring with the glue path so a bridge and
  * an ack never read the same back-to-back. */

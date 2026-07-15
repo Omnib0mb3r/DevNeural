@@ -4,29 +4,50 @@
  * The regression guard: with the flag OFF every helper is a passthrough,
  * so the live voice path is byte-identical. With it ON they route through
  * the front desk / renderer / heartbeat.
+ *
+ * 2026-07-15 rework: composeGlueReply's smart path (greetings AND general
+ * glue asides) is now askText on the persistent Max-plan judge session
+ * (src/lex/judge-session.ts), not a metered Haiku call. These tests mock
+ * judge-session.js wholesale - the same ROUTING-test pattern
+ * tests/inject-verdict-judge-routing.test.ts and
+ * tests/expectation-supervisor-judge-routing.test.ts use - so no real
+ * `claude` process is ever touched; judge-session.ts's own internals
+ * (timeout/respawn/serialization) are covered by tests/judge-session.test.ts.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('../src/lex/judge-session.js', () => ({
+  askText: vi.fn(),
+}));
+
 import {
   renderForSpeech,
   haikuRoute,
   heartbeatLine,
   composeGlueReply,
+  composeBridgeReply,
   renderReplyForSpeech,
   isGreetingAside,
 } from '../src/voice/voice-haiku-wiring.js';
 import { heartbeatPhrase } from '../src/voice/lex-voice-heartbeat.js';
 import { _resetDigest, pushDigest } from '../src/voice/voice-digest.js';
 import { _resetGlueHistory } from '../src/voice/voice-haiku-glue.js';
+import { askText } from '../src/lex/judge-session.js';
 
 let prior: string | undefined;
+let priorTimeout: string | undefined;
 beforeEach(() => {
   prior = process.env.DEVNEURAL_VOICE_HAIKU;
+  priorTimeout = process.env.DEVNEURAL_GLUE_ASK_TIMEOUT_MS;
   _resetDigest();
   _resetGlueHistory();
+  vi.mocked(askText).mockReset();
 });
 afterEach(() => {
   if (prior === undefined) delete process.env.DEVNEURAL_VOICE_HAIKU;
   else process.env.DEVNEURAL_VOICE_HAIKU = prior;
+  if (priorTimeout === undefined) delete process.env.DEVNEURAL_GLUE_ASK_TIMEOUT_MS;
+  else process.env.DEVNEURAL_GLUE_ASK_TIMEOUT_MS = priorTimeout;
   _resetDigest();
   _resetGlueHistory();
 });
@@ -97,75 +118,247 @@ describe('flag ON: routes through the haiku layer', () => {
   });
 });
 
-describe('composeGlueReply fallback (no model: byte-identical to prior canned glue)', () => {
-  const off = { modelEnabled: false } as const;
-
-  it('repeat replays the last spoken line verbatim', async () => {
-    expect(
-      await composeGlueReply('say that again', 'the build is green', off),
-    ).toBe('the build is green');
+describe('composeGlueReply: silence guard (askText null/unavailable - the tiny fallback pool)', () => {
+  beforeEach(() => {
+    vi.mocked(askText).mockResolvedValue(null);
   });
 
-  it('empty replay returns the canned line', async () => {
-    expect(await composeGlueReply('say that again', null, off)).toBe(
+  it('repeat replays the last spoken line verbatim, without ever calling askText', async () => {
+    expect(
+      await composeGlueReply('say that again', 'the build is green'),
+    ).toBe('the build is green');
+    expect(askText).not.toHaveBeenCalled();
+  });
+
+  it('empty replay (askText null) returns the deterministic canned line', async () => {
+    expect(await composeGlueReply('say that again', null)).toBe(
       "I haven't said anything yet.",
     );
   });
 
-  it('delivery tweaks ack', async () => {
-    expect(await composeGlueReply('slower', null, off)).toBe('Slowing down.');
-    expect(await composeGlueReply('louder', null, off)).toBe('Speaking up.');
-    expect(await composeGlueReply('quieter', null, off)).toBe('Going quieter.');
+  it('delivery tweaks fall back to the deterministic ack', async () => {
+    expect(await composeGlueReply('slower', null)).toBe('Slowing down.');
+    expect(await composeGlueReply('louder', null)).toBe('Speaking up.');
+    expect(await composeGlueReply('quieter', null)).toBe('Going quieter.');
   });
 
   it('bare acknowledgments are absorbed (null = nothing spoken)', async () => {
-    expect(await composeGlueReply('thanks', 'x', off)).toBeNull();
-    expect(await composeGlueReply('yes', 'x', off)).toBeNull();
+    expect(await composeGlueReply('thanks', 'x')).toBeNull();
+    expect(await composeGlueReply('yes', 'x')).toBeNull();
+  });
+
+  it('askText throwing is treated the same as null (never throws out of composeGlueReply)', async () => {
+    vi.mocked(askText).mockRejectedValue(new Error('judge session unavailable'));
+    expect(await composeGlueReply('louder', null)).toBe('Speaking up.');
   });
 });
 
-describe('composeGlueReply live model path', () => {
-  it('delivery tweak comes from the model, not the canned line', async () => {
-    const seen: string[] = [];
-    const reply = await composeGlueReply('slow down', null, {
-      generate: async ({ hint }) => {
-        seen.push(hint);
-        return "sure, I'll ease off the pace";
-      },
-    });
+describe('composeGlueReply: askText is the primary path (the smart path)', () => {
+  it('a delivery tweak comes from askText, not the canned line', async () => {
+    vi.mocked(askText).mockResolvedValue("sure, I'll ease off the pace");
+    const reply = await composeGlueReply('slow down', null);
     expect(reply).toBe("sure, I'll ease off the pace");
     expect(reply).not.toBe('Slowing down.');
-    expect(seen).toEqual(['slower']);
   });
 
-  it('bare ack can now get a warm reply instead of silence', async () => {
-    const reply = await composeGlueReply('thanks', 'x', {
-      generate: async ({ hint }) => {
-        expect(hint).toBe('ack');
-        return 'anytime';
-      },
-    });
-    expect(reply).toBe('anytime');
+  it('a bare ack can now get a warm reply instead of silence', async () => {
+    vi.mocked(askText).mockResolvedValue('anytime');
+    expect(await composeGlueReply('thanks', 'x')).toBe('anytime');
   });
 
-  it('model <none>/null on a tweak falls back to the deterministic line', async () => {
-    const reply = await composeGlueReply('louder', null, {
-      modelEnabled: true,
-      generate: async () => null,
-    });
-    expect(reply).toBe('Speaking up.');
+  it('a null askText reply on a tweak falls back to the deterministic line', async () => {
+    vi.mocked(askText).mockResolvedValue(null);
+    expect(await composeGlueReply('louder', null)).toBe('Speaking up.');
   });
 
-  it('repeat stays a verbatim replay and never calls the model', async () => {
-    let called = false;
-    const reply = await composeGlueReply('say that again', 'forty two', {
-      generate: async () => {
-        called = true;
-        return 'paraphrased';
-      },
-    });
+  it('repeat with nothing said yet asks askText first, then falls back on a miss', async () => {
+    vi.mocked(askText).mockResolvedValue('nothing yet, but go ahead');
+    expect(await composeGlueReply('say that again', null)).toBe(
+      'nothing yet, but go ahead',
+    );
+
+    vi.mocked(askText).mockResolvedValue(null);
+    _resetGlueHistory();
+    expect(await composeGlueReply('say that again', null)).toBe(
+      "I haven't said anything yet.",
+    );
+  });
+
+  it('a repeat with a real last-spoken line never calls askText (verbatim replay only)', async () => {
+    vi.mocked(askText).mockResolvedValue('paraphrased instead');
+    const reply = await composeGlueReply('say that again', 'forty two');
     expect(reply).toBe('forty two');
-    expect(called).toBe(false);
+    expect(askText).not.toHaveBeenCalled();
+  });
+
+  it('an exact back-to-back repeat of the last spoken line is rejected (never-twice ring)', async () => {
+    vi.mocked(askText).mockResolvedValue('glad that landed');
+    const first = await composeGlueReply('nice', 'x');
+    expect(first).toBe('glad that landed');
+
+    /* Same reply again: the ring rejects it, so the deterministic guard
+     * (null = absorb, for a bare ack) fires instead of an echo. */
+    vi.mocked(askText).mockResolvedValue('glad that landed');
+    const second = await composeGlueReply('nice', 'x');
+    expect(second).toBeNull();
+  });
+});
+
+describe('composeGlueReply: greetings via askText (persistent-session smart greeting)', () => {
+  it('prefers askText over the guard, using whatever it says verbatim', async () => {
+    vi.mocked(askText).mockResolvedValue(
+      "morning - the migration's still holding steady, ready when you are",
+    );
+    const reply = await composeGlueReply('good morning', null);
+    expect(reply).toBe(
+      "morning - the migration's still holding steady, ready when you are",
+    );
+  });
+
+  it('falls back to the two-line neutral guard when askText is null - no correction logic', async () => {
+    vi.mocked(askText).mockResolvedValue(null);
+    const morning = () => new Date(2026, 0, 1, 8, 0, 0);
+    expect(await composeGlueReply('good morning', null, { now: morning })).toBe(
+      'Morning.',
+    );
+
+    _resetGlueHistory();
+    vi.mocked(askText).mockResolvedValue(null);
+    const night = () => new Date(2026, 0, 1, 23, 0, 0);
+    expect(await composeGlueReply('good morning', null, { now: night })).toBe(
+      'Hey.',
+    );
+  });
+
+  it('the guard never repeats the immediately-previous line back-to-back', async () => {
+    vi.mocked(askText).mockResolvedValue(null);
+    const morning = () => new Date(2026, 0, 1, 8, 0, 0);
+    const first = await composeGlueReply('good morning', null, { now: morning });
+    const second = await composeGlueReply('good morning', null, { now: morning });
+    expect(first).toBe('Morning.');
+    expect(second).not.toBe(first);
+    expect(second).toBe('Hey.');
+  });
+
+  it('non-greeting asides are unaffected by the greeting guard', async () => {
+    vi.mocked(askText).mockResolvedValue(null);
+    expect(await composeGlueReply('thanks', 'x')).toBeNull();
+    expect(await composeGlueReply('slower', null)).toBe('Slowing down.');
+  });
+});
+
+describe('composeGlueReply: askText prompt contract', () => {
+  it('the timeout defaults to 4000ms', async () => {
+    vi.mocked(askText).mockResolvedValue('hi there');
+    await composeGlueReply('hello', null);
+    expect(vi.mocked(askText).mock.calls[0]![0].timeoutMs).toBe(4000);
+  });
+
+  it('DEVNEURAL_GLUE_ASK_TIMEOUT_MS overrides the default', async () => {
+    process.env.DEVNEURAL_GLUE_ASK_TIMEOUT_MS = '1500';
+    vi.mocked(askText).mockResolvedValue('hi there');
+    await composeGlueReply('hello', null);
+    expect(vi.mocked(askText).mock.calls[0]![0].timeoutMs).toBe(1500);
+  });
+
+  it('a deps.timeoutMs override wins over the env var', async () => {
+    process.env.DEVNEURAL_GLUE_ASK_TIMEOUT_MS = '1500';
+    vi.mocked(askText).mockResolvedValue('hi there');
+    await composeGlueReply('hello', null, { timeoutMs: 900 });
+    expect(vi.mocked(askText).mock.calls[0]![0].timeoutMs).toBe(900);
+  });
+
+  it('carries the persona line in system and the aside verbatim in prompt', async () => {
+    vi.mocked(askText).mockResolvedValue('hi there');
+    await composeGlueReply('good morning, hows the migration going', null);
+    const call = vi.mocked(askText).mock.calls[0]![0];
+    expect(call.system).toContain('You are Lex');
+    expect(call.prompt).toContain(
+      '"good morning, hows the migration going"',
+    );
+  });
+
+  it('carries lastDecision/openQuestion from the live digest when present', async () => {
+    pushDigest(
+      {
+        currentTask: 'wiring the voice lane',
+        lastDecision: 'moved glue onto the persistent session',
+        openQuestion: 'still deciding the guard pool size',
+        workerStatus: 'idle',
+        nextSteps: 'ship it',
+      },
+      1,
+    );
+    vi.mocked(askText).mockResolvedValue('hi there');
+    await composeGlueReply('good morning', null);
+    const call = vi.mocked(askText).mock.calls[0]![0];
+    expect(call.prompt).toContain('moved glue onto the persistent session');
+    expect(call.prompt).toContain('still deciding the guard pool size');
+  });
+
+  it('omits digest lines gracefully when no digest has landed yet', async () => {
+    vi.mocked(askText).mockResolvedValue('hi there');
+    await composeGlueReply('good morning', null);
+    const call = vi.mocked(askText).mock.calls[0]![0];
+    expect(call.prompt).not.toMatch(/Last decision:/);
+    expect(call.prompt).not.toMatch(/Open question:/);
+  });
+
+  it('instructs the model to use the clock only as calibration and never mention the time', async () => {
+    vi.mocked(askText).mockResolvedValue('hi there');
+    await composeGlueReply('good morning', null, {
+      now: () => new Date(2026, 0, 1, 8, 0, 0),
+    });
+    const call = vi.mocked(askText).mock.calls[0]![0];
+    expect(call.prompt).toMatch(/calibration only/i);
+    expect(call.prompt).toMatch(/never mention the time/i);
+    /* The actual clock value is present so the model CAN calibrate, but
+     * it is explicitly told not to speak it. */
+    expect(call.prompt).toContain('08:00');
+  });
+
+  it('passes the last spoken line as an explicit avoid, and omits it when there is none', async () => {
+    vi.mocked(askText).mockResolvedValue('hi there');
+    await composeGlueReply('thanks', 'the build is green');
+    const withLast = vi.mocked(askText).mock.calls[0]![0];
+    expect(withLast.prompt).toContain('Never repeat this line');
+    expect(withLast.prompt).toContain('the build is green');
+
+    vi.mocked(askText).mockClear();
+    vi.mocked(askText).mockResolvedValue('hi there');
+    await composeGlueReply('thanks', null);
+    const withoutLast = vi.mocked(askText).mock.calls[0]![0];
+    expect(withoutLast.prompt).not.toContain('Never repeat this line');
+  });
+});
+
+describe('composeGlueReply / composeBridgeReply: the metered path is retired', () => {
+  it('composeGlueReply never calls the deprecated generateGlueReply', async () => {
+    const glueModule = await import('../src/voice/voice-haiku-glue.js');
+    const spy = vi.spyOn(glueModule, 'generateGlueReply');
+
+    vi.mocked(askText).mockResolvedValue('a reply');
+    await composeGlueReply('good morning', null);
+    await composeGlueReply('slower', null);
+    await composeGlueReply('thanks', 'x');
+
+    vi.mocked(askText).mockResolvedValue(null);
+    await composeGlueReply('good afternoon', null);
+    await composeGlueReply('say that again', null);
+
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it('composeBridgeReply stays deterministic: never calls generateBridgeReply, always returns the fallback', async () => {
+    const glueModule = await import('../src/voice/voice-haiku-glue.js');
+    const spy = vi.spyOn(glueModule, 'generateBridgeReply');
+
+    const out = await composeBridgeReply('what is the worker doing', 'one sec');
+    expect(out).toBe('one sec');
+    expect(spy).not.toHaveBeenCalled();
+    expect(askText).not.toHaveBeenCalled();
+    spy.mockRestore();
   });
 });
 
@@ -234,74 +427,6 @@ describe('isGreetingAside (whole-utterance greeting matcher)', () => {
     expect(isGreetingAside('thanks')).toBe(false);
     expect(isGreetingAside('quiet')).toBe(false);
     expect(isGreetingAside('slower')).toBe(false);
-  });
-});
-
-describe('composeGlueReply: time-aware canned greetings (requirement 3)', () => {
-  const off = { modelEnabled: false } as const;
-
-  it('answers a morning greeting with a morning-daypart line when the model is off', async () => {
-    const now = () => new Date(2026, 0, 1, 8, 0, 0); // 08:00 local -> morning
-    const reply = await composeGlueReply('good morning', null, { ...off, now });
-    expect(['Good morning.', 'Morning.']).toContain(reply);
-  });
-
-  it('answers a generic greeting with the plain daypart line, no correction', async () => {
-    const now = () => new Date(2026, 0, 1, 2, 0, 0); // 02:00 local -> late night
-    const reply = await composeGlueReply('hey', null, { ...off, now });
-    expect([
-      "Hey - it's late, but good to hear from you.",
-      'Still up. Hi.',
-    ]).toContain(reply);
-  });
-
-  it('gently corrects a mismatched greeting instead of mirroring it back (good morning at night)', async () => {
-    const now = () => new Date(2026, 0, 1, 23, 0, 0); // 23:00 local -> late night
-    const reply = await composeGlueReply('good morning', null, { ...off, now });
-    expect(reply?.toLowerCase()).not.toContain('good morning');
-    expect(reply?.toLowerCase()).toMatch(/night/);
-  });
-
-  it('an early-morning "good morning" is not treated as a mismatch', async () => {
-    const now = () => new Date(2026, 0, 1, 6, 0, 0); // 06:00 local -> early morning
-    const reply = await composeGlueReply('good morning', null, { ...off, now });
-    expect(['You\'re up early - good morning.', 'Morning. Early start today.']).toContain(
-      reply,
-    );
-  });
-
-  it('never repeats the immediately-previous canned greeting back-to-back', async () => {
-    const now = () => new Date(2026, 0, 1, 8, 0, 0);
-    const first = await composeGlueReply('good morning', null, { ...off, now });
-    const second = await composeGlueReply('good morning', null, { ...off, now });
-    expect(second).not.toBe(first);
-  });
-
-  it('prefers the live model over the canned pool, using the greeting hint', async () => {
-    const seen: string[] = [];
-    const reply = await composeGlueReply('good morning', null, {
-      generate: async ({ hint }) => {
-        seen.push(hint);
-        return 'morning - ready when you are';
-      },
-    });
-    expect(reply).toBe('morning - ready when you are');
-    expect(seen).toEqual(['greeting']);
-  });
-
-  it('falls back to the canned pool when the live model misses', async () => {
-    const now = () => new Date(2026, 0, 1, 14, 0, 0); // afternoon
-    const reply = await composeGlueReply('good afternoon', null, {
-      modelEnabled: true,
-      generate: async () => null,
-      now,
-    });
-    expect(['Good afternoon.', 'Afternoon.']).toContain(reply);
-  });
-
-  it('non-greeting asides are unaffected (still absorb / canned delivery lines)', async () => {
-    expect(await composeGlueReply('thanks', 'x', off)).toBeNull();
-    expect(await composeGlueReply('slower', null, off)).toBe('Slowing down.');
   });
 });
 

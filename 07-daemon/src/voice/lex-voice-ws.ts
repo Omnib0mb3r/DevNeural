@@ -2931,10 +2931,14 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
             return;
           }
         } else if (dec.route.lane === 'fast') {
-          /* haiku alone: answer glue with zero Opus round-trip. The reply
-           * is LIVE haiku in persona (warm + varied) when a key is set,
-           * else the deterministic fallback. A bare ack returns null and
-           * is absorbed silently. */
+          /* zero Opus round-trip: answer glue with askText on the
+           * persistent Max-plan judge session (2026-07-15 rework,
+           * src/lex/judge-session.ts), in persona and grounded in the
+           * live digest, warm and varied - no metered per-call cost,
+           * since that session is kept open for exactly this. On
+           * disabled/unavailable/timeout composeGlueReply falls back to
+           * its own tiny deterministic guard. A bare ack returns null
+           * and is absorbed silently either way. */
           const reply = await composeGlueReply(trimmed, lastSpokenText);
           if (reply) {
             speak(reply);
@@ -2960,14 +2964,16 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           state.utteranceStartedDuringTts = false;
           return;
         } else {
-          /* slow: a request-specific bridge now, Lex reasons below, reply
-           * rendered through the preserve-list when it lands. The bridge
-           * is composed live (warm + specific to what they asked) with a
-           * fail-fast fallback to the deterministic hash line. Fire it
-           * WITHOUT awaiting so Lex's inject below is not delayed by the
-           * haiku call; the bridge speaks the moment it lands, ahead of
-           * Lex's Opus reply. speak() serialises via the TTS queue, so the
-           * bridge and the eventual reply never overlap. */
+          /* slow: an instant deterministic bridge line now (dec.route.bridge,
+           * voice-lane-router.ts's pickBridgeLine), Lex reasons below, reply
+           * rendered through the preserve-list when it lands. composeBridgeReply
+           * (2026-07-15 rework) is a synchronous passthrough of that fallback -
+           * no model call, live or persistent - because the bridge exists to
+           * fill the silence the INSTANT Lex starts reasoning; any round trip
+           * here would be the delay it exists to hide. Still fired WITHOUT
+           * awaiting (kept async/`.then()`-shaped) so Lex's inject below is
+           * never delayed by it either way. speak() serialises via the TTS
+           * queue, so the bridge and the eventual reply never overlap. */
           if (dec.route.bridge) {
             const fallbackBridge = dec.route.bridge;
             const bridgeUtterance = trimmed;
