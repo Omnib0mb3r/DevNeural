@@ -45,6 +45,19 @@ import {
   runDistillationFlush,
 } from '../lex/session-end-pipeline.js';
 
+/* Injected daemon logger (mirrors embedder/index.ts's setEmbedderLogger
+ * pattern). Every console.log/warn in this file used to write to stdout,
+ * which the daemon only ever redirects to daemon.stdout.log via
+ * Start-Process; that file sits at 0 bytes after days of uptime, so the
+ * whole [pty-host] diagnostic stream was invisible. Defaults to a no-op
+ * so standalone imports (tests, scripts) never crash; daemon.ts (or
+ * whichever module first imports this file at daemon startup) must call
+ * setPtyHostLogger(logger) to route these lines into daemon.log. */
+let logFn: (msg: string) => void = () => undefined;
+export function setPtyHostLogger(log: (msg: string) => void): void {
+  logFn = log;
+}
+
 interface PtyHandle {
   ptyId: string;
   /** Brainstorm row uuid this PTY is bound to. Set at spawn time
@@ -573,7 +586,7 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
               try { handle.pty.write('\r'); } catch { /* swallow */ }
             }
           }, 80);
-          console.log(
+          logFn(
             `[pty-host] auto-dismissed CC native prompt pty=${handle.ptyId} session=${handle.sessionId ?? '-'}`,
           );
         } catch {
@@ -624,7 +637,7 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
     /* Explicit, structured log line so daemon.log carries the full
      * diagnostic. Without this, a non-zero exit (or a kill-9 from the
      * panic path) left no breadcrumb anywhere. */
-    console.log(
+    logFn(
       `[pty-host] exit pty=${handle.ptyId} session=${
         handle.sessionId ?? "-"
       } code=${exitCode ?? "?"} signal=${
@@ -671,10 +684,10 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
             mode: bs.mode,
             reason: 'pty-exit',
           },
-          (msg) => console.log(msg),
+          (msg) => logFn(msg),
         )
           .catch((err) =>
-            console.log(
+            logFn(
               `[pty-host] session-end pipeline failed: ${(err as Error).message}`,
             ),
           )
@@ -734,9 +747,9 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
                 mode: detachingMode,
                 reason: 'worker-detach',
               },
-              (msg) => console.log(msg),
+              (msg) => logFn(msg),
             ).catch((err) =>
-              console.log(
+              logFn(
                 `[pty-host] worker-detach flush failed: ${(err as Error).message}`,
               ),
             );
@@ -920,7 +933,7 @@ export function ptyInject(
     const klass = e.name ?? 'Error';
     handle.lastError = message;
     handle.lastErrorClass = klass;
-    console.log(
+    logFn(
       `[pty-host] inject error pty=${handle.ptyId} session=${
         handle.sessionId ?? "-"
       } class=${klass} error=${JSON.stringify(message)} last_command=${JSON.stringify(
@@ -1066,7 +1079,7 @@ export function ptyKill(ptyIdOrSession: string): boolean {
   let handle = ptys.get(ptyIdOrSession);
   if (!handle) handle = getPtyBySession(ptyIdOrSession);
   if (!handle) {
-    console.warn(`[pty-host] ptyKill: handle not found for ${ptyIdOrSession}`);
+    logFn(`[pty-host] ptyKill: handle not found for ${ptyIdOrSession}`);
     return false;
   }
   const pid = handle.pty.pid;
@@ -1084,7 +1097,7 @@ export function ptyKill(ptyIdOrSession: string): boolean {
     handle.pty.kill();
     killed = true;
   } catch (err) {
-    console.warn(
+    logFn(
       `[pty-host] ptyKill: pty.kill() threw for ${ptyId} pid=${pid}: ${(err as Error).message}`,
     );
   }
@@ -1100,7 +1113,7 @@ export function ptyKill(ptyIdOrSession: string): boolean {
        * Anything else is a real failure worth logging. */
       const msg = (err as Error).message;
       if (!/not found|not running|128/i.test(msg)) {
-        console.warn(
+        logFn(
           `[pty-host] ptyKill: taskkill failed for ${ptyId} pid=${pid}: ${msg}`,
         );
       }
@@ -1124,7 +1137,7 @@ export function ptyKill(ptyIdOrSession: string): boolean {
     }
     setTimeout(() => ptys.delete(ptyId), 60_000);
   }
-  console.log(
+  logFn(
     `[pty-host] ptyKill: ${ptyId} pid=${pid} killed=${killed}`,
   );
   return killed;

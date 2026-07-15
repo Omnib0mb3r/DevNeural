@@ -124,6 +124,20 @@ import {
   type LexDigest,
 } from './voice-digest.js';
 
+/* Injected daemon logger (mirrors embedder/index.ts's setEmbedderLogger
+ * pattern). Every console.log/warn/error in this file used to write to
+ * stdout, which the daemon only ever redirects to daemon.stdout.log /
+ * daemon.stderr.log via Start-Process; those files sit at 0 bytes after
+ * days of uptime, so the whole [voice-ws] / [lex-compaction] diagnostic
+ * stream was invisible. Defaults to a no-op so standalone imports (tests,
+ * scripts) never crash; daemon.ts (or whichever module first imports this
+ * file at daemon startup) must call setVoiceWsLogger(logger) to route
+ * these lines into daemon.log. */
+let logFn: (msg: string) => void = () => undefined;
+export function setVoiceWsLogger(log: (msg: string) => void): void {
+  logFn = log;
+}
+
 /* Voice modes drive whether the daemon synthesizes Lex's response
  * out loud. The browser still receives transcript + assistant-text
  * events in every mode so the on-screen panel updates regardless. */
@@ -736,7 +750,7 @@ export function _flushPendingUtterancesImpl(
       /* nudge is fire-and-forget */
     }
   }, delayMs);
-  (deps.log ?? console.log)(
+  (deps.log ?? logFn)(
     `[voice-ws] mid-turn-no-tts queue flush count=${queued.length}`,
   );
   send({
@@ -860,14 +874,14 @@ export function _captureNotesUtteranceOnlyImpl(
       cc_session_id: null,
     });
   } catch (err) {
-    (deps.log ?? console.log)(
+    (deps.log ?? logFn)(
       `[voice-ws] notes-mode capture insert failed: ${(err as Error).message}`,
     );
   }
 }
 
 export function attachLexVoiceWs(socket: FastifyWS): void {
-  console.log(`[voice-ws] client connected (attach)`);
+  logFn(`[voice-ws] client connected (attach)`);
   const state: ConnState = {
     ws: socket,
     bindKey: null,
@@ -1289,7 +1303,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
     if (!last || !last.text) return;
     if (Date.now() - last.mtimeMs > REPLAY_WINDOW_MS) return;
-    console.log(
+    logFn(
       `[voice-ws] replay-on-switch: speaking last reply (age=${Math.round((Date.now() - last.mtimeMs) / 1000)}s) bindKey=${state.bindKey ?? 'null'}`,
     );
     speak(last.text);
@@ -1747,7 +1761,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         { contextTokens: tokens },
         {
           state: state.compaction,
-          log: (msg) => console.log(msg),
+          log: (msg) => logFn(msg),
           runSessionEnd: async () => {
             await fireSessionEndPipeline('compaction-restart');
           },
@@ -1780,7 +1794,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
                 ...(restartCwd ? { cwd: restartCwd } : {}),
               });
               if (built.feedback_memories.kept.length > 0) {
-                console.log(
+                logFn(
                   `[lex-compaction] hard-rules baked into restart prompt kept=${built.feedback_memories.kept.length} cwd=${restartCwd}`,
                 );
               }
@@ -1867,7 +1881,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           },
         },
       ).catch((err) => {
-        console.log(
+        logFn(
           `[lex-compaction] supervisor threw: ${(err as Error).message}`,
         );
       });
@@ -1939,7 +1953,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       state.pendingUserUtterances = [];
       const drain = formatQueueDrain(queued);
       if (!drain) break;
-      console.log(
+      logFn(
         `[voice-ws] direct-llm drain count=${drain.count} chars=${drain.text.length}`,
       );
       pending = drain.text;
@@ -1977,7 +1991,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         cc_session_id: null,
       });
     } catch (err) {
-      console.log(
+      logFn(
         `[voice-ws] direct-llm user chunk insert failed: ${(err as Error).message}`,
       );
     }
@@ -2044,7 +2058,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         reply = await callVoiceChat(messages, { signal: controller.signal });
       } catch (err) {
         if ((err as Error).name === 'AbortError' || controller.signal.aborted) {
-          console.log(
+          logFn(
             `[voice-ws] direct-llm reply aborted mid-call bs=${bsId.slice(0, 8)}`,
           );
           send({ t: 'direct-llm-aborted', reason: 'contradiction' });
@@ -2069,7 +2083,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           cc_session_id: null,
         });
       } catch (err) {
-        console.log(
+        logFn(
           `[voice-ws] direct-llm assistant chunk insert failed: ${(err as Error).message}`,
         );
       }
@@ -2210,7 +2224,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     const now = Date.now();
     const prev = state.lastVoiceCmdMs[kind] ?? 0;
     if (now - prev < VOICE_CMD_DEDUPE_MS) {
-      console.log(
+      logFn(
         `[voice-ws] voice-command dedupe kind=${kind} source=${source} prev_ms_ago=${now - prev}`,
       );
       return false;
@@ -2235,7 +2249,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         return true;
       }
       case 'end_session': {
-        console.log(
+        logFn(
           `[voice-ws] voice-cmd matched kind=end_session source=${source} bindKey=${state.bindKey ?? 'null'} watchSessionId=${state.watchSessionId ?? 'null'} brainstormId=${state.brainstormId ?? 'null'}`,
         );
         send({ t: 'session-end', reason: 'voice-command' });
@@ -2249,7 +2263,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           try {
             await fireSessionEndPipeline('voice-command');
           } catch (err) {
-            console.log(
+            logFn(
               `[voice-ws] end_session: pipeline threw ${(err as Error).message}`,
             );
           }
@@ -2268,11 +2282,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
               status: 'dormant',
               currentPtyId: null,
             });
-            console.log(
+            logFn(
               `[voice-ws] end_session: anchor flipped dormant ${anchorId}`,
             );
           } catch (err) {
-            console.log(
+            logFn(
               `[voice-ws] end_session: anchor teardown failed ${anchorId}: ${(err as Error).message}`,
             );
           }
@@ -2630,7 +2644,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         : isBlankMarker
           ? 'blank-audio-marker'
           : 'too-few-words';
-      console.log(
+      logFn(
         `[voice-ws] dropped whisper utterance: reason=${reason} words=${wordCount} text=${JSON.stringify(trimmed)}`,
       );
       send({ t: 'transcript', text: '', ms: result.ms });
@@ -2640,7 +2654,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     /* Real voice turn confirmed (passed the noise floor): Lex talks
      * back. Clears any suppression a prior typed turn left set. */
     state.suppressSpeakForTurn = false;
-    console.log(
+    logFn(
       `[voice-ws] transcript received words=${wordCount} bindKey=${state.bindKey ?? 'null'} duringTts=${state.utteranceStartedDuringTts} text=${JSON.stringify(trimmed.slice(0, 120))}`,
     );
     /* Wave 2 day 2 step 11: persist this utterance into the per-session
@@ -2701,7 +2715,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      *                  continue; the user must re-engage via the UI
      *                  to get TTS back) */
     const cmd = matchVoiceCommand(result.text);
-    console.log(
+    logFn(
       `[voice-ws] matcher result kind=${cmd?.kind ?? 'none'} duringTts=${state.utteranceStartedDuringTts}`,
     );
     if (cmd) {
@@ -2828,7 +2842,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * already went to the client so the operator can see what
      * happened; only the daemon-side inject is suppressed. */
     if (state.utteranceStartedDuringTts) {
-      console.log(
+      logFn(
         `[voice-ws] suppressed non-wake utterance during TTS: ${JSON.stringify(result.text.slice(0, 80))}`,
       );
       state.utteranceStartedDuringTts = false;
@@ -2874,7 +2888,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
               /* best-effort; controller may have completed */
             }
           }
-          console.log(
+          logFn(
             `[voice-ws] direct-llm contradiction; cleared queue depth=${dropped} text=${JSON.stringify(result.text.slice(0, 80))} aborted_inflight=true`,
           );
           send({
@@ -2885,7 +2899,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           return;
         }
         state.pendingUserUtterances.push(result.text);
-        console.log(
+        logFn(
           `[voice-ws] direct-llm mid-reply queue push depth=${state.pendingUserUtterances.length} text=${JSON.stringify(result.text.slice(0, 80))}`,
         );
         send({
@@ -3000,7 +3014,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
        * defeats the wake-word contract. */
       const lateCmd = matchVoiceCommand(result.text);
       if (lateCmd) {
-        console.log(
+        logFn(
           `[voice-ws] mid-turn-queue: lex command "${lateCmd.kind}" punches through, dispatching synchronously`,
         );
         dispatchVoiceCommand(
@@ -3013,7 +3027,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         return;
       }
       state.pendingUserUtterances.push(result.text);
-      console.log(
+      logFn(
         `[voice-ws] mid-turn-no-tts queue push depth=${state.pendingUserUtterances.length} text=${JSON.stringify(result.text.slice(0, 80))}`,
       );
       send({
@@ -3327,13 +3341,13 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * are logged not thrown so teardown always proceeds. */
   async function fireSessionEndPipeline(reason: string): Promise<void> {
     if (state.sessionEndFired) {
-      console.log(
+      logFn(
         `[voice-ws] session-end pipeline: latch already fired reason=${reason}`,
       );
       return;
     }
     state.sessionEndFired = true;
-    console.log(
+    logFn(
       `[voice-ws] session-end pipeline entered reason=${reason} bindKey=${state.bindKey ?? 'null'} watchSessionId=${state.watchSessionId ?? 'null'} brainstormId=${state.brainstormId ?? 'null'}`,
     );
     try {
@@ -3358,7 +3372,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         /* Voice WS without a brainstorm row (read-only TTS bind, or
          * a session that ended before the row was created). Nothing
          * to summarise; skip silently. */
-        console.log(
+        logFn(
           `[voice-ws] session-end pipeline: brainstorm row not resolved (handle=${state.bindKey ?? 'null'} watch=${state.watchSessionId ?? 'null'} bsId=${state.brainstormId ?? 'null'} reason=${reason}); skipping`,
         );
         return;
@@ -3384,7 +3398,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           mode: bs.mode || state.mode,
           reason,
         },
-        (msg) => console.log(msg),
+        (msg) => logFn(msg),
       );
       if (flushOnly) {
         /* Re-arm so a subsequent voice end-session / explicit UI end
@@ -3394,7 +3408,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         state.sessionEndFired = false;
       }
     } catch (err) {
-      console.log(
+      logFn(
         `[voice-ws] session-end pipeline failed: ${(err as Error).message}`,
       );
     }

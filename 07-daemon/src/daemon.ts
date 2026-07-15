@@ -27,7 +27,8 @@ import { cullRawChunks } from './reinforcement/raw-chunks-cull.js';
 import { purgeMeetingAudio } from './voice/meeting-audio-purge.js';
 import { whisperStatus } from './voice/whisper.js';
 import { piperStatus } from './voice/piper.js';
-import { getVoiceWsStats } from './voice/lex-voice-ws.js';
+import { getVoiceWsStats, setVoiceWsLogger } from './voice/lex-voice-ws.js';
+import { setPtyHostLogger } from './dashboard/pty-host.js';
 import {
   useVoiceHaiku,
   voiceApiKey,
@@ -125,6 +126,8 @@ async function main(): Promise<void> {
   logger(`daemon starting; pid=${process.pid}`);
 
   setEmbedderLogger(logger);
+  setVoiceWsLogger(logger);
+  setPtyHostLogger(logger);
   logger('opening store...');
   const store = await Store.open(logger);
   logger(
@@ -304,7 +307,7 @@ async function main(): Promise<void> {
    * recent jsonl tail aligns with the expected outcome, and on
    * drift fires lex-attention so the operator sees a push and Lex
    * sees the correction text on its next voice turn. */
-  const expectationSupervisor = startExpectationSupervisor();
+  const expectationSupervisor = startExpectationSupervisor({ log: logger });
   void expectationSupervisor;
 
   /* External heartbeat poster (Wave 2 day 1 step 5).
