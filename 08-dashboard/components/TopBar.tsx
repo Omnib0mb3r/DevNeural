@@ -15,6 +15,7 @@ import { VoiceTopBarPill } from "./VoiceClient";
 import { PanicButton } from "./PanicButton";
 import { lexPickStable } from "@/lib/lex";
 import { resolveModKey, type ModKey } from "@/lib/platform-mod-key";
+import { resolveHealthPill } from "@/lib/health-pill";
 
 const TABS = [
   { href: "/",            label: "Home",           icon: "Home" as const },
@@ -97,9 +98,12 @@ export function TopBar({ activeTab }: { activeTab: string }) {
   });
 
   const unread = health.data?.unread_notifications ?? 0;
+  /* health.data?.rollup only reflects the last successful fetch; while
+   * loading (no data yet) it falls back to "ok" same as before. Once
+   * the query errors (daemon unreachable), resolveHealthPill overrides
+   * that fallback so the pill never claims "ok" on a dead daemon. */
   const rollup = health.data?.rollup ?? "ok";
-  const rollupLabel =
-    rollup === "ok" ? "all systems online" : rollup === "warn" ? "degraded" : "failure";
+  const healthPill = resolveHealthPill(rollup, health.isError);
 
   const [notifOpen, setNotifOpen] = useState(false);
   const notifRef = useRef<HTMLDivElement>(null);
@@ -359,12 +363,16 @@ export function TopBar({ activeTab }: { activeTab: string }) {
            * health when the label is dropped. */}
           <div
             className={`hidden sm:flex items-center gap-1.5 h-9 px-2 sm:px-3 rounded-pill hairline shimmer-pill text-[11px] font-mono ${
-              rollup === "ok" ? "text-ok" : rollup === "warn" ? "text-warn" : "text-err"
+              healthPill.tone === "ok"
+                ? "text-ok"
+                : healthPill.tone === "warn"
+                  ? "text-warn"
+                  : "text-err"
             }`}
-            title={rollupLabel}
+            title={healthPill.label}
           >
-            <StatusDot status={rollup === "fail" ? "fail" : rollup} pulse={rollup === "ok"} />
-            <span className="hidden sm:inline">{rollupLabel}</span>
+            <StatusDot status={healthPill.dotStatus} pulse={healthPill.pulse} />
+            <span className="hidden sm:inline">{healthPill.label}</span>
           </div>
         </div>
       </div>

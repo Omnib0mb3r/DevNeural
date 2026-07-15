@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { SparkAreaChart } from "@tremor/react";
 import {
@@ -9,6 +9,14 @@ import {
   daemonRestart,
   DaemonError,
 } from "@/lib/daemon-client";
+import {
+  clearPersistedRestart,
+  isPersistedRestartFresh,
+  readPersistedRestart,
+  restartWaitStage,
+  writePersistedRestart,
+  RESTART_DEADLINE_MS,
+} from "@/lib/restart-state";
 import { Icon } from "./Icon";
 import { StatusDot } from "./StatusDot";
 import { LogTail } from "./LogTail";
@@ -16,56 +24,52 @@ import { DiagnosticsPanel } from "./DiagnosticsPanel";
 import { BackfillPanel } from "./BackfillPanel";
 import { lexPickStable } from "@/lib/lex";
 
+const POLL_INTERVAL_MS = 1_500;
+const SLOW_RESTART_NOTE =
+  "Still restarting. The safety net can take up to 10 minutes to relaunch.";
+
 /* Daemon restart card.
  *
  * Calls POST /admin/daemon/restart, then enters a "waiting for new
- * instance" loop that polls /dashboard/health every 1.5s until it gets
- * a 200 back. The running daemon exits ~250ms after responding, so the
- * very next health probe will fail; we keep retrying until the autostart
- * Task Scheduler safety net (or our own relauncher) brings it back. The
- * progress message keeps the user informed instead of leaving the page
- * looking frozen for the ~3-6s gap. */
+ * instance" loop that polls /health every 1.5s until it gets a 200
+ * back. The running daemon exits ~250ms after responding, so the very
+ * next health probe will fail; we keep retrying until the autostart
+ * Task Scheduler safety net (or our own relauncher) brings it back.
+ *
+ * Two honesty fixes on top of the original loop:
+ *
+ *   1. The wait budget is 15 minutes, not 220s. ~18% of historical
+ *      restarts take longer than a few seconds, some up to ~10 minutes
+ *      when the relauncher silently fails and the 5-minute Task
+ *      Scheduler safety net has to recover it. After 90s of no
+ *      response the card admits the restart is slow instead of
+ *      staying silent; only past the full 15 minutes does it declare
+ *      failure and point at daemon.log.
+ *   2. The "waiting for it to come back" state is persisted to
+ *      localStorage (see lib/restart-state.ts) so a page refresh mid
+ *      outage resumes the waiting UI instead of quietly reverting to
+ *      a plain "restart daemon" button as if nothing were happening. */
 function DaemonRestartCard() {
   const [phase, setPhase] = useState<"idle" | "requesting" | "waiting" | "back" | "error">("idle");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [progressNote, setProgressNote] = useState<string | null>(null);
+  const resumedRef = useRef(false);
 
-  const restartM = useMutation({
-    mutationFn: () => daemonRestart(),
-    onMutate: () => {
-      setErrorMsg(null);
-      setPhase("requesting");
-    },
-    onSuccess: () => {
-      setPhase("waiting");
-      void waitForBack();
-    },
-    onError: (err) => {
-      const e = err as DaemonError;
-      const payload = e.payload as { error?: string } | undefined;
-      setErrorMsg(payload?.error ?? e.message ?? "restart request failed");
-      setPhase("error");
-    },
-  });
-
-  async function waitForBack() {
+  async function waitForBack(startedAtMs: number) {
     /* Use the public /health probe (not /dashboard/health) so the
      * post-restart wait works even when the dashboard cookie is
      * missing or expired. /dashboard/health is auth-gated and would
-     * 401 until the user re-unlocks, making this loop look stuck.
-     *
-     * Window is 220s. Cold boot is ~10s on localhost (mostly embedder
-     * warmup) but iPad-over-Tailscale adds relay lag and Safari
-     * background throttling that push the first successful probe
-     * well past a 60s budget. 220s covers a slow respawn (autostart
-     * watchdog tick) plus Tailscale Serve proxy re-binding plus the
-     * ~8s embedder warmup with margin. False "failed" was harmless
-     * but misleading; this just lets the legitimate path finish. */
-    const deadline = Date.now() + 220_000;
+     * 401 until the user re-unlocks, making this loop look stuck. */
+    const deadline = startedAtMs + RESTART_DEADLINE_MS;
     while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 1500));
+      const stage = restartWaitStage(Date.now() - startedAtMs);
+      setProgressNote(stage === "slow" ? SLOW_RESTART_NOTE : null);
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
       try {
         const res = await fetch("/health", { credentials: "include" });
         if (res.ok) {
+          clearPersistedRestart();
+          setProgressNote(null);
           setPhase("back");
           setTimeout(() => setPhase("idle"), 4_000);
           return;
@@ -74,9 +78,49 @@ function DaemonRestartCard() {
         /* expected during the gap */
       }
     }
-    setErrorMsg("daemon did not come back within 220s; check daemon.log");
+    clearPersistedRestart();
+    setProgressNote(null);
+    setErrorMsg("daemon did not come back within 15 minutes; check daemon.log");
     setPhase("error");
   }
+
+  // Resume a waiting UI across a page refresh mid-restart. Runs once on
+  // mount; the resumedRef guard keeps React 18/19 StrictMode's dev-only
+  // double effect invocation from starting two overlapping poll loops.
+  useEffect(() => {
+    if (resumedRef.current) return;
+    resumedRef.current = true;
+    const persisted = readPersistedRestart();
+    if (!persisted) return;
+    if (!isPersistedRestartFresh(persisted.startedAtMs, Date.now())) {
+      clearPersistedRestart();
+      return;
+    }
+    setPhase("waiting");
+    void waitForBack(persisted.startedAtMs);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const restartM = useMutation({
+    mutationFn: () => daemonRestart(),
+    onMutate: () => {
+      setErrorMsg(null);
+      setProgressNote(null);
+      setPhase("requesting");
+    },
+    onSuccess: () => {
+      const startedAtMs = Date.now();
+      writePersistedRestart(startedAtMs);
+      setPhase("waiting");
+      void waitForBack(startedAtMs);
+    },
+    onError: (err) => {
+      const e = err as DaemonError;
+      const payload = e.payload as { error?: string } | undefined;
+      setErrorMsg(payload?.error ?? e.message ?? "restart request failed");
+      setPhase("error");
+    },
+  });
 
   const busy = phase === "requesting" || phase === "waiting";
   const label =
@@ -118,6 +162,9 @@ function DaemonRestartCard() {
           {label}
         </button>
       </div>
+      {progressNote && (
+        <div className="px-5 pb-4 text-xs text-txt3 font-mono">{progressNote}</div>
+      )}
       {errorMsg && (
         <div className="px-5 pb-4 text-xs text-err font-mono">{errorMsg}</div>
       )}
