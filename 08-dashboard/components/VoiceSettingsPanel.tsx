@@ -4,6 +4,13 @@ import { useEffect, useRef, useState } from "react";
 import { emitVoiceSettingUpdate } from "@/lib/voice-settings-bus";
 import { migrateLegacyMicGain } from "@/lib/mic-gain-migration";
 import { fetchVoiceHealth, type VoiceHealthRow } from "@/lib/voice-watchdog";
+import {
+  getPersistedAudioOutputDevice,
+  listAudioOutputs,
+  setPersistedAudioOutputDevice,
+  supportsSinkSelection,
+  type AudioOutputDevice,
+} from "@/lib/audio-output";
 
 const BARGE_STORAGE_KEY = "lex-barge-cooldown-ms";
 const BARGE_MIN = 0;
@@ -85,6 +92,19 @@ export function VoiceSettingsPanel() {
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved">(
     "idle",
   );
+
+  /* Output-device routing (phone Bluetooth). Purely client-side: no
+   * daemon endpoint, nothing to hydrate from /voice/piper-status.
+   * "" means "system default" and is stored as a cleared preference
+   * (null) rather than a literal empty string; see
+   * setPersistedAudioOutputDevice. sinkSelectionSupported is a
+   * platform capability, not a preference, so it is computed once. */
+  const [outputDevices, setOutputDevices] = useState<AudioOutputDevice[]>([]);
+  const [selectedOutputDeviceId, setSelectedOutputDeviceId] =
+    useState<string>(() => getPersistedAudioOutputDevice() ?? "");
+  const [sinkSelectionSupported] = useState<boolean>(() =>
+    supportsSinkSelection(),
+  );
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const vadSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const micGainSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -110,6 +130,29 @@ export function VoiceSettingsPanel() {
     return () => {
       cancelled = true;
       clearInterval(t);
+    };
+  }, []);
+
+  /* Populate the "Play through" list on mount and whenever the OS
+   * device set changes (Bluetooth headset paired/unpaired, USB audio
+   * plugged in). Harmless no-op on platforms without setSinkId; the
+   * list still renders, it's just rendered disabled. */
+  useEffect(() => {
+    let cancelled = false;
+    function refresh(): void {
+      void listAudioOutputs().then((devices) => {
+        if (!cancelled) setOutputDevices(devices);
+      });
+    }
+    refresh();
+    if (typeof navigator !== "undefined" && navigator.mediaDevices) {
+      navigator.mediaDevices.addEventListener("devicechange", refresh);
+    }
+    return () => {
+      cancelled = true;
+      if (typeof navigator !== "undefined" && navigator.mediaDevices) {
+        navigator.mediaDevices.removeEventListener("devicechange", refresh);
+      }
     };
   }, []);
 
@@ -162,6 +205,17 @@ export function VoiceSettingsPanel() {
       })
       .catch(() => undefined);
   }, []);
+
+  /* Discrete choice, not a dragged slider, so no debounce and no
+   * daemon round-trip: this preference is entirely client-side
+   * (localStorage + the same-window settings bus that the live
+   * VoiceClient subscribes to). "" clears the preference back to
+   * "system default" instead of persisting a literal empty string. */
+  function changeOutputDevice(deviceId: string): void {
+    setSelectedOutputDeviceId(deviceId);
+    setPersistedAudioOutputDevice(deviceId || null);
+    emitVoiceSettingUpdate({ key: "audio_output_device", value: deviceId });
+  }
 
   function changeVadSensitivity(next: number): void {
     const clamped = Math.max(VAD_MIN, Math.min(VAD_MAX, next));
@@ -276,6 +330,40 @@ export function VoiceSettingsPanel() {
       </header>
 
       <div className="px-5 py-4 space-y-5">
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <label
+              htmlFor="audio-output-device"
+              className="text-sm text-txt1 font-emphasized"
+            >
+              Play through
+            </label>
+          </div>
+          <select
+            id="audio-output-device"
+            value={selectedOutputDeviceId}
+            disabled={!sinkSelectionSupported}
+            onChange={(e) => changeOutputDevice(e.target.value)}
+            className="w-full h-9 px-3 rounded-input bg-surface2 hairline text-txt1 outline-none focus:ring-1 focus:ring-brand/60 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+            aria-describedby="audio-output-device-help"
+          >
+            <option value="">System default</option>
+            {outputDevices.map((d) => (
+              <option key={d.deviceId} value={d.deviceId}>
+                {d.label}
+              </option>
+            ))}
+          </select>
+          <p
+            id="audio-output-device-help"
+            className="text-nano text-txt3 leading-relaxed"
+          >
+            {sinkSelectionSupported
+              ? "Which speaker or Bluetooth device Lex's replies play through. Applies live to a running voice session."
+              : "iOS does not allow web apps to choose the output device; audio follows the phone's own routing."}
+          </p>
+        </div>
+
         <div className="space-y-2">
           <div className="flex items-center justify-between">
             <label

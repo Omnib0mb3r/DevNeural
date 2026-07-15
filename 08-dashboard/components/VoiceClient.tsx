@@ -22,6 +22,13 @@ import { logWake } from "@/lib/wake-log";
 import { logVoice, computeReconnectBackoffMs } from "@/lib/voice-log";
 import { getVadModule, resetVadModuleCache } from "@/lib/voice-ort-config";
 import { warmAudioContext } from "@/lib/voice-audio-warm";
+import {
+  applyAudioOutput,
+  applyIosAudioSessionHint,
+  getPersistedAudioOutputDevice,
+  listAudioOutputs,
+  supportsSinkSelection,
+} from "@/lib/audio-output";
 import { buildVadOptionSet, type VadOptionSet } from "@/lib/voice-vad-options";
 import {
   migrateLegacyMicGain,
@@ -1252,6 +1259,40 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     };
   }
 
+  /* Phone Bluetooth output routing. setSinkId only exists on desktop
+   * Chrome + Chrome Android 110+ (supportsSinkSelection() gates it
+   * out everywhere else, notably iOS/Safari and Firefox); applying it
+   * is a no-op there and the context just plays through whatever the
+   * platform picked. Fire-and-forget: the caller does not need to
+   * await this, it just wants the sink applied and the outcome
+   * logged for the diagnostics panel. */
+  function applyOutputDeviceToCtx(
+    ctx: AudioContext | null,
+    deviceId: string,
+  ): void {
+    if (!ctx || !supportsSinkSelection()) return;
+    void applyAudioOutput(ctx, deviceId).then((result) => {
+      logVoice(
+        "audio-context-state",
+        result.ok
+          ? "audio output device applied"
+          : "audio output device apply failed",
+        { deviceId, ok: result.ok, error: result.error ?? null },
+        result.ok ? "info" : "warn",
+      );
+    });
+  }
+
+  /* Re-apply the user's persisted "Play through" choice (set in
+   * VoiceSettingsPanel) to a freshly created AudioContext. Called at
+   * both AudioContext-creation sites: the start-voice user gesture in
+   * toggleEnabled and the watchdog's heal-step-2 reset below. */
+  function applyPersistedOutputDevice(ctx: AudioContext | null): void {
+    const deviceId = getPersistedAudioOutputDevice();
+    if (!deviceId) return;
+    applyOutputDeviceToCtx(ctx, deviceId);
+  }
+
   /* Full audio-sink reset. Closes the current AudioContext, warms a
    * fresh one in the same window, and bumps the TTS generation so
    * any in-flight PCM frames land in the new context (or get dropped
@@ -1286,6 +1327,8 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         AudioContextCtor: win.AudioContext,
         WebkitAudioContextCtor: win.webkitAudioContext,
       });
+      applyIosAudioSessionHint();
+      applyPersistedOutputDevice(audioCtxRef.current);
     }
     /* Restart the stall clock from the moment the new sink came up
      * so the watchdog's next probe does not immediately re-flag the
@@ -1593,9 +1636,53 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             setActiveVoiceState(u.value);
           }
           break;
+        case "audio_output_device":
+          if (typeof u.value === "string") {
+            applyOutputDeviceToCtx(audioCtxRef.current, u.value);
+          }
+          break;
       }
     });
     return unsubscribe;
+  }, []);
+
+  /* Bluetooth headsets and other external outputs can disappear
+   * mid-session (phone walks out of range, headset powers off). If
+   * the device the user chose in "Play through" drops out of the OS
+   * device list, fall back to the platform default sink instead of
+   * leaving the context pointed at a device that no longer exists.
+   * Silent by design (no UI banner: this can legitimately happen
+   * several times in one mobile session); the voice-log ring buffer
+   * is the audit trail. */
+  useEffect(() => {
+    if (typeof navigator === "undefined" || !navigator.mediaDevices) {
+      return;
+    }
+    function handleDeviceChange(): void {
+      const deviceId = getPersistedAudioOutputDevice();
+      if (!deviceId) return;
+      const ctx = audioCtxRef.current;
+      if (!ctx || !supportsSinkSelection()) return;
+      void listAudioOutputs().then((outputs) => {
+        const stillPresent = outputs.some((o) => o.deviceId === deviceId);
+        if (stillPresent) return;
+        void applyAudioOutput(ctx, "").then((result) => {
+          logVoice(
+            "audio-context-state",
+            "chosen audio output device disappeared; fell back to default sink",
+            { deviceId, ok: result.ok, error: result.error ?? null },
+            "warn",
+          );
+        });
+      });
+    }
+    navigator.mediaDevices.addEventListener("devicechange", handleDeviceChange);
+    return () => {
+      navigator.mediaDevices.removeEventListener(
+        "devicechange",
+        handleDeviceChange,
+      );
+    };
   }, []);
 
   /* Persist speed on every change. Debounce server writes so dragging
@@ -2958,6 +3045,12 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           WebkitAudioContextCtor: win.webkitAudioContext,
         });
       }
+      /* Same gesture chain: nudge iOS's routing category and re-apply
+       * the user's chosen output device (desktop Chrome / Chrome
+       * Android only; see lib/audio-output.ts). Both are no-ops on
+       * platforms/contexts where they don't apply. */
+      applyIosAudioSessionHint();
+      applyPersistedOutputDevice(audioCtxRef.current);
       setEnabled(true);
       return;
     }

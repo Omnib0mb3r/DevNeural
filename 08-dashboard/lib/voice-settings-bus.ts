@@ -23,7 +23,8 @@ export type VoiceSettingKey =
   | "vad_redemption_ms"
   | "barge_cooldown_ms"
   | "speed"
-  | "active_voice";
+  | "active_voice"
+  | "audio_output_device";
 
 export interface VoiceSettingUpdate {
   key: VoiceSettingKey;
