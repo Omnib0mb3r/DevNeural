@@ -14,6 +14,7 @@ import { ensureDataRoot, daemonLogFile, daemonPidFile } from './paths.js';
 import { writePid, readPid, removeStalePid, isAlive } from './lifecycle/pid.js';
 import { SignalCoalescer } from './lifecycle/signals.js';
 import { setShutdownHook } from './lifecycle/shutdown-hook.js';
+import { createRotatingAppender } from './lifecycle/log-rotation.js';
 import { startTranscriptWatcher } from './capture/transcript-watcher.js';
 import { startFsWatcher } from './capture/fs-watcher.js';
 import { startGitWatcher } from './capture/git-watcher.js';
@@ -81,10 +82,24 @@ import { fileURLToPath } from 'node:url';
 
 const PORT = Number(process.env.DEVNEURAL_PORT ?? 3747);
 
+/* F1 (observability hardening): daemon.log grew unrotated to 130MB /
+ * 1.13M lines with no cap. createRotatingAppender wraps the raw
+ * appendFileSync sink with a periodic size check (every 1000 writes
+ * or 60s) that renames daemon.log -> daemon.log.1 once the file
+ * crosses DEVNEURAL_LOG_MAX_BYTES (default 32MB), keeping exactly one
+ * rotated generation. See src/lifecycle/log-rotation.ts. */
+const DAEMON_LOG_MAX_BYTES = Number(
+  process.env.DEVNEURAL_LOG_MAX_BYTES ?? 32 * 1024 * 1024,
+);
+const appendDaemonLog = createRotatingAppender({
+  filePath: daemonLogFile(),
+  maxBytes: DAEMON_LOG_MAX_BYTES,
+});
+
 function logger(msg: string): void {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
   try {
-    fs.appendFileSync(daemonLogFile(), line, 'utf-8');
+    appendDaemonLog(line);
     return;
   } catch {
     /* fall through to stderr; daemon.log is unreachable */
@@ -195,6 +210,7 @@ async function main(): Promise<void> {
   startBridgePresenceLoop(store.db, {
     intervalMs: bridgePresenceInterval,
     freshMs: bridgePresenceFreshMs,
+    log: logger,
     onError: (err) =>
       logger(`[bridge-presence] reconcile failed: ${err.message}`),
   });
@@ -613,6 +629,7 @@ async function main(): Promise<void> {
     const { emitNotification } = await import('./dashboard/notifications.js');
     groomingHandle = installGroomingScheduler({
       db: store.db,
+      log: logger,
       emit: (input) =>
         emitNotification({
           severity: input.severity,

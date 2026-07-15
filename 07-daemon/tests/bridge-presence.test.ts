@@ -5,7 +5,7 @@
  * with project_session rows by migration 019, simulating presence
  * files written by the VS Code bridge.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -17,6 +17,7 @@ import {
   readPresenceDir,
   groupByCwd,
   decodeBridgeMarker,
+  startBridgePresenceLoop,
 } from '../src/dashboard/bridge-presence.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -631,6 +632,18 @@ describe('reconcileBridgePresence', () => {
     expect(created?.project_slug).toBe('just-cloned-repo');
     expect(result.liveAnchorIds).toContain(created!.id);
   });
+
+  it('reports presenceRecordCount = total fresh records read this pass, before grouping by cwd', () => {
+    const now = 4_900_000;
+    writePresence('a.json', { cwd: 'C:/dev/Projects/proj-a', bridge_id: 'bridge-a' }, now);
+    writePresence('b.json', { cwd: 'C:/dev/Projects/proj-b', bridge_id: 'bridge-b' }, now);
+    const result = reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => now,
+    });
+    expect(result.presenceRecordCount).toBe(2);
+  });
 });
 
 describe('groupByCwd', () => {
@@ -666,5 +679,98 @@ describe('decodeBridgeMarker', () => {
       primaryBridgeId: null,
       count: 0,
     });
+  });
+});
+
+describe('startBridgePresenceLoop heartbeat (observability hardening F3)', () => {
+  /* F3: the 1s reconcile loop logged errors only, so a quiet
+   * daemon.log was ambiguous between "healthy, nothing to do" and
+   * "the timer died". These pins lock in an hourly INFO heartbeat
+   * built from data reconcile already returns, without touching the
+   * 1s reconcile cadence itself. */
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('stays silent before the heartbeat interval elapses, then logs using data reconcile already computed', () => {
+    vi.useFakeTimers();
+    const start = 10_000_000;
+    vi.setSystemTime(start);
+    /* freshMs generously wide so the presence file stays "fresh"
+     * across the whole simulated hour; the point of this test is the
+     * heartbeat cadence, not presence staleness. */
+    writePresence(
+      'window1.json',
+      { cwd: 'C:/dev/Projects/proj-a', bridge_id: 'bridge-w1' },
+      start,
+    );
+
+    const log = vi.fn();
+    const loop = startBridgePresenceLoop(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 4 * 60 * 60_000,
+      intervalMs: 1_000,
+      heartbeatMs: 60 * 60_000,
+      log,
+    });
+
+    vi.advanceTimersByTime(59 * 60_000);
+    expect(log).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(2 * 60_000);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith('[bridge-presence] tick ok live=1 presences=1');
+
+    loop.stop();
+  });
+
+  it('repeats the heartbeat on each subsequent interval rather than firing once', () => {
+    vi.useFakeTimers();
+    const start = 20_000_000;
+    vi.setSystemTime(start);
+    writePresence(
+      'window1.json',
+      { cwd: 'C:/dev/Projects/proj-a', bridge_id: 'bridge-w1' },
+      start,
+    );
+
+    const log = vi.fn();
+    const loop = startBridgePresenceLoop(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 6 * 60 * 60_000,
+      intervalMs: 1_000,
+      heartbeatMs: 60 * 60_000,
+      log,
+    });
+
+    vi.advanceTimersByTime(61 * 60_000);
+    expect(log).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(60 * 60_000);
+    expect(log).toHaveBeenCalledTimes(2);
+
+    loop.stop();
+  });
+
+  it('does not change the 1s reconcile cadence: anchor still flips live on the first tick, heartbeat aside', () => {
+    vi.useFakeTimers();
+    const start = 30_000_000;
+    vi.setSystemTime(start);
+    writePresence(
+      'window1.json',
+      { cwd: 'C:/dev/Projects/proj-a', bridge_id: 'bridge-w1' },
+      start,
+    );
+
+    const loop = startBridgePresenceLoop(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      intervalMs: 1_000,
+      heartbeatMs: 60 * 60_000,
+    });
+
+    vi.advanceTimersByTime(1_000);
+    expect(db.getProjectSession('anchor-A')!.status).toBe('live');
+
+    loop.stop();
   });
 });

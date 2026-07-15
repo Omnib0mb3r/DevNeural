@@ -12,6 +12,7 @@ import {
   findFreshestArtifact,
   installGroomingScheduler,
   runGroomingTick,
+  type GroomingTickResult,
 } from '../src/lex/grooming-watch.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -411,5 +412,112 @@ describe('installGroomingScheduler (Fix 48 codex 11a daemon boot)', () => {
      * call stop() even when boot wiring partially failed. */
     expect(() => handle.stop()).not.toThrow();
     expect(() => handle.stop()).not.toThrow();
+  });
+});
+
+describe('installGroomingScheduler logging (observability hardening F2)', () => {
+  /* F2: this 30-min scheduler carried zero log calls, so it could
+   * not be proven alive or dead from any signal - the same
+   * silent-failure class that hid the transcript-watcher death for
+   * 65 days. These pins lock in: a boot line (cadence + enabled
+   * state), one INFO summary per tick, an explicit skip line on the
+   * re-entrancy guard, and an error line (no longer swallowed) when
+   * a tick throws. */
+
+  it('logs a boot line with cadence and enabled state', () => {
+    const log = vi.fn();
+    const handle = installGroomingScheduler(
+      { db, now: () => NOW, log },
+      { intervalMs: 60 * 60_000 },
+    );
+    expect(log).toHaveBeenCalledWith(
+      '[grooming-watch] up interval=3600000ms enabled=true',
+    );
+    handle.stop();
+  });
+
+  it('logs one INFO line per tick summarizing scanned/gaps/groomed/skipped counts', () => {
+    seedRef({ endedAgo: 3 * 3_600_000, summary: null }); // trips distill_failure_persistent
+    const log = vi.fn();
+    const handle = installGroomingScheduler(
+      {
+        db,
+        now: () => NOW,
+        log,
+        scanDir: () => [],
+        readMtime: () => null,
+        readTranscript: () => null,
+      },
+      { intervalMs: 60 * 60_000 },
+    );
+    log.mockClear();
+    const out = handle.tickNow();
+    expect(out.emitted.length).toBeGreaterThan(0);
+    expect(log).toHaveBeenCalledWith(
+      `[grooming-watch] tick scanned=${out.evaluated} gaps=${out.gaps.length} groomed=${out.emitted.length} skipped=${out.skipped_debounce.length}`,
+    );
+    handle.stop();
+  });
+
+  it('logs a skip line and returns a zero result when a tick fires while one is already in flight', () => {
+    seedRef({ endedAgo: 3 * 3_600_000, summary: null }); // trips distill_failure_persistent -> emit fires
+    const log = vi.fn();
+    let handle: ReturnType<typeof installGroomingScheduler>;
+    let innerResult: GroomingTickResult | undefined;
+    const emit = vi.fn(() => {
+      /* Re-entrant call fired synchronously from inside the outer
+       * tick's own emit step, while inFlight is still true. Capture
+       * the result for assertion after the outer call returns rather
+       * than asserting here - a failed assertion inside this
+       * callback would be swallowed by runGroomingTick's own
+       * try/catch around emit and silently pass the test. */
+      innerResult = handle.tickNow();
+    });
+    handle = installGroomingScheduler(
+      {
+        db,
+        now: () => NOW,
+        log,
+        emit,
+        scanDir: () => [],
+        readMtime: () => null,
+        readTranscript: () => null,
+      },
+      { intervalMs: 60 * 60_000 },
+    );
+    log.mockClear();
+    handle.tickNow();
+    expect(innerResult).toEqual({
+      evaluated: 0,
+      gaps: [],
+      emitted: [],
+      skipped_debounce: [],
+    });
+    expect(log).toHaveBeenCalledWith(
+      '[grooming-watch] tick skipped: previous tick still in flight',
+    );
+    handle.stop();
+  });
+
+  it('logs an error line and does not throw when a tick blows up instead of swallowing the failure', () => {
+    seedRef({ endedAgo: 1000, summary: 'x' });
+    const log = vi.fn();
+    const handle = installGroomingScheduler(
+      {
+        db,
+        now: () => NOW,
+        log,
+        readTranscript: () => {
+          throw new Error('disk read boom');
+        },
+      },
+      { intervalMs: 60 * 60_000 },
+    );
+    log.mockClear();
+    expect(() => handle.tickNow()).not.toThrow();
+    expect(log).toHaveBeenCalledWith(
+      '[grooming-watch] tick failed: disk read boom',
+    );
+    handle.stop();
   });
 });

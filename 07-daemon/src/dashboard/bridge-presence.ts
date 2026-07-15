@@ -71,6 +71,11 @@ export interface ReconcileResult {
   liveCwds: string[];
   liveAnchorIds: string[];
   dormantAnchorIds: string[];
+  /** Total fresh presence records read this pass, before grouping by
+   * cwd (i.e. one per bridge window, not one per anchor). Surfaced so
+   * the heartbeat log in startBridgePresenceLoop can report activity
+   * without a second directory read. */
+  presenceRecordCount: number;
 }
 
 export interface ReconcileOptions {
@@ -369,24 +374,45 @@ export function reconcileBridgePresence(
     dormantAnchorIds.push(row.id);
   }
 
-  return { liveCwds, liveAnchorIds, dormantAnchorIds };
+  return { liveCwds, liveAnchorIds, dormantAnchorIds, presenceRecordCount: records.length };
 }
 
 export interface BridgePresenceLoop {
   stop: () => void;
 }
 
+/** F3: default cadence for the "still alive" heartbeat line on the
+ * 1s reconcile loop. The loop previously logged errors only, so a
+ * quiet daemon.log was ambiguous between "healthy, nothing to do"
+ * and "the timer died". One INFO line an hour resolves that without
+ * adding noise to a log that already gets 3600 silent ticks/hour. */
+export const DEFAULT_BRIDGE_PRESENCE_HEARTBEAT_MS = 60 * 60_000;
+
 export function startBridgePresenceLoop(
   db: IndexDb,
   opts: ReconcileOptions & {
     intervalMs?: number;
     onError?: (err: Error) => void;
+    log?: (msg: string) => void;
+    /** Heartbeat cadence (ms). Defaults to 1 hour. */
+    heartbeatMs?: number;
   } = {},
 ): BridgePresenceLoop {
   const interval = opts.intervalMs ?? 1_000;
+  const log = opts.log ?? ((): void => undefined);
+  const heartbeatMs = opts.heartbeatMs ?? DEFAULT_BRIDGE_PRESENCE_HEARTBEAT_MS;
+  const clock = opts.now ?? Date.now;
+  let lastHeartbeatMs = clock();
   const timer = setInterval(() => {
     try {
-      reconcileBridgePresence(db, opts);
+      const result = reconcileBridgePresence(db, opts);
+      const nowMs = clock();
+      if (nowMs - lastHeartbeatMs >= heartbeatMs) {
+        lastHeartbeatMs = nowMs;
+        log(
+          `[bridge-presence] tick ok live=${result.liveAnchorIds.length} presences=${result.presenceRecordCount}`,
+        );
+      }
     } catch (err) {
       opts.onError?.(err as Error);
     }

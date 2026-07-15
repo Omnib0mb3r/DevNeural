@@ -82,6 +82,14 @@ export interface GroomingTickDeps {
   /** Anchors whose worker spawn is currently blocked by the loose-ends
    * gate. Caller passes the map from the gate's report cache. */
   looseEndsBlockedAt?: Map<string, number>;
+  /** Daemon logger, threaded in the same shape every other scheduler
+   * in this codebase uses (see distillation-scheduler.ts,
+   * cancelled-tool-recovery.ts). Defaults to a no-op so unit tests
+   * that construct GroomingTickDeps directly don't have to pass one.
+   * Observability hardening finding F2: this tick previously carried
+   * zero log calls, so it could not be proven alive or dead from any
+   * signal. */
+  log?: (msg: string) => void;
 }
 
 export const GROOMING_TICK_MS_DEFAULT = 30 * 60_000;
@@ -467,6 +475,7 @@ export function installGroomingScheduler(
   deps: GroomingTickDeps,
   opts: { intervalMs?: number } = {},
 ): GroomingHandle {
+  const log = deps.log ?? ((): void => undefined);
   const envInterval = Number(process.env.DEVNEURAL_GROOMING_TICK_MS);
   const interval =
     opts.intervalMs ??
@@ -476,13 +485,27 @@ export function installGroomingScheduler(
   const state = deps.state ?? new Map<string, number>();
   const sharedDeps: GroomingTickDeps = { ...deps, state };
   let inFlight = false;
+  /* F2: previously fire-and-forget with zero log calls anywhere in
+   * this module, the same silent-failure class that hid the
+   * transcript-watcher death for 65 days. Every path out of tick()
+   * now logs: a summary line on success, an explicit skip line when
+   * re-entrancy guards against an overlapping run, and an error line
+   * (no longer swallowed) when runGroomingTick itself throws. */
   const tick = (): GroomingTickResult => {
     if (inFlight) {
+      log('[grooming-watch] tick skipped: previous tick still in flight');
       return { evaluated: 0, gaps: [], emitted: [], skipped_debounce: [] };
     }
     inFlight = true;
     try {
-      return runGroomingTick(sharedDeps);
+      const result = runGroomingTick(sharedDeps);
+      log(
+        `[grooming-watch] tick scanned=${result.evaluated} gaps=${result.gaps.length} groomed=${result.emitted.length} skipped=${result.skipped_debounce.length}`,
+      );
+      return result;
+    } catch (err) {
+      log(`[grooming-watch] tick failed: ${(err as Error).message}`);
+      return { evaluated: 0, gaps: [], emitted: [], skipped_debounce: [] };
     } finally {
       inFlight = false;
     }
@@ -493,6 +516,7 @@ export function installGroomingScheduler(
   if (typeof (handle as { unref?: () => void }).unref === 'function') {
     (handle as unknown as { unref: () => void }).unref();
   }
+  log(`[grooming-watch] up interval=${interval}ms enabled=true`);
   return {
     stop: () => clearInterval(handle),
     tickNow: tick,
