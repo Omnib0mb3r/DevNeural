@@ -9,14 +9,36 @@ reflects what was true at the last update.
 The rule: anyone reading this should start cold and know where the code
 is, what is in flight, what is shippable next, and what blocks it.
 
-Last touched: 2026-07-15 (second cursor). Branch `master` @ 20971ec.
-Daemon suite 1756/1757 green (same 1 pre-existing grooming-routes
+Last touched: 2026-07-15 (third cursor). Branch `master` @ 2a669c2.
+Daemon suite 1763/1764 green (same 1 pre-existing grooming-routes
 failure). Dashboard build green. Dist rebuilt from committed source.
-The daemon RESTARTED onto the first-wave build mid-day 2026-07-15
-(capture catch-up drained the 65-day backlog, 948 files; curator
-injections are firing organically again). A SECOND restart is needed
-to pick up the wave-3 additions below. Bridge VSIX rebuilt +
-installed 2026-07-15 (VS Code windows activate on reload).
+One daemon restart pending to activate waves 3+4 (expectation
+dispatcher + supersede policy, diarization, inject verdicts, logger
+routing, restart-relauncher chain).
+
+### 2026-07-15 wave 4 (operator escalations, all root-caused live)
+
+- 1e1d48e Lex stuck on "listening": persisted vad_redemption_ms=6000
+  (set while the slider was dead) became a live 6-second silence
+  requirement after the ms-based VAD fix; no utterance ever
+  finalized. Live daemon pref corrected 6000 -> 768 immediately;
+  one-time client migrations reset placebo-era redemption (>2500ms)
+  and near-mute gain (<0.5) exactly once, marked so deliberate
+  post-fix settings stick.
+- 1e1d48e restart still hung ~4 min: the wave-2 relauncher fired the
+  SAFETY-NET task whose non-Force alive-probe no-ops against the
+  dying daemon (proof: request 14:53:40 -> boot 14:57:32). New
+  on-demand DevNeural-Daemon-Restart task (start-daemon -Force),
+  REGISTERED on this machine, fired first in the relaunch chain;
+  safety task then powershell only on spawn errors. Active for
+  restarts issued by the NEXT daemon build onward.
+- 2a669c2 expectation supersede policy per operator: contradictory
+  instruction supersedes the prior open expectation ('superseded'
+  close, schema already allowed it); independent commands both stay
+  open and one combined reply closes both in the same tick (verified
+  by test). Local-only judge, 3s timeout, fail-open to keep-both.
+- Operator decisions recorded: RAG/LightRAG parked BY AGREEMENT
+  ("later"); voice fix verified path = hard refresh + speak.
 
 ### 2026-07-15 wave 3 (operator rule: nothing deferred unilaterally)
 
