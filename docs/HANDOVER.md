@@ -550,3 +550,20 @@ Green + committed = "built", not "verified".
 - Additive only: never break existing behavior or the regression-guard
   surfaces (terminal/PTY binding, bridge presence, cross-session inject).
 - The Bash tool runs Git Bash, not PowerShell; use POSIX there.
+
+## Lex decisions on the three open calls (2026-07-15, 1:10 PM Eastern)
+
+Injected answer bounced (bridge owns no terminal for this session; the
+worker runs in the VS Code Claude panel, so bridge/PTY transports cannot
+reach it). Parking the decisions here instead.
+
+1. Daemon restart: operator-only, stays pending. Do not restart.
+2. LightRAG/RAG-Anything: NO-GO for now. New external dependency is the
+   user's call. Do not install anything until he says go.
+3. Expectation supersede policy: DECIDED, and it is your next work item.
+   Implement: a new instruction injected to a worker supersedes that
+   worker's prior OPEN expectation. Mark the old row status=superseded
+   with superseded_by=<new expectation id> and a timestamp; never delete
+   rows (audit trail stays). Add a test covering supersede-on-new-
+   instruction; keep existing dispatcher tests green. Commit with a
+   Rebuild line.
