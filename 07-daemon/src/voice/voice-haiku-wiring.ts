@@ -288,3 +288,84 @@ export async function composeGlueReply(
   /* Pure ack / yes-no: absorb, no spoken reply, no Lex round-trip. */
   return null;
 }
+
+/* Fast-lane transcript hole fix (2026-07-15).
+ *
+ * When the 'fast' lane above answers with a spoken glue reply, the
+ * exchange is absorbed entirely on the daemon side: nothing is ever
+ * injected into Lex's PTY, so it never reaches her jsonl and never
+ * reaches her awareness. lex-voice-ws.ts persists both sides of an
+ * absorbed exchange durably (see _captureAbsorbedAsideImpl there) and
+ * also queues it onto a bounded per-connection ring so Lex can be told
+ * about it on her NEXT real turn without forcing an extra round-trip.
+ * The three helpers below are the pure (no DB, no socket) half of that
+ * fix: ring bookkeeping and the text block rendered as an inject
+ * prefix. Conversation mode only (shouldCaptureAbsorbedAside) - notes
+ * mode already has its own capture-only path for unaddressed
+ * utterances and a different spoken-reply contract (silent), and this
+ * fix must not touch either. */
+
+export interface AbsorbedAsideEntry {
+  atMs: number;
+  aside: string;
+  reply: string;
+}
+
+/** True only for conversation mode. An ADDRESSED notes-mode utterance
+ * can still reach the 'fast' lane branch (the name-gate only screens
+ * UNADDRESSED ones), but notes mode already owns its capture story
+ * (captureNotesUtteranceOnly) and never speaks TTS; this keeps the
+ * ring/capture fix from touching that path at all. push-to-talk is
+ * likewise excluded - the operator's requirement scoped this to
+ * conversation mode explicitly. */
+export function shouldCaptureAbsorbedAside(
+  mode: 'conversation' | 'notes' | 'push-to-talk',
+): boolean {
+  return mode === 'conversation';
+}
+
+/** Accumulation cap: oldest entries drop silently once the ring holds
+ * more than this many. Separate from the smaller DISPLAY cap in
+ * _formatAbsorbedAsideBlockImpl below - the ring can hold up to this
+ * many, but only the most recent few are ever rendered into an inject
+ * prefix. */
+export const ABSORBED_ASIDE_RING_MAX = 10;
+
+/** Pure append-and-cap. Returns a new array; never mutates `ring`. */
+export function _pushAbsorbedAsideImpl(
+  ring: AbsorbedAsideEntry[],
+  entry: AbsorbedAsideEntry,
+  max: number = ABSORBED_ASIDE_RING_MAX,
+): AbsorbedAsideEntry[] {
+  const next = ring.concat(entry);
+  return next.length > max ? next.slice(next.length - max) : next;
+}
+
+/** Display cap for the rendered block: at most this many lines, most
+ * recent first-out (oldest dropped first). Independent of
+ * ABSORBED_ASIDE_RING_MAX (the ring can carry more than this; the
+ * prefix just never shows more than this many). */
+const ABSORBED_ASIDE_BLOCK_MAX_LINES = 3;
+
+/** Renders the ring as a one-line-per-aside inject prefix, e.g.
+ * `[voice asides since last turn: "good morning" -> "Morning."]` for
+ * a single entry, or a multi-line block (still one bracket) for more
+ * than one, with a "(+N more)" header suffix when the ring holds more
+ * than ABSORBED_ASIDE_BLOCK_MAX_LINES entries. '' for an empty ring -
+ * the caller adds no prefix at all in that case. Pure; does not
+ * mutate or clear the ring (the caller owns that, only after a
+ * successful inject). */
+export function _formatAbsorbedAsideBlockImpl(
+  ring: ReadonlyArray<AbsorbedAsideEntry>,
+): string {
+  if (ring.length === 0) return '';
+  const dropped = Math.max(0, ring.length - ABSORBED_ASIDE_BLOCK_MAX_LINES);
+  const shown = ring.slice(-ABSORBED_ASIDE_BLOCK_MAX_LINES);
+  const lines = shown.map((e) => `"${e.aside}" -> "${e.reply}"`);
+  const header =
+    dropped > 0
+      ? `voice asides since last turn (+${dropped} more):`
+      : 'voice asides since last turn:';
+  if (lines.length === 1) return `[${header} ${lines[0]}]`;
+  return `[${header}\n${lines.join('\n')}]`;
+}

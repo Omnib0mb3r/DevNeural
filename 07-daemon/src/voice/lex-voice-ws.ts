@@ -115,6 +115,10 @@ import {
   composeGlueReply,
   composeBridgeReply,
   renderReplyForSpeech,
+  shouldCaptureAbsorbedAside,
+  _pushAbsorbedAsideImpl,
+  _formatAbsorbedAsideBlockImpl,
+  type AbsorbedAsideEntry,
 } from './voice-haiku-wiring.js';
 import { useVoiceHaiku } from './voice-haiku.js';
 import {
@@ -290,6 +294,20 @@ interface ConnState {
    * AFTER a kill belong to a fresh logical turn and start a new run. */
   ttsQueue: Array<{ cleanText: string }>;
   ttsQueueRunning: boolean;
+  /* Fast-lane transcript hole fix (2026-07-15). Bounded ring of
+   * conversation-mode asides the haiku fast lane absorbed (glue reply
+   * spoken, nothing forwarded to Lex - see the 'fast' lane branch in
+   * handleUtteranceEnd and _captureAbsorbedAsideImpl below). Drained
+   * into a one-line-per-aside prefix on the NEXT real ptyInject to
+   * Lex so she becomes aware of the exchange on her next turn without
+   * forcing an extra round-trip; cleared only after that inject
+   * succeeds. Capped via _pushAbsorbedAsideImpl (voice-haiku-
+   * wiring.ts) so a long chatty gap before Lex's next real turn
+   * cannot grow this unbounded. If no real inject happens before
+   * session end, the durable record is the brainstorm_chunks rows
+   * _captureAbsorbedAsideImpl already wrote - this ring is only the
+   * awareness mechanism, never the record of truth. */
+  absorbedAsides: AbsorbedAsideEntry[];
 }
 
 /* 2026-05-22: lifted from 4 MB to 64 MB. The old 4 MB ceiling was a
@@ -880,6 +898,100 @@ export function _captureNotesUtteranceOnlyImpl(
   }
 }
 
+/* Fast-lane transcript hole fix (2026-07-15), task 1.
+ *
+ * The haiku fast lane's 'fast' route (haikuRoute -> composeGlueReply
+ * in handleUtteranceEnd) answers small-talk asides - greetings, acks,
+ * delivery hints - by speaking a glue reply straight off the daemon.
+ * Nothing is ever injected into Lex's PTY for that turn: correct for
+ * latency and for BF-4 (the glue model sees only persona + digest +
+ * aside, never Lex's own context), but it leaves the exchange with no
+ * durable record and no way for Lex to ever learn it happened.
+ *
+ * This persists BOTH sides directly to brainstorm_chunks the instant
+ * the fast lane absorbs, mirroring _captureNotesUtteranceOnlyImpl's
+ * shape one level up: same insertChunk/nextTurnIndex/newId/log deps,
+ * same try/catch-and-log-never-throw contract, same "no ptyInject /
+ * handleDirectLlmUtterance dependency in sight" proof that this path
+ * cannot forward by construction. model_id is tagged
+ * 'voice-glue-capture' (distinct from 'voice-notes-capture' and
+ * 'voice-direct-llm') so these rows are identifiable without
+ * inspecting text.
+ *
+ * Two sequential inserts, not a batch: nextTurnIndex reads
+ * MAX(turn_index)+1 fresh from the DB on every call (index-db.ts), so
+ * the reply row's index must be requested AFTER the aside row lands,
+ * or both rows would claim the same turn_index.
+ *
+ * No double-store: the aside was never forwarded down the cc-pty
+ * inject path (ptyInject is not in this function's dependency list
+ * either), so brainstorm-jsonl-ingestor - which is the writer for
+ * every OTHER cc-pty chunk row, sourced by walking what the claude
+ * CLI itself wrote to its jsonl - never sees this text. This capture
+ * is therefore the row's only writer, exactly as
+ * _captureNotesUtteranceOnlyImpl is the only writer for an
+ * unaddressed notes-mode utterance. */
+export interface _CaptureAbsorbedAsideDeps {
+  brainstormId: string;
+  aside: string;
+  reply: string;
+  insertChunk: (row: {
+    id: string;
+    brainstorm_id: string;
+    turn_index: number;
+    role: 'user' | 'lex';
+    mode: 'conversation';
+    text: string;
+    model_id: string;
+    cc_session_id: string | null;
+  }) => void;
+  nextTurnIndex: (brainstormId: string) => number;
+  /** Test seam; defaults to node:crypto randomUUID. */
+  newId?: () => string;
+  log?: (msg: string) => void;
+}
+
+const ABSORBED_ASIDE_MODEL_ID = 'voice-glue-capture';
+
+export function _captureAbsorbedAsideImpl(
+  deps: _CaptureAbsorbedAsideDeps,
+): void {
+  const newId = deps.newId ?? randomUUID;
+  const log = deps.log ?? logFn;
+  try {
+    deps.insertChunk({
+      id: newId(),
+      brainstorm_id: deps.brainstormId,
+      turn_index: deps.nextTurnIndex(deps.brainstormId),
+      role: 'user',
+      mode: 'conversation',
+      text: deps.aside,
+      model_id: ABSORBED_ASIDE_MODEL_ID,
+      cc_session_id: null,
+    });
+  } catch (err) {
+    log(
+      `[voice-ws] absorbed-aside capture (user) insert failed: ${(err as Error).message}`,
+    );
+  }
+  try {
+    deps.insertChunk({
+      id: newId(),
+      brainstorm_id: deps.brainstormId,
+      turn_index: deps.nextTurnIndex(deps.brainstormId),
+      role: 'lex',
+      mode: 'conversation',
+      text: deps.reply,
+      model_id: ABSORBED_ASIDE_MODEL_ID,
+      cc_session_id: null,
+    });
+  } catch (err) {
+    log(
+      `[voice-ws] absorbed-aside capture (reply) insert failed: ${(err as Error).message}`,
+    );
+  }
+}
+
 export function attachLexVoiceWs(socket: FastifyWS): void {
   logFn(`[voice-ws] client connected (attach)`);
   const state: ConnState = {
@@ -912,6 +1024,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     inFlightDirectLlmReply: false,
     ttsQueue: [],
     ttsQueueRunning: false,
+    absorbedAsides: [],
   };
 
   /* Working-heartbeat state. lastSpeechMs is the epoch ms of the most
@@ -2595,6 +2708,26 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     });
   }
 
+  /* Fast-lane transcript hole fix (2026-07-15), task 1. Thin closure
+   * over _captureAbsorbedAsideImpl, same split as
+   * captureNotesUtteranceOnly directly above: the DB-touching logic
+   * lives in the exported impl with injected deps so it is unit-
+   * testable without a live socket or a real DB. Called only from the
+   * 'fast' lane branch below, gated on
+   * shouldCaptureAbsorbedAside(state.mode). */
+  function captureAbsorbedAside(aside: string, reply: string): void {
+    const bsId = resolveBoundBrainstormId();
+    if (!bsId) return;
+    const store = getStore();
+    _captureAbsorbedAsideImpl({
+      brainstormId: bsId,
+      aside,
+      reply,
+      insertChunk: (row) => store.db.insertBrainstormChunk(row),
+      nextTurnIndex: (id) => store.db.nextTurnIndex(id),
+    });
+  }
+
   async function handleUtteranceEnd(): Promise<void> {
     if (state.micBuf.length === 0) {
       send({ t: 'error', code: 'empty-utterance', message: 'no audio' });
@@ -2803,7 +2936,27 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
            * else the deterministic fallback. A bare ack returns null and
            * is absorbed silently. */
           const reply = await composeGlueReply(trimmed, lastSpokenText);
-          if (reply) speak(reply);
+          if (reply) {
+            speak(reply);
+            /* Fast-lane transcript hole fix (2026-07-15): this
+             * exchange (glue reply spoken, nothing forwarded) is
+             * about to vanish unless recorded here. Persist both
+             * sides now - durable even if the session ends before
+             * Lex's next real turn - and queue it onto the ring so
+             * Lex learns about it on her NEXT real inject (see the
+             * ptyInject call below in the cc-pty branch). Gated to
+             * conversation mode per shouldCaptureAbsorbedAside; an
+             * addressed notes-mode utterance can reach this same
+             * branch but must not touch either the ring or this
+             * capture. */
+            if (shouldCaptureAbsorbedAside(state.mode)) {
+              captureAbsorbedAside(trimmed, reply);
+              state.absorbedAsides = _pushAbsorbedAsideImpl(
+                state.absorbedAsides,
+                { atMs: Date.now(), aside: trimmed, reply },
+              );
+            }
+          }
           state.utteranceStartedDuringTts = false;
           return;
         } else {
@@ -3045,9 +3198,20 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     if (state.partialChain.length > 0) {
       partialChainBlock = renderPartialChain() + '\n\n';
     }
+    /* Fast-lane transcript hole fix (2026-07-15), task 2. This is
+     * "the NEXT real inject to Lex" the ring was waiting for: drain
+     * every conversation-mode aside the fast lane absorbed since her
+     * last real turn into a one-line-per-aside prefix so she knows
+     * the exchange happened, even though it never reached her
+     * context directly. Empty ring -> '' -> this block is a no-op and
+     * the inject stays byte-identical to before this fix. */
+    let asideBlock = '';
+    if (state.absorbedAsides.length > 0) {
+      asideBlock = _formatAbsorbedAsideBlockImpl(state.absorbedAsides) + '\n\n';
+    }
     const ir = ptyInject(
       state.bindKey,
-      snapshotBlock + gateNote + partialChainBlock + voiceTag + result.text,
+      asideBlock + snapshotBlock + gateNote + partialChainBlock + voiceTag + result.text,
       true,
     );
     if (!ir.ok) {
@@ -3056,8 +3220,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
     /* Consume the partial chain only after a successful inject. If
      * inject fails, the chain stays so the retry path on the next
-     * utterance still carries the partials. */
+     * utterance still carries the partials. Same contract for the
+     * aside ring: only cleared once the prefix has actually landed in
+     * Lex's PTY. */
     state.partialChain = [];
+    state.absorbedAsides = [];
     send({ t: 'injected' });
     state.awaitingResponseSince = Date.now();
     /* Phase 3 of LEX-STANDALONE-SUPERVISION (2026-05-24): stamp the
