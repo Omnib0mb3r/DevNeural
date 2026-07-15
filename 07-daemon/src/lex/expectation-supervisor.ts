@@ -60,6 +60,33 @@ export function recordExpectation(input: RecordExpectationInput): string {
   return id;
 }
 
+/* Dispatcher-facing derivation (goal-audit fix wave, 2026-07-15).
+ * recordExpectation's only writer was, until this wave, nothing at
+ * all -- see the 2026-07-15 goal audit. The dispatcher call sites
+ * (cross-session-inject.ts, dashboard/routes.ts operator routes)
+ * need a cheap, deterministic way to turn "the text Lex just sent a
+ * worker" into the short label EVAL_SYSTEM_PROMPT expects as
+ * "Expected outcome: X". No LLM call here -- this runs inline on
+ * every accepted dispatch, so it has to be free. Takes the first
+ * non-blank line (steer/inject text is usually a single instruction;
+ * multi-paragraph prompts still get a usable label from their lede),
+ * collapses internal whitespace, and caps length so a long paste
+ * doesn't bloat the lex_worker_expectation row or, later, the eval
+ * prompt built from it. */
+const EXPECTED_OUTCOME_MAX_CHARS = 240;
+
+export function deriveExpectedOutcome(text: string): string {
+  const firstLine =
+    text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0) ?? '';
+  const collapsed = firstLine.replace(/\s+/g, ' ').trim();
+  if (!collapsed) return '(empty instruction)';
+  if (collapsed.length <= EXPECTED_OUTCOME_MAX_CHARS) return collapsed;
+  return `${collapsed.slice(0, EXPECTED_OUTCOME_MAX_CHARS - 3)}...`;
+}
+
 interface EvaluationResult {
   aligned: boolean;
   drift_summary: string;
@@ -115,6 +142,7 @@ Return STRICT JSON only, no prose:
 
 async function evaluateExpectation(
   row: WorkerExpectationRow,
+  log: (msg: string) => void,
 ): Promise<EvaluationResult | null> {
   const tail = readWorkerJsonlTail(row.anchor_id);
   if (!tail || tail.trim().length < 80) {
@@ -143,7 +171,7 @@ async function evaluateExpectation(
       { maxTokens: 300, temperature: 0.1 },
     );
   } catch (err) {
-    console.log(
+    log(
       `[expectation] LLM call failed for id=${row.id}: ${(err as Error).message}`,
     );
     return null;
@@ -169,16 +197,30 @@ async function evaluateExpectation(
   };
 }
 
-export async function runExpectationTick(): Promise<{
+export interface ExpectationTickDeps {
+  /** Daemon logger, threaded in the same shape every other scheduler
+   * in this codebase uses (see grooming-watch.ts's installGrooming
+   * Scheduler, commit b656ead). Defaults to a no-op so callers that
+   * don't care about liveness (and existing tests) don't have to
+   * pass one. Goal-audit fix wave (2026-07-15) F-shaped finding:
+   * this tick's only observability was raw console.log, invisible to
+   * daemon.log's rotation and untestable via a spy. */
+  log?: (msg: string) => void;
+}
+
+export async function runExpectationTick(
+  deps: ExpectationTickDeps = {},
+): Promise<{
   evaluated: number;
   drift_fired: number;
 }> {
+  const log = deps.log ?? ((): void => undefined);
   const db = getStore().db;
   const open = db.listOpenWorkerExpectations({ limit: 20 });
   let evaluated = 0;
   let driftFired = 0;
   for (const row of open) {
-    const result = await evaluateExpectation(row);
+    const result = await evaluateExpectation(row, log);
     if (!result) continue;
     evaluated += 1;
     db.updateWorkerExpectationEvaluation(row.id, {
@@ -222,6 +264,9 @@ export async function runExpectationTick(): Promise<{
       }
     }
   }
+  log(
+    `[expectation-supervisor] tick open=${open.length} evaluated=${evaluated} drift_fired=${driftFired}`,
+  );
   return { evaluated, drift_fired: driftFired };
 }
 
@@ -234,20 +279,27 @@ export interface ExpectationSupervisorHandle {
  * tick so daemon boot doesn't race ollama warm-up. */
 export function startExpectationSupervisor(opts: {
   intervalMs?: number;
+  /** Daemon logger. See ExpectationTickDeps.log; defaults to a
+   * no-op. daemon.ts wires this with its own `logger` in one line,
+   * mirroring grooming-watch's installGroomingScheduler({ log:
+   * logger }) call site added in commit b656ead. */
+  log?: (msg: string) => void;
 } = {}): ExpectationSupervisorHandle {
+  const log = opts.log ?? ((): void => undefined);
   const intervalMs = Math.max(
     10_000,
     opts.intervalMs ??
       Number(process.env.DEVNEURAL_EXPECTATION_TICK_MS ?? 90_000),
   );
   const timer = setInterval(() => {
-    void runExpectationTick().catch((err) =>
-      console.log(
+    void runExpectationTick({ log }).catch((err) =>
+      log(
         `[expectation-supervisor] tick threw: ${(err as Error).message}`,
       ),
     );
   }, intervalMs);
   if (typeof timer.unref === 'function') timer.unref();
+  log(`[expectation-supervisor] up interval=${intervalMs}ms enabled=true`);
   return {
     stop: () => clearInterval(timer),
   };

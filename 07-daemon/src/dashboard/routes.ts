@@ -88,6 +88,10 @@ import {
   detachWorkerSession,
 } from '../lex/brainstorm-store.js';
 import {
+  recordExpectation,
+  deriveExpectedOutcome,
+} from '../lex/expectation-supervisor.js';
+import {
   ensureServer as ensureWhisper,
   transcribeWav,
   whisperStatus,
@@ -585,6 +589,42 @@ export async function registerDashboardRoutes(
       anchorId: outcome.kind === 'live-direct' ? outcome.anchor_id : null,
       redirected: false,
     };
+  }
+
+  /* Expectation-supervisor dispatcher wiring (2026-07-15 goal-audit
+   * fix wave). recordExpectation's only writer was, until this wave,
+   * nothing at all: the 90s evaluator ticked forever over an
+   * eternally-empty lex_worker_expectation table. /lex/steer,
+   * /sessions/:id/prompt, and /sessions/:id/inject share this single
+   * call site (the fourth dispatch point, crossSessionInject, wires
+   * itself the same way inside cross-session-inject.ts). Record one
+   * expectation per delivered instruction: a COMMITTED, successfully
+   * DELIVERED text sent by a Lex anchor that declared itself
+   * (fromAnchorId = body.from_anchor_id) to a known worker project-
+   * session anchor (targetAnchorId = resolveDispatchTarget's
+   * anchorId). Suggestions (commit:false), deliverability failures,
+   * scope rejections, and dispatches with no resolvable worker
+   * anchor are deliberately excluded -- only judge alignment against
+   * instructions that actually landed on a worker Lex supervises.
+   * Best-effort: must never turn an already-successful delivery
+   * response into a caller-visible error. */
+  function recordDispatchExpectation(opts: {
+    fromAnchorId: string | undefined;
+    targetAnchorId: string | null;
+    text: string;
+    commit: boolean;
+  }): void {
+    if (!opts.commit) return;
+    if (!opts.fromAnchorId || !opts.targetAnchorId) return;
+    try {
+      recordExpectation({
+        brainstormId: opts.fromAnchorId,
+        anchorId: opts.targetAnchorId,
+        expectedOutcome: deriveExpectedOutcome(opts.text),
+      });
+    } catch {
+      /* best-effort; see comment above */
+    }
   }
 
   // ── Dashboard surface ─────────────────────────────────────────────
@@ -1109,6 +1149,14 @@ export async function registerDashboardRoutes(
       return r;
     }
     log(`[dashboard] prompt queued for session ${target}`);
+    /* /sessions/:id/prompt always commits (queueSessionPrompt has no
+     * suggest variant of its own; that's /sessions/:id/suggest). */
+    recordDispatchExpectation({
+      fromAnchorId: body.from_anchor_id,
+      targetAnchorId: dispatch.anchorId,
+      text: body.text,
+      commit: true,
+    });
     return r;
   });
 
@@ -2504,6 +2552,12 @@ export async function registerDashboardRoutes(
     const target = dispatch.dispatchTarget;
     const ptyResult = ptyInject(target, body.text, commit);
     if (ptyResult.ok) {
+      recordDispatchExpectation({
+        fromAnchorId: body.from_anchor_id,
+        targetAnchorId: dispatch.anchorId,
+        text: body.text,
+        commit,
+      });
       return { ...ptyResult, target, transport: 'pty' as const };
     }
     /* Dual transport (control-transport fix, 2026-07-14): the PTY
@@ -2534,6 +2588,12 @@ export async function registerDashboardRoutes(
       reply.code(404);
       return { ok: false, error: bridgeResult.error };
     }
+    recordDispatchExpectation({
+      fromAnchorId: body.from_anchor_id,
+      targetAnchorId: dispatch.anchorId,
+      text: body.text,
+      commit,
+    });
     return { ok: true, target, transport: 'bridge' as const };
   });
 
@@ -3051,6 +3111,12 @@ export async function registerDashboardRoutes(
     const dispatchTarget = dispatch.dispatchTarget;
     const result = ptyInject(dispatchTarget, body.text, commit);
     if (result.ok) {
+      recordDispatchExpectation({
+        fromAnchorId: body.from_anchor_id,
+        targetAnchorId: dispatch.anchorId,
+        text: body.text,
+        commit,
+      });
       return { ok: true, target: dispatchTarget, transport: 'pty' as const };
     }
     /* Dual transport (control-transport fix, 2026-07-14): bridge-
@@ -3078,6 +3144,12 @@ export async function registerDashboardRoutes(
       reply.code(404);
       return { ok: false, error: bridgeResult.error };
     }
+    recordDispatchExpectation({
+      fromAnchorId: body.from_anchor_id,
+      targetAnchorId: dispatch.anchorId,
+      text: body.text,
+      commit,
+    });
     return { ok: true, target: dispatchTarget, transport: 'bridge' as const };
   });
 

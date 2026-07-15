@@ -37,6 +37,7 @@ import {
   resolveDeliverableBridgeForSession,
   type DeliverabilityResult,
 } from '../dashboard/bridge-presence.js';
+import { recordExpectation, deriveExpectedOutcome } from './expectation-supervisor.js';
 import type { IndexDb } from '../store/index-db.js';
 
 /* Allowlist env var. Comma-separated name/id prefixes. Empty = allow all. */
@@ -385,6 +386,48 @@ export function crossSessionInject(
     }
   }
 
+  /* Expectation-supervisor dispatcher wiring (2026-07-15 goal-audit
+   * fix wave). recordExpectation's only writer was, until this wave,
+   * nothing at all: the 90s evaluator ticked forever over an
+   * eternally-empty lex_worker_expectation table. This is the
+   * natural authority boundary for the cross-session transport -- a
+   * COMMITTED delivery to a known worker project-session anchor
+   * (anchor_id), sent by a Lex anchor that declared itself
+   * (from_lex_anchor_id), is exactly the "Lex told the worker to do
+   * X" event the expectation row models. Both fields are already
+   * resolved by the caller (routes.ts's resolveDispatchTarget /
+   * checkLexScope) before crossSessionInject ever runs, so this is a
+   * read of state already on hand, not a new resolution.
+   *
+   * Deliberately excluded:
+   *   - commit:false (suggestions) -- nothing was actually delivered
+   *     for the worker to act on yet.
+   *   - anchor_id absent -- covers self-injects into Lex's own
+   *     brainstorm session (checkLexScope allows those) and targets
+   *     with no known project anchor; neither has a worker jsonl to
+   *     tail.
+   *   - from_lex_anchor_id absent -- daemon-internal supervisors,
+   *     cron, and the dashboard's own operator-typed injects are not
+   *     "Lex dispatched a task" events.
+   *
+   * Best-effort by design: recordExpectation reaches through the
+   * brainstorm-store's getStore() singleton, not the `db` handle
+   * this function was called with, so a store not yet initialised
+   * (or any other write failure) must not turn an already-successful
+   * inject into a caller-visible error. */
+  function recordDispatchExpectation(): void {
+    if (!commit || !from_lex_anchor_id || !anchor_id) return;
+    try {
+      recordExpectation({
+        brainstormId: from_lex_anchor_id,
+        anchorId: anchor_id,
+        expectedOutcome: deriveExpectedOutcome(text),
+      });
+    } catch {
+      /* best-effort; see comment above */
+    }
+  }
+
   /* 1. Token auth. Fix 15 — accept tokens signed against the legacy
    * target_session, the route-overridden signed_session (when the
    * route redirected a stale uuid), or the anchor id (stable across
@@ -451,6 +494,7 @@ export function crossSessionInject(
       return { ok: false, decision: 'rejected_pty', error: reason };
     }
     audit('accepted');
+    recordDispatchExpectation();
     /* Auto-CR nudge. Some workers attached over the daemon-owned PTY
      * still leave the input box without a submit after the primary
      * inject; firing a bare CR through the same channel settles
@@ -515,6 +559,7 @@ export function crossSessionInject(
   }
 
   audit('accepted');
+  recordDispatchExpectation();
   /* Auto-CR nudge through the bridge transport. The VS Code bridge
    * VSIX delivers the primary text via bracketed paste, which the
    * worker treats as a multi-character paste that does NOT include
