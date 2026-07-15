@@ -100,6 +100,29 @@ function normalizeCwd(cwd: string): string {
     .replace(/^([a-z]):/, (_m, d: string) => `${d.toUpperCase()}:`);
 }
 
+/* R3 fix (2026-07-14): production carried TWO project_session rows
+ * for the same directory differing only by drive-letter case
+ * ('c:/dev/Projects/DevNeural' vs 'C:/dev/Projects/DevNeural') -- a
+ * normalizeCwd bypass that predates consistent normalization in this
+ * file. getProjectSessionByCwd does an exact `cwd = ?` match, so a
+ * stale mixed-case row on disk is invisible to a normalized lookup;
+ * pre-fix that miss fell through to ensureAnchorForCwd and minted a
+ * SECOND anchor for the same directory, and the duplicate never
+ * healed itself on later reconciles. Scan for a case-insensitive
+ * match before conceding "not found" so an old mixed-case row gets
+ * reused instead of duplicated. Reuses the normalizeCwd already
+ * defined in this file; does not introduce a second implementation. */
+function findAnchorByCwd(
+  db: IndexDb,
+  cwd: string,
+): ProjectSessionRow | null {
+  const normalized = normalizeCwd(cwd);
+  const exact = db.getProjectSessionByCwd(normalized);
+  if (exact) return exact;
+  const all = db.listProjectSessions({ limit: 100_000 });
+  return all.find((row) => normalizeCwd(row.cwd) === normalized) ?? null;
+}
+
 function defaultClaudeProjectsDir(): string {
   return path.posix.join(
     os.homedir().replace(/\\/g, '/'),
@@ -250,7 +273,7 @@ export function reconcileBridgePresence(
    * back to dormant. */
   const touched = new Set<string>();
   for (const [cwd, recs] of byCwd) {
-    let anchor = db.getProjectSessionByCwd(cwd);
+    let anchor = findAnchorByCwd(db, cwd);
     if (!anchor) {
       /* PROJECT-ANCHORS.md `## Seeding`: bridge reports a cwd no
        * boot seed pass has covered (new top-level dir created after
@@ -264,7 +287,7 @@ export function reconcileBridgePresence(
          * our insert attempt. Re-read; if still missing the helper
          * itself failed (read-only DB, FK constraint) and there is
          * nothing more we can do here. */
-        anchor = db.getProjectSessionByCwd(cwd);
+        anchor = findAnchorByCwd(db, cwd);
         if (!anchor) continue;
       } else {
         anchor = created;

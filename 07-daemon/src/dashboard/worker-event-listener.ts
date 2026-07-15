@@ -84,6 +84,52 @@ export interface ProcessChangeResult {
   anchor_id?: string;
 }
 
+/* R2 fix (2026-07-14): the pre-fix log line was `routed=${count}`,
+ * which is the number of RouteResult entries produced -- not the
+ * number of events actually delivered. A run where every single
+ * event resolved to 'no-target' still logged routed=N and read as
+ * success. Aggregate the real per-outcome counts so the daemon log
+ * tells the truth. Exported (pure function, no I/O) so it is
+ * unit-testable without standing up chokidar. Keeps the historic
+ * "[worker-event] anchor=" prefix so existing grep patterns still
+ * match. */
+export function formatRoutedLogLine(
+  anchorId: string,
+  routed: RouteResult[],
+): string {
+  const counts = {
+    sent: 0,
+    no_target: 0,
+    debounced: 0,
+    kill_switch: 0,
+    inject_failed: 0,
+  };
+  for (const r of routed) {
+    switch (r.outcome) {
+      case 'sent':
+        counts.sent++;
+        break;
+      case 'no-target':
+        counts.no_target++;
+        break;
+      case 'debounced':
+        counts.debounced++;
+        break;
+      case 'kill-switch':
+        counts.kill_switch++;
+        break;
+      case 'inject-failed':
+        counts.inject_failed++;
+        break;
+    }
+  }
+  return (
+    `[worker-event] anchor=${anchorId} sent=${counts.sent} ` +
+    `no_target=${counts.no_target} debounced=${counts.debounced} ` +
+    `kill_switch=${counts.kill_switch} inject_failed=${counts.inject_failed}`
+  );
+}
+
 /* Fix 34d.1 (2026-05-26): pre-fix shipped routing bug.
  *
  * Earlier code keyed queueSessionPrompt on ref.lex_session_id, which
@@ -462,9 +508,7 @@ export function startWorkerEventListener(
       try {
         const r = processChange(file.replace(/\\/g, '/'), procDeps);
         if (r.outcome === 'routed') {
-          log(
-            `[worker-event] anchor=${r.anchor_id} routed=${r.routed?.length ?? 0}`,
-          );
+          log(formatRoutedLogLine(r.anchor_id ?? 'unknown', r.routed ?? []));
         }
       } catch (err) {
         log(`[worker-event] processChange failed: ${(err as Error).message}`);

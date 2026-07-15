@@ -378,6 +378,54 @@ describe('reconcileBridgePresence', () => {
     expect(db.getProjectSession('anchor-B')!.status).toBe('dormant');
   });
 
+  it('reuses an anchor whose stored cwd differs only by drive-letter case instead of minting a duplicate (R3)', () => {
+    /* Simulate a pre-fix legacy row: inserted directly with a
+     * lowercase drive letter, bypassing normalizeCwd entirely (the
+     * historical bug this test guards against). */
+    db.insertProjectSession({
+      id: 'anchor-case',
+      project_slug: 'proj-case',
+      cwd: 'c:/dev/Projects/proj-case',
+      title: 'proj-case',
+      status: 'dormant',
+      current_session_id: null,
+      current_bridge_id: null,
+      current_pty_id: null,
+      created_ms: 1,
+      last_seen_ms: 1,
+    });
+    const before = db.listProjectSessions({ limit: 1000 }).length;
+
+    const now = 4_800_000;
+    writePresence(
+      'case-window.json',
+      {
+        cwd: 'C:/dev/Projects/proj-case',
+        bridge_id: 'bridge-case',
+        cc_session_ids: ['cc-case-1'],
+      },
+      now,
+    );
+    const result = reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => now,
+    });
+
+    /* The exact-match lookup on the normalized cwd would miss the
+     * lowercase-drive row and, pre-fix, fall through to
+     * ensureAnchorForCwd and create a SECOND row for the same
+     * directory. Post-fix: the existing row is reused, row count is
+     * unchanged, and it is the one that flips live. */
+    const after = db.listProjectSessions({ limit: 1000 }).length;
+    expect(after).toBe(before);
+    expect(result.liveAnchorIds).toEqual(['anchor-case']);
+    const row = db.getProjectSession('anchor-case')!;
+    expect(row.status).toBe('live');
+    expect(row.current_bridge_id).toBe('bridge-case');
+    expect(row.current_session_id).toBe('cc-case-1');
+  });
+
   it('multiple anchors flip independently in a single reconcile pass', () => {
     const now = 7_000_000;
     writePresence(

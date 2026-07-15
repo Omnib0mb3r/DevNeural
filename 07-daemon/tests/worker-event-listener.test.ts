@@ -13,11 +13,15 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { IndexDb } from '../src/store/index-db.js';
 import { runMigrations } from '../src/db/migrate.js';
-import { WorkerEventGate } from '../src/dashboard/worker-event-router.js';
+import {
+  WorkerEventGate,
+  type RouteResult,
+} from '../src/dashboard/worker-event-router.js';
 import { newAnchorTailState } from '../src/dashboard/worker-event-detect.js';
 import {
   processChange,
   deliverSupervisorPromptToLex,
+  formatRoutedLogLine,
 } from '../src/dashboard/worker-event-listener.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -212,6 +216,44 @@ describe('processChange', () => {
     expect(r.routed?.[0]?.outcome).toBe('kill-switch');
     expect(deps.onKillSwitch).toHaveBeenCalledWith('anchor-A');
     expect(deps.inject).not.toHaveBeenCalled();
+  });
+});
+
+describe('formatRoutedLogLine (R2: truthful outcome-count log line)', () => {
+  it('counts each RouteResult outcome instead of just the raw dispatch count', () => {
+    const routed: RouteResult[] = [
+      { outcome: 'sent', decision: { decision: 'accept' } },
+      { outcome: 'sent', decision: { decision: 'accept' } },
+      { outcome: 'no-target', decision: { decision: 'accept' } },
+      {
+        outcome: 'debounced',
+        decision: { decision: 'debounce', reason: 'per-type-gap' },
+      },
+      { outcome: 'kill-switch', decision: { decision: 'kill-switch' } },
+      { outcome: 'inject-failed', decision: { decision: 'accept' } },
+    ];
+    /* Pre-fix this scenario logged `routed=6`, which reads as
+     * success even though only 2 of the 6 events actually sent. */
+    const line = formatRoutedLogLine('anchor-A', routed);
+    expect(line).toBe(
+      '[worker-event] anchor=anchor-A sent=2 no_target=1 debounced=1 kill_switch=1 inject_failed=1',
+    );
+  });
+
+  it('reports all-no-target runs truthfully instead of reading as success', () => {
+    const routed: RouteResult[] = [
+      { outcome: 'no-target', decision: { decision: 'accept' } },
+      { outcome: 'no-target', decision: { decision: 'accept' } },
+    ];
+    const line = formatRoutedLogLine('anchor-A', routed);
+    expect(line).toBe(
+      '[worker-event] anchor=anchor-A sent=0 no_target=2 debounced=0 kill_switch=0 inject_failed=0',
+    );
+  });
+
+  it('keeps the historic "[worker-event] anchor=" prefix so existing grep patterns still match', () => {
+    const line = formatRoutedLogLine('anchor-B', []);
+    expect(line.startsWith('[worker-event] anchor=anchor-B')).toBe(true);
   });
 });
 

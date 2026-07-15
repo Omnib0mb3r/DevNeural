@@ -20,6 +20,7 @@
  */
 import type { IndexDb, ProjectSessionRow } from '../store/index-db.js';
 import { recordWorkerEventDiagnostic } from './worker-event-diagnostics.js';
+import { emitNotification } from './notifications.js';
 
 export type WorkerEventType =
   | 'idle'
@@ -335,6 +336,12 @@ export interface RouteDeps {
   /** Kill-switch handler. Called when the gate trips. Production sets
    * supervision_mode='polling' on the anchor and emits a notification. */
   onKillSwitch?: (anchorId: string) => void;
+  /** Notification emitter for the no-target verdict (R1 fix, 2026-07-14:
+   * for 26 days every worker event that resolved to no live lex_session
+   * was silently discarded -- only the kill-switch path notified).
+   * Defaults to the real dashboard emitter; tests inject a spy the same
+   * way KillSwitchDeps.emit does. */
+  emit?: typeof emitNotification;
   now?: number;
   /** Fix 34 diagnostics. When provided, the router records gate +
    * route-resolved verdicts to worker_event_diagnostic_log so a dead
@@ -352,6 +359,41 @@ export type RouteOutcome =
 export interface RouteResult {
   outcome: RouteOutcome;
   decision: RouteDecision;
+}
+
+/* R1 fix (2026-07-14): 26 days of worker events silently routed to
+ * verdict 'no-target' (no live lex_session) with zero operator
+ * signal -- only the kill-switch path notified. Mirrors
+ * WorkerEventGate's per-anchor debounce style: a module-level map of
+ * anchor_id -> last-notified-ms, gapped at 60 minutes so a project
+ * stuck without a live Lex session gets exactly one notification per
+ * cooldown window instead of spamming the bell on every dropped
+ * event. */
+const NO_TARGET_NOTIFY_COOLDOWN_MS = 60 * 60 * 1000;
+const noTargetLastNotifiedMs = new Map<string, number>();
+
+export function resetNoTargetNotifyStateForTest(): void {
+  noTargetLastNotifiedMs.clear();
+}
+
+function notifyNoTarget(
+  emit: typeof emitNotification | undefined,
+  anchor: ProjectSessionRow,
+  now: number,
+): void {
+  const last = noTargetLastNotifiedMs.get(anchor.id);
+  if (last !== undefined && now - last < NO_TARGET_NOTIFY_COOLDOWN_MS) return;
+  noTargetLastNotifiedMs.set(anchor.id, now);
+  const label = anchor.title || anchor.project_slug || anchor.id.slice(0, 8);
+  const doEmit = emit ?? emitNotification;
+  doEmit({
+    severity: 'warn',
+    source: 'supervision',
+    notify_class: 'signal',
+    title: `Worker event dropped for ${label}`,
+    body: `No live Lex session to deliver to; the event was discarded. Bind a Lex brainstorm to ${label} so future worker events reach a supervisor.`,
+    link: '/projects',
+  });
 }
 
 export function routeWorkerEvent(
@@ -384,6 +426,7 @@ export function routeWorkerEvent(
     recordRouteResolved(deps.db, event.anchor_id, target, event.type);
   }
   if (!target) {
+    notifyNoTarget(deps.emit, deps.anchor, now);
     return { outcome: 'no-target', decision };
   }
   const text = buildSupervisorPrompt({

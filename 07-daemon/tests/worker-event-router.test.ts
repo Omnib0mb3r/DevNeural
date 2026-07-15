@@ -21,6 +21,7 @@ import {
   detectPermissionDenied,
   detectTestFailure,
   resetLexTargetCacheForTest,
+  resetNoTargetNotifyStateForTest,
   resolveLexTargetSession,
   routeWorkerEvent,
   type WorkerEvent,
@@ -296,6 +297,118 @@ describe('routeWorkerEvent', () => {
       anchor: anchor(),
     });
     expect(r.outcome).toBe('inject-failed');
+  });
+
+  describe('no-target notification (R1: 26 days of silent drops)', () => {
+    beforeEach(() => {
+      resetNoTargetNotifyStateForTest();
+    });
+
+    it('emits a warn notification once when the target resolves to null', () => {
+      const inject = vi.fn(() => ({ ok: true }));
+      const emit = vi.fn().mockReturnValue({ id: 'n-1' });
+      const r = routeWorkerEvent(event(), {
+        gate: new WorkerEventGate(debounceDefaults()),
+        resolveTarget: () => null,
+        inject,
+        anchor: anchor({ title: 'DevNeural' }),
+        emit,
+        now: 1_000,
+      });
+      expect(r.outcome).toBe('no-target');
+      expect(inject).not.toHaveBeenCalled();
+      expect(emit).toHaveBeenCalledTimes(1);
+      const arg = emit.mock.calls[0]![0] as {
+        severity: string;
+        source: string;
+        title: string;
+        link: string;
+        notify_class: string;
+      };
+      expect(arg.severity).toBe('warn');
+      expect(arg.source).toBe('supervision');
+      expect(arg.notify_class).toBe('signal');
+      expect(arg.title).toMatch(/DevNeural/);
+      expect(arg.link).toBe('/projects');
+    });
+
+    it('debounces a second no-target notification for the same anchor within 60 minutes', () => {
+      const inject = vi.fn(() => ({ ok: true }));
+      const emit = vi.fn().mockReturnValue({ id: 'n-1' });
+      const deps = {
+        /* per-type-gap/hourly-cap set wide open so the GATE itself
+         * never debounces; only the notify-cooldown under test can
+         * suppress the second emit. */
+        gate: new WorkerEventGate({
+          perTypeMinGapMs: 0,
+          perAnchorHourlyCap: 999,
+          killSwitchPerTenMinutes: 999,
+        }),
+        resolveTarget: () => null,
+        inject,
+        anchor: anchor(),
+        emit,
+      };
+      const first = routeWorkerEvent(event({ type: 'idle' }), {
+        ...deps,
+        now: 1_000,
+      });
+      const second = routeWorkerEvent(event({ type: 'commit' }), {
+        ...deps,
+        now: 1_000 + 30 * 60 * 1000,
+      });
+      expect(first.outcome).toBe('no-target');
+      expect(second.outcome).toBe('no-target');
+      expect(emit).toHaveBeenCalledTimes(1);
+    });
+
+    it('notifies again for the same anchor once the 60-minute cooldown elapses', () => {
+      const inject = vi.fn(() => ({ ok: true }));
+      const emit = vi.fn().mockReturnValue({ id: 'n-1' });
+      const deps = {
+        gate: new WorkerEventGate({
+          perTypeMinGapMs: 0,
+          perAnchorHourlyCap: 999,
+          killSwitchPerTenMinutes: 999,
+        }),
+        resolveTarget: () => null,
+        inject,
+        anchor: anchor(),
+        emit,
+      };
+      routeWorkerEvent(event({ type: 'idle' }), { ...deps, now: 1_000 });
+      routeWorkerEvent(event({ type: 'commit' }), {
+        ...deps,
+        now: 1_000 + 61 * 60 * 1000,
+      });
+      expect(emit).toHaveBeenCalledTimes(2);
+    });
+
+    it('tracks the notify cooldown per anchor, not globally', () => {
+      const inject = vi.fn(() => ({ ok: true }));
+      const emit = vi.fn().mockReturnValue({ id: 'n-1' });
+      const base = {
+        gate: new WorkerEventGate({
+          perTypeMinGapMs: 0,
+          perAnchorHourlyCap: 999,
+          killSwitchPerTenMinutes: 999,
+        }),
+        resolveTarget: () => null,
+        inject,
+        emit,
+      };
+      routeWorkerEvent(event({ anchor_id: 'anchor-A' }), {
+        ...base,
+        anchor: anchor({ id: 'anchor-A' }),
+        now: 1_000,
+      });
+      routeWorkerEvent(event({ anchor_id: 'anchor-B' }), {
+        ...base,
+        anchor: anchor({ id: 'anchor-B' }),
+        now: 1_100,
+      });
+      expect(emit).toHaveBeenCalledTimes(2);
+    });
   });
 
   it('returns kill-switch and calls the handler when the gate trips', () => {
