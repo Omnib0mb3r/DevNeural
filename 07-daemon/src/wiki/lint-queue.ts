@@ -16,10 +16,28 @@
  * Wired by daemon.ts at startup via initLintQueue(store, log). Anything
  * that touches wiki pages calls scheduleLint(reason) to bump the debounce.
  */
+import * as fs from 'node:fs';
 import type { Store } from '../store/index.js';
 import { runLint } from './lint.js';
 import { generateWhatsNew } from './whats-new.js';
 import { decayInactivePages } from '../reinforcement/index.js';
+import { wikiWhatsNewFile } from '../paths.js';
+
+const WHATS_NEW_STALE_MS = 24 * 60 * 60 * 1000; // 24h
+
+/** True when whats-new.md hasn't been regenerated in 24h+ (or has never
+ * been generated at all). Checked against file mtime rather than a
+ * module-level timestamp so the staleness signal survives a daemon
+ * restart -- a quiet wiki shouldn't get an immediate regen just because
+ * the process happened to restart. */
+function whatsNewIsStale(): boolean {
+  try {
+    const stat = fs.statSync(wikiWhatsNewFile());
+    return Date.now() - stat.mtimeMs >= WHATS_NEW_STALE_MS;
+  } catch {
+    return true;
+  }
+}
 
 interface QueueState {
   store: Store;
@@ -91,9 +109,16 @@ async function cycle(): Promise<void> {
       `[lint-queue] lint applied: scanned=${lintResult.scanned} actions=${lintResult.actions.length}`,
     );
 
-    // Reinforcement decay only when lint actually made changes; otherwise
-    // we'd be writing decayed weights every minute even on quiet wikis.
-    if (lintResult.actions.length > 0) {
+    // Reinforcement decay + whats-new normally only run when lint actually
+    // made changes; otherwise we'd be writing decayed weights every minute
+    // even on quiet wikis. But a wiki can stay quiet (zero actions) for
+    // longer than the Daily Brief should go stale, so a cycle that finds
+    // nothing to lint still forces a refresh once whats-new.md has passed
+    // its 24h staleness window -- e.g. after a long period the watcher
+    // itself was dead upstream and lint has nothing new to say yet.
+    const hadActions = lintResult.actions.length > 0;
+    const staleRefresh = !hadActions && whatsNewIsStale();
+    if (hadActions || staleRefresh) {
       try {
         const decayResult = await decayInactivePages(state.store, log);
         log(
@@ -107,7 +132,9 @@ async function cycle(): Promise<void> {
       // reflects the new state within the lint cadence.
       try {
         generateWhatsNew(7);
-        log(`[lint-queue] whats-new regenerated`);
+        log(
+          `[lint-queue] whats-new regenerated${staleRefresh ? ' (quiet cycle, 24h staleness refresh)' : ''}`,
+        );
       } catch (err) {
         log(`[lint-queue] whats-new failed: ${(err as Error).message}`);
       }

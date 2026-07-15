@@ -434,23 +434,201 @@ export interface WatcherOptions {
   store?: Store;
 }
 
+/** Timestamp (ms since epoch) of the last time the live watcher received a
+ * jsonl add/change event, or a catch-up pass processed a file. 0 means
+ * "never" (fresh process, or watcher hasn't fired yet). Exported read-only
+ * via lastTranscriptEventMs() so callers/tests can assert on liveness
+ * without reaching into module internals. */
+let lastEventMs = 0;
+
+function touchLastEvent(): void {
+  lastEventMs = Date.now();
+}
+
+/** Test/diagnostic seam: current lastEventMs value. */
+export function lastTranscriptEventMs(): number {
+  return lastEventMs;
+}
+
+/** Fix 34b (mirrored from src/dashboard/worker-event-listener.ts): chokidar
+ * v4 removed glob support entirely. Watching `${root}/**\/*.jsonl` as a
+ * string binds chokidar to that literal path, which never exists, so the
+ * watcher reports 'ready' but no add/change event ever fires for real
+ * session files. The fix is to watch the ROOT DIRECTORY and filter to
+ * .jsonl files with `ignored`; chokidar recurses into
+ * ~/.claude/projects/<slug>/ on its own since directories are never
+ * ignored, and non-jsonl files are skipped once stats arrive. This
+ * predicate is exported so tests can exercise the filter logic directly
+ * without mocking the filesystem watcher. */
+export function isIgnoredTranscriptPath(
+  filePath: string,
+  stats?: fs.Stats,
+): boolean {
+  if (stats && stats.isFile()) {
+    return !filePath.replace(/\\/g, '/').endsWith('.jsonl');
+  }
+  return false;
+}
+
+interface JsonlFileInfo {
+  file: string;
+  mtimeMs: number;
+  size: number;
+}
+
+/** List .jsonl files one level below root (root/<slug>/<uuid>.jsonl), which
+ * is the only shape Claude Code ever produces under ~/.claude/projects.
+ * Used by both the boot catch-up scan and the staleness self-check so
+ * there is exactly one place that knows the on-disk layout. */
+function listJsonlFiles(root: string): JsonlFileInfo[] {
+  const out: JsonlFileInfo[] = [];
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.posix.join(root, entry.name);
+    let children: fs.Dirent[];
+    try {
+      children = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const child of children) {
+      if (!child.isFile() || !child.name.endsWith('.jsonl')) continue;
+      const fp = path.posix.join(dir, child.name);
+      try {
+        const stat = fs.statSync(fp);
+        out.push({ file: fp, mtimeMs: stat.mtimeMs, size: stat.size });
+      } catch {
+        continue;
+      }
+    }
+  }
+  return out;
+}
+
+const CATCHUP_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
+const CATCHUP_LOG_EVERY = 25;
+
+/** One-shot boot catch-up: the watcher was dead (silently, wrong glob) for
+ * ~65 days before this fix, so a lot of session jsonl has unprocessed
+ * bytes sitting past their persisted offset. Walk the tree once at start,
+ * bounded to files touched in the last 90 days, and replay each through
+ * the normal processFile path (sequentially, so embedding calls don't
+ * pile up). processFile is offset-aware and a no-op if a file has nothing
+ * new, so this is safe to run on every boot, not just the first one after
+ * the fix lands. */
+/** Exported (also used as the boot catch-up seam) so tests can drive the
+ * scan directly against a synthetic root dir + offsets state without
+ * waiting on the fire-and-forget call inside startTranscriptWatcher. */
+export async function runTranscriptCatchupScan(
+  root: string,
+  store: Store | undefined,
+  log: (msg: string) => void,
+): Promise<void> {
+  loadOffsets();
+  const now = Date.now();
+  const candidates = listJsonlFiles(root).filter((f) => {
+    if (now - f.mtimeMs > CATCHUP_MAX_AGE_MS) return false;
+    const cursor = offsets[f.file] ?? 0;
+    return f.size > cursor;
+  });
+  if (candidates.length === 0) {
+    log(`[transcript-watcher] catch-up: nothing pending`);
+    return;
+  }
+  log(`[transcript-watcher] catch-up: ${candidates.length} file(s) with unprocessed bytes`);
+  let processed = 0;
+  let totalChunks = 0;
+  let totalBytes = 0;
+  for (const candidate of candidates) {
+    try {
+      const result = await processFile(candidate.file, store, log);
+      totalChunks += result.chunks;
+      totalBytes += result.bytes;
+      touchLastEvent();
+    } catch (err) {
+      log(
+        `[transcript-watcher] catch-up: ${path.basename(candidate.file)} failed: ${(err as Error)?.message ?? err}`,
+      );
+    }
+    processed++;
+    if (processed % CATCHUP_LOG_EVERY === 0) {
+      log(
+        `[transcript-watcher] catch-up progress: ${processed}/${candidates.length} files`,
+      );
+    }
+  }
+  log(
+    `[transcript-watcher] catch-up done: ${processed}/${candidates.length} files, +${totalChunks} chunks (${totalBytes}B)`,
+  );
+}
+
+const STALE_CHECK_INTERVAL_MS = 30 * 60 * 1000; // 30 min
+const STALE_THRESHOLD_MS = 6 * 60 * 60 * 1000; // 6 h
+
+/** Cheap liveness self-check so a repeat of "chokidar bound but never
+ * fired" is never silent again. If the watcher hasn't processed a single
+ * event in 6h AND the filesystem shows a jsonl file whose mtime is newer
+ * than that last-processed timestamp (i.e. something happened that we
+ * missed), log loudly. A directory scan at 30-minute cadence is cheap
+ * relative to the cost of a multi-week silent outage. */
+function checkStaleness(root: string, log: (msg: string) => void): void {
+  const elapsed = Date.now() - lastEventMs;
+  if (elapsed < STALE_THRESHOLD_MS) return;
+  const files = listJsonlFiles(root);
+  let newestMtime = 0;
+  for (const f of files) {
+    if (f.mtimeMs > newestMtime) newestMtime = f.mtimeMs;
+  }
+  if (newestMtime > lastEventMs) {
+    log(
+      `[transcript-watcher] STALE: fs shows newer jsonl than last processed event ` +
+        `(newest_mtime=${new Date(newestMtime).toISOString()}, ` +
+        `last_event=${lastEventMs ? new Date(lastEventMs).toISOString() : 'never'}, root=${root})`,
+    );
+  }
+}
+
 export function startTranscriptWatcher(
   options: WatcherOptions = {},
 ): TranscriptWatcher {
   const root = (options.rootDir ?? DEFAULT_ROOT).replace(/\\/g, '/');
   const log = options.log ?? (() => undefined);
   if (!fs.existsSync(root)) {
-    log(`[transcript-watcher] root not present: ${root}`);
+    log(`[transcript-watcher] boot: root not present: ${root}, mode=idle`);
     return { stop: async () => undefined };
   }
 
-  const watcher: FSWatcher = chokidar.watch(`${root}/**/*.jsonl`, {
-    ignoreInitial: false,
+  log(`[transcript-watcher] boot: root=${root} mode=dir-watch+jsonl-filter (chokidar v4, glob-free)`);
+
+  // Fix 34b (see isIgnoredTranscriptPath doc comment above): watch the
+  // root directory itself, not a glob string. depth:1 bounds recursion to
+  // root -> <slug>/ -> <uuid>.jsonl, which is the only shape this tree
+  // ever takes; deeper traversal would just be wasted watch handles.
+  //
+  // ignoreInitial:true (matches worker-event-listener.ts's own Fix 34b)
+  // is deliberate: the explicit runCatchupScan below owns the boot
+  // backlog sequentially and offset-aware. Letting chokidar ALSO fire
+  // 'add' for every pre-existing file (ignoreInitial:false) would race
+  // that scan -- two concurrent processFile calls on the same fresh file
+  // both read from offset 0 before either persists, doubling every
+  // transcripts.jsonl line, observation, and reinforcement signal.
+  const watcher: FSWatcher = chokidar.watch(root, {
+    ignoreInitial: true,
     persistent: true,
+    depth: 1,
     awaitWriteFinish: { stabilityThreshold: 250, pollInterval: 100 },
+    ignored: isIgnoredTranscriptPath,
+    ignorePermissionErrors: true,
   });
 
   const onChange = (file: string): void => {
+    touchLastEvent();
     void processFile(file.replace(/\\/g, '/'), options.store, log).then(
       (result) => {
         if (result.chunks > 0) {
@@ -469,8 +647,21 @@ export function startTranscriptWatcher(
   });
 
   log(`[transcript-watcher] watching ${root}`);
+
+  // One-shot backlog drain. Fire-and-forget: the live watcher above is
+  // already bound and will pick up anything written while catch-up runs,
+  // and processFile's offset tracking makes double-processing harmless.
+  void runTranscriptCatchupScan(root, options.store, log).catch((err) => {
+    log(`[transcript-watcher] catch-up failed: ${(err as Error)?.message ?? err}`);
+  });
+
+  const staleTimer: NodeJS.Timeout = setInterval(() => {
+    checkStaleness(root, log);
+  }, STALE_CHECK_INTERVAL_MS);
+
   return {
     stop: async () => {
+      clearInterval(staleTimer);
       await watcher.close();
     },
   };
