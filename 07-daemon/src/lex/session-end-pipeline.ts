@@ -60,6 +60,7 @@ import {
   finalize as finalizeAudioBundle,
   discard as discardAudioBundle,
 } from '../voice/audio-bundle.js';
+import { runMeetingDiarization, hasHfToken } from './meeting-diarize.js';
 import { writeThreadDoc } from './thread-doc.js';
 import { publishDashboardEvent } from '../dashboard/event-bus.js';
 
@@ -364,6 +365,60 @@ async function runOrderedPipeline(
         log(
           `[session-end] audio bundle finalised: ${finalised.cueCount} cues, ${finalised.bytes} pcm bytes -> ${finalised.audioPath}`,
         );
+
+        /* Step 3b (post-session meeting diarization, 2026-07-15).
+         * Additive hook only: fires runMeetingDiarization() as a
+         * detached async task so a slow whisperx+pyannote pass never
+         * blocks session teardown. finalizeAudioBundle() deletes its
+         * in-memory accumulator on first success, so `finalised` being
+         * truthy here means this is the one call per session that just
+         * produced the WAV -- the natural "meeting session finalizes"
+         * moment, and a natural guard against firing twice for the
+         * same session across concurrent teardown paths.
+         *
+         * Gated behind the operator opt-in runtime_config key
+         * 'diarize_meetings' (absent or anything other than 'on' means
+         * off) plus an HF_TOKEN/HUGGINGFACE_TOKEN presence pre-check so
+         * we do not spawn python only to have it exit 2.
+         * runMeetingDiarization() re-checks session kind, consent, WAV
+         * presence, and the token itself, so this gate is a fast-path
+         * only, not the source of truth. */
+        if (isMeeting) {
+          try {
+            const diarizeOn =
+              store.db.getRuntimeConfig('diarize_meetings') === 'on';
+            if (!diarizeOn) {
+              log(
+                `[session-end] diarization skipped: runtime_config diarize_meetings != 'on'`,
+              );
+            } else if (!hasHfToken(process.env)) {
+              log(
+                `[session-end] diarization skipped: no HF_TOKEN/HUGGINGFACE_TOKEN in env`,
+              );
+            } else {
+              log(`[session-end] diarization starting: brainstorm=${input.brainstormId}`);
+              void runMeetingDiarization(input.brainstormId, { store, log })
+                .then((res) => {
+                  if (res.ok) {
+                    log(
+                      `[session-end] diarization finished: brainstorm=${input.brainstormId} segments=${res.storedCount ?? 0}`,
+                    );
+                  } else {
+                    log(
+                      `[session-end] diarization skipped/failed: brainstorm=${input.brainstormId} reason=${res.skipped ?? 'unknown'}${res.error ? ` (${res.error})` : ''}`,
+                    );
+                  }
+                })
+                .catch((err) => {
+                  log(
+                    `[session-end] diarization failed: brainstorm=${input.brainstormId} ${(err as Error).message}`,
+                  );
+                });
+            }
+          } catch (err) {
+            log(`[session-end] diarization hook failed: ${(err as Error).message}`);
+          }
+        }
       }
     }
   } catch (err) {

@@ -325,6 +325,26 @@ export interface BrainstormChunkRow {
   cc_session_id: string | null;
 }
 
+/* meeting_diarization row (migration 050, 2026-07-15). One row per
+ * diarized segment parsed from diarize.py's <stem>_diarized.srt
+ * output. Lives independently of brainstorm_chunks because chunk rows
+ * carry no audio-relative timing (see the migration comment); merging
+ * by time overlap is therefore not possible without guessing, so
+ * diarization results get their own table instead. speaker is the
+ * raw pyannote label (e.g. SPEAKER_00); speaker_guess is a best-effort
+ * mapping onto the session's attendees list by speaker index order,
+ * kept separate from the raw label since the guess is often wrong. */
+export interface MeetingDiarizationRow {
+  id: string;
+  session_id: string;
+  start_ms: number;
+  end_ms: number;
+  speaker: string;
+  speaker_guess: string | null;
+  text: string;
+  created_at: string;
+}
+
 /* lex_session row. The durable Lex brainstorm anchor introduced in
  * PLAN-lex-session-rewrite.md step 1. The id is daemon-owned and
  * surfaces as the canonical session identifier everywhere (Past
@@ -705,13 +725,18 @@ export class IndexDb {
   }
 
   /* CI-2: hits, corrections, clicks. Multiple rows per curator_log
-   * row are allowed; each follow-up signal appends. */
+   * row are allowed; each follow-up signal appends.
+   *
+   * 'llm-judge' (migration 049) is the inject-verdict explicit LLM
+   * second opinion: see src/reinforcement/inject-verdict.ts. It is
+   * additive alongside the cosine-based 'regex-inferred' signal, not
+   * a replacement. */
   insertCuratorSignal(row: {
     id: string;
     curator_log_id: string;
     prompt_id: string;
     signal: 'hit' | 'correction' | 'click' | 'wrong';
-    source: 'regex-inferred' | 'user-explicit' | 'dashboard-click';
+    source: 'regex-inferred' | 'user-explicit' | 'dashboard-click' | 'llm-judge';
     weight: number;
   }): void {
     this.db
@@ -1103,6 +1128,44 @@ export class IndexDb {
       )
       .get(brainstormId, ccSessionId) as { n: number } | undefined;
     return r?.n ?? 0;
+  }
+
+  /* meeting_diarization helpers (migration 050, 2026-07-15). Caller
+   * (src/lex/meeting-diarize.ts) generates ids and passes complete
+   * rows, matching the insertBackfillReview / insertLexFeedback
+   * convention elsewhere in this class. Bulk insert runs in one
+   * transaction so a partial diarization result never leaves a
+   * half-written segment set behind. */
+  insertMeetingDiarizationSegments(
+    rows: Array<{
+      id: string;
+      session_id: string;
+      start_ms: number;
+      end_ms: number;
+      speaker: string;
+      speaker_guess: string | null;
+      text: string;
+    }>,
+  ): number {
+    if (rows.length === 0) return 0;
+    const insert = this.db.prepare(
+      `INSERT INTO meeting_diarization
+         (id, session_id, start_ms, end_ms, speaker, speaker_guess, text)
+       VALUES (@id, @session_id, @start_ms, @end_ms, @speaker, @speaker_guess, @text)`,
+    );
+    const tx = this.db.transaction((items: typeof rows) => {
+      for (const item of items) insert.run(item);
+    });
+    tx(rows);
+    return rows.length;
+  }
+
+  listMeetingDiarization(sessionId: string): MeetingDiarizationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM meeting_diarization WHERE session_id = ? ORDER BY start_ms ASC`,
+      )
+      .all(sessionId) as MeetingDiarizationRow[];
   }
 
   /* Wave 2 day 3 backfill_review_queue helpers. Insert is the band
@@ -2523,6 +2586,35 @@ export class IndexDb {
     return this.db
       .prepare(`SELECT * FROM wiki_pages_meta WHERE id = ?`)
       .get(id) as WikiPageRow | undefined;
+  }
+
+  /* All wiki_pages_meta rows regardless of status. Used by the wiki
+   * index/disk reconciler (src/wiki/reconcile-index.ts) to diff the
+   * SQL meta table against pages actually present on disk; the
+   * existing status-scoped queries (topPagesByWeight) can't see rows
+   * whose status has drifted, which is exactly the failure mode the
+   * reconciler exists to catch. */
+  allWikiPages(): WikiPageRow[] {
+    return this.db.prepare(`SELECT * FROM wiki_pages_meta`).all() as WikiPageRow[];
+  }
+
+  /* Remove a wiki_pages_meta row plus its FTS row and any cross_refs
+   * edges. Used by the reconciler for two cases: (1) a meta row whose
+   * backing file no longer exists anywhere on disk (pages/pending/
+   * archive) -- there is no "archived but fileless" state in this
+   * schema, archived pages still live in wiki/archive/, so an orphan
+   * row has nothing to move to and is deleted outright; (2) a
+   * quarantined test-fixture page, where the row is removed as part
+   * of pulling the file out of the live wiki entirely. */
+  deleteWikiPage(id: string): void {
+    const txn = this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM wiki_pages_meta WHERE id = ?`).run(id);
+      this.db.prepare(`DELETE FROM wiki_fts WHERE page_id = ?`).run(id);
+      this.db
+        .prepare(`DELETE FROM cross_refs WHERE from_page = ? OR to_page = ?`)
+        .run(id, id);
+    });
+    txn();
   }
 
   setCrossRefs(fromPage: string, toPages: string[]): void {
