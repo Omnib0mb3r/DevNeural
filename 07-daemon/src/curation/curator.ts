@@ -51,6 +51,10 @@ const COSINE_FLOOR_RAW = Number(
 const TOKEN_BUDGET = Number(process.env.DEVNEURAL_INJECT_TOKEN_BUDGET ?? 600);
 const DIVERSITY_THRESHOLD = 0.85;
 const ALWAYS_USE_LLM = process.env.DEVNEURAL_CURATOR_LLM === '1';
+/* R3: pre-injection vet gate. Default OFF — byte-identical behavior to
+ * today when unset. See vetCandidate() for the timeout/fallback contract. */
+const CURATOR_VET_ENABLED = process.env.DEVNEURAL_CURATOR_VET === '1';
+const VET_TIMEOUT_MS = Number(process.env.DEVNEURAL_CURATOR_VET_TIMEOUT_MS ?? 800);
 
 const sessionBlacklist = new Map<string, Set<string>>();
 
@@ -131,10 +135,11 @@ function computeConfidence(score: number, threshold: number): number {
 function logCuratorDecision(
   store: Store,
   row: {
+    id: string;
     prompt_id: string;
     session_id: string;
     project_slug: string;
-    decision: 'inject' | 'silence';
+    decision: 'inject' | 'silence' | 'vetoed';
     page_slug: string | null;
     score: number | null;
     threshold: number;
@@ -144,10 +149,7 @@ function logCuratorDecision(
   log: (msg: string) => void,
 ): void {
   try {
-    store.db.insertCuratorLog({
-      id: randomUUID(),
-      ...row,
-    });
+    store.db.insertCuratorLog(row);
   } catch (err) {
     log(`[curator] insertCuratorLog failed: ${(err as Error).message}`);
   }
@@ -177,10 +179,15 @@ export async function curate(
   log: (msg: string) => void = () => undefined,
 ): Promise<CurationOutput> {
   const promptId = randomUUID();
+  /* One curator_log row is written per curate() call; generate its id
+   * up front so every decision branch (silence / inject / vetoed) and
+   * the reinforcement Pending record (R2) can reference the same row. */
+  const curatorLogId = randomUUID();
   if (!shouldInject(input.prompt)) {
     logCuratorDecision(
       store,
       {
+        id: curatorLogId,
         prompt_id: promptId,
         session_id: input.sessionId,
         project_slug: input.projectId,
@@ -262,6 +269,7 @@ export async function curate(
     logCuratorDecision(
       store,
       {
+        id: curatorLogId,
         prompt_id: promptId,
         session_id: input.sessionId,
         project_slug: input.projectId,
@@ -324,33 +332,11 @@ export async function curate(
 
   injection = capByBudget(injection, TOKEN_BUDGET);
 
-  // Record the injection for reinforcement: we want to know after the
-  // assistant replies whether the page actually got used. bestWiki uses
-  // the canonical wiki path; bestRaw seeds a raw-pending so a follow-up
-  // hit can promote the chunk into a wiki distillation pass.
-  if (bestWiki) {
-    const pagePath = path.posix.join(
-      bestWiki.metadata.status === 'canonical' ? wikiPagesDir() : wikiPendingDir(),
-      `${bestWiki.id}.md`,
-    );
-    const summary = `${bestWiki.metadata.title}\n\n${bestWiki.metadata.trigger} → ${bestWiki.metadata.insight}`;
-    recordInjection(input.sessionId, bestWiki.id, pagePath, summary);
-  } else if (bestRaw) {
-    const meta = bestRaw.metadata;
-    const text = typeof meta.text_preview === 'string' ? meta.text_preview : '';
-    const projectId =
-      typeof meta.project_id === 'string' && meta.project_id
-        ? meta.project_id
-        : input.projectId;
-    if (text.length >= 40) {
-      recordRawInjection(input.sessionId, bestRaw.id, text, projectId);
-    }
-  }
-
-  /* CI-1 + CI-5: log the inject decision with confidence and the
-   * resolved source_class. The confidence formula is the simple
-   * (score - threshold) / (1 - threshold) heuristic; refinement to a
-   * calibrated logistic regression is Wave 3 work per Appendix H. */
+  /* CI-1 + CI-5: resolved source_class + confidence for whichever
+   * candidate won. Computed before the vet gate so both the 'vetoed'
+   * and 'inject' log rows can reuse it. The confidence formula is the
+   * simple (score - threshold) / (1 - threshold) heuristic; refinement
+   * to a calibrated logistic regression is Wave 3 work per Appendix H. */
   const winner = bestWiki
     ? {
         page_slug: bestWiki.id,
@@ -373,9 +359,81 @@ export async function curate(
         };
   const confidence =
     winner.score !== null ? computeConfidence(winner.score, winner.threshold) : null;
+
+  /* R3: pre-injection vet gate. Default OFF (byte-identical behavior
+   * when off — this whole block is skipped). When on, ask the same
+   * provider/plumbing llmPolish uses whether this candidate actually
+   * helps THIS prompt, under a hard timeout. Timeout or any error
+   * falls back to today's behavior (inject): the hook must never
+   * block on a slow or unavailable judge. */
+  if (CURATOR_VET_ENABLED && provider && provider.isConfigured() && injection.length > 0) {
+    const verdict = await vetCandidate(provider, input.prompt, injection, log);
+    if (verdict.outcome === 'timeout') {
+      log('[curator] vet: timed out, falling back to inject');
+    } else if (verdict.outcome === 'error') {
+      log(`[curator] vet: ${verdict.detail}, falling back to inject`);
+    } else if (verdict.outcome === 'veto') {
+      log(`[curator] vet: vetoed (${verdict.reason})`);
+      logCuratorDecision(
+        store,
+        {
+          id: curatorLogId,
+          prompt_id: promptId,
+          session_id: input.sessionId,
+          project_slug: input.projectId,
+          decision: 'vetoed',
+          page_slug: winner.page_slug,
+          score: winner.score,
+          threshold: winner.threshold,
+          confidence,
+          source_class: winner.source_class,
+        },
+        log,
+      );
+      return {
+        ...SKIPPED,
+        prompt_id: promptId,
+        components: { ...SKIPPED.components, skipped_reason: 'vetoed' },
+      };
+    }
+  }
+
+  // Record the injection for reinforcement: we want to know after the
+  // assistant replies whether the page actually got used. bestWiki uses
+  // the canonical wiki path; bestRaw seeds a raw-pending so a follow-up
+  // hit can promote the chunk into a wiki distillation pass. curatorLogId
+  // + promptId (R2) let the reinforcement HIT/correction evaluators write
+  // curator_signal rows that correlate back to this decision.
+  if (bestWiki) {
+    const pagePath = path.posix.join(
+      bestWiki.metadata.status === 'canonical' ? wikiPagesDir() : wikiPendingDir(),
+      `${bestWiki.id}.md`,
+    );
+    const summary = `${bestWiki.metadata.title}\n\n${bestWiki.metadata.trigger} → ${bestWiki.metadata.insight}`;
+    recordInjection(input.sessionId, bestWiki.id, pagePath, summary, curatorLogId, promptId);
+  } else if (bestRaw) {
+    const meta = bestRaw.metadata;
+    const text = typeof meta.text_preview === 'string' ? meta.text_preview : '';
+    const projectId =
+      typeof meta.project_id === 'string' && meta.project_id
+        ? meta.project_id
+        : input.projectId;
+    if (text.length >= 40) {
+      recordRawInjection(
+        input.sessionId,
+        bestRaw.id,
+        text,
+        projectId,
+        curatorLogId,
+        promptId,
+      );
+    }
+  }
+
   logCuratorDecision(
     store,
     {
+      id: curatorLogId,
       prompt_id: promptId,
       session_id: input.sessionId,
       project_slug: input.projectId,
@@ -570,6 +628,107 @@ Polish or return verbatim.`;
     log,
   );
   return result.value?.injection ?? null;
+}
+
+/* R3: pre-injection vet gate.
+ *
+ * Reuses the same provider plumbing as llmPolish (pickProvider /
+ * callValidated) but asks a strict yes/no question instead of a rewrite:
+ * "does this candidate actually help THIS prompt?" A hard timeout races
+ * the provider call so a slow or hung judge can never block the hook —
+ * on timeout or any error the caller falls back to today's behavior
+ * (inject). Only an explicit, validated 'veto' response suppresses the
+ * injection. */
+interface VetShape {
+  decision: 'inject' | 'veto';
+  reason: string;
+}
+
+const validateVet: Validator<VetShape> = (raw) => {
+  if (!raw || typeof raw !== 'object')
+    return { ok: false, errors: ['response not object'] };
+  const obj = raw as Record<string, unknown>;
+  const decision = obj.decision;
+  if (decision !== 'inject' && decision !== 'veto') {
+    return { ok: false, errors: ['decision must be "inject" or "veto"'] };
+  }
+  const reason = typeof obj.reason === 'string' ? obj.reason : '';
+  return { ok: true, value: { decision, reason }, errors: [] };
+};
+
+export type VetOutcome =
+  | { outcome: 'inject' }
+  | { outcome: 'veto'; reason: string }
+  | { outcome: 'timeout' }
+  | { outcome: 'error'; detail: string };
+
+export async function vetCandidate(
+  provider: LlmProvider,
+  prompt: string,
+  candidate: string,
+  log: (msg: string) => void,
+): Promise<VetOutcome> {
+  const system = `You are a strict gatekeeper for a developer assistant's context injector.
+
+Given the user's next prompt and a candidate context blob about to be injected ahead of it, decide whether the candidate actually helps answer THIS prompt.
+
+Output strictly this JSON shape:
+{ "decision": "inject" | "veto", "reason": "one short sentence" }
+
+Hard rules:
+- "veto" means the candidate is irrelevant, stale, or would mislead the assistant for this specific prompt.
+- "inject" means the candidate is plausibly useful context for this prompt.
+- When genuinely uncertain, prefer "inject" — a missed injection costs more than a slightly-off one.
+- reason is exactly one short sentence.`;
+
+  const user = `User's next prompt:
+${prompt.slice(0, 600)}
+
+Candidate injection:
+${candidate.slice(0, 4000)}
+
+Answer inject or veto.`;
+
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<VetOutcome>((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve({ outcome: 'timeout' });
+    }, VET_TIMEOUT_MS);
+  });
+
+  const call = (async (): Promise<VetOutcome> => {
+    try {
+      const result = await callValidated(
+        provider,
+        {
+          role: 'self_query',
+          systemBlocks: [{ text: system, cache: true }],
+          user,
+          maxTokens: 120,
+          signal: controller.signal,
+        },
+        validateVet,
+        log,
+      );
+      if (!result.value) {
+        return { outcome: 'error', detail: result.errors.join('; ') || 'no value' };
+      }
+      if (result.value.decision === 'veto') {
+        return { outcome: 'veto', reason: result.value.reason || 'unspecified' };
+      }
+      return { outcome: 'inject' };
+    } catch (err) {
+      return { outcome: 'error', detail: (err as Error).message };
+    }
+  })();
+
+  try {
+    return await Promise.race([call, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function capByBudget(text: string, tokenBudget: number): string {

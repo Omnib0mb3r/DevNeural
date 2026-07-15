@@ -12,7 +12,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,16 +23,57 @@ const HOOK_RUNNER_DIST = path
   .resolve(__dirname, '..', '..', '..', 'dist', 'capture', 'hooks', 'hook-runner.js')
   .replace(/\\/g, '/');
 
+const SEVEN_DAEMON_ROOT = path.resolve(__dirname, '..', '..', '..');
+
 /**
- * On Windows, spawning `node` directly from Claude Code's hook runner causes
- * a console window to flash on the active desktop for every hook firing
- * (multiple times per prompt). Wrapping the node call in a VBScript shim
- * launched via wscript.exe with WindowStyle 0 produces zero visible flash.
- * The shim is generated at install time and lives next to hook-runner.js.
+ * R1 fix: hooks must run silently (no console flash) AND still receive
+ * Claude Code's JSON payload on stdin.
+ *
+ * The original silencing attempt wrapped every phase in wscript.exe +
+ * a generated VBScript shim (WshShell.Run). That hides the window, but
+ * WshShell.Run does NOT pipe stdin to the child process, so every hook
+ * phase wrapped this way received an empty payload: user_prompt
+ * observations landed with prompt='' and session='unknown', tool
+ * payloads landed empty. Only SessionStart's live entry was hand-patched
+ * around this (via scripts/silence-all-hooks.ps1) to route through
+ * silent-shim.exe instead, which is a native console app
+ * (scripts/silent-shim/Program.cs) that hides its window via
+ * CreateNoWindow=true *and* pumps stdin/stdout/stderr through
+ * (RedirectStandardInput/Output/Error=true). That is the only wrapper
+ * that is both silent and payload-preserving. Every phase must route
+ * through it, not just SessionStart.
+ *
+ * silent-shim.exe is a compiled .NET artifact (dotnet publish), not a
+ * TypeScript build output, so it is not produced by `npm run build`
+ * and its bin/ directory is gitignored. We resolve it the same way
+ * scripts/silence-all-hooks.ps1 / repair-double-wrapped-hooks.ps1 do:
+ * an optional env override, then the framework-dependent publish
+ * output, then the self-contained win-x64 publish output.
  */
-const SILENT_SHIM = path
-  .resolve(__dirname, '..', '..', '..', 'dist', 'capture', 'hooks', 'silent-runner.vbs')
-  .replace(/\\/g, '/');
+function silentShimCandidates(): string[] {
+  const candidates = [
+    process.env.DEVNEURAL_SILENT_SHIM,
+    path.resolve(SEVEN_DAEMON_ROOT, 'scripts', 'silent-shim', 'bin', 'silent-shim.exe'),
+    path.resolve(
+      SEVEN_DAEMON_ROOT,
+      'scripts',
+      'silent-shim',
+      'bin',
+      'Release',
+      'net8.0',
+      'win-x64',
+      'silent-shim.exe',
+    ),
+  ];
+  return candidates.filter((p): p is string => Boolean(p));
+}
+
+function resolveSilentShim(): string | null {
+  for (const candidate of silentShimCandidates()) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
 
 interface HookCommandEntry {
   type: 'command';
@@ -51,7 +92,7 @@ interface SettingsFile {
   [key: string]: unknown;
 }
 
-const HOOK_PHASES: Array<{ event: string; phase: string; matcher?: string }> = [
+export const HOOK_PHASES: Array<{ event: string; phase: string; matcher?: string }> = [
   { event: 'PreToolUse', phase: 'pre' },
   { event: 'PostToolUse', phase: 'post' },
   { event: 'UserPromptSubmit', phase: 'prompt' },
@@ -69,36 +110,32 @@ const HOOK_PHASES: Array<{ event: string; phase: string; matcher?: string }> = [
   { event: 'SessionStart', phase: 'session_start' },
 ];
 
-function buildCommand(phase: string): string {
-  // wscript runs VBScripts with no console window. Path uses backslashes
-  // because wscript.exe's command-line parser is fussy about forward slashes
-  // even though node accepts them.
-  const shim = SILENT_SHIM.replace(/\//g, '\\');
-  return `wscript.exe "${shim}" ${phase}`;
-}
-
-function ensureSilentShim(): void {
-  const shimDir = path.dirname(SILENT_SHIM);
-  fs.mkdirSync(shimDir, { recursive: true });
-  // The shim takes the phase as argument and runs hook-runner.js with it.
-  // WshShell.Run window-style 0 = hidden, third arg false = don't wait.
-  // On error we fall back to running visibly so failures aren't completely silent.
-  const runnerWin = HOOK_RUNNER_DIST.replace(/\//g, '\\');
-  const vbs = [
-    'Option Explicit',
-    'Dim sh, phase, cmd',
-    'Set sh = CreateObject("WScript.Shell")',
-    'If WScript.Arguments.Count > 0 Then',
-    '  phase = WScript.Arguments(0)',
-    'Else',
-    '  phase = ""',
-    'End If',
-    `cmd = "node """ & "${runnerWin.replace(/\\/g, '\\\\')}" & """ " & phase`,
-    'sh.Run cmd, 0, False',
-    'Set sh = Nothing',
-    '',
-  ].join('\r\n');
-  fs.writeFileSync(SILENT_SHIM, vbs, 'utf-8');
+/**
+ * Build the hook command for one phase, wrapped in silent-shim.exe exactly
+ * the way the (previously hand-patched) working SessionStart entry is:
+ *   "<shim>" "node \"<hook-runner-dist>\" <phase>"
+ *
+ * The inner command is a single quoted argument (silent-shim.exe splits on
+ * the first whitespace to find its own exe, then forwards the remainder
+ * verbatim as ProcessStartInfo.Arguments — see Program.cs). Embedded
+ * double-quotes are backslash-escaped rather than cmd-style doubled ("")
+ * because Claude Code on Windows invokes hook commands through Git Bash,
+ * which treats `""` inside a `"..."` string as empty-string concatenation
+ * and collapses the whole inner command into a single mis-split argv[0].
+ * Backslash `\"` is honored by both bash and CommandLineToArgvW, so it
+ * survives either invocation path (see scripts/reescape-hook-args.ps1,
+ * which fixed the same bug for the manually-patched entries).
+ *
+ * shimPath is passed in rather than read from a module constant so this
+ * function stays a pure string formatter, independently testable without
+ * depending on whether silent-shim.exe has been built on the machine
+ * running the tests.
+ */
+export function buildCommand(phase: string, shimPath: string): string {
+  const shim = shimPath.replace(/\//g, '\\');
+  const inner = `node "${HOOK_RUNNER_DIST}" ${phase}`;
+  const escapedInner = inner.replace(/"/g, '\\"');
+  return `"${shim}" "${escapedInner}"`;
 }
 
 const V1_PATHS = [
@@ -115,6 +152,13 @@ function isV1Entry(entry: HookCommandEntry): boolean {
   return false;
 }
 
+/* Matches both the current silent-shim.exe-wrapped shape and the old
+ * broken wscript+VBS shape (R1). The hook-runner.js path substring
+ * survives inside the shim wrapper untouched (only its surrounding
+ * quotes get backslash-escaped — see buildCommand), so the same
+ * `.includes()` check recognizes both; the silent-runner.vbs checks
+ * stay so re-running install-hooks replaces old broken entries instead
+ * of leaving them alongside the fixed one. */
 function isV2Entry(entry: HookCommandEntry): boolean {
   if (!entry || entry.type !== 'command') return false;
   if (typeof entry.command !== 'string') return false;
@@ -126,7 +170,7 @@ function isV2Entry(entry: HookCommandEntry): boolean {
   );
 }
 
-function isDevNeuralEntry(entry: HookCommandEntry): boolean {
+export function isDevNeuralEntry(entry: HookCommandEntry): boolean {
   return isV1Entry(entry) || isV2Entry(entry);
 }
 
@@ -225,7 +269,19 @@ function main(): void {
     process.exit(1);
   }
 
-  ensureSilentShim();
+  const shimPath = resolveSilentShim();
+  if (!shimPath) {
+    console.error(
+      `[install-hooks] silent-shim.exe not built. It is a .NET binary, not a\n` +
+        `TypeScript build output, so \`npm run build\` does not produce it. Build it with:\n` +
+        `  cd 07-daemon/scripts/silent-shim && dotnet publish -c Release -r win-x64\n` +
+        `expected one of:\n` +
+        silentShimCandidates()
+          .map((c) => `  ${c}`)
+          .join('\n'),
+    );
+    process.exit(1);
+  }
 
   const settings = loadSettings();
   const hooks = ensureHooksObject(settings);
@@ -236,13 +292,23 @@ function main(): void {
   }
 
   for (const { event, phase, matcher } of HOOK_PHASES) {
-    const command = buildCommand(phase);
+    const command = buildCommand(phase, shimPath);
     addHook(hooks, event, command, matcher ?? (event.endsWith('ToolUse') ? '*' : undefined));
   }
 
   saveSettings(settings);
   console.log(`[install-hooks] wrote ${SETTINGS_PATH}`);
   console.log(`[install-hooks] hook runner: ${HOOK_RUNNER_DIST}`);
+  console.log(`[install-hooks] silent shim: ${shimPath}`);
 }
 
-main();
+/* Guard the CLI entrypoint so the module is import-safe for tests. When
+ * run as `node install-hooks.js`, import.meta.url matches the resolved
+ * argv[1] file URL and main() fires; when imported by a test file the
+ * guard is false and only the exported functions become available.
+ * Without this guard, importing this module for its buildCommand /
+ * isDevNeuralEntry exports would fire main() inside the test worker and
+ * overwrite the real ~/.claude/settings.json. */
+if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+  main();
+}

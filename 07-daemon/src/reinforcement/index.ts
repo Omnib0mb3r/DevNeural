@@ -24,6 +24,7 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { embedOne } from '../embedder/index.js';
 import type { Store } from '../store/index.js';
 import {
@@ -94,6 +95,12 @@ interface Pending {
   // raw-only:
   projectId?: string;
   rawText?: string;
+  /* R2: curator_log correlation. Set by curator.ts's curate() when it
+   * records the injection; carried through so the HIT/correction
+   * evaluators below can write curator_signal rows that join back to
+   * the originating curator_log decision. */
+  curatorLogId?: string;
+  promptId?: string;
 }
 
 const pending = new Map<string, Pending>();
@@ -211,6 +218,8 @@ export function recordInjection(
   pageId: string,
   pagePath: string,
   summary: string,
+  curatorLogId: string,
+  promptId: string,
 ): void {
   pending.set(sessionId, {
     sessionId,
@@ -219,6 +228,8 @@ export function recordInjection(
     pagePath,
     injectedAt: Date.now(),
     summary,
+    curatorLogId,
+    promptId,
   });
   // Also write a visible "injection" event so the dashboard can surface
   // what the curator decided to send. Without this, the only way to
@@ -237,6 +248,8 @@ export function recordRawInjection(
   chunkId: string,
   rawText: string,
   projectId: string,
+  curatorLogId: string,
+  promptId: string,
 ): void {
   pending.set(sessionId, {
     sessionId,
@@ -247,6 +260,8 @@ export function recordRawInjection(
     summary: rawText,
     projectId,
     rawText,
+    curatorLogId,
+    promptId,
   });
   appendReinforcementLog({
     kind: 'injection',
@@ -410,6 +425,43 @@ export async function reindexPage(store: Store, page: PageOnDisk): Promise<void>
   });
 }
 
+/* R2: write a curator_signal row correlating back to the curator_log
+ * decision that produced this injection (see curator.ts's curate(),
+ * which threads curatorLogId/promptId through recordInjection and
+ * recordRawInjection). This is what feeds /stats/curator-health's
+ * hit_total and correction_total; insertCuratorSignal previously had
+ * zero production callers. 'regex-inferred' is used for both signal
+ * kinds: corrections are literally regex-matched (CORRECTION_PATTERNS)
+ * and hits are the closest available automatic-inference bucket in the
+ * 3-value source enum (the other two, 'user-explicit' and
+ * 'dashboard-click', are for the dashboard's manual "this was wrong" /
+ * click-through paths, not this cosine-similarity auto-detection).
+ * Older Pending records lack curatorLogId/promptId only if some future
+ * caller bypasses curator.ts's curate(); skip rather than insert a row
+ * with a dangling FK. Failures are logged, never thrown — telemetry
+ * must not break the reinforcement loop. */
+function writeCuratorSignal(
+  store: Store,
+  p: Pending,
+  signal: 'hit' | 'correction',
+  weight: number,
+  log: (msg: string) => void,
+): void {
+  if (!p.curatorLogId || !p.promptId) return;
+  try {
+    store.db.insertCuratorSignal({
+      id: randomUUID(),
+      curator_log_id: p.curatorLogId,
+      prompt_id: p.promptId,
+      signal,
+      source: 'regex-inferred',
+      weight,
+    });
+  } catch (err) {
+    log(`[reinforce] insertCuratorSignal failed: ${(err as Error).message}`);
+  }
+}
+
 export async function evaluateAssistantReply(
   store: Store,
   sessionId: string,
@@ -456,6 +508,7 @@ export async function evaluateAssistantReply(
       project: p.projectId,
       cosine,
     });
+    writeCuratorSignal(store, p, 'hit', cosine, log);
     log(`[reinforce] raw-hit on chunk ${p.pageId} (cosine ${cosine.toFixed(2)}); scheduling wiki ingest`);
     pending.delete(sessionId);
     void scheduleRawHitIngest(store, p, log);
@@ -481,6 +534,7 @@ export async function evaluateAssistantReply(
       page: p.pageId,
       cosine,
     });
+    writeCuratorSignal(store, p, 'hit', cosine, log);
     appendLog(`reinforce: promoted ${p.pageId} to canonical (hit cosine ${cosine.toFixed(2)})`);
     void reindexPage(store, {
       ...page,
@@ -495,6 +549,7 @@ export async function evaluateAssistantReply(
       cosine,
       weight: fm.weight,
     });
+    writeCuratorSignal(store, p, 'hit', cosine, log);
     void reindexPage(store, { ...page, frontmatter: fm });
   }
   // Hit consumed: drop pending so the same injection can't be
@@ -572,6 +627,7 @@ export function evaluateCorrection(
       chunk: p.pageId,
       project: p.projectId,
     });
+    writeCuratorSignal(store, p, 'correction', 1.0, log);
     pending.delete(sessionId);
     return;
   }
@@ -591,6 +647,7 @@ export function evaluateCorrection(
     page: p.pageId,
     weight: fm.weight,
   });
+  writeCuratorSignal(store, p, 'correction', 1.0, log);
   log(`[reinforce] correction on ${p.pageId}: weight=${fm.weight.toFixed(2)}`);
   appendLog(`reinforce: correction on ${p.pageId} (weight ${fm.weight.toFixed(2)})`);
 
@@ -653,6 +710,15 @@ export function isPauseModeActive(): boolean {
   }
 }
 
+/* R4: decay auto-pause visibility. isPauseModeActive's logic is
+ * untouched — it already self-heals once injections write
+ * reinforcement.log.jsonl again. This only remembers whether the
+ * *previous* decay run was paused, so the first run after a resume can
+ * log one line; without it, recovery from auto-pause is invisible
+ * (decay just silently starts running again with nothing in the
+ * daemon log to show it happened). */
+let lastDecayWasPaused = false;
+
 export async function decayInactivePages(
   store: Store,
   log: (msg: string) => void = () => undefined,
@@ -661,10 +727,16 @@ export async function decayInactivePages(
    * lookup uses the live IndexDb without depending on a separate
    * boot-time setPauseModeStore() (which would skew tests). */
   setPauseModeStore(store);
-  if (isPauseModeActive()) {
+  const paused = isPauseModeActive();
+  if (paused) {
     log('[reinforce] pause mode active; decay skipped');
+    lastDecayWasPaused = true;
     return { decayed: 0, archived: 0 };
   }
+  if (lastDecayWasPaused) {
+    log('[reinforce] pause mode auto-cleared; decay resuming');
+  }
+  lastDecayWasPaused = false;
   let decayed = 0;
   let archived = 0;
   const dirs = [wikiPagesDir(), wikiPendingDir()];
