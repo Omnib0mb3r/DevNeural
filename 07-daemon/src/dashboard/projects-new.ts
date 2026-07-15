@@ -27,14 +27,20 @@ const WORKSPACE_INJECT_DIR = path.posix.join(
   '.workspace-inject',
 );
 
-export function queueProjectBootstrap(workspace: string, command: string): void {
-  fs.mkdirSync(WORKSPACE_INJECT_DIR, { recursive: true });
-  /* Slug is the sanitized workspace path PLUS a short hash so two
-   * projects with paths that collide after sanitization (e.g. one
-   * truncated past 80 chars, or differing only on punctuation that
-   * we strip) still get distinct marker filenames. Without the hash,
-   * a second start-claude press could overwrite a first that hadn't
-   * been claimed yet. */
+/* Slug is the sanitized workspace path PLUS a short hash so two
+ * projects with paths that collide after sanitization (e.g. one
+ * truncated past 80 chars, or differing only on punctuation that we
+ * strip) still get distinct marker filenames. Without the hash, a
+ * second start-claude press could overwrite a first that hadn't been
+ * claimed yet.
+ *
+ * Exported (not just inlined into queueProjectBootstrap) so
+ * pollInjectResult below can derive the SAME result-file path the
+ * bridge writes to (09-bridge/src/extension.ts derives its result
+ * filename by string surgery on the claimed marker's own path, not by
+ * recomputing this slug, so the two sides stay in lockstep as long as
+ * this is the one place the slug is computed on the daemon side). */
+export function injectSlug(workspace: string): string {
   const normalized = workspace.replace(/\\/g, '/');
   const sanitized = normalized
     .replace(/[^a-z0-9]+/gi, '_')
@@ -45,7 +51,21 @@ export function queueProjectBootstrap(workspace: string, command: string): void 
     .update(normalized.toLowerCase())
     .digest('hex')
     .slice(0, 8);
-  const slug = `${sanitized}_${hash}`;
+  return `${sanitized}_${hash}`;
+}
+
+/* WP-H (spawn delivery feedback): path of the result file the bridge
+ * writes after it (attempts to) run the workspace-inject command,
+ * e.g. .workspace-inject/<slug>.result.json next to the marker's own
+ * .workspace-inject/<slug>.json. */
+export function injectResultFile(workspace: string): string {
+  return path.posix.join(WORKSPACE_INJECT_DIR, `${injectSlug(workspace)}.result.json`);
+}
+
+export function queueProjectBootstrap(workspace: string, command: string): void {
+  fs.mkdirSync(WORKSPACE_INJECT_DIR, { recursive: true });
+  const normalized = workspace.replace(/\\/g, '/');
+  const slug = injectSlug(workspace);
   /* Write to .tmp first then rename onto the polled .json filename so
    * the bridge never reads a partial file. The bridge unlinks
    * malformed JSON, which would otherwise drop a request that
@@ -66,6 +86,82 @@ export function queueProjectBootstrap(workspace: string, command: string): void 
     'utf-8',
   );
   fs.renameSync(tmpFile, finalFile);
+}
+
+/* WP-H: delivery confirmation for the workspace-inject flow.
+ *
+ * The bridge (09-bridge/src/extension.ts runWorkspaceInject) writes
+ * .workspace-inject/<slug>.result.json = {ok, error?, at, workspace}
+ * once it has claimed the marker and either run the command or hit an
+ * error. This polls for that file so a route can tell the dashboard
+ * whether the terminal inject actually happened instead of returning
+ * an unconditional ok:true the moment the marker was queued.
+ *
+ * Callers: /projects/:id/start-claude in routes.ts. projects-routes.ts
+ * (openProjectAnchor) also calls queueProjectBootstrap via the same
+ * bootstrapQueue shape but is owned by a different work package; it
+ * does not yet wire this poller in (see HANDOVER note). */
+export interface InjectDeliveryResult {
+  delivery: 'confirmed' | 'failed' | 'unconfirmed';
+  error?: string;
+}
+
+export interface PollInjectResultOptions {
+  /** Total time to keep polling before giving up. Default 12s. */
+  timeoutMs?: number;
+  /** Delay between polls. Default 250ms. */
+  intervalMs?: number;
+  /** Clock injection for tests. */
+  now?: () => number;
+  /** Sleep injection for tests (avoids real 12s waits in the suite). */
+  sleep?: (ms: number) => Promise<void>;
+  /** Result-file reader injection for tests. Returns null when the
+   * file does not exist (or is unreadable), matching fs.readFileSync
+   * ENOENT semantics without forcing tests to touch real disk. */
+  readResultFile?: (file: string) => string | null;
+}
+
+function defaultReadResultFile(file: string): string | null {
+  try {
+    return fs.readFileSync(file, 'utf-8');
+  } catch {
+    return null;
+  }
+}
+
+export async function pollInjectResult(
+  workspace: string,
+  opts: PollInjectResultOptions = {},
+): Promise<InjectDeliveryResult> {
+  const timeoutMs = opts.timeoutMs ?? 12_000;
+  const intervalMs = opts.intervalMs ?? 250;
+  const now = opts.now ?? Date.now;
+  const sleep =
+    opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const readResultFile = opts.readResultFile ?? defaultReadResultFile;
+  const resultFile = injectResultFile(workspace);
+  const deadline = now() + timeoutMs;
+
+  for (;;) {
+    const raw = readResultFile(resultFile);
+    if (raw !== null) {
+      try {
+        const parsed = JSON.parse(raw) as { ok?: boolean; error?: string };
+        if (parsed.ok === true) return { delivery: 'confirmed' };
+        return {
+          delivery: 'failed',
+          error: parsed.error ?? 'bridge reported failure with no error detail',
+        };
+      } catch {
+        /* Result file mid-write (bridge writes tmp-then-rename, so
+         * this should be rare, but a torn read is possible on a slow
+         * disk). Treat as not-yet-ready and keep polling rather than
+         * failing the whole delivery check on a parse race. */
+      }
+    }
+    if (now() >= deadline) return { delivery: 'unconfirmed' };
+    await sleep(intervalMs);
+  }
 }
 
 const TEMPLATE_REPO =

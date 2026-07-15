@@ -27,6 +27,12 @@ import { writePresenceFiles, presenceFilename, legacyPresenceFilename } from './
 import { cwdToSlug } from './slug.js';
 import { CcSessionLatch } from './cc-session-latch.js';
 import { buildBridgePayload } from './bridge-payload.js';
+import {
+  resultFileForClaim,
+  buildWorkspaceInjectResultPayload,
+  isResultFile,
+  isStaleResultFile,
+} from './workspace-inject-result.js';
 
 const channel = vscode.window.createOutputChannel('DevNeural Bridge');
 
@@ -965,6 +971,49 @@ function getWorkspaceInjectDir(): string {
   return path.posix.join(getBridgeDir(), '.workspace-inject');
 }
 
+/* WP-H: delivery-result files share the marker directory and the
+ * marker TTL. No separate cleanup timer -- this runs from the same
+ * tick as the marker sweep below. */
+function cleanupStaleResultFiles(dir: string, entries: fs.Dirent[]): void {
+  const now = Date.now();
+  for (const e of entries) {
+    if (!e.isFile() || !isResultFile(e.name)) continue;
+    const file = path.posix.join(dir, e.name);
+    try {
+      const stat = fs.statSync(file);
+      if (isStaleResultFile(stat.mtimeMs, now, WORKSPACE_INJECT_TTL_MS)) {
+        fs.unlinkSync(file);
+      }
+    } catch {
+      /* ignore -- another window's tick may have already removed it */
+    }
+  }
+}
+
+/* WP-H: write the delivery-result file the daemon's pollInjectResult
+ * (07-daemon src/dashboard/projects-new.ts) polls for. Best-effort:
+ * a failure to write the result file must never throw out of
+ * runWorkspaceInject -- the inject itself already happened (or
+ * failed) and the claim file cleanup in the caller's `finally` still
+ * has to run either way. */
+function writeWorkspaceInjectResult(
+  claimFile: string,
+  workspace: string,
+  result: { ok: boolean; error?: string },
+): void {
+  const file = resultFileForClaim(claimFile);
+  const payload = buildWorkspaceInjectResultPayload(workspace, result);
+  try {
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf-8');
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    channel.appendLine(
+      `[workspace-inject] failed to write result file ${file}: ${(err as Error).message}`,
+    );
+  }
+}
+
 interface WorkspaceInjectMarker {
   workspace: string;
   command: string;
@@ -980,12 +1029,23 @@ function processWorkspaceInjects(): void {
   } catch {
     return;
   }
+  /* WP-H: sweep stale delivery-result files on the same tick that
+   * sweeps stale markers, instead of running a second timer. Any
+   * window's tick can safely do this — result files are inert
+   * bookkeeping, not workspace-owned pending work, so there's no
+   * "owns this workspace" gate like the marker loop below. */
+  cleanupStaleResultFiles(dir, entries);
+
   const folders = vscode.workspace.workspaceFolders ?? [];
   if (folders.length === 0) return;
   const myWorkspaces = folders.map((f) => normalizePath(f.uri.fsPath));
 
   for (const e of entries) {
-    if (!e.isFile() || !e.name.endsWith('.json')) continue;
+    /* '.result.json' entries also end in '.json' but are delivery
+     * results, not markers awaiting a command — exclude them or
+     * they'd get parsed as a WorkspaceInjectMarker (undefined
+     * .command / .queued_at) and claimed/run as bogus work. */
+    if (!e.isFile() || !e.name.endsWith('.json') || isResultFile(e.name)) continue;
     const file = path.posix.join(dir, e.name);
     let marker: WorkspaceInjectMarker;
     try {
@@ -1042,9 +1102,9 @@ async function runWorkspaceInject(
   marker: WorkspaceInjectMarker,
   claimFile: string,
 ): Promise<void> {
+  const wsNormalized = normalizePath(marker.workspace.replace(/\\/g, '/'));
   try {
     const wsPath = marker.workspace.replace(/\\/g, '/');
-    const wsNormalized = normalizePath(wsPath);
     /* Always create a fresh terminal at the workspace cwd. We used to
      * try to reuse the active terminal as an optimization, but that
      * was unsafe: VS Code's activeTerminal can point at any shell the
@@ -1068,10 +1128,16 @@ async function runWorkspaceInject(
     channel.appendLine(
       `[workspace-inject] ran "${marker.command}" in ${wsNormalized}`,
     );
+    /* WP-H: tell the daemon's poller the inject actually landed. */
+    writeWorkspaceInjectResult(claimFile, wsNormalized, { ok: true });
   } catch (err) {
-    channel.appendLine(
-      `[workspace-inject] failed: ${(err as Error).message}`,
-    );
+    const message = (err as Error).message;
+    channel.appendLine(`[workspace-inject] failed: ${message}`);
+    /* WP-H: failure path also gets a result file so the daemon's
+     * poller can report delivery:'failed' + the bridge error instead
+     * of timing out to 'unconfirmed' for something we actually know
+     * failed. */
+    writeWorkspaceInjectResult(claimFile, wsNormalized, { ok: false, error: message });
   } finally {
     try {
       fs.unlinkSync(claimFile);

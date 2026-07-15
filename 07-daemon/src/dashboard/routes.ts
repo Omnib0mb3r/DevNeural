@@ -151,6 +151,172 @@ import {
 } from './push.js';
 import { writePage, parsePage } from '../wiki/schema.js';
 
+/* WP-F: directories the seeding scan never registers even if they
+ * hold a git repo. Archive/Holding are graveyards for retired
+ * projects; tmp is scratch space. Dot-dirs (.git, .vscode, ...) are
+ * excluded by a separate startsWith('.') check since there's no fixed
+ * list of them. */
+const SCAN_EXCLUDED_DIRS = new Set(['Archive', 'Holding', 'tmp']);
+
+/* WP-I-b: name of the logon/5-min-safety-net Scheduled Task installed
+ * by scripts/install-daemon-autostart.ps1 ($taskName in that script).
+ * Keep in sync manually — the install script is a separate,
+ * infrequently-touched artifact and pulling it in as a data source at
+ * runtime would be more machinery than the constant is worth. */
+const RELAUNCH_TASK_NAME = 'DevNeural-Daemon';
+
+export interface RelaunchDeps {
+  /** child_process.spawn injection for tests. */
+  spawnFn?: typeof spawn;
+  log?: (msg: string) => void;
+}
+
+export type RelaunchStrategy = 'schtasks' | 'powershell' | 'failed';
+
+/* WP-I-b: daemon self-restart relauncher, extracted so tests can pin
+ * the fallback decision with an injected spawn fn instead of
+ * spawning real processes.
+ *
+ * Primary path triggers the daemon's own autostart Scheduled Task via
+ * `schtasks /run /tn <taskName>`. Scheduled Task execution runs under
+ * the Task Scheduler service, not under this process's job object, so
+ * it survives even when this process is torn down mid-relaunch — the
+ * failure mode that made the previous direct `spawn('powershell.exe',
+ * ..., {detached: true})` relaunch silently die with its parent job
+ * object roughly 47% of the time, leaving nothing to bind the port
+ * until the 5-minute Scheduled Task safety-net tick caught it.
+ *
+ * Falls back to the previous direct `powershell.exe ...
+ * start-daemon.ps1 -Force` relaunch only when the schtasks spawn
+ * itself errors (ENOENT, no schtasks.exe on PATH, task renamed or
+ * deleted out from under this route, etc.), so a working daemon still
+ * gets a second attempt at coming back even when the scheduled task
+ * itself is the thing that broke. */
+export function armRelauncher(
+  taskName: string,
+  startScript: string,
+  deps: RelaunchDeps = {},
+): RelaunchStrategy {
+  const spawnFn = deps.spawnFn ?? spawn;
+  const relLog = deps.log ?? ((): void => undefined);
+
+  const spawnPowershellFallback = (): boolean => {
+    const inline = `Start-Sleep -Seconds 2; & '${startScript.replace(/'/g, "''")}' -Force`;
+    try {
+      const fallback = spawnFn(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-ExecutionPolicy', 'Bypass',
+          '-WindowStyle', 'Hidden',
+          '-Command', inline,
+        ],
+        { detached: true, stdio: 'ignore', windowsHide: true },
+      );
+      fallback.on('error', (err) => {
+        relLog(
+          `[admin] RELAUNCH FAILED: powershell fallback spawn error: ${err.message}`,
+        );
+      });
+      fallback.unref();
+      return true;
+    } catch (err) {
+      relLog(
+        `[admin] RELAUNCH FAILED: powershell fallback spawn threw: ${(err as Error).message}`,
+      );
+      return false;
+    }
+  };
+
+  try {
+    const child = spawnFn('schtasks', ['/run', '/tn', taskName], {
+      windowsHide: true,
+    });
+    child.on('error', (err) => {
+      relLog(
+        `[admin] RELAUNCH FAILED: schtasks spawn error (task ${taskName}): ${err.message}; falling back to powershell start-daemon.ps1`,
+      );
+      spawnPowershellFallback();
+    });
+    child.unref();
+    return 'schtasks';
+  } catch (err) {
+    relLog(
+      `[admin] RELAUNCH FAILED: schtasks spawn threw: ${(err as Error).message}; falling back to powershell start-daemon.ps1`,
+    );
+    return spawnPowershellFallback() ? 'powershell' : 'failed';
+  }
+}
+
+export interface ScanAndRegisterResult {
+  ok: boolean;
+  error?: string;
+  registered: { id: string; name: string }[];
+  skipped: {
+    dir: string;
+    reason: 'excluded' | 'no_identity' | 'already_registered';
+  }[];
+}
+
+/* WP-F: seeding route core logic, extracted so tests can call it
+ * directly against a real temp directory tree without spinning up
+ * Fastify (mirrors the pattern in projects-routes.ts, whose exported
+ * handlers are tested the same way in tests/projects-routes.test.ts).
+ *
+ * Walks the TOP LEVEL of `root` only (no recursion into project
+ * subdirectories) and calls resolveProjectIdentity + recordIdentity
+ * per surviving directory. See the KNOWN COLLISION note on the
+ * /projects/scan-and-register route below for the remote-based-id
+ * caveat with undetached template clones. */
+export async function scanAndRegisterProjects(
+  root: string,
+  log: (msg: string) => void = () => undefined,
+): Promise<ScanAndRegisterResult> {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch (err) {
+    return {
+      ok: false,
+      error: `failed to read ${root}: ${(err as Error).message}`,
+      registered: [],
+      skipped: [],
+    };
+  }
+
+  const { resolveProjectIdentity } = await import('../identity/project-id.js');
+  const { recordIdentity, getProject } = await import('../identity/registry.js');
+
+  const registered: { id: string; name: string }[] = [];
+  const skipped: ScanAndRegisterResult['skipped'] = [];
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const name = entry.name;
+    if (name.startsWith('.') || SCAN_EXCLUDED_DIRS.has(name)) {
+      skipped.push({ dir: name, reason: 'excluded' });
+      continue;
+    }
+    const full = path.posix.join(root, name);
+    const identity = resolveProjectIdentity(full);
+    if (identity.id === 'global') {
+      skipped.push({ dir: name, reason: 'no_identity' });
+      continue;
+    }
+    if (getProject(identity.id)) {
+      skipped.push({ dir: name, reason: 'already_registered' });
+      continue;
+    }
+    recordIdentity(identity);
+    registered.push({ id: identity.id, name: identity.name });
+  }
+
+  log(
+    `[dashboard] scan-and-register: ${registered.length} registered, ${skipped.length} skipped under ${root}`,
+  );
+  return { ok: true, registered, skipped };
+}
+
 export async function registerDashboardRoutes(
   app: FastifyInstance,
   store: Store,
@@ -163,8 +329,13 @@ export async function registerDashboardRoutes(
    * of this file. */
   const { registerProjectAnchorRoutes } = await import('./projects-routes.js');
   registerProjectAnchorRoutes(app, store.db, log);
-  const { decodeBridgeMarker, resolveDeliverableBridgeForSession } =
-    await import('./bridge-presence.js');
+  const {
+    decodeBridgeMarker,
+    resolveDeliverableBridgeForSession,
+    readPresenceDir,
+    defaultPresenceDir,
+    DEFAULT_BRIDGE_TIMEOUT_MS,
+  } = await import('./bridge-presence.js');
 
   /* Panic button surface (PANIC-BUTTON.md). POST /panic, POST
    * /projects/:id/interrupt, GET /panic/recent. Bound to the real
@@ -3275,6 +3446,44 @@ export async function registerDashboardRoutes(
     return r;
   });
 
+  /* WP-F: bulk-seed the project registry.
+   *
+   * Walks the top level of C:/dev/Projects (or body.root) and calls
+   * resolveProjectIdentity + recordIdentity per directory so projects
+   * that predate the dashboard, or that were created outside the
+   * "+ New Project" flow above (a manual `git clone`, a folder copied
+   * in from another machine), show up in the registry without
+   * needing a live Claude session to trigger capture-side
+   * registration first.
+   *
+   * KNOWN COLLISION: identity ids are derived from the git remote,
+   * not the directory path (see resolveProjectIdentity in
+   * ../identity/project-id.ts). createProject() above detaches .git
+   * and re-inits after cloning dev-template specifically so each new
+   * project gets its own remote-less identity. A directory cloned
+   * from dev-template WITHOUT that detach step (e.g. a plain `git
+   * clone` done outside this dashboard) still points at the
+   * template's own remote, so it hashes to the SAME identity id as
+   * every other undetached clone. Observed in the wild: ZsgAreaBlock
+   * and dev-template collided this way — whichever directory this
+   * route sees first "wins" the id, and every later same-remote
+   * directory reports already_registered even though it is a
+   * distinct folder on disk. Not fixed here; this route reports
+   * exactly what the identity layer resolves. */
+  app.post('/projects/scan-and-register', async (req, reply) => {
+    const body = (req.body ?? {}) as { root?: string };
+    const root = (body.root ?? 'C:/dev/Projects').replace(/\\/g, '/');
+    if (!fs.existsSync(root)) {
+      reply.code(400);
+      return { ok: false, error: `root not found: ${root}` };
+    }
+    const result = await scanAndRegisterProjects(root, log);
+    if (!result.ok) {
+      reply.code(500);
+    }
+    return result;
+  });
+
   /* Start Claude in an existing registered project.
    *
    * Looks up the project root from the registry, drops a workspace-
@@ -3346,8 +3555,26 @@ export async function registerDashboardRoutes(
     const command = body.dangerous
       ? 'claude --dangerously-skip-permissions'
       : 'claude';
-    const { queueProjectBootstrap } = await import('./projects-new.js');
     const warnings: string[] = [];
+    /* WP-H: coarse bridge-liveness precheck. If NOT ONE bridge window
+     * anywhere has posted a fresh presence heartbeat, no VS Code
+     * window can possibly be running to claim the marker we're about
+     * to write, so warn immediately instead of making the caller wait
+     * out the full delivery poll below just to learn the same thing.
+     * Deliberately NOT scoped to proj.root's own presence: this call
+     * usually opens a BRAND NEW window for a project with no presence
+     * file yet, so a per-workspace check would false-positive on
+     * every legitimate cold-start spawn. "at least one bridge is
+     * alive somewhere" is the right-sized signal here. */
+    try {
+      const alive =
+        readPresenceDir(defaultPresenceDir(), Date.now(), DEFAULT_BRIDGE_TIMEOUT_MS)
+          .length > 0;
+      if (!alive) warnings.push('bridge_offline');
+    } catch {
+      warnings.push('bridge_offline');
+    }
+    const { queueProjectBootstrap, pollInjectResult } = await import('./projects-new.js');
     try {
       queueProjectBootstrap(proj.root, command);
     } catch (err) {
@@ -3382,12 +3609,38 @@ export async function registerDashboardRoutes(
     } catch (err) {
       warnings.push(`vs code launch failed: ${(err as Error).message}`);
     }
-    log(`[dashboard] start-claude queued for project ${proj.name} (${id})`);
+    log(
+      `[dashboard] start-claude queued for project ${proj.name} (${id}); polling for bridge delivery confirmation`,
+    );
+    /* WP-H: replace the old unconditional ok:true with an honest
+     * delivery signal instead of declaring success the instant the
+     * marker file was written.
+     *   confirmed   -- the bridge ran the inject. ok:true.
+     *   failed      -- the bridge claimed the marker and told us it
+     *                  could NOT run the command. We know this
+     *                  attempt did not land, so ok flips to false and
+     *                  the response carries a 502 (this daemon did
+     *                  its job; the downstream bridge reported the
+     *                  failure).
+     *   unconfirmed -- no result file showed up within the poll
+     *                  window. NOT the same as failure: the VS Code
+     *                  window may still be launching (cold start,
+     *                  extension host activation) and could still
+     *                  claim the marker after we stop watching. ok
+     *                  stays true because the request itself was
+     *                  processed correctly; the dashboard should
+     *                  treat this as "keep watching," not an error. */
+    const delivery = await pollInjectResult(proj.root);
+    if (delivery.delivery === 'failed') {
+      reply.code(502);
+    }
     return {
-      ok: true,
+      ok: delivery.delivery !== 'failed',
       project_id: id,
       root: proj.root,
       command,
+      delivery: delivery.delivery,
+      ...(delivery.error ? { bridge_error: delivery.error } : {}),
       warnings: warnings.length ? warnings : undefined,
     };
   });
@@ -4233,42 +4486,28 @@ export async function registerDashboardRoutes(
       reply.code(500);
       return { ok: false, error: `start-daemon.ps1 not found at ${startScript}` };
     }
-    /* Direct PowerShell launch: -Command runs an inline script that
-     * sleeps then dot-sources start-daemon.ps1. No cmd.exe, no nested
-     * quoting, no `timeout` shell builtin. Keeps the spawn argv clean
-     * and avoids the "bad argument" error path some shells produce when
-     * their builtins see a quoted operand. */
-    /* -Force on start-daemon.ps1 bypasses the "already alive" probe so
-     * the relauncher cannot self-skip during the old daemon's graceful
-     * shutdown window. Without -Force, the probe at t+2s sees the old
-     * Fastify still answering /health (chokidar watcher close + app
-     * close + store close take 2-6s on Windows) and exits 0 with
-     * "already alive; skipping spawn". The sidecar Stop-Process then
-     * kills the old daemon at t+6s and nothing is left to bind :3747
-     * until the Task Scheduler 5-min autostart tick — average wait
-     * ~2.5min, worst ~5min. Task Scheduler itself does NOT pass -Force;
-     * its job is to no-op when the daemon is healthy. */
-    const inline = `Start-Sleep -Seconds 2; & '${startScript.replace(/'/g, "''")}' -Force`;
-    try {
-      const child = spawn(
-        'powershell.exe',
-        [
-          '-NoProfile',
-          '-ExecutionPolicy', 'Bypass',
-          '-WindowStyle', 'Hidden',
-          '-Command', inline,
-        ],
-        {
-          detached: true,
-          stdio: 'ignore',
-          windowsHide: true,
-        },
-      );
-      child.unref();
-    } catch (err) {
+    /* WP-I-b: schtasks-based relaunch (see armRelauncher above) with
+     * the previous direct powershell.exe start-daemon.ps1 spawn kept
+     * as a fallback attempt. -Force on start-daemon.ps1 (used by both
+     * the fallback here and by the Scheduled Task's own action when
+     * schtasks succeeds — the task action itself doesn't pass -Force,
+     * see install-daemon-autostart.ps1) matters because without it
+     * the "already alive" probe at t+2s can see the old Fastify still
+     * answering /health (chokidar watcher close + app close + store
+     * close take 2-6s on Windows) and skip the respawn. The sidecar
+     * Stop-Process below then kills the old daemon at t+6s and
+     * nothing is left to bind :3747 until the next Scheduled Task
+     * safety-net tick — average wait ~2.5min, worst ~5min. */
+    const strategy = armRelauncher(RELAUNCH_TASK_NAME, startScript, { log });
+    if (strategy === 'failed') {
       reply.code(500);
-      return { ok: false, error: `relauncher spawn failed: ${(err as Error).message}` };
+      return {
+        ok: false,
+        error:
+          'relauncher spawn failed: schtasks and the powershell fallback both failed to spawn',
+      };
     }
+    log(`[admin] daemon restart relauncher armed via ${strategy}`);
     /* Exit path with EXTERNAL hard-kill watchdog.
      *
      * process.exit(0) alone hangs on Windows when a worker thread
