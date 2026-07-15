@@ -41,8 +41,13 @@ import {
 } from '../paths.js';
 import { appendLog, commitWiki } from '../wiki/scaffolding.js';
 import { blacklistPageForSession } from '../curation/curator.js';
+import { pickProvider } from '../llm/index.js';
+import { judgeInjectionUse } from './inject-verdict.js';
 
 const HIT_COSINE = Number(process.env.DEVNEURAL_HIT_COSINE ?? 0.65);
+/* Explicit inject-verdict judge (default off, zero behavior change on
+ * the cosine path when unset). See scheduleInjectVerdict below. */
+const INJECT_VERDICT_ENABLED = process.env.DEVNEURAL_INJECT_VERDICT === '1';
 const HIT_WEIGHT_GAIN = 0.05;
 const CORRECTION_WEIGHT_LOSS = 0.10;
 const DECAY_PER_SESSION = 0.995;
@@ -462,6 +467,66 @@ function writeCuratorSignal(
   }
 }
 
+/* Explicit LLM verdict on injection use (additive to the cosine path
+ * above, which stays untouched and authoritative for promote/decay).
+ * Behind DEVNEURAL_INJECT_VERDICT (default off; unset means this
+ * function is a pure no-op and evaluateAssistantReply's cosine
+ * behavior is byte-identical to before this feature existed).
+ *
+ * Fire-and-forgotten by the caller (never awaited): a slow or
+ * unavailable local model must never delay the transcript watcher.
+ * judgeInjectionUse itself races a hard timeout internally, so this
+ * promise always settles within DEVNEURAL_INJECT_VERDICT_TIMEOUT_MS
+ * regardless.
+ *
+ * Writes a curator_signal row with source='llm-judge' so the health
+ * card can show the LLM's second opinion alongside the cosine-based
+ * 'regex-inferred' signal: 'used' -> signal 'hit', 'ignored' -> signal
+ * 'wrong' (the existing 3-value signal enum's closest fit; 'wrong' has
+ * no other production writer today -- see index-db.ts). 'unclear'
+ * verdicts (judge timeout, provider error, or genuine model
+ * uncertainty) write nothing: there is no informative signal to
+ * record, and the reinforcement loop already treats "no data" as the
+ * neutral case everywhere else. */
+function scheduleInjectVerdict(
+  store: Store,
+  p: Pending,
+  replyText: string,
+  log: (msg: string) => void,
+): void {
+  if (!INJECT_VERDICT_ENABLED) return;
+  if (!p.curatorLogId || !p.promptId) return;
+  const curatorLogId = p.curatorLogId;
+  const promptId = p.promptId;
+  const summary = p.summary;
+  void (async () => {
+    try {
+      const provider = pickProvider();
+      if (!provider || !provider.isConfigured()) return;
+      const result = await judgeInjectionUse(
+        { provider, log },
+        { injectedSummary: summary, replyText },
+      );
+      if (result.verdict === 'unclear') {
+        log(`[reinforce] inject-verdict unclear: ${result.reason}`);
+        return;
+      }
+      const signal = result.verdict === 'used' ? 'hit' : 'wrong';
+      store.db.insertCuratorSignal({
+        id: randomUUID(),
+        curator_log_id: curatorLogId,
+        prompt_id: promptId,
+        signal,
+        source: 'llm-judge',
+        weight: 1.0,
+      });
+      log(`[reinforce] inject-verdict ${result.verdict}: ${result.reason}`);
+    } catch (err) {
+      log(`[reinforce] inject-verdict failed: ${(err as Error).message}`);
+    }
+  })();
+}
+
 export async function evaluateAssistantReply(
   store: Store,
   sessionId: string,
@@ -480,6 +545,13 @@ export async function evaluateAssistantReply(
   } catch {
     return;
   }
+
+  // Explicit inject-verdict judge: additive second opinion, fired
+  // after the cosine evaluation above regardless of hit/no-hit so it
+  // can independently confirm or contradict the cosine call. See
+  // scheduleInjectVerdict's doc comment; no-op unless
+  // DEVNEURAL_INJECT_VERDICT=1.
+  scheduleInjectVerdict(store, p, replyText, log);
 
   if (cosine < HIT_COSINE) {
     appendReinforcementLog({

@@ -330,7 +330,10 @@ async function processFile(
     // P5: reinforcement signals based on role and pending injection
     if (store) {
       if (role === 'assistant' || record.role === 'assistant') {
-        void evaluateAssistantReply(store, session, scrubbed).catch(() => undefined);
+        // log passed through so inject-verdict's diagnostics (see
+        // reinforcement/index.ts's scheduleInjectVerdict) actually
+        // reach the daemon log instead of falling into the no-op default.
+        void evaluateAssistantReply(store, session, scrubbed, log).catch(() => undefined);
       } else if (role === 'user' || record.role === 'user') {
         evaluateCorrection(store, session, scrubbed);
       }
