@@ -9,13 +9,135 @@ reflects what was true at the last update.
 The rule: anyone reading this should start cold and know where the code
 is, what is in flight, what is shippable next, and what blocks it.
 
-Last touched: 2026-07-09. Branch `master`. Daemon suite
-1448 green (1 pre-existing grooming-routes failure, present on clean
-baseline). Dashboard 146 unit green. The operator rebuild + restart
-HAPPENED (multiple times 2026-07-09, operator-directed): everything in
-the old "Pending the operator daemon rebuild + restart" list is LIVE
-and was spot-verified (headless distill ticking, lifecycle route with
-real gate probes, /knowledge orb data, knowledge-index routes).
+Last touched: 2026-07-15. Branch `master` @ 4105eae. Daemon suite
+1659/1660 green (same 1 pre-existing grooming-routes failure, present
+on clean baseline). Dashboard build green, 185 unit tests. Dist
+rebuilt from committed source 2026-07-15; daemon NOT restarted (still
+running the 2026-07-09 build; operator owns the restart).
+
+### 2026-07-15 goal audit: 13 fix packages, 9 commits (b5cbf69..4105eae)
+
+Full-system audit of the operator's broken-feature list. Every claim
+was root-caused with live evidence before fixing. Summary; details in
+each commit body:
+
+- CAPTURE PIPELINE DEAD 65 DAYS (auto-lint, daily brief, wiki,
+  reinforcement all starved): chokidar v4 dropped glob support and
+  transcript-watcher passed a glob string, watching nothing since
+  2026-05-11. Fixed (root-dir watch + filter, Fix 34b pattern), plus
+  offset-aware boot catch-up for the backlog and a 30-min staleness
+  self-check. 2199c96.
+- HOOK STDIN NEVER PIPED (curator loop dead at stage zero, all hook
+  payloads empty): every phase except SessionStart wrapped in
+  wscript.exe silent-runner.vbs which drops stdin. install-hooks now
+  wraps every phase in silent-shim.exe; APPLIED 2026-07-15 (settings
+  .json rewritten with backup, 33 shim entries, zero VBS). New CC
+  sessions get real payloads. Also: curator_signal ledger wired,
+  opt-in DEVNEURAL_CURATOR_VET judge gate (default off). a8e6cfe.
+- CONTROL PATHS PTY-ONLY: panic/double-ESC and /lex/steer could not
+  reach bridge-attached workers (live pty_not_found proof); the four
+  operator inject routes lacked the Fix 15a stale-uuid redirect + Fix
+  18 deliverability gate; rejected_scope 403s were invisible AND the
+  audit-table CHECK constraint was silently swallowing those rows.
+  All fixed; migrations 046-048. f2fc8fb.
+- SMART-CLEAR HAD NO DRIVER (primitives live since 2026-07-09, zero
+  fires): Lex's prompt never mentioned the loop. New scoped-only
+  Supervision drive contract (continuous duty, proactive report-back,
+  full state->plan->vet->stop->clear-and-paste->confirm loop, stopping
+  point rules) + smart-clear/compact endpoints in API_SURFACE; the
+  from_anchor_id mandate is now scoped-only (unscoped Lex is no longer
+  told to send an anchor id the daemon 403s). 669961f.
+- WORKER EVENTS DROPPED SILENTLY 26 DAYS (no live lex_session,
+  no-target discard, misleading routed=N log): no-target now emits a
+  debounced operator notification, the log line reports real outcome
+  counts, bridge-presence lookups are case-insensitive. 5f3fdcf. DB
+  repaired live (backups first): 3 drive-letter-case anchor splits
+  merged (DevNeural event toggle was on a dead duplicate), live
+  DevNeural anchor set supervision_mode=event, runtime_config
+  default_supervision_mode=event, 27 projects seeded into the
+  registry (was 1; LOC tile now has data).
+- DASHBOARD: dev-proxy missing stats/lex/admin/pty prefixes + JSON
+  fetches to /sessions,/projects,/reminders losing to page routes
+  (beforeFiles JSON-gated rewrites added; WS paths preserved); three
+  KPI cards used nonexistent Tailwind tokens (the different-outline
+  complaint) -> shared ui/Card; projects()/reminders errors no longer
+  masked as empty states; stub metrics labeled honestly; stale-brief
+  badge. 147c99f. Health pill shows unreachable on query error;
+  restart waiting UI persists across refresh, polls 15 min with
+  honest copy; /settings links to /system. eea7597.
+- RESTART RELAUNCHER silently failed ~47% (no error handler +
+  job-object kill of the detached child; recovery waited for the
+  5-min scheduled-task tick = the operator's 10-minute blank).
+  Relaunch now schtasks /run DevNeural-Daemon with logged powershell
+  fallback. Start Claude is no longer fire-and-forget: bridge writes
+  .result.json, daemon polls and reports delivery
+  confirmed/failed/unconfirmed + bridge_offline warning (bridge needs
+  VSIX rebuild+reinstall to ship its half). POST
+  /projects/scan-and-register added. 1a565aa.
+- VOICE: fast/slow lanes get a local-time context block (daypart-
+  aware greetings, mismatch correction); greetings answer on the fast
+  lane even digest-cold; digest seeds at session bind (warm right
+  after switch); filler pool rewritten natural. 0578fab. Mic sliders
+  actually work now: vad-web 0.0.30 ms-based option keys (legacy
+  frame keys were silently dropped), live setOptions on drag, and one
+  shared GainNode stream feeds BOTH VAD triggering and transcription
+  (gain finally tames pickup). 8e7e03d.
+- MEETING NOTES MODE made real: notes mode sets kind='meeting' via a
+  default-on toggle in the hello (consent gate, purge, /meetings UI,
+  meeting retrieval weight now engage); name-gated replies (non-
+  addressed utterances captured to brainstorm_chunks, only
+  "lex + question/request" forwarded); MeetingDetail transcript view
+  + attendees/topic editing (PATCH /meetings/:id); README privacy
+  claim scoped honestly. 4105eae.
+- OBSERVABILITY: daemon.log rotation (32MB, one generation),
+  grooming-watch tick logging (+ unguarded-throw fix),
+  bridge-presence hourly heartbeat. b656ead.
+- TTS double-talk: VERIFIED solved (layered guards traced); mouth
+  lock is flag-conditional but unconditional layers cover it.
+
+### Pending the operator (2026-07-15)
+
+- Daemon restart to go live on the new build (relauncher fix, dual
+  transport, capture revival + catch-up, meeting notes, scan route).
+  The restart button itself is fixed IN this build, so use the
+  scheduled task or start-daemon.ps1 for THIS one restart.
+- Dashboard prod: cd 08-dashboard && npm run build (for the static
+  export daemon serves; dev :3000 already reflects source).
+- 09-bridge: npm run build && npm run package, reinstall VSIX
+  (delivery confirmation + result files).
+- tailscale serve: remove/document the undocumented :10000 -> dev
+  :3000 rule (dev/prod confusion source). tailscale serve status to
+  list; the :443 -> 3747 rule is the documented one.
+- ZsgAreaBlock still points at dev-template's git remote (identity
+  collision, registry holds one entry for both). Fix its remote or
+  accept shared identity. OPS + transcribe are not git repos (no LOC
+  contribution possible).
+- Rotate BRIDGER_ANTHROPIC_API (hit a terminal 2026-07-09; still in
+  use as voice key).
+- Optional flags: DEVNEURAL_CURATOR_VET=1 (pre-inject judge),
+  DEVNEURAL_VOICE_HAIKU already self-enables with key.
+
+### Deferred (flagged, not built this pass)
+
+- expectation-supervisor is dead by construction (recordExpectation
+  has zero callers; table empty forever). Needs a dispatcher design.
+- Diarization: wire C:/dev/Projects/transcribe/diarize.py (whisperx +
+  pyannote, working on this GPU) as a post-session batch against the
+  consented meeting WAV; merge speaker labels into chunks.
+- LightRAG/RAG-Anything: recommended hybrid - daemon stays the single
+  ingest front door (POST /upload, /ingest, /lex/index-docs),
+  optional LightRAG fan-out backend later; Remarkable-Pro posts
+  transcriptions to the daemon when its /ingest seam ships.
+- Explicit worker accept/decline signal for curator injections
+  (today: inference via reply-cosine + correction regex).
+- Wiki SQL/disk desync (167 rows vs 179 files, test-fixture pages in
+  prod data root) - rebuild-index pass once capture is confirmed
+  flowing again.
+- console.log black hole: stdout/stderr redirect files are 0 bytes;
+  lex-voice-ws.ts + pty-host.ts diagnostics invisible. Migrate to the
+  injected logger.
+- projects-routes.ts openProjectAnchor still uses its own DB-status
+  poll, not the new .result.json delivery signal.
 
 ### 2026-07-09 fix: Lex voice silent - CLAUDE_CODE_CHILD_SESSION leak
 
