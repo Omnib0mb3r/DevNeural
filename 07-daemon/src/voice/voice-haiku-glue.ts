@@ -7,9 +7,12 @@
  * so the quick replies are warm, varied, and continuous with the moment.
  *
  * BF-4 boundary (preserved): the model only ever sees (a) the user's
- * conversational aside and (b) the persona prompt, which carries ONLY
- * Lex's already-synthesized live digest. It never sees raw brainstorm /
- * project content. The digest is Lex-canonical synthesis, not transcript.
+ * conversational aside, (b) the persona prompt, which carries ONLY Lex's
+ * already-synthesized live digest, and (c) the LOCAL CONTEXT block
+ * (2026-07-14) - the daemon's own clock (time / day / date / daypart),
+ * never anything derived from the user or the project. It never sees raw
+ * brainstorm / project content. The digest is Lex-canonical synthesis,
+ * not transcript.
  *
  * Latency posture: this runs on the fast lane (haiku alone, zero Opus),
  * so one short Haiku call is the design, not a regression. The call is
@@ -22,13 +25,20 @@
  * is rejected, so the same aside never reads the same way twice.
  */
 import Anthropic from '@anthropic-ai/sdk';
-import { VOICE_HAIKU_MODEL, voiceApiKey } from './voice-haiku.js';
+import { VOICE_HAIKU_MODEL, voiceApiKey, localContextBlock } from './voice-haiku.js';
 import { getDigest } from './voice-digest.js';
 import { buildHaikuPersonaPrompt } from './voice-persona.js';
 
-/** Delivery-tweak hint the fast lane already classified, plus the two
- * non-tweak glue shapes (a bare ack, or a repeat with nothing said yet). */
-export type GlueHint = 'slower' | 'louder' | 'quieter' | 'ack' | 'nothing-said';
+/** Delivery-tweak hint the fast lane already classified, plus the
+ * non-tweak glue shapes (a bare ack, a repeat with nothing said yet, or a
+ * greeting the local-context block below should answer time-aware). */
+export type GlueHint =
+  | 'slower'
+  | 'louder'
+  | 'quieter'
+  | 'ack'
+  | 'nothing-said'
+  | 'greeting';
 
 /* One short spoken sentence; a tight ceiling keeps the lane fast. */
 const VOICE_GLUE_MAX_TOKENS = 48;
@@ -103,6 +113,21 @@ export function _resetGlueHistory(): void {
   recent.length = 0;
 }
 
+/** True when `line` is the immediately-previous spoken line. Exposed so a
+ * deterministic canned pool outside this module (the time-aware greeting
+ * fallback in voice-haiku-wiring.ts) can share the SAME never-twice ring
+ * the live model reads/writes - a canned pick and a live pick then never
+ * read the same back-to-back either, and the canned pool keeps rotating
+ * instead of freezing on its first candidate. */
+export function wasLastSpoken(line: string): boolean {
+  return recent.length > 0 && recent[recent.length - 1] === line;
+}
+
+/** Register a canned pick in the shared ring (see wasLastSpoken above). */
+export function rememberSpokenLine(line: string): void {
+  remember(line);
+}
+
 function hintLine(hint: GlueHint): string {
   switch (hint) {
     case 'slower':
@@ -113,6 +138,8 @@ function hintLine(hint: GlueHint): string {
       return 'The user asked you to be quieter; acknowledge it in passing, in your own words.';
     case 'nothing-said':
       return 'The user asked you to repeat yourself, but you have not said anything yet; say so warmly.';
+    case 'greeting':
+      return 'The user greeted you. Reply with a short, warm greeting that matches the LOCAL CONTEXT time of day below - not necessarily the word they used. If their greeting does not match the real time (e.g. they said "good morning" but it is actually evening), gently correct it in passing instead of echoing the wrong time back.';
     case 'ack':
     default:
       return 'The user gave a short acknowledgment or yes/no about what was just said.';
@@ -142,6 +169,9 @@ export interface GenerateGlueDeps {
   /** Override the persona prompt (tests). Default: built from the live
    * digest singleton, BF-4 safe. */
   personaPrompt?: string;
+  /** Test seam: pin the local-context clock. Default: real time, read
+   * fresh at call time (daemon clock, never derived from user content). */
+  now?: () => Date;
 }
 
 /* Generate one warm, varied, in-persona glue reply. Returns null to mean
@@ -155,7 +185,8 @@ export async function generateGlueReply(
   const persona =
     deps?.personaPrompt ??
     buildHaikuPersonaPrompt(getDigest()?.digest ?? null);
-  const system = `${persona}\n\n${glueInstruction(input.hint)}`;
+  const now = deps?.now?.() ?? new Date();
+  const system = `${persona}\n\n${localContextBlock(now)}\n\n${glueInstruction(input.hint)}`;
 
   let out: string | null;
   try {
@@ -218,7 +249,8 @@ export async function generateBridgeReply(
   const persona =
     deps?.personaPrompt ??
     buildHaikuPersonaPrompt(getDigest()?.digest ?? null);
-  const system = `${persona}\n\n${bridgeInstruction()}`;
+  const now = deps?.now?.() ?? new Date();
+  const system = `${persona}\n\n${localContextBlock(now)}\n\n${bridgeInstruction()}`;
   let out: string | null;
   try {
     out = await call({

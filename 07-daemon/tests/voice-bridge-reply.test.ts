@@ -62,4 +62,51 @@ describe('generateBridgeReply', () => {
     );
     expect(out).toBeNull();
   });
+
+  /* Requirement 5: the same LOCAL CONTEXT block goes into the bridge
+   * composer's system prompt (committed b5cbf69), so slow-lane bridge
+   * lines are daypart-aware too, not just glue. */
+  describe('local context (bridge line is daypart-aware)', () => {
+    it('includes the LOCAL CONTEXT block, sourced from the injected clock', async () => {
+      let system = '';
+      const call = async (i: { system: string }) => {
+        system = i.system;
+        return 'let me pull that up';
+      };
+      await generateBridgeReply(
+        { utterance: 'what is the academy worker doing' },
+        { call, now: () => new Date(2026, 6, 14, 18, 15, 0) },
+      );
+      expect(system).toContain('LOCAL CONTEXT');
+      expect(system).toContain('18:15');
+      expect(system.toLowerCase()).toContain('evening');
+    });
+
+    it('defaults to the real clock when no `now` dep is supplied', async () => {
+      let system = '';
+      const call = async (i: { system: string }) => {
+        system = i.system;
+        return 'checking';
+      };
+      await generateBridgeReply({ utterance: 'status' }, { call });
+      expect(system).toContain('LOCAL CONTEXT');
+    });
+  });
+
+  it('BF-4: local context carries only time/day/date, never raw content', async () => {
+    let system = '';
+    const call = async (i: { system: string }) => {
+      system = i.system;
+      return 'looking';
+    };
+    await generateBridgeReply(
+      { utterance: 'what is the academy worker doing' },
+      { call, now: () => new Date(2026, 6, 14, 9, 0, 0) },
+    );
+    const block = system.slice(
+      system.indexOf('LOCAL CONTEXT'),
+      system.indexOf('VOICE FAST LANE: BRIDGE'),
+    );
+    expect(block).not.toMatch(/brainstorm|academy|worker/i);
+  });
 });

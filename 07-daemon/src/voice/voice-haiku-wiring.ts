@@ -7,7 +7,7 @@
  * is the existing phrase. Keeping the flag logic here (not inline in the
  * 2000-line WS handler) makes "flag-off is unchanged" unit-testable.
  */
-import { useVoiceHaiku } from './voice-haiku.js';
+import { useVoiceHaiku, daypartOf, type Daypart } from './voice-haiku.js';
 import { renderSpoken, renderSpokenAsync } from './voice-renderer.js';
 import { frontDeskDecision, type FrontDeskDecision } from './voice-frontdesk.js';
 import { composeHeartbeat } from './voice-heartbeat-haiku.js';
@@ -17,6 +17,8 @@ import {
   generateBridgeReply,
   glueModelAvailable,
   renderReplyLive,
+  wasLastSpoken,
+  rememberSpokenLine,
   type GenerateGlueDeps,
   type GlueHint,
 } from './voice-haiku-glue.js';
@@ -64,13 +66,32 @@ export async function renderReplyForSpeech(
 
 /* Inbound routing gate. OFF: null, so the WS runs its existing inject
  * path untouched. ON: the full front-desk decision (control -> glue ->
- * lane, persona prompt, digest freshness). */
+ * lane, persona prompt, digest freshness).
+ *
+ * Greeting override (2026-07-14, requirements 3 + 4): the deny-by-default
+ * whitelist (voice-whitelist.ts, out of this module's scope) has no
+ * notion of greetings, so "good morning" etc. always fell out of its
+ * not-glue branch and queued to Lex - digest fresh or not, cold start or
+ * not - landing a generic bridge filler instead of an actual answer. A
+ * greeting never needs a project/code/state fact (it is answered from the
+ * local clock, not the digest), so once the utterance matches the local
+ * greeting detector, this downgrades a 'slow' route to 'fast' regardless
+ * of digest freshness - including the digest-absent cold-start case
+ * (requirement 4). Anything that is NOT a greeting keeps going through
+ * frontDeskDecision's existing staleness gate untouched. */
 export function haikuRoute(
   text: string,
   ctx: { lastTurnMs: number; assumeDigestFresh?: boolean },
 ): FrontDeskDecision | null {
   if (!useVoiceHaiku()) return null;
-  return frontDeskDecision(text, ctx);
+  const dec = frontDeskDecision(text, ctx);
+  if (dec.route.lane === 'slow' && isGreetingAside(text)) {
+    return {
+      ...dec,
+      route: { lane: 'fast', reason: 'greeting-answered-locally' },
+    };
+  }
+  return dec;
 }
 
 /* Heartbeat line. OFF: the existing duration-aware phrase, unchanged.
@@ -105,6 +126,89 @@ function deliveryHintOf(t: string): 'slower' | 'louder' | 'quieter' | null {
   if (/^(louder|speak up|speak louder|a bit louder)$/.test(t)) return 'louder';
   if (/^(quieter|speak quieter)$/.test(t)) return 'quieter';
   return null;
+}
+
+/* Time-aware greeting handling (2026-07-14). Operator complaint: "good
+ * morning" / "good afternoon" landed a canned "on it" or a bridge filler
+ * ("checking now") because greetings were not in the deny-by-default
+ * whitelist at all - they always queued to Lex, digest-fresh or not, cold
+ * start or not. Fixed here (owned files only): a small whole-utterance
+ * greeting matcher, a route override so a greeting always answers on the
+ * fast lane (see haikuRoute below), and a deterministic time-aware canned
+ * pool so even a no-key / call-miss reply is never a bare "on it". */
+
+export type GreetingClaim = 'morning' | 'afternoon' | 'evening' | 'generic';
+
+/* Whole-utterance match, same normalized-full-match convention as
+ * deliveryHintOf/REPEAT_RE above and the deny-by-default whitelist ("yeah,
+ * and what about the schema" is not glue; "good morning" alone is).
+ * 'morning' / 'afternoon' / 'evening' carry a claim about the time of day
+ * that gets checked against the real daypart below; 'generic' (hello/hi/
+ * hey/...) makes no claim, so it always gets the plain daypart line. */
+function greetingClaimOf(t: string): GreetingClaim | null {
+  if (/^(good morning|morning|mornin)$/.test(t)) return 'morning';
+  if (/^(good afternoon|afternoon)$/.test(t)) return 'afternoon';
+  if (/^(good evening|evening)$/.test(t)) return 'evening';
+  if (/^(hello|hi|hey|hey lex|hiya|yo|howdy)$/.test(t)) return 'generic';
+  return null;
+}
+
+function normalize(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, ' ').trim().replace(/[.!?,]+$/, '');
+}
+
+/** True when the whole (normalized) utterance is a greeting. Exported for
+ * the route override (haikuRoute) and for tests. */
+export function isGreetingAside(text: string): boolean {
+  return greetingClaimOf(normalize(text)) !== null;
+}
+
+/* Does the claimed time of day cover the real daypart? 'morning' spans
+ * both early-morning and morning (nobody minds "good morning" at 6:30);
+ * afternoon/evening are exact. Anything not covered - including every
+ * specific claim during 'late night' - is a mismatch and gets the light
+ * correction pool instead of the plain one. */
+function claimMatchesDaypart(claim: GreetingClaim, daypart: Daypart): boolean {
+  if (claim === 'generic') return true;
+  if (claim === 'morning') return daypart === 'early morning' || daypart === 'morning';
+  return claim === daypart;
+}
+
+/* Plain daypart-correct greeting. Two natural, warm, contraction-friendly
+ * variants per daypart - short spoken lines, no name-tacking, no robotic
+ * fragments. */
+const GREETING_LINES: Record<Daypart, [string, string]> = {
+  'early morning': ["You're up early - good morning.", 'Morning. Early start today.'],
+  morning: ['Good morning.', 'Morning.'],
+  afternoon: ['Good afternoon.', 'Afternoon.'],
+  evening: ['Good evening.', 'Evening.'],
+  'late night': ["Hey - it's late, but good to hear from you.", 'Still up. Hi.'],
+};
+
+/* Light correction when the greeting's claimed time of day does not match
+ * the real one (e.g. "good morning" said at 2am). States the real daypart
+ * without mirroring the wrong word back. */
+const GREETING_CORRECTION_LINES: Record<Daypart, [string, string]> = {
+  'early morning': ["It's actually early morning here, still dark out - but hey.", 'Early morning on my end - hi.'],
+  morning: ["It's morning here too, just later than that sounded - hey.", 'Morning here as well.'],
+  afternoon: ["It's actually afternoon here - but good to hear from you.", 'Afternoon on my end - hey.'],
+  evening: ["It's evening here, not that - good to hear from you though.", 'Evening on my end - hi.'],
+  'late night': ["It's actually the middle of the night here - but good to hear from you.", 'Pretty late on my end, still around though.'],
+};
+
+/* Deterministic time-aware canned greeting (requirement 3/4 fallback).
+ * Shares the live-model never-twice ring (voice-haiku-glue.ts) so a
+ * canned pick and a live pick never read the same back-to-back, and the
+ * pool itself still alternates call over call instead of freezing on its
+ * first candidate. */
+function cannedGreeting(claim: GreetingClaim, now: Date): string {
+  const daypart = daypartOf(now.getHours());
+  const pool = claimMatchesDaypart(claim, daypart)
+    ? GREETING_LINES[daypart]
+    : GREETING_CORRECTION_LINES[daypart];
+  const pick = pool.find((line) => !wasLastSpoken(line)) ?? pool[0];
+  rememberSpokenLine(pick);
+  return pick;
 }
 
 export interface ComposeGlueDeps extends GenerateGlueDeps {
@@ -148,6 +252,7 @@ export async function composeGlueReply(
 ): Promise<string | null> {
   const t = text.toLowerCase().replace(/\s+/g, ' ').trim().replace(/[.!?,]+$/, '');
   const delivery = deliveryHintOf(t);
+  const claim = greetingClaimOf(t);
   const modelEnabled =
     deps?.modelEnabled ?? (useVoiceHaiku() && glueModelAvailable());
   const generate = deps?.generate ?? generateGlueReply;
@@ -159,16 +264,27 @@ export async function composeGlueReply(
   if (REPEAT_RE.test(t)) {
     /* Verbatim replay of what was actually said; never the model. */
     if (lastSpoken && lastSpoken.trim()) return lastSpoken;
-    return (await live('nothing-said')) ?? 'I had not said anything yet.';
+    return (await live('nothing-said')) ?? "I haven't said anything yet.";
+  }
+
+  if (claim !== null) {
+    /* Greeting-shaped aside (requirement 3/4): prefer the live in-persona
+     * line - it can weave the moment/digest in naturally - and fall back
+     * to the deterministic time-aware canned pool rather than a bare-ack
+     * absorb, so a greeting is never met with silence or a stale filler,
+     * even with no key or a call miss, even right after a cold start. */
+    const reply = await live('greeting');
+    if (reply) return reply;
+    return cannedGreeting(claim, deps?.now?.() ?? new Date());
   }
 
   const reply = await live(delivery ?? 'ack');
   if (reply) return reply;
 
-  /* Deterministic fallback (byte-identical to the prior canned glue). */
+  /* Deterministic fallback for delivery tweaks. */
   if (delivery === 'slower') return 'Slowing down.';
   if (delivery === 'louder') return 'Speaking up.';
-  if (delivery === 'quieter') return 'Quieter.';
+  if (delivery === 'quieter') return 'Going quieter.';
   /* Pure ack / yes-no: absorb, no spoken reply, no Lex round-trip. */
   return null;
 }

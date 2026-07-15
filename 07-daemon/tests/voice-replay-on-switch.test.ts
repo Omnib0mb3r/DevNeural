@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { readLastAssistantTurn } from '../src/voice/lex-voice-ws.js';
+import {
+  readLastAssistantTurn,
+  _seedDigestFromLastTurnImpl,
+} from '../src/voice/lex-voice-ws.js';
+import type { LexDigest } from '../src/voice/voice-digest.js';
 
 /**
  * Item 2 (2026-07-09): switching to a session replays its last reply once
@@ -61,5 +65,118 @@ describe('readLastAssistantTurn', () => {
 
   it('returns null when the file cannot be read', () => {
     expect(readLastAssistantTurn('x.jsonl', { readTail: () => null, statMtimeMs: () => 1 })).toBeNull();
+  });
+});
+
+/**
+ * Fast-lane cold-start-on-switch fix (2026-07-14). buildVoiceDigest only
+ * pushes at end_turn boundaries, so right after a bind/switch the digest
+ * is stale or absent until Lex's next reply and the fast lane degrades
+ * (queues everything). _seedDigestFromLastTurnImpl seeds the digest from
+ * the session's real last turn at bind time, reusing the same
+ * readLastAssistantTurn extraction the replay-on-switch feature already
+ * does. Pure + dependency-injected: no real WS, filesystem, or clock.
+ */
+describe('_seedDigestFromLastTurnImpl (fast-lane cold-start-on-switch fix)', () => {
+  const digest = (over: Partial<LexDigest> = {}): LexDigest => ({
+    currentTask: '',
+    lastDecision: '',
+    openQuestion: '',
+    workerStatus: '',
+    nextSteps: '',
+    ...over,
+  });
+
+  it('seeds the digest and returns the fresh stamp when the last turn is recent', () => {
+    const pushed: Array<{ digest: LexDigest; ms: number }> = [];
+    const out = _seedDigestFromLastTurnImpl('x.jsonl', {
+      readLastAssistantTurn: () => ({
+        text: 'the migration landed, tests are green',
+        mtimeMs: 1_000,
+        uuid: 'a1',
+      }),
+      getDigest: () => null,
+      pushDigest: (d, ms) => pushed.push({ digest: d, ms }),
+      buildVoiceDigest: (text) => digest({ lastDecision: text }),
+      now: () => 1_000 + 5_000, // 5s after the turn: within any window
+      replayWindowMs: 8 * 60 * 1000,
+    });
+    expect(out).toBe(6_000);
+    expect(pushed).toHaveLength(1);
+    expect(pushed[0]!.ms).toBe(6_000);
+    expect(pushed[0]!.digest.lastDecision).toBe(
+      'the migration landed, tests are green',
+    );
+  });
+
+  it('carries the prior digest forward into buildVoiceDigest (same contract as the turn-boundary push)', () => {
+    const prior = digest({ currentTask: 'wiring the voice lane' });
+    let seenPrev: LexDigest | null | undefined;
+    _seedDigestFromLastTurnImpl('x.jsonl', {
+      readLastAssistantTurn: () => ({ text: 'reply', mtimeMs: 0, uuid: null }),
+      getDigest: () => ({ digest: prior, ms: 0 }),
+      pushDigest: () => {},
+      buildVoiceDigest: (_text, prev) => {
+        seenPrev = prev;
+        return digest();
+      },
+      now: () => 0,
+    });
+    expect(seenPrev).toBe(prior);
+  });
+
+  it('does not seed when there is no jsonl path', () => {
+    let called = false;
+    const out = _seedDigestFromLastTurnImpl(null, {
+      readLastAssistantTurn: () => {
+        called = true;
+        return null;
+      },
+      getDigest: () => null,
+      pushDigest: () => {
+        throw new Error('must not push');
+      },
+      buildVoiceDigest: () => digest(),
+    });
+    expect(out).toBeNull();
+    expect(called).toBe(false);
+  });
+
+  it('does not seed when there is no last assistant turn', () => {
+    const out = _seedDigestFromLastTurnImpl('x.jsonl', {
+      readLastAssistantTurn: () => null,
+      getDigest: () => null,
+      pushDigest: () => {
+        throw new Error('must not push');
+      },
+      buildVoiceDigest: () => digest(),
+    });
+    expect(out).toBeNull();
+  });
+
+  it('does not seed when the last turn is older than the recency window (leaves the gate as before)', () => {
+    const out = _seedDigestFromLastTurnImpl('x.jsonl', {
+      readLastAssistantTurn: () => ({ text: 'old reply', mtimeMs: 0, uuid: null }),
+      getDigest: () => null,
+      pushDigest: () => {
+        throw new Error('must not push');
+      },
+      buildVoiceDigest: () => digest(),
+      now: () => 9 * 60 * 1000, // 9 minutes later
+      replayWindowMs: 8 * 60 * 1000,
+    });
+    expect(out).toBeNull();
+  });
+
+  it('is best-effort: a read failure never throws, just leaves the gate untouched', () => {
+    const out = _seedDigestFromLastTurnImpl('x.jsonl', {
+      readLastAssistantTurn: () => {
+        throw new Error('fs error');
+      },
+      getDigest: () => null,
+      pushDigest: () => {},
+      buildVoiceDigest: () => digest(),
+    });
+    expect(out).toBeNull();
   });
 });

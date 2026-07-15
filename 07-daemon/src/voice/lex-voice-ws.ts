@@ -116,7 +116,12 @@ import {
   renderReplyForSpeech,
 } from './voice-haiku-wiring.js';
 import { useVoiceHaiku } from './voice-haiku.js';
-import { pushDigest, getDigest, buildVoiceDigest } from './voice-digest.js';
+import {
+  pushDigest,
+  getDigest,
+  buildVoiceDigest,
+  type LexDigest,
+} from './voice-digest.js';
 
 /* Voice modes drive whether the daemon synthesizes Lex's response
  * out loud. The browser still receives transcript + assistant-text
@@ -412,6 +417,65 @@ export function readLastAssistantTurn(
     };
   }
   return null;
+}
+
+/* Fast-lane cold-start-on-switch fix (2026-07-14). buildVoiceDigest is
+ * only pushed at end_turn boundaries, so right after a session bind/
+ * switch the digest is stale or absent until Lex's NEXT reply, and the
+ * haiku fast lane degrades (queues everything, or answers off nothing)
+ * for however long that takes. Fix: at bind, derive a digest from the
+ * session's real last turn (already read for replay-on-switch) and push
+ * it, so lastLexTurnMs/digest freshness reflect the prior turn instead of
+ * a blank slate. Independent of the audio-replay gates in
+ * maybeReplayLastTurnOnBind (notes mode / REPLAY_ON_SWITCH / once-per-
+ * socket) - those decide whether we SPEAK the last turn, this decides
+ * whether the fast lane KNOWS about it, and the two questions differ (a
+ * notes session still deserves a warm fast lane on switch). Pure +
+ * exported so the seed/no-seed boundary is unit-testable without a real
+ * WS or filesystem; mirrors the _flushPendingUtterancesImpl seam below. */
+export interface SeedDigestFromLastTurnDeps {
+  readLastAssistantTurn: (jsonlPath: string) => LastAssistantTurn | null;
+  getDigest: () => { digest: LexDigest; ms: number } | null;
+  pushDigest: (digest: LexDigest, atMs: number) => void;
+  buildVoiceDigest: (replyText: string, prev?: LexDigest | null) => LexDigest;
+  /** Test seam: pin the clock. Default: Date.now. */
+  now?: () => number;
+  /** Recency window: a last turn older than this never seeds. Default:
+   * REPLAY_WINDOW_MS (same "recent" definition as replay-on-switch). */
+  replayWindowMs?: number;
+}
+
+/* Returns the fresh timestamp both the digest and lastLexTurnMs were
+ * stamped with when it seeded (so the caller's closure-local
+ * lastLexTurnMs can be reassigned to match - digest.ms >= lastTurnMs must
+ * hold for isDigestFresh to read true), or null when it left the
+ * freshness gate untouched (no jsonl, no last turn, read failure, or the
+ * last turn is older than the recency window). Best-effort: never
+ * throws. */
+export function _seedDigestFromLastTurnImpl(
+  jsonlPath: string | null,
+  deps: SeedDigestFromLastTurnDeps,
+): number | null {
+  if (!jsonlPath) return null;
+  const now = (deps.now ?? Date.now)();
+  const windowMs = deps.replayWindowMs ?? REPLAY_WINDOW_MS;
+  let last: LastAssistantTurn | null;
+  try {
+    last = deps.readLastAssistantTurn(jsonlPath);
+  } catch {
+    return null;
+  }
+  if (!last || !last.text) return null;
+  if (now - last.mtimeMs > windowMs) return null;
+  try {
+    deps.pushDigest(
+      deps.buildVoiceDigest(last.text, deps.getDigest()?.digest ?? null),
+      now,
+    );
+  } catch {
+    return null;
+  }
+  return now;
 }
 
 /* One voice WS per PTY. Without this, a user with multiple dashboard
@@ -1090,6 +1154,20 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * this is a separate one-shot speak. The panel already shows the turn
    * from history, so we only add the audio. */
   function maybeReplayLastTurnOnBind(): void {
+    /* Fast-lane cold-start-on-switch fix: seed the digest from the real
+     * prior turn at bind time, independent of the audio-replay gates
+     * below (see _seedDigestFromLastTurnImpl above for why). Gated on
+     * useVoiceHaiku so the flag-off path stays byte-identical; best-
+     * effort so it can never block a bind. */
+    if (useVoiceHaiku()) {
+      const seededMs = _seedDigestFromLastTurnImpl(state.jsonlPath, {
+        readLastAssistantTurn,
+        getDigest,
+        pushDigest,
+        buildVoiceDigest,
+      });
+      if (seededMs !== null) lastLexTurnMs = seededMs;
+    }
     if (!REPLAY_ON_SWITCH || replayedOnBind) return;
     replayedOnBind = true;
     if (state.mode === 'notes') return;

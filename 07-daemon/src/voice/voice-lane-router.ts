@@ -34,11 +34,11 @@ export interface LaneDecision {
  * across different questions to avoid a robotic single phrase. The real
  * haiku-generated bridge is the flag-flip capstone; this is the default. */
 const BRIDGE_LINES = [
-  'let me check',
-  'one sec',
-  'looking that up',
-  'checking now',
-  'give me a moment',
+  'Let me pull that up.',
+  'One sec, checking.',
+  'Give me a moment on that.',
+  "Let me see what's there.",
+  'Taking a look now.',
 ];
 
 function hash(s: string): number {

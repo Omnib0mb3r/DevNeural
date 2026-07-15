@@ -155,6 +155,75 @@ describe('generateGlueReply', () => {
     );
     expect(system.toLowerCase()).toContain('slow down');
   });
+
+  /* 2026-07-14: local-context clock (requirement 2). The glue model was
+   * context-blind about the time of day - "good morning" could land a
+   * canned "on it" or a mismatched mirrored greeting. Now every glue call
+   * carries the daemon's local time / day / date / daypart, sourced fresh
+   * at call time (never from the user's words), and is told to use it. */
+  describe('local context (time-of-day awareness)', () => {
+    it('includes the LOCAL CONTEXT block, sourced from the injected clock', async () => {
+      let system = '';
+      const call: GlueModelCall = async (i) => {
+        system = i.system;
+        return 'good morning to you too';
+      };
+      await generateGlueReply(
+        { utterance: 'good morning', hint: 'greeting' },
+        { call, now: () => new Date(2026, 6, 14, 7, 30, 0) },
+      );
+      expect(system).toContain('LOCAL CONTEXT');
+      expect(system).toContain('07:30');
+      expect(system).toContain('Tuesday');
+      expect(system.toLowerCase()).toContain('morning');
+    });
+
+    it('the greeting hint instructs a time-correct reply, not an echo', async () => {
+      let system = '';
+      const call: GlueModelCall = async (i) => {
+        system = i.system;
+        return 'evening to you too';
+      };
+      await generateGlueReply(
+        { utterance: 'good morning', hint: 'greeting' },
+        { call, now: () => new Date(2026, 6, 14, 22, 0, 0) },
+      );
+      expect(system.toLowerCase()).toContain('greeted');
+      expect(system.toLowerCase()).toContain('gently correct');
+      expect(system).toContain('late night');
+    });
+
+    it('defaults to the real clock when no `now` dep is supplied', async () => {
+      let system = '';
+      const call: GlueModelCall = async (i) => {
+        system = i.system;
+        return 'hi';
+      };
+      await generateGlueReply({ utterance: 'hi', hint: 'greeting' }, { call });
+      expect(system).toContain('LOCAL CONTEXT');
+    });
+  });
+
+  /* BF-4 re-check: the local-context addition must stay inside the
+   * boundary - daemon clock only, never raw user/project content. */
+  it('BF-4: local context carries only time/day/date, never raw content', async () => {
+    let system = '';
+    const call: GlueModelCall = async (i) => {
+      system = i.system;
+      return 'morning';
+    };
+    await generateGlueReply(
+      { utterance: 'good morning', hint: 'greeting' },
+      { call, now: () => new Date(2026, 6, 14, 8, 0, 0) },
+    );
+    const block = system.slice(
+      system.indexOf('LOCAL CONTEXT'),
+      system.indexOf('VOICE FAST LANE'),
+    );
+    /* Only clock-derived tokens: no digest/project vocabulary leaks into
+     * the local-context block itself. */
+    expect(block).not.toMatch(/brainstorm|project|worker|task/i);
+  });
 });
 
 describe('renderReplyLive', () => {

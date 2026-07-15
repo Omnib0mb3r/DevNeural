@@ -12,19 +12,23 @@ import {
   heartbeatLine,
   composeGlueReply,
   renderReplyForSpeech,
+  isGreetingAside,
 } from '../src/voice/voice-haiku-wiring.js';
 import { heartbeatPhrase } from '../src/voice/lex-voice-heartbeat.js';
-import { _resetDigest } from '../src/voice/voice-digest.js';
+import { _resetDigest, pushDigest } from '../src/voice/voice-digest.js';
+import { _resetGlueHistory } from '../src/voice/voice-haiku-glue.js';
 
 let prior: string | undefined;
 beforeEach(() => {
   prior = process.env.DEVNEURAL_VOICE_HAIKU;
   _resetDigest();
+  _resetGlueHistory();
 });
 afterEach(() => {
   if (prior === undefined) delete process.env.DEVNEURAL_VOICE_HAIKU;
   else process.env.DEVNEURAL_VOICE_HAIKU = prior;
   _resetDigest();
+  _resetGlueHistory();
 });
 
 describe('flag OFF: byte-identical passthrough (regression guard)', () => {
@@ -104,14 +108,14 @@ describe('composeGlueReply fallback (no model: byte-identical to prior canned gl
 
   it('empty replay returns the canned line', async () => {
     expect(await composeGlueReply('say that again', null, off)).toBe(
-      'I had not said anything yet.',
+      "I haven't said anything yet.",
     );
   });
 
   it('delivery tweaks ack', async () => {
     expect(await composeGlueReply('slower', null, off)).toBe('Slowing down.');
     expect(await composeGlueReply('louder', null, off)).toBe('Speaking up.');
-    expect(await composeGlueReply('quieter', null, off)).toBe('Quieter.');
+    expect(await composeGlueReply('quieter', null, off)).toBe('Going quieter.');
   });
 
   it('bare acknowledgments are absorbed (null = nothing spoken)', async () => {
@@ -205,5 +209,149 @@ describe('renderReplyForSpeech (live-haiku reply render)', () => {
     /* The whole reply is spoken (safe render), tail included. */
     expect(r).toContain('slow-lane bridge');
     expect(r).toContain('First, the migration landed');
+  });
+});
+
+describe('isGreetingAside (whole-utterance greeting matcher)', () => {
+  it('matches greeting phrases, case-insensitively and normalized', () => {
+    expect(isGreetingAside('good morning')).toBe(true);
+    expect(isGreetingAside('Good Morning')).toBe(true);
+    expect(isGreetingAside('  good   morning  ')).toBe(true);
+    expect(isGreetingAside('good morning.')).toBe(true);
+    expect(isGreetingAside('morning')).toBe(true);
+    expect(isGreetingAside('good afternoon')).toBe(true);
+    expect(isGreetingAside('good evening')).toBe(true);
+    expect(isGreetingAside('hello')).toBe(true);
+    expect(isGreetingAside('hey lex')).toBe(true);
+    expect(isGreetingAside('hi')).toBe(true);
+  });
+
+  it('does not match a substantive turn that merely mentions a greeting word', () => {
+    expect(isGreetingAside('good morning, what did the tests do overnight')).toBe(false);
+  });
+
+  it('does not match non-greeting glue or control turns', () => {
+    expect(isGreetingAside('thanks')).toBe(false);
+    expect(isGreetingAside('quiet')).toBe(false);
+    expect(isGreetingAside('slower')).toBe(false);
+  });
+});
+
+describe('composeGlueReply: time-aware canned greetings (requirement 3)', () => {
+  const off = { modelEnabled: false } as const;
+
+  it('answers a morning greeting with a morning-daypart line when the model is off', async () => {
+    const now = () => new Date(2026, 0, 1, 8, 0, 0); // 08:00 local -> morning
+    const reply = await composeGlueReply('good morning', null, { ...off, now });
+    expect(['Good morning.', 'Morning.']).toContain(reply);
+  });
+
+  it('answers a generic greeting with the plain daypart line, no correction', async () => {
+    const now = () => new Date(2026, 0, 1, 2, 0, 0); // 02:00 local -> late night
+    const reply = await composeGlueReply('hey', null, { ...off, now });
+    expect([
+      "Hey - it's late, but good to hear from you.",
+      'Still up. Hi.',
+    ]).toContain(reply);
+  });
+
+  it('gently corrects a mismatched greeting instead of mirroring it back (good morning at night)', async () => {
+    const now = () => new Date(2026, 0, 1, 23, 0, 0); // 23:00 local -> late night
+    const reply = await composeGlueReply('good morning', null, { ...off, now });
+    expect(reply?.toLowerCase()).not.toContain('good morning');
+    expect(reply?.toLowerCase()).toMatch(/night/);
+  });
+
+  it('an early-morning "good morning" is not treated as a mismatch', async () => {
+    const now = () => new Date(2026, 0, 1, 6, 0, 0); // 06:00 local -> early morning
+    const reply = await composeGlueReply('good morning', null, { ...off, now });
+    expect(['You\'re up early - good morning.', 'Morning. Early start today.']).toContain(
+      reply,
+    );
+  });
+
+  it('never repeats the immediately-previous canned greeting back-to-back', async () => {
+    const now = () => new Date(2026, 0, 1, 8, 0, 0);
+    const first = await composeGlueReply('good morning', null, { ...off, now });
+    const second = await composeGlueReply('good morning', null, { ...off, now });
+    expect(second).not.toBe(first);
+  });
+
+  it('prefers the live model over the canned pool, using the greeting hint', async () => {
+    const seen: string[] = [];
+    const reply = await composeGlueReply('good morning', null, {
+      generate: async ({ hint }) => {
+        seen.push(hint);
+        return 'morning - ready when you are';
+      },
+    });
+    expect(reply).toBe('morning - ready when you are');
+    expect(seen).toEqual(['greeting']);
+  });
+
+  it('falls back to the canned pool when the live model misses', async () => {
+    const now = () => new Date(2026, 0, 1, 14, 0, 0); // afternoon
+    const reply = await composeGlueReply('good afternoon', null, {
+      modelEnabled: true,
+      generate: async () => null,
+      now,
+    });
+    expect(['Good afternoon.', 'Afternoon.']).toContain(reply);
+  });
+
+  it('non-greeting asides are unaffected (still absorb / canned delivery lines)', async () => {
+    expect(await composeGlueReply('thanks', 'x', off)).toBeNull();
+    expect(await composeGlueReply('slower', null, off)).toBe('Slowing down.');
+  });
+});
+
+describe('haikuRoute: greeting always answers on the fast lane (requirement 3/4)', () => {
+  beforeEach(() => {
+    process.env.DEVNEURAL_VOICE_HAIKU = '1';
+  });
+
+  it('routes a greeting to fast even with no digest ever pushed (cold start)', () => {
+    const d = haikuRoute('good morning', { lastTurnMs: 1 });
+    expect(d?.route.lane).toBe('fast');
+  });
+
+  it('routes a greeting to fast even when a digest exists but is stale', () => {
+    pushDigest(
+      {
+        currentTask: '',
+        lastDecision: '',
+        openQuestion: '',
+        workerStatus: '',
+        nextSteps: '',
+      },
+      1,
+    );
+    const d = haikuRoute('hello', { lastTurnMs: 100 });
+    expect(d?.route.lane).toBe('fast');
+  });
+
+  it('routes a greeting to fast when the digest is fresh too', () => {
+    const d = haikuRoute('good afternoon', {
+      lastTurnMs: 0,
+      assumeDigestFresh: true,
+    });
+    expect(d?.route.lane).toBe('fast');
+  });
+
+  it('a non-greeting substantive turn still queues (staleness gate untouched)', () => {
+    const d = haikuRoute('how many tests pass', { lastTurnMs: 1 });
+    expect(d?.route.lane).toBe('slow');
+  });
+
+  it('a non-greeting substantive turn still queues even with assumeDigestFresh', () => {
+    const d = haikuRoute('how many tests pass', {
+      lastTurnMs: 0,
+      assumeDigestFresh: true,
+    });
+    expect(d?.route.lane).toBe('slow');
+  });
+
+  it('control commands are unaffected by the greeting override', () => {
+    expect(haikuRoute('quiet', { lastTurnMs: 0 })?.route.lane).toBe('control');
   });
 });
