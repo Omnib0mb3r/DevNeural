@@ -9,12 +9,34 @@ reflects what was true at the last update.
 The rule: anyone reading this should start cold and know where the code
 is, what is in flight, what is shippable next, and what blocks it.
 
-Last touched: 2026-07-15 (third cursor). Branch `master` @ 2a669c2.
-Daemon suite 1763/1764 green (same 1 pre-existing grooming-routes
-failure). Dashboard build green. Dist rebuilt from committed source.
-One daemon restart pending to activate waves 3+4 (expectation
-dispatcher + supersede policy, diarization, inject verdicts, logger
-routing, restart-relauncher chain).
+Last touched: 2026-07-15 (fourth cursor). Branch `master` @ 4e6ad54.
+Daemon suite 1815/1816 green (same 1 pre-existing grooming-routes
+failure). Dashboard unit suite 212 green, build green (prod out/
+refreshed). Dist rebuilt from committed source. One daemon restart
+pending to activate waves 3-5.
+
+### 2026-07-15 wave 5 (operator direction: one smart path, Max plan, records everywhere)
+
+- d275bd5 absorbed voice asides captured to brainstorm_chunks AND
+  batched into Lex's next inject as a compact aside log (no more
+  transcript holes from the fast lane).
+- 8d36e93 persistent Max-plan judge session (spawned once, kept open
+  like Lex, zero marginal cost): supersede/inject-verdict/expectation
+  judges route through it, ollama demoted to fallback, curator vet
+  gate exempt (800ms in-hook budget). askText entry point for voice.
+  DEVNEURAL_JUDGE_SESSION=0 escape hatch. Vitest backstop prevents
+  test runs from ever spawning a real session.
+- b83c816 small talk answered by the persistent session: colleague
+  greeting prompt (digest-led, clock as calibration only, never
+  spoken), metered Haiku glue calls retired (functions deprecated in
+  place), bridge filler back to instant deterministic line, canned
+  shrunk to a two-line silence guard.
+- 4e6ad54 phone Bluetooth output routing: Play through picker
+  (Android Chrome setSinkId, persisted, live-applied, devicechange
+  fallback), iOS audioSession play-and-record hint in the start
+  gesture, honest iOS-disabled copy (no output-pick API on iOS,
+  platform wall). Root cause: communication-mode mic session + zero
+  sink control; cars fail HFP negotiation where headphones succeed.
 
 ### 2026-07-15 wave 4 (operator escalations, all root-caused live)
 
