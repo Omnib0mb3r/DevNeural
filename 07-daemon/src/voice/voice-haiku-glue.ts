@@ -22,7 +22,7 @@
  * is rejected, so the same aside never reads the same way twice.
  */
 import Anthropic from '@anthropic-ai/sdk';
-import { VOICE_HAIKU_MODEL } from './voice-haiku.js';
+import { VOICE_HAIKU_MODEL, voiceApiKey } from './voice-haiku.js';
 import { getDigest } from './voice-digest.js';
 import { buildHaikuPersonaPrompt } from './voice-persona.js';
 
@@ -59,7 +59,7 @@ const defaultCall: GlueModelCall = async ({
   maxTokens,
   temperature,
 }) => {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = voiceApiKey();
   if (!apiKey) return null;
   if (!client) {
     /* No SDK auto-retries: on the voice lane a retry is worse than the
@@ -83,9 +83,10 @@ const defaultCall: GlueModelCall = async ({
   return text || null;
 };
 
-/** True when a live glue call can be made (API key present). */
+/** True when a live glue call can be made (a voice API key is present -
+ * ANTHROPIC_API_KEY or the BRIDGER fallback). */
 export function glueModelAvailable(): boolean {
-  return Boolean(process.env.ANTHROPIC_API_KEY);
+  return Boolean(voiceApiKey());
 }
 
 /* Recent spoken glue lines, newest last. Fed back as an avoid-list and
@@ -176,6 +177,62 @@ export async function generateGlueReply(
   if (recent.length > 0 && recent[recent.length - 1] === cleaned) {
     return null;
   }
+  remember(cleaned);
+  return cleaned;
+}
+
+/* Bridge instruction (DRIVE-QUEUE, slow-lane filler). The user asked
+ * something that needs Lex to actually look (a project / code / state /
+ * history question); Lex is about to reason on it. This produces the
+ * INSTANT spoken line that fills the gap - the "let me look" slot - but
+ * specific to what they actually asked instead of a canned filler. */
+function bridgeInstruction(): string {
+  const lines = [
+    '--- VOICE FAST LANE: BRIDGE (you are speaking out loud, right now) ---',
+    'The user just asked something that needs you to actually look or',
+    'think - a project, code, state, or history question - and you are',
+    'about to go find the answer. Say ONE short, natural spoken line, in',
+    'your own voice, that acknowledges THEIR SPECIFIC request and signals',
+    'you are on it right now. Make it specific to what they asked (lean on',
+    'the digest for the topic when it helps); vary your phrasing every',
+    'time. Do NOT answer the question yet and do NOT invent facts - this',
+    'is only the bridge before you reason. Never reuse a line you have',
+    'used before.',
+  ];
+  if (recent.length > 0) {
+    lines.push('Avoid repeating any of these recent lines:');
+    for (const r of recent) lines.push(`- ${r}`);
+  }
+  return lines.join('\n');
+}
+
+/* Generate one warm, specific, in-persona BRIDGE line for the slow lane.
+ * Returns null on unavailable/failed/empty (caller uses the deterministic
+ * bridge). Shares the never-twice ring with the glue path so a bridge and
+ * an ack never read the same back-to-back. */
+export async function generateBridgeReply(
+  input: { utterance: string },
+  deps?: GenerateGlueDeps,
+): Promise<string | null> {
+  const call = deps?.call ?? defaultCall;
+  const persona =
+    deps?.personaPrompt ??
+    buildHaikuPersonaPrompt(getDigest()?.digest ?? null);
+  const system = `${persona}\n\n${bridgeInstruction()}`;
+  let out: string | null;
+  try {
+    out = await call({
+      system,
+      user: input.utterance,
+      maxTokens: VOICE_GLUE_MAX_TOKENS,
+      temperature: VOICE_GLUE_TEMPERATURE,
+    });
+  } catch {
+    return null;
+  }
+  const cleaned = (out ?? '').trim();
+  if (!cleaned || /^<none>\.?$/i.test(cleaned)) return null;
+  if (recent.length > 0 && recent[recent.length - 1] === cleaned) return null;
   remember(cleaned);
   return cleaned;
 }

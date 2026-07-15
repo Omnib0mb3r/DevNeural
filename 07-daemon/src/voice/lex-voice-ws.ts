@@ -112,6 +112,7 @@ import {
   heartbeatLine,
   haikuRoute,
   composeGlueReply,
+  composeBridgeReply,
   renderReplyForSpeech,
 } from './voice-haiku-wiring.js';
 import { useVoiceHaiku } from './voice-haiku.js';
@@ -317,6 +318,98 @@ function findJsonlBySessionId(sessionId: string): string | null {
       `${sessionId}.jsonl`,
     );
     if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/* Replay-on-switch (2026-07-09). When a voice client binds to a session
+ * that just produced a reply the user may not have heard - they were on
+ * another brainstorm, or just switched to this one - speak that last
+ * reply once so switching catches you up. Guarded by recency: binding to
+ * a session whose last turn is old (loading /lex hours later) never dumps
+ * a stale reply. DEVNEURAL_VOICE_REPLAY_ON_SWITCH=0 disables it;
+ * DEVNEURAL_VOICE_REPLAY_WINDOW_MS tunes the window (default 8 min). */
+const REPLAY_ON_SWITCH =
+  (process.env.DEVNEURAL_VOICE_REPLAY_ON_SWITCH ?? '1') !== '0';
+const REPLAY_WINDOW_MS = Number(
+  process.env.DEVNEURAL_VOICE_REPLAY_WINDOW_MS ?? 8 * 60 * 1000,
+);
+
+export interface LastAssistantTurn {
+  text: string;
+  mtimeMs: number;
+  uuid: string | null;
+}
+
+/* Extract the most recent assistant reply (concatenated text blocks) from
+ * a Claude Code session jsonl, with the file's mtime for the recency
+ * guard. Reads only the tail (last 64 KB) so a multi-MB transcript is
+ * cheap; a partial first line just fails JSON.parse and is skipped.
+ * Exported + dependency-injected so the replay logic is unit-testable
+ * without a real file. */
+export function readLastAssistantTurn(
+  jsonlPath: string,
+  deps?: {
+    readTail?: (p: string, bytes: number) => string | null;
+    statMtimeMs?: (p: string) => number;
+  },
+): LastAssistantTurn | null {
+  const statMtimeMs =
+    deps?.statMtimeMs ??
+    ((p) => {
+      try {
+        return fs.statSync(p).mtimeMs;
+      } catch {
+        return 0;
+      }
+    });
+  const readTail =
+    deps?.readTail ??
+    ((p, bytes) => {
+      try {
+        const size = fs.statSync(p).size;
+        const start = Math.max(0, size - bytes);
+        const fd = fs.openSync(p, 'r');
+        try {
+          const len = size - start;
+          const buf = Buffer.alloc(len);
+          fs.readSync(fd, buf, 0, len, start);
+          return buf.toString('utf-8');
+        } finally {
+          fs.closeSync(fd);
+        }
+      } catch {
+        return null;
+      }
+    });
+  const body = readTail(jsonlPath, 65536);
+  if (!body) return null;
+  const lines = body.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const trimmed = lines[i]?.trim();
+    if (!trimmed) continue;
+    let rec: {
+      type?: string;
+      uuid?: string;
+      message?: { content?: Array<{ type?: string; text?: string }> };
+    };
+    try {
+      rec = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (rec.type !== 'assistant' || !rec.message?.content) continue;
+    const text = rec.message.content
+      .filter((b) => b.type === 'text' && b.text)
+      .map((b) => b.text)
+      .join('')
+      .trim();
+    if (!text) continue;
+    return {
+      text,
+      mtimeMs: statMtimeMs(jsonlPath),
+      uuid: typeof rec.uuid === 'string' ? rec.uuid : null,
+    };
   }
   return null;
 }
@@ -650,6 +743,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * matching push. */
   let lastLexTurnMs = 0;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /* Replay-on-switch guard: speak the bound session's last reply at most
+   * once per socket, even if the read misses or the turn is too old. */
+  let replayedOnBind = false;
 
   /* Fix 40 (2026-05-26): centralise piper synth lifecycle behind a
    * controller that serialises same-turn speak() calls and cancels
@@ -800,6 +896,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       });
       claimWatchTarget();
       startJsonlWatch();
+      maybeReplayLastTurnOnBind();
       return;
     }
     state.bindKey = handle.sessionId ?? handle.ptyId;
@@ -863,6 +960,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     });
     claimWatchTarget();
     if (state.jsonlPath) startJsonlWatch();
+    maybeReplayLastTurnOnBind();
     /* Fix 31 (2026-05-25): migrate awaitingResponseSince from the
      * brainstorm row when binding to an in-flight turn. The race:
      * a prior WS for the same brainstorm fired ptyInject and set
@@ -981,6 +1079,33 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       state.watchTimer = null;
     }
     stopHeartbeat();
+  }
+
+  /* Replay-on-switch (item 2). Called once after a bind resolves a
+   * jsonl. If the bound session's last assistant reply is recent (within
+   * REPLAY_WINDOW_MS) and this is not a silent notes session, speak it
+   * once so switching to the session catches you up on what you may have
+   * missed. No double-speak risk: the live watcher's offset is stamped at
+   * EOF on bind, so the last turn (which is before EOF) is never re-read;
+   * this is a separate one-shot speak. The panel already shows the turn
+   * from history, so we only add the audio. */
+  function maybeReplayLastTurnOnBind(): void {
+    if (!REPLAY_ON_SWITCH || replayedOnBind) return;
+    replayedOnBind = true;
+    if (state.mode === 'notes') return;
+    if (!state.jsonlPath) return;
+    let last: LastAssistantTurn | null = null;
+    try {
+      last = readLastAssistantTurn(state.jsonlPath);
+    } catch {
+      return;
+    }
+    if (!last || !last.text) return;
+    if (Date.now() - last.mtimeMs > REPLAY_WINDOW_MS) return;
+    console.log(
+      `[voice-ws] replay-on-switch: speaking last reply (age=${Math.round((Date.now() - last.mtimeMs) / 1000)}s) bindKey=${state.bindKey ?? 'null'}`,
+    );
+    speak(last.text);
   }
 
   /* Periodic "still working" pulse while a turn is in flight. The gate
@@ -2371,9 +2496,26 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           state.utteranceStartedDuringTts = false;
           return;
         } else {
-          /* slow: instant bridge now, Lex reasons below, reply rendered
-           * through the preserve-list when it lands. */
-          if (dec.route.bridge) speak(dec.route.bridge);
+          /* slow: a request-specific bridge now, Lex reasons below, reply
+           * rendered through the preserve-list when it lands. The bridge
+           * is composed live (warm + specific to what they asked) with a
+           * fail-fast fallback to the deterministic hash line. Fire it
+           * WITHOUT awaiting so Lex's inject below is not delayed by the
+           * haiku call; the bridge speaks the moment it lands, ahead of
+           * Lex's Opus reply. speak() serialises via the TTS queue, so the
+           * bridge and the eventual reply never overlap. */
+          if (dec.route.bridge) {
+            const fallbackBridge = dec.route.bridge;
+            const bridgeUtterance = trimmed;
+            void composeBridgeReply(bridgeUtterance, fallbackBridge)
+              .then((line) => {
+                if (line) speak(line);
+              })
+              .catch(() => {
+                /* never let the bridge composition break the turn */
+                speak(fallbackBridge);
+              });
+          }
           state.utteranceStartedDuringTts = false;
           /* fall through to the existing inject path */
         }

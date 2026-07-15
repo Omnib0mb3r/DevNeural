@@ -9,13 +9,99 @@ reflects what was true at the last update.
 The rule: anyone reading this should start cold and know where the code
 is, what is in flight, what is shippable next, and what blocks it.
 
-Last touched: 2026-07-09. Branch `master`, tree clean. Daemon suite
+Last touched: 2026-07-09. Branch `master`. Daemon suite
 1448 green (1 pre-existing grooming-routes failure, present on clean
 baseline). Dashboard 146 unit green. The operator rebuild + restart
 HAPPENED (multiple times 2026-07-09, operator-directed): everything in
 the old "Pending the operator daemon rebuild + restart" list is LIVE
 and was spot-verified (headless distill ticking, lifecycle route with
 real gate probes, /knowledge orb data, knowledge-index routes).
+
+### 2026-07-09 fix: Lex voice silent - CLAUDE_CODE_CHILD_SESSION leak
+
+Symptom: talking to Lex, he either hung "thinking" with no reply, or
+replied only as on-screen text with no voice. Root cause (not a
+DevNeural regression - an inherited-env bug): the daemon had been
+restarted from inside a Claude Code session, so
+`CLAUDE_CODE_CHILD_SESSION=1` sat in the daemon's process.env.
+`spawnLex` passed the full env through to every Lex PTY (pty-host.ts
+old line 391, `{...process.env, ...opts.env}`). A claude that sees
+that flag runs in child-session mode: it writes NO transcript jsonl
+under `~/.claude/projects/<slug>/<uuid>.jsonl` and NO
+`~/.claude/sessions/<pid>.json` pidfile. The voice + terminal-mirror
+pipeline tails that jsonl for assistant turns, so a child-session Lex
+was invisible: it thought and replied inside its own PTY, but the
+watcher never saw the turn - no assistant-text event, no Piper TTS,
+injects looked ignored. Broke ~00:17 Jul 9 when the last long-lived
+sessions (created before the poison entered the daemon env) were
+killed by a restart; every fresh spawn after that inherited the flag.
+
+Proof chain: daemon Lex sessions (cc=4735ac31, ddd60b75) had no jsonl
+on disk and no pidfile; direct PTY repro showed claude replies but
+writes nothing while the flag is set; stripping
+`CLAUDE_CODE_CHILD_SESSION` alone restored both the transcript and the
+pidfile. Not version- or wrapper-specific (2.1.197 and 2.1.205, cmd
+wrapper and direct exe, all reproduce; `--print` is unaffected).
+
+Fix: `sanitizeClaudeSpawnEnv` in `07-daemon/src/dashboard/pty-host.ts`
+strips the parent's child-session identity markers
+(`CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ID`,
+`CLAUDE_TRANSCRIPT_PATH`) from the env AFTER merging opts.env, so Lex
+always spawns as a top-level session regardless of how the daemon was
+launched. Regression test `tests/spawn-env-child-session.test.ts`
+(5 cases). Built + operator-directed daemon restart applied and
+verified LIVE 2026-07-09: fresh Lex spawn now writes its transcript
+jsonl and pidfile; old broken PTYs died with the old daemon. NOT yet
+git-committed (source edited + dist rebuilt on disk). Rebuild: yes.
+
+Note: an env dump during diagnosis surfaced `BRIDGER_ANTHROPIC_API`
+(a real Anthropic key) to the terminal. It is now intentionally used as
+the voice-haiku key (see next entry); still worth rotating since it hit
+a terminal, but it is no longer just a leak.
+
+### 2026-07-09 batch: voice smartness + switch + cold-start + replay
+
+Four operator-reported issues, all fixed + LIVE (daemon restarted, boot
+log confirms `[voice-haiku] enabled=true api_key=present flag=1`). New
+tests across the batch; full suite green apart from the one pre-existing
+grooming-watch failure.
+
+- Smart replies (was: flat "on it" / "let me look"). Two causes:
+  (1) no ANTHROPIC_API_KEY, so glue + spoken render fell back to canned
+  lines; (2) the slow-lane bridge was never wired to a live model.
+  Fixes: `voiceApiKey()` (voice-haiku.ts) reads ANTHROPIC_API_KEY OR
+  `BRIDGER_ANTHROPIC_API` (a persistent User env var the daemon inherits
+  on ANY launch path - the flag/key kept coming up absent because recent
+  restarts were manual `node dist/daemon.js` that skip start-daemon.ps1's
+  env block); `enableVoiceHaikuIfKeyPresent()` self-enables the lane at
+  daemon boot when a key is present (useVoiceHaiku() stays a strict '1'
+  gate for testability). Slow-lane bridge is now `composeBridgeReply` /
+  `generateBridgeReply` - a live, request-specific line ("let me pull up
+  the academy status") fired async so Lex's inject is not delayed, with a
+  fail-fast fallback to the deterministic `pickBridgeLine`. Billing: the
+  key is read as BRIDGER_ANTHROPIC_API (claude ignores it) and spawnLex
+  strips ANTHROPIC_API_KEY (SPAWN_STRIP_ENV), so Lex stays on Claude Max.
+  A `[voice-haiku]` boot log line makes flat-voice a one-line check.
+- Session switch didn't move the voice controls. `VoiceClient.tsx` bound
+  to the newest-started brainstorm PTY (stale "one Lex at a time"
+  assumption); with worker-scoped brainstorms several are live at once.
+  Now mirrors app/lex/page.tsx: the `?brainstorm=` selection's
+  current_pty_id wins, newest-started only as the un-parameterised
+  fallback. Needs the DASHBOARD build (done) + daemon restart to serve.
+- Cold-start preload polluted. The recent-thread tail was flooded with
+  `[silent supervision tick]` prompts + empty "." acks. `isNoiseTurn`
+  (jsonl-transcript-reader.ts) filters both, so the seed reflects the
+  real thread. Empty prior-session summaries were a side effect of the
+  child-session persistence bug (fixed above).
+- Replay-on-switch (item 2, operator "do what makes sense"). On binding
+  to a session, `maybeReplayLastTurnOnBind` speaks its last assistant
+  reply ONCE if recent (`readLastAssistantTurn` + REPLAY_WINDOW_MS,
+  default 8 min; DEVNEURAL_VOICE_REPLAY_ON_SWITCH=0 disables). No
+  double-speak: the live watcher's offset is EOF at bind. notes mode
+  stays silent.
+
+Not committed to git (source edited + dist + dashboard rebuilt on disk,
+all live). Rebuild: yes.
 
 ### 2026-07-09 session: worker-scoped brainstorms + switch + binding
 

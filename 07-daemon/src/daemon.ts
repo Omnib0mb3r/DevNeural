@@ -27,6 +27,11 @@ import { purgeMeetingAudio } from './voice/meeting-audio-purge.js';
 import { whisperStatus } from './voice/whisper.js';
 import { piperStatus } from './voice/piper.js';
 import { getVoiceWsStats } from './voice/lex-voice-ws.js';
+import {
+  useVoiceHaiku,
+  voiceApiKey,
+  enableVoiceHaikuIfKeyPresent,
+} from './voice/voice-haiku.js';
 import { embedOne, warmUp, getEmbedDim, getModelId, setEmbedderLogger, embedderStats } from './embedder/index.js';
 import { ensureWiki } from './wiki/scaffolding.js';
 import { runSeed, hasSeeded } from './corpus/seed.js';
@@ -1356,6 +1361,16 @@ async function main(): Promise<void> {
     const host = process.env.DEVNEURAL_BIND ?? '0.0.0.0';
     await app.listen({ port: PORT, host });
     logger(`listening on http://${host}:${PORT}`);
+    /* Voice-haiku readiness (2026-07-09). Self-enable the smart voice
+     * lane when a key is present so it no longer depends on
+     * start-daemon.ps1's env block reaching this process, then log the
+     * resolved state - a flat-voice complaint becomes a one-line log
+     * check. The key resolves from ANTHROPIC_API_KEY or the BRIDGER
+     * fallback. */
+    enableVoiceHaikuIfKeyPresent();
+    logger(
+      `[voice-haiku] enabled=${useVoiceHaiku()} api_key=${voiceApiKey() ? 'present' : 'absent'} flag=${process.env.DEVNEURAL_VOICE_HAIKU ?? 'unset'}`,
+    );
   } catch (err) {
     logger(`http listen failed: ${(err as Error).message}`);
   }

@@ -328,6 +328,67 @@ function tryDiscoverSession(handle: PtyHandle): void {
   }
 }
 
+/* Environment markers Claude Code stamps on a running session's own
+ * process to signal "you are executing inside another Claude Code
+ * session." If the DAEMON was launched from within a Claude Code
+ * session - an operator restart typed at a `claude` terminal, or the
+ * /admin/daemon/restart route firing while the operator drove it from
+ * Claude Code - these leak into the daemon's process.env and, because
+ * spawnLex passes the full env through, into every Lex PTY we spawn.
+ *
+ * The critical one is CLAUDE_CODE_CHILD_SESSION=1. A claude that sees
+ * it runs in child-session mode and writes NO transcript jsonl under
+ * ~/.claude/projects/<slug>/<uuid>.jsonl (and no ~/.claude/sessions/
+ * <pid>.json pidfile). The entire voice + terminal-mirror pipeline
+ * tails that jsonl for Lex's assistant turns, so a child-session Lex
+ * is invisible to the daemon: it thinks + replies in its own PTY, but
+ * the watcher never observes the turn -> voice looks "stuck thinking",
+ * the mirror stays blank, and injects appear to go nowhere. Root-caused
+ * 2026-07-09; stripping CLAUDE_CODE_CHILD_SESSION alone restores both
+ * the transcript and the pidfile (verified by direct PTY repro).
+ *
+ * Lex is always a TOP-LEVEL session, so none of these parent-session
+ * identity markers should ever reach it. Strip them so the daemon is
+ * immune to however it happened to be launched. Config-scope vars
+ * (CLAUDE_CONFIG_DIR, ANTHROPIC_*, DEVNEURAL_*) are deliberately left
+ * intact - only the per-session identity markers are removed. */
+export const CHILD_SESSION_ENV_MARKERS = [
+  'CLAUDE_CODE_CHILD_SESSION',
+  'CLAUDE_CODE_SESSION_ID',
+  'CLAUDE_TRANSCRIPT_PATH',
+] as const;
+
+/* Billing-scope strip (2026-07-09). The daemon sets ANTHROPIC_API_KEY in
+ * its OWN process.env so the voice-haiku SDK (glue + spoken render) can
+ * make cheap Haiku calls. But Claude Code treats ANTHROPIC_API_KEY as an
+ * override that switches a session from the Claude Max subscription
+ * (OAuth) to per-token API billing. Lex runs Opus at xhigh effort, so
+ * inheriting the key would silently bill every supervisor turn against
+ * the API at a large multiple of the Max cost. Strip it from the spawn
+ * env only: the daemon still reads it from its own process.env for the
+ * SDK, and Lex falls back to Max OAuth exactly as it does today. A
+ * worker that genuinely needs API billing can pass it back via opts.env.
+ */
+export const SPAWN_STRIP_ENV = [
+  ...CHILD_SESSION_ENV_MARKERS,
+  'ANTHROPIC_API_KEY',
+] as const;
+
+/* Build the env for a spawned claude from a base env, dropping the
+ * child-session identity markers + the API-key billing override above.
+ * Pure + exported so the regression test can assert the strip without
+ * standing up a PTY. */
+export function sanitizeClaudeSpawnEnv(
+  base: NodeJS.ProcessEnv,
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(base)) {
+    if (v !== undefined) env[k] = v;
+  }
+  for (const k of SPAWN_STRIP_ENV) delete env[k];
+  return env;
+}
+
 /**
  * Spawn a `claude` (or any) PTY at the given cwd. The returned ptyId
  * lets the dashboard address the live PTY before claude has written
@@ -388,7 +449,16 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
     cols: opts.cols ?? 110,
     rows: opts.rows ?? 34,
     cwd,
-    env: { ...process.env, ...(opts.env ?? {}) } as Record<string, string>,
+    /* Strip the parent's child-session identity markers (see
+     * sanitizeClaudeSpawnEnv above) AFTER merging opts.env, so a
+     * marker cannot re-enter from either source. Without this a
+     * daemon launched from inside Claude Code spawns every Lex in
+     * child-session mode, which writes no transcript jsonl and makes
+     * voice/mirror go dark. */
+    env: sanitizeClaudeSpawnEnv({
+      ...process.env,
+      ...(opts.env ?? {}),
+    }),
   });
 
   const cols = opts.cols ?? 110;

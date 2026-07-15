@@ -14,6 +14,7 @@ import { composeHeartbeat } from './voice-heartbeat-haiku.js';
 import { heartbeatPhrase } from './lex-voice-heartbeat.js';
 import {
   generateGlueReply,
+  generateBridgeReply,
   glueModelAvailable,
   renderReplyLive,
   type GenerateGlueDeps,
@@ -111,6 +112,33 @@ export interface ComposeGlueDeps extends GenerateGlueDeps {
    * present. */
   modelEnabled?: boolean;
   generate?: typeof generateGlueReply;
+}
+
+/* Slow-lane BRIDGE line. OFF / no key / call miss: returns the
+ * deterministic fallback (the caller's pickBridgeLine hash pick), so the
+ * behavior is byte-identical to before. ON + key: a warm, request-
+ * specific line from the live model. Always resolves to a spoken line
+ * (never null) - the bridge must never be silent, unlike glue which can
+ * absorb. The caller fires this WITHOUT awaiting before injecting Lex, so
+ * Lex starts reasoning immediately and the bridge speaks the moment it
+ * lands (well before an Opus reply). */
+export interface ComposeBridgeDeps extends GenerateGlueDeps {
+  /** Force the live model path on/off (tests). Default: flag on AND key. */
+  modelEnabled?: boolean;
+  generate?: typeof generateBridgeReply;
+}
+
+export async function composeBridgeReply(
+  utterance: string,
+  fallback: string,
+  deps?: ComposeBridgeDeps,
+): Promise<string> {
+  const modelEnabled =
+    deps?.modelEnabled ?? (useVoiceHaiku() && glueModelAvailable());
+  if (!modelEnabled && !deps?.generate) return fallback;
+  const gen = deps?.generate ?? generateBridgeReply;
+  const reply = await gen({ utterance }, deps);
+  return reply ?? fallback;
 }
 
 export async function composeGlueReply(

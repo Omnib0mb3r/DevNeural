@@ -8,7 +8,7 @@ import { usePathname } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { Icon } from "./Icon";
 import { LexThumbs } from "./LexThumbs";
-import { listPtys, type PtyEntry } from "@/lib/daemon-client";
+import { listPtys, lexAnchors, type PtyEntry } from "@/lib/daemon-client";
 import { emitVoiceSettingUpdate, onVoiceSettingUpdate } from "@/lib/voice-settings-bus";
 import { emitTranscriptTurn } from "@/lib/transcript-bus";
 import {
@@ -293,21 +293,42 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * surfaces status + mute + stop so the user can see and control
    * voice without losing their place.
    *
-   * sessionId is resolved from the same pty-list query the /lex
-   * page uses: the most-recently-started non-exited PTY whose cwd
-   * ends in /brainstorm. There's only one Lex at a time so binding
-   * the engine to "whichever brainstorm PTY is live right now" is
-   * the correct behaviour regardless of route. */
+   * sessionId resolution MUST match the /lex page (app/lex/page.tsx)
+   * so voice, text, and the terminal mirror all bind to the SAME
+   * session. Worker-scoped brainstorms (2026-07-08) allow several
+   * live brainstorm PTYs at once, all sharing the /brainstorm cwd, so
+   * the old "newest-started brainstorm PTY" rule welded the voice
+   * engine to whichever session started last and made "switch to" a
+   * no-op for the controls even though the WS hello already honored
+   * ?brainstorm=. Honor the selection here too: the selected anchor's
+   * current_pty_id wins; newest-started is only the fallback for an
+   * un-parameterised visit. */
   const ptysQ = useQuery({
     queryKey: ["pty-list"],
     queryFn: listPtys,
     refetchInterval: 3_000,
   });
-  const lexPty: PtyEntry | undefined = (ptysQ.data?.ptys ?? [])
-    .filter(
-      (p) => !p.exited && /\/brainstorm\/?$/i.test(p.cwd.replace(/\\/g, "/")),
-    )
-    .sort((a, b) => b.startedAt - a.startedAt)[0];
+  const anchorsQ = useQuery({
+    queryKey: ["lex-anchors", "live"],
+    queryFn: () => lexAnchors({ status: "live", limit: 20 }),
+    refetchInterval: 5_000,
+  });
+  const selectedAnchorId: string | null =
+    typeof window !== "undefined"
+      ? new URL(window.location.href).searchParams.get("brainstorm")
+      : null;
+  const brainstormPtys = (ptysQ.data?.ptys ?? []).filter(
+    (p) => !p.exited && /\/brainstorm\/?$/i.test(p.cwd.replace(/\\/g, "/")),
+  );
+  const selectedAnchor = selectedAnchorId
+    ? (anchorsQ.data?.anchors ?? []).find((a) => a.id === selectedAnchorId) ??
+      null
+    : null;
+  const lexPty: PtyEntry | undefined = selectedAnchorId
+    ? selectedAnchor?.current_pty_id
+      ? brainstormPtys.find((p) => p.ptyId === selectedAnchor.current_pty_id)
+      : undefined
+    : [...brainstormPtys].sort((a, b) => b.startedAt - a.startedAt)[0];
   const sessionId: string | null = lexPty?.sessionId ?? null;
   const hasLex = Boolean(lexPty);
 

@@ -16,24 +16,37 @@ import {
 import { _resetDigest, pushDigest } from '../src/voice/voice-digest.js';
 
 let priorKey: string | undefined;
+let priorBridger: string | undefined;
 beforeEach(() => {
+  /* voiceApiKey() reads ANTHROPIC_API_KEY OR the BRIDGER fallback, so a
+   * key-presence test must control both (the dev env carries a persistent
+   * BRIDGER_ANTHROPIC_API). */
   priorKey = process.env.ANTHROPIC_API_KEY;
+  priorBridger = process.env.BRIDGER_ANTHROPIC_API;
+  delete process.env.BRIDGER_ANTHROPIC_API;
   _resetGlueHistory();
   _resetDigest();
 });
 afterEach(() => {
   if (priorKey === undefined) delete process.env.ANTHROPIC_API_KEY;
   else process.env.ANTHROPIC_API_KEY = priorKey;
+  if (priorBridger === undefined) delete process.env.BRIDGER_ANTHROPIC_API;
+  else process.env.BRIDGER_ANTHROPIC_API = priorBridger;
   _resetGlueHistory();
   _resetDigest();
 });
 
 describe('glueModelAvailable', () => {
-  it('tracks the API key presence', () => {
+  it('tracks the API key presence (ANTHROPIC_API_KEY)', () => {
     process.env.ANTHROPIC_API_KEY = 'sk-test';
     expect(glueModelAvailable()).toBe(true);
     delete process.env.ANTHROPIC_API_KEY;
     expect(glueModelAvailable()).toBe(false);
+  });
+  it('is available via the BRIDGER_ANTHROPIC_API fallback', () => {
+    delete process.env.ANTHROPIC_API_KEY;
+    process.env.BRIDGER_ANTHROPIC_API = 'sk-bridger';
+    expect(glueModelAvailable()).toBe(true);
   });
 });
 

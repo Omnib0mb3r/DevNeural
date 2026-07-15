@@ -92,6 +92,26 @@ function extractTurn(line: string): ExtractedTurn | null {
   return null;
 }
 
+/* Automated non-conversation turns that must not seed a fresh Lex.
+ *
+ * The 2-minute supervision watcher injects a large `[silent supervision
+ * tick] Supervise ONLY ...` user turn every cycle, and Lex answers each
+ * with a bare "." When those land in the recent-thread tail (cold-start
+ * seed) they crowd out the real conversation - a session that spent the
+ * night supervising reads back as ten identical tick prompts and empty
+ * replies, so the seed teaches Lex nothing about the actual thread.
+ * Drop them at the reader: the tick prompts (any bracketed
+ * silent/supervision marker) and the empty "." acks that answer them. */
+const NOISE_USER_RE = /^\s*\[(?:silent\s+)?(?:supervision|awareness|heartbeat)\b[^\]]*\]/i;
+export function isNoiseTurn(role: string, text: string): boolean {
+  const t = text.trim();
+  if (!t) return true;
+  if (role === 'user' && NOISE_USER_RE.test(t)) return true;
+  /* Empty/placeholder assistant acks (the "LEX: ." answer to a tick). */
+  if (role !== 'user' && /^[.\s]*$/.test(t)) return true;
+  return false;
+}
+
 export function readTranscriptFromJsonlRefs(
   db: IndexDb,
   brainstormId: string,
@@ -125,6 +145,7 @@ export function readTranscriptFromJsonlRefs(
       if (!line) continue;
       const turn = extractTurn(line);
       if (!turn) continue;
+      if (isNoiseTurn(turn.role, turn.text)) continue;
       const trimmed = turn.text.length > 800 ? turn.text.slice(0, 800) : turn.text;
       lines.push(`${turn.role}: ${trimmed}`);
     }
