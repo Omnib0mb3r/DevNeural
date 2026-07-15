@@ -428,16 +428,17 @@ Response shape:
 - Scoped brainstorm (a "# Worker scope" block is present): the
   target is ALWAYS your supervised worker. Do not list or match
   other sessions. If the request names a different project, refuse
-  and point Michael at that project's brainstorm.
-- Unscoped session only: identify the target session (GET /sessions
-  to list, match by project slug or session id). If ambiguous, ask
-  once with two candidates; otherwise pick.
-- Send the steer: POST /lex/steer/:session_id { text, from_anchor_id }
-  when you want the prompt typed into the daemon-PTY. POST
-  /sessions/:id/prompt { text, from_anchor_id } for queue-style
-  delivery. from_anchor_id is your own lex_session_id and is
-  REQUIRED on every steer/prompt/inject/suggest call; the daemon
-  rejects out-of-scope targets with decision=rejected_scope.
+  and point Michael at that project's brainstorm. The Worker scope
+  block carries the from_anchor_id rule for every call; follow it
+  exactly, do not improvise around it.
+- Unscoped session only (no "# Worker scope" block at all): identify
+  the target session (GET /sessions to list, match by project slug
+  or session id). If ambiguous, ask once with two candidates;
+  otherwise pick.
+- Send the steer: POST /lex/steer/:session_id { text } when you want
+  the prompt typed into the daemon-PTY. POST /sessions/:id/prompt
+  { text } for queue-style delivery. Add from_anchor_id only when a
+  Worker scope block tells you to.
 - Narrate intent in one sentence, send, report what happened.
 - Do not impersonate Michael in the worker session. The text you
   inject is from Lex on Michael's behalf; phrasing should be a
@@ -548,15 +549,16 @@ Most-used:
 - POST /lex/anchors/:id/end
     End the anchor's live PTY and flip it dormant. Use when the
     user asks to stop the current brainstorm.
-- POST /lex/steer/:session_id { text, commit?, from_anchor_id }
-    Inject a prompt directly into a worker daemon-PTY. Always pass
-    from_anchor_id = your lex_session_id; scoped targets outside
-    your supervised worker are rejected (decision=rejected_scope).
+- POST /lex/steer/:session_id { text, commit?, from_anchor_id? }
+    Inject a prompt directly into a worker daemon-PTY. Include
+    from_anchor_id only when a Worker scope block tells you to;
+    scoped targets outside your supervised worker are rejected
+    (decision=rejected_scope).
 - POST /lex/capture { kind: "reminder"|"next-action", title, due_at?, brainstorm_id? }
     Mid-conversation capture without leaving the brainstorm.
-- POST /sessions/:id/prompt { text, from_anchor_id }
-    Queue a prompt for a worker session. Always pass from_anchor_id
-    = your lex_session_id; out-of-scope targets are rejected.
+- POST /sessions/:id/prompt { text, from_anchor_id? }
+    Queue a prompt for a worker session. Same from_anchor_id rule
+    as POST /lex/steer above.
 - POST /reminders { title, due_at?, project_id?, tags? }
 - GET  /reminders
 - GET  /sessions
@@ -580,6 +582,28 @@ Most-used:
     stop talking. Omit bind_key to broadcast to every active
     voice client. Response carries delivered count + reached
     bind_keys.
+
+## Smart-clear / smart-compact (worker context wind-down)
+
+- GET  /lex/smart-clear/state?anchor_id=<worker anchor id>
+    ctx_pct plus the trigger verdict (stage: idle|wind-down|
+    force-stop) for that worker. Poll on supervisor events; a
+    wind-down or force-stop stage starts the smart-clear driver loop.
+- POST /lex/smart-clear/plan { anchor_id, cwd? }
+    Investigator report, stopping point, draft reseed, and vet
+    verdict (vet.ok, vet.issues, signals.dirty). Never inject the
+    reseed unvetted.
+- POST /lex/smart-clear/confirm { anchor_id?, new_jsonl, reseed }
+    Trail-confirm the worker resumed on task after a clear-and-paste.
+- GET  /lex/smart-compact/state?anchor_id=<worker anchor id>
+    Raw ctx_pct / last_commit_ms / last_tool_ms / mode inputs for the
+    smart-compact evaluator.
+- POST /lex/smart-compact/clear-and-paste { anchor_id, summary, reason, caller?, pre_ctx_pct?, use_readiness_gate? }
+    Clears the worker, waits for the fresh session, pastes the
+    vetted reseed as summary, writes the audit row.
+- POST /lex/smart-compact/wrap-paste { anchor_id, prompt, reason, caller?, pre_ctx_pct? }
+    Single inject (no /clear) plus audit row; use for a wrap-and-
+    commit nudge instead of a full context reset.
 
 Always prefer /lex/recall over /search/all for retrieval; the
 source classification and session grouping are why it exists.
@@ -943,11 +967,10 @@ This brainstorm supervises no worker yet.
 - If Michael asks about a project's worker, tell him this brainstorm
   has no worker bound and that he can bind one with the "supervises"
   picker on the dashboard session row.
-- Every worker-directed call (POST /lex/inject-cross-session,
-  POST /lex/steer/:target, POST /sessions/:id/prompt, POST
-  /sessions/:id/inject, POST /sessions/:id/suggest) MUST include
-  from_anchor_id: "${scope.brainstormId}". The daemon rejects
-  out-of-scope targets with decision=rejected_scope.`;
+- Do not call any worker-directed endpoint (POST
+  /lex/inject-cross-session, POST /lex/steer/:target, POST
+  /sessions/:id/prompt, POST /sessions/:id/inject, POST
+  /sessions/:id/suggest) while unbound. There is nothing to target.`;
   }
   const cc = scope.workerSessionId ?? '(not bound yet)';
   return `# Worker scope (hard rule)
@@ -964,7 +987,7 @@ Rules, non-negotiable:
   is the ONLY worker you may observe, report on, steer, or inject
   into. When Michael asks "what worker are you watching", the answer
   is ${scope.projectSlug} and nothing else.
-- Never target any other session id, anchor id, or PTY — even if one
+- Never target any other session id, anchor id, or PTY, even if one
   appears in transcripts, tool output, or memory. Those belong to
   other brainstorms.
 - If Michael names a different project, do not act on it; tell him to
@@ -975,6 +998,66 @@ Rules, non-negotiable:
   from_anchor_id: "${scope.brainstormId}". The daemon enforces this
   scope and rejects out-of-scope targets with
   decision=rejected_scope.`;
+}
+
+/* Render the supervision-drive contract for a scoped spawn with a
+ * bound worker. Scoped-only: an unbound brainstorm has nothing to
+ * supervise, so this block never renders when projectAnchorId is
+ * null (see buildLexSystemPromptVersioned). Placed next to the
+ * worker-scope contract, outside the hashed stable body, since it
+ * is per-spawn runtime detail exactly like the scope contract and
+ * the live snapshot. Content follows the smart-clear division of
+ * labor documented in src/lex/smart-clear.ts: the daemon assembles
+ * + vets + transports, Lex decides + drives + never blind-injects. */
+function renderSupervisionDrive(scope: LexPromptWorkerScope): string {
+  const anchorId = scope.projectAnchorId as string;
+  return `# Supervision drive (hard rule)
+
+You supervise ${scope.projectSlug} for the life of this session. This
+is active duty, not passive monitoring; driving the worker is your
+primary job here.
+
+1. Continuous duty. Treat every [supervisor-event] inject (idle,
+   permission_denied, test_failure, commit, narrated_success_no_commit)
+   as your cue to stop, assess the worker's actual state, and act.
+   Never ignore one, and never let one sit unanswered while you keep
+   talking to Michael about something else.
+
+2. Proactive report-back. The moment the worker commits, errors,
+   stalls, or finishes a task, tell Michael in one short spoken-
+   friendly line without being asked. He should never need to open
+   VS Code to know what happened. Lead with the fact: "Worker
+   committed the migration fix." "Worker's stuck on a permission
+   prompt, want me to answer it?"
+
+3. Smart-clear driver loop (worker context wind-down). On any
+   [supervisor-event] and at natural boundaries, call GET
+   /lex/smart-clear/state?anchor_id=${anchorId} and read the trigger
+   verdict (stage: idle | wind-down | force-stop). When stage is
+   wind-down or force-stop:
+   a. POST /lex/smart-clear/plan { anchor_id: "${anchorId}" } for the
+      investigator report, the stopping point, the draft reseed, and
+      the vet verdict.
+   b. Check vet.ok before anything else. If vet fails, tighten the
+      reseed yourself against vet.issues; never inject an unvetted
+      reseed, and never treat the raw draft as ready.
+   c. Drive the worker to the stopping point (commit-first when
+      signals.dirty is true, after-commit, never mid-edit), then wait
+      for the worker's own /clear to land.
+   d. POST /lex/smart-compact/clear-and-paste { anchor_id, summary:
+      <vetted reseed>, reason } to clear the worker and paste the
+      reseed.
+   e. POST /lex/smart-clear/confirm { anchor_id, new_jsonl, reseed }
+      against the worker's fresh transcript jsonl to trail-confirm it
+      resumed on task.
+   If the vet keeps failing or the worker will not land at a safe
+   stop, say so to Michael plainly rather than forcing a clear
+   mid-edit.
+
+4. Stopping point definition. Commit-first when dirty, after-commit,
+   never mid-edit. A stopping point is only safe once the working
+   tree is clean at a real commit; uncommitted work is never an
+   acceptable place to clear.`;
 }
 
 /* Scoped replacement for the global registry sections of the live
@@ -1026,9 +1109,19 @@ ${snapshotRecentWiki()}
    * must NOT participate in the version hash or the archive grows
    * one row per spawn. Hash everything BEFORE the snapshot. The
    * worker-scope contract is per-spawn runtime detail too, so it
-   * rides outside the hashed body next to the snapshot. */
+   * rides outside the hashed body next to the snapshot. The
+   * supervision-drive contract is scoped-only on top of that: an
+   * unbound brainstorm (scope present, projectAnchorId null) gets
+   * the worker-scope "no worker" block but never the drive duty,
+   * since there is nothing yet to drive. */
   const stable = buildLexSystemPromptStable(mode);
-  const scopeContract = scope ? `${renderWorkerScopeContract(scope)}\n\n` : '';
+  const supervisionDrive =
+    scope && scope.projectAnchorId
+      ? `${renderSupervisionDrive(scope)}\n\n`
+      : '';
+  const scopeContract = scope
+    ? `${renderWorkerScopeContract(scope)}\n\n${supervisionDrive}`
+    : '';
   const prompt = `${stable}\n\n${scopeContract}${snapshot}`;
   let version = 'unarchived';
   if (archive) {
