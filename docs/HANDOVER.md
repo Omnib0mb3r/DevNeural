@@ -9,11 +9,36 @@ reflects what was true at the last update.
 The rule: anyone reading this should start cold and know where the code
 is, what is in flight, what is shippable next, and what blocks it.
 
-Last touched: 2026-07-15. Branch `master` @ 4105eae. Daemon suite
-1659/1660 green (same 1 pre-existing grooming-routes failure, present
-on clean baseline). Dashboard build green, 185 unit tests. Dist
-rebuilt from committed source 2026-07-15; daemon NOT restarted (still
-running the 2026-07-09 build; operator owns the restart).
+Last touched: 2026-07-15 (second cursor). Branch `master` @ 20971ec.
+Daemon suite 1756/1757 green (same 1 pre-existing grooming-routes
+failure). Dashboard build green. Dist rebuilt from committed source.
+The daemon RESTARTED onto the first-wave build mid-day 2026-07-15
+(capture catch-up drained the 65-day backlog, 948 files; curator
+injections are firing organically again). A SECOND restart is needed
+to pick up the wave-3 additions below. Bridge VSIX rebuilt +
+installed 2026-07-15 (VS Code windows activate on reload).
+
+### 2026-07-15 wave 3 (operator rule: nothing deferred unilaterally)
+
+- e876ca3 voice-ws + pty-host diagnostics through the daemon logger.
+- 635cee6 anchor open reports bridge delivery confirmation.
+- 08544cf post-session meeting diarization (transcribe/diarize.py,
+  opt-in runtime_config diarize_meetings='on' + HF_TOKEN, migration
+  050 meeting_diarization table).
+- 02749c9 explicit LLM inject verdicts (DEVNEURAL_INJECT_VERDICT=1,
+  migration 049, curator_signal source llm-judge).
+- 70363af expectation dispatcher: drift detection finally has data
+  (open design question: supersede policy for repeat dispatches).
+- 6f27bbc wiki reconcile tool, applied live w/ backups: zero drift.
+- 20971ec decay now syncs meta rows (the drift regenerator) +
+  drafts-promote test can no longer leak into the production data
+  root (it had, twice; leaked files quarantined).
+- Dashboard access incident root-caused: prod builds share .next with
+  the supervised dev server, corrupting its cache mid-build; dev
+  server restarted clean. Known residual: full prod builds while the
+  dev server runs can transiently unstyle it.
+- LightRAG/RAG-Anything install: awaiting explicit operator GO (new
+  external service + Python dependency stack).
 
 ### 2026-07-15 goal audit: 13 fix packages, 9 commits (b5cbf69..4105eae)
 
