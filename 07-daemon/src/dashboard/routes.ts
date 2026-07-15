@@ -1503,7 +1503,14 @@ export async function registerDashboardRoutes(
       cwd?: string;
       title?: string;
       supervises_project_anchor_id?: string | null;
+      kind?: string;
     };
+    /* Meeting-notes fixes (2026-07), task 1 (F1): thread an explicit
+     * kind through to spawnLexSession/writeThroughBrainstormRow so a
+     * cc-pty anchor can land as kind='meeting' too. Anything other
+     * than the literal 'meeting' stays undefined (SQLite default
+     * 'brainstorm'), matching /brainstorms/standalone's contract. */
+    const kind = body.kind === 'meeting' ? ('meeting' as const) : undefined;
     const cwd =
       body.cwd ?? path.posix.join(DATA_ROOT.replace(/\\/g, '/'), 'brainstorm');
     if (!fs.existsSync(cwd)) {
@@ -1553,6 +1560,7 @@ export async function registerDashboardRoutes(
       const r = spawnLexSession({
         cwd,
         title: body.title,
+        kind,
         extraArgs: ['--dangerously-skip-permissions'],
         buildSystemPrompt: (prep) => {
           built = buildLexSpawnPrompt({
@@ -4700,6 +4708,7 @@ export async function registerDashboardRoutes(
       user_label?: string;
       mode?: string;
       cwd?: string;
+      kind?: string;
     };
     const userLabel =
       typeof body.user_label === 'string' && body.user_label.trim()
@@ -4711,9 +4720,15 @@ export async function registerDashboardRoutes(
         : 'conversation';
     const cwd =
       typeof body.cwd === 'string' && body.cwd.trim() ? body.cwd : undefined;
+    /* Meeting-notes fixes (2026-07), task 1 (F1): explicit kind from
+     * the caller wins; anything other than the literal 'meeting'
+     * leaves the row at the default 'brainstorm' rather than
+     * silently inferring from mode (CODEX-REVIEW-002.md:71 wants an
+     * explicit confirm, not an auto-flip). */
+    const kind = body.kind === 'meeting' ? 'meeting' : undefined;
     let row;
     try {
-      row = createStandaloneBrainstorm({ userLabel, mode, cwd });
+      row = createStandaloneBrainstorm({ userLabel, mode, cwd, kind });
     } catch (err) {
       reply.code(500);
       return { ok: false, error: (err as Error).message };
@@ -4962,6 +4977,54 @@ export async function registerDashboardRoutes(
       action_items: store.db.listMeetingActionItems(id),
       audio_purges_at,
     };
+  });
+
+  /* PATCH /meetings/:id (meeting-notes fixes 2026-07, task 4 / F4).
+   * attendees + meeting_topic already existed as columns with no
+   * write endpoint. attendees is stored as the same comma-separated
+   * string MeetingDetail's attendee chips already parse; validation
+   * just checks type (string or null to clear), same shape as every
+   * other Phase Two PATCH in this file. */
+  app.patch('/meetings/:id', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const row = store.db.getBrainstorm(id);
+    if (!row || (row.kind ?? 'brainstorm') !== 'meeting') {
+      reply.code(404);
+      return { ok: false, error: 'meeting not found' };
+    }
+    const body = (req.body ?? {}) as {
+      attendees?: string | null;
+      meeting_topic?: string | null;
+    };
+    const patch: Partial<{
+      attendees: string | null;
+      meeting_topic: string | null;
+    }> = {};
+    if ('attendees' in body) {
+      if (body.attendees !== null && typeof body.attendees !== 'string') {
+        reply.code(400);
+        return { ok: false, error: 'attendees must be a string or null' };
+      }
+      patch.attendees =
+        body.attendees === null ? null : body.attendees.trim();
+    }
+    if ('meeting_topic' in body) {
+      if (
+        body.meeting_topic !== null &&
+        typeof body.meeting_topic !== 'string'
+      ) {
+        reply.code(400);
+        return { ok: false, error: 'meeting_topic must be a string or null' };
+      }
+      patch.meeting_topic =
+        body.meeting_topic === null ? null : body.meeting_topic.trim();
+    }
+    if (Object.keys(patch).length === 0) {
+      reply.code(400);
+      return { ok: false, error: 'attendees or meeting_topic required' };
+    }
+    store.db.setBrainstormPhaseTwo(id, patch);
+    return { ok: true, meeting: store.db.getBrainstorm(id) };
   });
 
   app.post('/meetings/:id/consent-ack', async (req, reply) => {

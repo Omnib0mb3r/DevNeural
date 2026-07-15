@@ -188,6 +188,16 @@ const SPEED_MAX = 1.5;
 const SPEED_STEP = 0.05;
 const SPEED_DEFAULT = 1.0;
 
+/* Meeting-notes fixes (2026-07), task 1. Notes-mode-only toggle:
+ * when on, this session's hello classifies it kind='meeting' instead
+ * of the default 'brainstorm', which is what unlocks the /meetings
+ * surface, the consent gate, and audio-retention rules for it
+ * (CODEX-REVIEW-002.md:71 wants this explicit, never inferred
+ * silently from mode alone). Defaults ON so a fresh notes session
+ * gets meeting treatment by default; persisted so the user's last
+ * choice survives a reload. No stored value yet -> default true. */
+const MEETING_KIND_STORAGE_KEY = "lex-notes-meeting-kind";
+
 /* Barge-in cooldown is edited on the /settings page; VoiceClient just
  * consumes it. Stored on the server in voice-preferences.json; mirrored
  * to localStorage as an optimistic seed so the gate works on the very
@@ -469,6 +479,13 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * Notes only        = Lex captures + transcribes, no spoken reply.
    * Push-to-talk      = no VAD, hold the button, release to send. */
   const [mode, setMode] = useState<Mode>("conversation");
+  /* Meeting-notes fixes (2026-07), task 1: notes-mode "meeting
+   * session" toggle. See MEETING_KIND_STORAGE_KEY above. */
+  const [meetingKindOn, setMeetingKindOn] = useState<boolean>(() => {
+    if (typeof window === "undefined") return true;
+    const raw = window.localStorage.getItem(MEETING_KIND_STORAGE_KEY);
+    return raw === null ? true : raw === "1";
+  });
   const [voices, setVoices] = useState<VoicePack[]>([]);
   const [activeVoice, setActiveVoiceState] = useState<string>("");
   /* Persisted globally: localStorage holds the optimistic UI value so
@@ -561,6 +578,10 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   const [pttHolding, setPttHolding] = useState(false);
   const modeRef = useRef<Mode>("conversation");
   modeRef.current = mode;
+  /* Meeting-notes fixes (2026-07), task 1: read at hello-send time,
+   * same pattern as modeRef. */
+  const meetingKindOnRef = useRef<boolean>(true);
+  meetingKindOnRef.current = meetingKindOn;
   /* Status ref so non-React handlers (mute, finalize) can branch on
    * the latest status without going through state. Mirrored via the
    * effect below. */
@@ -1780,6 +1801,15 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
               ? { brainstorm_id: brainstormIdFromUrl }
               : { session_id: sessionId ?? undefined }),
             mode: modeRef.current,
+            /* Meeting-notes fixes (2026-07), task 1: explicit-confirm
+             * kind. Only notes mode with the toggle on classifies as
+             * a meeting; every other mode (and notes with the toggle
+             * off) explicitly sends 'brainstorm' so a reconnect never
+             * leaves kind ambiguous. */
+            kind:
+              modeRef.current === "notes" && meetingKindOnRef.current
+                ? "meeting"
+                : "brainstorm",
           });
           if (wasReconnect) {
             /* Daemon restart breaks voice: on reconnect the WS re-binds
@@ -3028,6 +3058,37 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           </>
         )}
       </div>
+      {mode === "notes" && (
+        <div className="px-5 py-3 border-b border-border1 flex items-center gap-2">
+          <label
+            className={`flex items-center gap-2 text-nano font-mono text-txt3 ${
+              enabled ? "opacity-60" : "cursor-pointer"
+            }`}
+            title={
+              enabled
+                ? "Stop voice to change the meeting classification for this session."
+                : "When on, this notes session is classified as a meeting: consent-gated audio retention, an attendees/topic form, and it shows up under Meetings instead of Brainstorms. Off keeps it a private brainstorm dictation. Applies on connect."
+            }
+          >
+            <input
+              type="checkbox"
+              checked={meetingKindOn}
+              disabled={enabled}
+              onChange={(e) => {
+                setMeetingKindOn(e.target.checked);
+                if (typeof window !== "undefined") {
+                  window.localStorage.setItem(
+                    MEETING_KIND_STORAGE_KEY,
+                    e.target.checked ? "1" : "0",
+                  );
+                }
+              }}
+              className="accent-brandSoft"
+            />
+            <span>meeting session</span>
+          </label>
+        </div>
+      )}
       <div className="px-5 py-3 border-b border-border1 flex items-center gap-3">
         <label
           className="flex items-center gap-2 text-nano font-mono text-txt3 flex-1"

@@ -973,6 +973,17 @@ export const getMeeting = (id: string) =>
     audio_purges_at: string | null;
     error?: string;
   }>(`/meetings/${encodeURIComponent(id)}`);
+/* Meeting-notes fixes (2026-07), task 4 (F4): attendees + meeting_topic
+ * had columns and no write endpoint. Pass null to clear a field;
+ * omit a key to leave it unchanged. */
+export const patchMeeting = (
+  id: string,
+  body: { attendees?: string | null; meeting_topic?: string | null },
+) =>
+  request<{ ok: boolean; meeting?: MeetingRow; error?: string }>(
+    `/meetings/${encodeURIComponent(id)}`,
+    { method: "PATCH", body },
+  );
 export const consentAckMeeting = (id: string, acked_by?: string) =>
   request<{ ok: boolean; meeting?: MeetingRow; error?: string }>(
     `/meetings/${encodeURIComponent(id)}/consent-ack`,

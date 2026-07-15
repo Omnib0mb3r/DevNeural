@@ -185,6 +185,15 @@ export interface SpawnLexSessionOptions extends PrepareLexSpawnOptions {
   cols?: number;
   rows?: number;
   env?: Record<string, string>;
+  /** Meeting-notes fixes (2026-07), task 1 (F1). Legacy
+   * writeThroughBrainstormRow hardcoded every fresh cc-pty anchor's
+   * legacy-row kind to the SQLite default ('brainstorm'), so this
+   * live-creation path could never produce a meeting row. Optional so
+   * every existing caller compiles unchanged; only applied on the
+   * fresh-anchor branch (a reopen keeps whatever kind the row already
+   * has: reclassifying an in-progress conversation on reconnect
+   * would be surprising). */
+  kind?: 'brainstorm' | 'meeting';
 }
 
 export interface SpawnLexSessionResult extends SpawnLexResult {
@@ -198,17 +207,24 @@ export interface SpawnLexSessionResult extends SpawnLexResult {
  * Write-through keeps existing read paths (artifacts endpoints,
  * session-end pipeline, retrieval joins) working without a flag-day
  * migration. The legacy row's id matches lex_session.id so anything
- * keyed on either resolves the same conversation. */
-function writeThroughBrainstormRow(opts: {
+ * keyed on either resolves the same conversation.
+ *
+ * Exported (meeting-notes fixes 2026-07) so the kind-threading path
+ * (F1) is unit-testable directly, same rationale as prepareLexSpawn:
+ * this function never touches pty-host, so it does not require a
+ * real PTY subprocess the way spawnLexSession as a whole does. */
+export function writeThroughBrainstormRow(opts: {
   lexSession: LexSessionRow;
   ccSessionId: string;
   ptyId: string;
+  kind?: 'brainstorm' | 'meeting';
 }): void {
   const store = getStore();
   const existing = store.db.getBrainstorm(opts.lexSession.id);
   if (existing) {
     /* Reopen path: rebind the legacy row to the new PTY + CC
-     * session id and flip status back to active. */
+     * session id and flip status back to active. kind is left as-is
+     * (see the kind option's comment on SpawnLexSessionOptions). */
     bindBrainstormSessionId(opts.lexSession.id, opts.ptyId, opts.ccSessionId);
     return;
   }
@@ -238,6 +254,12 @@ function writeThroughBrainstormRow(opts: {
     last_summary: null,
     last_summary_ms: null,
   });
+  /* insertBrainstorm only writes the legacy 15-column shape (kind is
+   * a Phase Two additive column); a targeted UPDATE is required or
+   * an explicit kind is silently dropped. */
+  if (opts.kind) {
+    store.db.setBrainstormPhaseTwo(opts.lexSession.id, { kind: opts.kind });
+  }
 }
 
 /* Full spawn: prepare the rows + args, then hand off to pty-host's
@@ -305,6 +327,7 @@ export function spawnLexSession(
     writeThroughBrainstormRow({
       lexSession: prep.lexSession,
       ccSessionId: prep.ccSessionId,
+      kind: opts.kind,
       ptyId: ptyResult.ptyId,
     });
   } catch {

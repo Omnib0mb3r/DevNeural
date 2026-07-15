@@ -30,6 +30,7 @@ import { embedOne, getModelId } from '../embedder/index.js';
 import { readPage } from './schema.js';
 import { rewritePageFrontmatter, loadPage } from '../reinforcement/index.js';
 import { randomUUID } from 'node:crypto';
+import { classifyBrainstormKind } from '../lex/brainstorm-store.js';
 
 const BAND_HIGH = 0.85;
 const BAND_BORDERLINE = 0.65;
@@ -87,16 +88,6 @@ function loadTranscriptTurns(
     }
   }
   return turns;
-}
-
-function classifyKind(mode: string): 'brainstorm' | 'meeting' {
-  /* BF-14: mode='conversation' or 'push-to-talk' -> brainstorm;
-   * mode='notes' -> meeting (per the user's clarification 2026-05-10).
-   * Anything else falls back to brainstorm so legacy nulls don't
-   * silently become meetings (the privacy class is stricter on
-   * meetings). */
-  if (mode === 'notes') return 'meeting';
-  return 'brainstorm';
 }
 
 function tokens(text: string): Set<string> {
@@ -230,7 +221,7 @@ export async function runBackfillBrainstorms(
     if (!projectId) continue;
     const turns = loadTranscriptTurns(projectId, bs.claude_session_id);
     if (turns.length === 0) continue;
-    const kind = classifyKind(bs.mode);
+    const kind = classifyBrainstormKind(bs.mode);
     const inferredMode: BrainstormChunkRow['mode'] =
       bs.mode === 'conversation' || bs.mode === 'push-to-talk' || bs.mode === 'notes'
         ? bs.mode

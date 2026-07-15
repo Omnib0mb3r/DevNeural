@@ -16,7 +16,11 @@ import {
   addMeetingActionItem,
   updateMeetingActionItem,
   promoteMeetingToWiki,
+  patchMeeting,
+  getBrainstormChunksApi,
   type MeetingActionItem,
+  type MeetingRow,
+  type BrainstormChunkRow,
 } from "@/lib/daemon-client";
 import { AudioPlayer } from "./AudioPlayer";
 
@@ -38,6 +42,22 @@ export function MeetingDetail({ id }: { id: string }) {
   const promoteM = useMutation({
     mutationFn: () => promoteMeetingToWiki(id),
     onSettled: () => qc.invalidateQueries({ queryKey: ["meeting", id] }),
+  });
+  /* Meeting-notes fixes (2026-07), task 3 (F3): meetings share
+   * brainstorm_chunks with brainstorms, so the same fetch shape
+   * BrainstormDetail uses applies here: newest-N via order=desc,
+   * reversed to chronological for display (newest chunk ends up at
+   * the bottom of the rendered list). */
+  const chunks = useQuery({
+    queryKey: ["meeting-chunks", id],
+    queryFn: async () => {
+      const r = await getBrainstormChunksApi(id, 500, { order: "desc" });
+      if (r.ok) {
+        return { ...r, chunks: [...r.chunks].reverse() };
+      }
+      return r;
+    },
+    refetchInterval: 10_000,
   });
   if (q.isLoading) return <p className="p-4 text-sm text-txt3">loading…</p>;
   if (!q.data?.ok) return <p className="p-4 text-sm text-rose-400">{q.data?.error ?? "failed"}</p>;
@@ -78,6 +98,7 @@ export function MeetingDetail({ id }: { id: string }) {
           </div>
         ) : null}
       </div>
+      <MeetingEditForm id={id} meeting={m} />
       {!acked ? (
         <ConsentGate onAck={() => ackM.mutate()} pending={ackM.isPending} />
       ) : (
@@ -106,6 +127,7 @@ export function MeetingDetail({ id }: { id: string }) {
           {(m.keep_audio ?? 0) === 1 ? "release audio retention" : "keep audio (skip purge)"}
         </button>
       ) : null}
+      <MeetingTranscript chunks={chunks.data?.chunks ?? []} loading={chunks.isLoading} />
       <ActionItemList meetingId={id} items={items} />
       <div>
         <button
@@ -129,6 +151,118 @@ export function MeetingDetail({ id }: { id: string }) {
         ) : null}
       </div>
     </div>
+  );
+}
+
+/* Meeting-notes fixes (2026-07), task 4 (F4): attendees + meeting_topic
+ * had columns and no write endpoint. Local state seeds once from the
+ * initial fetch (not re-seeded on every 10s refetch) so a save
+ * cannot clobber mid-edit: it matches the deliberate "no reset on
+ * refetch" behaviour every other edit-in-place surface in this repo
+ * relies on (e.g. SupervisesPicker's own value prop). */
+function MeetingEditForm({ id, meeting }: { id: string; meeting: MeetingRow }) {
+  const qc = useQueryClient();
+  const [attendees, setAttendees] = useState(meeting.attendees ?? "");
+  const [topic, setTopic] = useState(meeting.meeting_topic ?? "");
+  const patchM = useMutation({
+    mutationFn: () =>
+      patchMeeting(id, {
+        attendees: attendees.trim() ? attendees.trim() : null,
+        meeting_topic: topic.trim() ? topic.trim() : null,
+      }),
+    onSettled: () => qc.invalidateQueries({ queryKey: ["meeting", id] }),
+  });
+  return (
+    <section>
+      <h2 className="text-sm font-semibold">Edit meeting details</h2>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          patchM.mutate();
+        }}
+        className="mt-1 flex flex-col gap-2 text-xs"
+      >
+        <label className="flex flex-col gap-1">
+          <span className="text-txt3">attendees (comma-separated)</span>
+          <input
+            value={attendees}
+            onChange={(e) => setAttendees(e.target.value)}
+            placeholder="alice, bob, carol"
+            className="rounded border border-border1 bg-surface2 px-2 py-1 font-mono"
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-txt3">topic</span>
+          <input
+            value={topic}
+            onChange={(e) => setTopic(e.target.value)}
+            placeholder="what this meeting is about"
+            className="rounded border border-border1 bg-surface2 px-2 py-1 font-mono"
+          />
+        </label>
+        <button
+          type="submit"
+          disabled={patchM.isPending}
+          className="self-start rounded border border-border1 bg-surface2 px-3 py-1 font-mono disabled:opacity-50"
+        >
+          {patchM.isPending ? "saving…" : "save"}
+        </button>
+        {patchM.data && !patchM.data.ok ? (
+          <p className="text-rose-400">{patchM.data.error}</p>
+        ) : null}
+      </form>
+    </section>
+  );
+}
+
+/* Meeting-notes fixes (2026-07), task 3 (F3): ported from
+ * BrainstormDetail's BrainstormTranscript. Meetings and brainstorms
+ * share brainstorm_chunks, and GET /brainstorms/:id/chunks already
+ * works for a meeting id (same table, no meeting-specific route
+ * needed). Wrapped in <details> for a native, JS-free collapse;
+ * chunks arrive oldest-first (see the chunks query above) so newest
+ * lands at the bottom of the rendered list. */
+function MeetingTranscript(props: {
+  chunks: BrainstormChunkRow[];
+  loading: boolean;
+}) {
+  const roleStyle: Record<BrainstormChunkRow["role"], string> = {
+    user: "text-brandSoft",
+    lex: "text-txt1",
+    tool: "text-txt3",
+  };
+  return (
+    <details open>
+      <summary className="cursor-pointer text-sm font-semibold">
+        Transcript
+      </summary>
+      <div className="mt-2">
+        {props.loading ? (
+          <p className="text-xs text-txt3">loading…</p>
+        ) : props.chunks.length === 0 ? (
+          <p className="text-xs text-txt3">no transcript chunks for this session.</p>
+        ) : (
+          <ol className="flex flex-col gap-2">
+            {props.chunks.map((c) => (
+              <li
+                key={c.id}
+                className="rounded border border-border1 bg-surface1 p-2 text-xs"
+              >
+                <div className="flex items-center gap-2 font-mono text-nano text-txt3">
+                  <span className={roleStyle[c.role]}>{c.role}</span>
+                  <span>turn {c.turn_index}</span>
+                  <span>{c.mode}</span>
+                  <span className="ml-auto">
+                    {new Date(c.created_at).toISOString().slice(11, 19)}
+                  </span>
+                </div>
+                <p className="mt-1 whitespace-pre-wrap text-txt2">{c.text}</p>
+              </li>
+            ))}
+          </ol>
+        )}
+      </div>
+    </details>
   );
 }
 

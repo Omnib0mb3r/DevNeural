@@ -63,6 +63,7 @@ import {
   getBrainstormByPty,
   getStore as getBrainstormStore,
   getBrainstorm,
+  setKind as setBrainstormKind,
 } from '../lex/brainstorm-store.js';
 import { processAssistantTurn } from '../lex/artifact-parser.js';
 import { fireForLexTurn as fireAttentionForLexTurn } from '../dashboard/lex-attention.js';
@@ -756,6 +757,114 @@ const SHORT_COMMAND_WORDS = new Set<string>([
   'done', 'cancel', 'kill', 'pause', 'abort', 'retry', 'next', 'send',
   'ship', 'build', 'hold', 'skip', 'undo', 'repeat',
 ]);
+
+/* Notes/meeting mode name-gate (MVP), meeting-notes fixes 2026-07
+ * (task 2 / F2). Lex's system-prompt contract otherwise replies to
+ * every utterance; in notes mode the room is usually dictating or
+ * discussing, not talking to Lex, so replying to everything derails
+ * the transcript and burns TTS/LLM cycles on chatter that was never
+ * addressed to her. lex-voice-commands.ts's matcher already requires
+ * an immediate "lex <command>" prefix for panic/mute/etc: this is a
+ * softer sibling heuristic for ordinary requests, not a command.
+ *
+ * An utterance is forwarded to Lex only when BOTH hold:
+ *   1. word-boundary "lex" appears (\blex\b, case-insensitive) so
+ *      "flex", "alex", "lexicon", etc. never false-fire; AND
+ *   2. it reads as a question or request:
+ *        a. the utterance ends in '?' (whisper's own judgement), or
+ *        b. an interrogative/imperative lead word ("what", "can",
+ *           "summarize", ...) appears within a few tokens AFTER the
+ *           "lex" mention: "lex what do you think", "hey lex can
+ *           you summarize" both match on (b) via "what" / "can".
+ * "let's flex the schedule" never reaches condition 1 (no word-
+ * boundary "lex" substring). Plain discussion that never says "lex"
+ * never reaches condition 1 either. "lex" mentioned with no ask
+ * ("lex is going to be here soon") reaches condition 1 but fails
+ * both (a) and (b): it deliberately excludes bare copulas/auxiliaries
+ * ("is", "are", "was", "were", "did") from the lead-word set because
+ * they read as narration about Lex at least as often as a question
+ * addressed to her; genuine questions phrased that way still match
+ * via the trailing '?' whisper usually supplies.
+ * Anything that fails the gate is still captured to brainstorm_chunks
+ * (see captureNotesUtteranceOnly); it is simply never forwarded. */
+const NOTES_GATE_LEX_RE = /\blex\b/i;
+const NOTES_GATE_TRAILING_Q_RE = /\?\s*$/;
+const NOTES_GATE_WINDOW = 4;
+const NOTES_GATE_LEAD_WORDS = new Set<string>([
+  'what', 'why', 'how', 'when', 'where', 'who', 'whom', 'whose', 'which',
+  'can', 'could', 'would', 'will', 'should',
+  'tell', 'give', 'summarize', 'summarise', 'explain', 'remind', 'check',
+  'help', 'show', 'list', 'find', 'look', 'note', 'capture', 'log',
+  'record', 'save', 'confirm', 'verify', 'repeat', 'clarify', 'describe',
+  'review', 'answer', 'please', 'start', 'stop', 'pause',
+]);
+
+export function isAddressedToLexInNotesMode(rawText: string): boolean {
+  const text = (rawText ?? '').trim();
+  if (!text) return false;
+  if (!NOTES_GATE_LEX_RE.test(text)) return false;
+  if (NOTES_GATE_TRAILING_Q_RE.test(text)) return true;
+  const tokens = text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] !== 'lex') continue;
+    const end = Math.min(tokens.length, i + 1 + NOTES_GATE_WINDOW);
+    for (let j = i + 1; j < end; j++) {
+      if (NOTES_GATE_LEAD_WORDS.has(tokens[j]!)) return true;
+    }
+  }
+  return false;
+}
+
+/* Meeting-notes fixes (2026-07), task 2. Deps for
+ * _captureNotesUtteranceOnlyImpl, extracted so the not-addressed
+ * notes-mode capture path is unit-testable without a live socket, a
+ * PTY, or a real IndexDb: same shape as _FlushPendingUtterancesDeps
+ * above. Deliberately has NO ptyInject / handleDirectLlmUtterance
+ * dependency: that absence is what proves this path cannot forward
+ * to Lex, only capture. */
+export interface _CaptureNotesUtteranceDeps {
+  brainstormId: string;
+  text: string;
+  insertChunk: (row: {
+    id: string;
+    brainstorm_id: string;
+    turn_index: number;
+    role: 'user';
+    mode: 'notes';
+    text: string;
+    model_id: string;
+    cc_session_id: string | null;
+  }) => void;
+  nextTurnIndex: (brainstormId: string) => number;
+  /** Test seam; defaults to node:crypto randomUUID. */
+  newId?: () => string;
+  log?: (msg: string) => void;
+}
+
+export function _captureNotesUtteranceOnlyImpl(
+  deps: _CaptureNotesUtteranceDeps,
+): void {
+  try {
+    deps.insertChunk({
+      id: (deps.newId ?? randomUUID)(),
+      brainstorm_id: deps.brainstormId,
+      turn_index: deps.nextTurnIndex(deps.brainstormId),
+      role: 'user',
+      mode: 'notes',
+      text: deps.text,
+      model_id: 'voice-notes-capture',
+      cc_session_id: null,
+    });
+  } catch (err) {
+    (deps.log ?? console.log)(
+      `[voice-ws] notes-mode capture insert failed: ${(err as Error).message}`,
+    );
+  }
+}
 
 export function attachLexVoiceWs(socket: FastifyWS): void {
   console.log(`[voice-ws] client connected (attach)`);
@@ -2395,6 +2504,83 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     return lines.join('\n');
   }
 
+  /* Resolve the brainstorm this socket is currently bound to, the
+   * same way several other blocks in this file already do (e.g. the
+   * per-turn feedback lookup around line 1416, the audio-persist
+   * block around line 2467): direct-llm sets state.brainstormId
+   * directly on bindByBrainstorm; cc-pty never does, so fall back to
+   * resolving it from the bound PTY handle's session/pty id. Shared
+   * by applyHelloKind and captureNotesUtteranceOnly below so both
+   * stay in sync with whatever this connection is actually bound to. */
+  function resolveBoundBrainstormId(): string | null {
+    if (state.brainstormId) return state.brainstormId;
+    try {
+      const handle = state.bindKey
+        ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
+        : null;
+      const watchSid = handle?.sessionId ?? state.watchSessionId ?? null;
+      const bs =
+        (watchSid && getBrainstormByClaudeSessionId(watchSid)) ||
+        (handle?.ptyId && getBrainstormByPty(handle.ptyId)) ||
+        null;
+      return bs?.id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /* Meeting-notes fixes (2026-07), task 1. Apply the hello frame's
+   * kind to whatever this socket just bound to. Idempotent (a no-op
+   * write is skipped) and best-effort: a failure here must never
+   * block hello-ack or the bind that already succeeded above. */
+  function applyHelloKind(kind: 'brainstorm' | 'meeting'): void {
+    try {
+      const bsId = resolveBoundBrainstormId();
+      if (!bsId) return;
+      const existing = getBrainstorm(bsId);
+      if (!existing) return;
+      const current = existing.kind === 'meeting' ? 'meeting' : 'brainstorm';
+      if (current !== kind) {
+        setBrainstormKind(bsId, kind);
+      }
+    } catch {
+      /* explicit-confirm kind flip is best-effort; never block hello-ack */
+    }
+  }
+
+  /* Notes/meeting name-gate (2026-07), task 2. Lex's system-prompt
+   * contract otherwise replies to every utterance; in notes mode the
+   * room is usually dictating or discussing, not talking to Lex, so
+   * every utterance still needs a durable record but only some of
+   * them should ever reach Lex. Called by handleUtteranceEnd for the
+   * not-addressed branch (the ONLY branch that writes here, by
+   * construction; see the isAddressedToLexInNotesMode call site's
+   * comment for why that mutual exclusion is what keeps this from
+   * double-storing against the cc-pty jsonl-ingestor / the direct-llm
+   * handler's own persist step, neither of which this utterance ever
+   * reaches). Mirrors the direct-llm user-chunk insert shape
+   * (handleDirectLlmUtterance's step 1 below) so the row looks the
+   * same across runtimes; model_id is tagged distinctly so a
+   * capture-only row is identifiable in future queries.
+   *
+   * Thin closure over _captureNotesUtteranceOnlyImpl (below), same
+   * split as _flushPendingUtterancesImpl: the DB-touching logic is
+   * exported with injected deps so tests can assert it writes a
+   * chunk WITHOUT going anywhere near ptyInject or
+   * handleDirectLlmUtterance: those functions are not even in its
+   * dependency list, so it cannot forward by construction. */
+  function captureNotesUtteranceOnly(text: string): void {
+    const bsId = resolveBoundBrainstormId();
+    if (!bsId) return;
+    const store = getStore();
+    _captureNotesUtteranceOnlyImpl({
+      brainstormId: bsId,
+      text,
+      insertChunk: (row) => store.db.insertBrainstormChunk(row),
+      nextTurnIndex: (id) => store.db.nextTurnIndex(id),
+    });
+  }
+
   async function handleUtteranceEnd(): Promise<void> {
     if (state.micBuf.length === 0) {
       send({ t: 'error', code: 'empty-utterance', message: 'no audio' });
@@ -2526,6 +2712,39 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       );
       state.utteranceStartedDuringTts = false;
       return;
+    }
+    /* Notes/meeting name-gate (2026-07), task 2. Voice commands above
+     * always run first regardless of mode (unchanged). In notes mode,
+     * either kind (brainstorm or meeting), every OTHER utterance is
+     * captured but only forwarded to Lex (haiku fast-desk, cc-pty
+     * inject, or direct-llm generate, all below) when it addresses
+     * her by name with a question/request shape. Notes mode never
+     * synthesizes TTS regardless of this gate (state.mode === 'notes'
+     * checks further down), so short-circuiting here before the
+     * haiku block and the cc-pty/direct-llm branches costs nothing
+     * mode-relevant and keeps conversation/push-to-talk completely
+     * unchanged (they never enter this branch).
+     *
+     * Double-store guard: a not-addressed turn returns here without
+     * ever reaching ptyInject or handleDirectLlmUtterance, so it can
+     * never reach a CC jsonl (cc-pty's brainstorm-jsonl-ingestor only
+     * sees what the claude CLI itself wrote) or duplicate
+     * handleDirectLlmUtterance's own step-1 persist (direct-llm). The
+     * capture write below is therefore the utterance's ONLY writer.
+     * An addressed turn is NOT captured here: it falls through to
+     * the existing forwarding paths, which are themselves the sole
+     * writer for THAT turn (the ingestor for cc-pty, step 1 of
+     * handleDirectLlmUtterance for direct-llm), so exactly one writer
+     * ever touches brainstorm_chunks per utterance either way. */
+    if (state.mode === 'notes') {
+      if (!isAddressedToLexInNotesMode(trimmed)) {
+        captureNotesUtteranceOnly(trimmed);
+        state.utteranceStartedDuringTts = false;
+        return;
+      }
+      /* Addressed: fall through unchanged to haiku / cc-pty /
+       * direct-llm below. Nothing extra is written here; see the
+       * guard note above. */
     }
     /* Pillar 3 capstone: haiku front desk. When DEVNEURAL_VOICE_HAIKU is
      * on, every inbound utterance routes through frontDeskDecision -
@@ -2884,7 +3103,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       return;
     }
     switch (msg.t) {
-      case 'hello':
+      case 'hello': {
         if (
           msg.mode === 'conversation' ||
           msg.mode === 'notes' ||
@@ -2904,7 +3123,22 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         } else {
           bind(typeof msg.session_id === 'string' ? msg.session_id : undefined);
         }
+        /* Meeting-notes fixes (2026-07), task 1 (F1 / explicit
+         * confirm). The client's notes-mode "meeting session" toggle
+         * rides every hello as kind:'meeting'|'brainstorm'; apply it
+         * to whatever bind() / bindByBrainstorm() just resolved. This
+         * is the explicit-confirm flip CODEX-REVIEW-002.md:71 asked
+         * for: kind only ever changes because the client said so on
+         * THIS connection, never inferred silently from mode alone. */
+        const helloKind =
+          msg.kind === 'meeting'
+            ? 'meeting'
+            : msg.kind === 'brainstorm'
+              ? 'brainstorm'
+              : null;
+        if (helloKind) applyHelloKind(helloKind);
         break;
+      }
       case 'set-mode':
         if (
           msg.mode === 'conversation' ||

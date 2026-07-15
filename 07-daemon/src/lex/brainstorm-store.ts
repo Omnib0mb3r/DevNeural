@@ -89,12 +89,32 @@ export function isBrainstormCwd(cwd: string): boolean {
   return /[\\/]brainstorm(\/|\\|$)/i.test(cwd.replace(/\\/g, '/'));
 }
 
+/* Meeting-notes fixes (2026-07): moved from
+ * wiki/backfill-brainstorms.ts (BF-14) so every live creation path
+ * can classify kind the same way the one-shot backfill always did,
+ * instead of kind only ever being set retroactively. mode='notes'
+ * -> 'meeting' (per the user's clarification 2026-05-10); anything
+ * else (including undefined/legacy) falls back to 'brainstorm' so a
+ * missing mode never silently becomes the stricter privacy class. */
+export function classifyBrainstormKind(
+  mode: string | undefined,
+): 'brainstorm' | 'meeting' {
+  if (mode === 'notes') return 'meeting';
+  return 'brainstorm';
+}
+
 export function registerBrainstorm(opts: {
   ptyId: string;
   cwd: string;
   startedMs: number;
   mode?: string;
   userLabel?: string | null;
+  /* Meeting-notes fixes (2026-07): explicit kind from the caller
+   * (e.g. the voice WS hello handler) wins over classifyBrainstormKind
+   * so an explicit toggle can hold a notes-mode session at
+   * kind='brainstorm' rather than the mode-derived default. Omit to
+   * fall back to classifyBrainstormKind(opts.mode). */
+  kind?: 'brainstorm' | 'meeting';
 }): BrainstormSessionRow {
   const id = randomUUID();
   const row: BrainstormSessionRow = {
@@ -115,7 +135,15 @@ export function registerBrainstorm(opts: {
     last_summary_ms: null,
   };
   db().insertBrainstorm(row);
-  return row;
+  /* insertBrainstorm() only writes the legacy 15-column shape (see
+   * the comment on setBrainstormPhaseTwo below); kind is a Phase Two
+   * additive column and needs its own UPDATE, then a re-read so the
+   * returned row actually reflects what landed in the DB rather than
+   * the pre-Phase-Two literal above. */
+  if (opts.kind) {
+    db().setBrainstormPhaseTwo(id, { kind: opts.kind });
+  }
+  return db().getBrainstorm(id) ?? row;
 }
 
 /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
@@ -134,6 +162,11 @@ export function createStandaloneBrainstorm(opts: {
   mode?: string;
   userLabel?: string | null;
   startedMs?: number;
+  /* Meeting-notes fixes (2026-07): explicit kind wins over
+   * classifyBrainstormKind(opts.mode); omit to leave the row at the
+   * SQLite default ('brainstorm'). See classifyBrainstormKind above
+   * for the mode->kind mapping callers can reuse. */
+  kind?: 'brainstorm' | 'meeting';
 }): BrainstormSessionRow {
   const id = randomUUID();
   const cwd = (
@@ -161,10 +194,14 @@ export function createStandaloneBrainstorm(opts: {
   db().insertBrainstorm(row);
   /* Set the migration 033 columns explicitly so the dashboard sees
    * 'direct-llm' / 'idle' immediately rather than the SQLite default
-   * 'cc-pty' that legacy spawnLex inserts inherit. */
+   * 'cc-pty' that legacy spawnLex inserts inherit. kind rides the
+   * same targeted UPDATE when the caller supplied one (meeting-notes
+   * fixes 2026-07); omitted entirely otherwise so the column keeps
+   * its SQLite default. */
   db().updateBrainstorm(id, {
     runtime_mode: 'direct-llm',
     lifecycle_state: 'idle',
+    ...(opts.kind ? { kind: opts.kind } : {}),
   });
   return db().getBrainstorm(id) ?? row;
 }
@@ -325,6 +362,19 @@ export function setLabel(
 
 export function setMode(id: string, mode: string): BrainstormSessionRow | null {
   return db().updateBrainstorm(id, { mode });
+}
+
+/* Meeting-notes fixes (2026-07), task 1: explicit-confirm kind flip.
+ * Called from the voice WS hello handler when the client's toggle
+ * disagrees with the row's current kind. updateBrainstorm's targeted
+ * UPDATE (not insertBrainstorm's fixed column list) is what makes a
+ * Phase Two column like kind settable outside setBrainstormPhaseTwo
+ * too; this thin wrapper just matches the setLabel/setMode shape. */
+export function setKind(
+  id: string,
+  kind: 'brainstorm' | 'meeting',
+): BrainstormSessionRow | null {
+  return db().updateBrainstorm(id, { kind });
 }
 
 export function endBrainstorm(
