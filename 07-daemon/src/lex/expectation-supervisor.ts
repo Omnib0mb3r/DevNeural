@@ -32,6 +32,7 @@ import {
   type WorkerEvent,
 } from '../dashboard/worker-event-router.js';
 import { callVoiceChat } from '../llm/voice-chat.js';
+import { askJudge } from './judge-session.js';
 import type { WorkerExpectationRow } from '../store/index-db.js';
 
 /* Public API: Lex's dispatcher calls this when it tells the worker
@@ -94,6 +95,19 @@ const DEFAULT_POLICY_TIMEOUT_MS = Number(
   process.env.DEVNEURAL_EXPECTATION_POLICY_TIMEOUT_MS ?? 3000,
 );
 
+/* Judge-session ask timeout for both classifySupersede and
+ * evaluateExpectation below (2026-07-15, persistent Max-plan judge
+ * session). Deliberately much more generous than DEFAULT_POLICY_
+ * TIMEOUT_MS: askJudge's target is the operator's kept-open Claude Max
+ * session, which has zero marginal cost per call, so there is no
+ * reason to race it as tightly as the metered/local ollama fallback.
+ * Both call sites here are fire-and-forget from the judge session's
+ * perspective -- a slow judge reply just means the ollama fallback
+ * below fires instead, never a blocked caller. */
+const JUDGE_ASK_TIMEOUT_MS = Number(
+  process.env.DEVNEURAL_EXPECTATION_JUDGE_TIMEOUT_MS ?? 15_000,
+);
+
 const EXPECTATION_POLICY_SYSTEM_PROMPT = `You are a dispatch-policy judge for a coding supervisor. The supervisor is about to record a NEW instruction it just sent to a worker. One OPEN instruction sent earlier to the SAME worker is still outstanding (not yet resolved). Decide whether the NEW instruction contradicts the OPEN one.
 
 Return STRICT JSON only, no prose:
@@ -119,6 +133,31 @@ async function classifySupersede(
   timeoutMs: number,
   log: (msg: string) => void,
 ): Promise<SupersedeVerdict> {
+  const questionPrompt = `Open instruction: ${openInstruction}\nNew instruction: ${newInstruction}\n\nDoes the new instruction contradict the open one?`;
+
+  /* Prefer the persistent Max-plan judge session (2026-07-15 operator
+   * directive: keep child sessions open, don't pay per call). askJudge
+   * resolves null when DEVNEURAL_JUDGE_SESSION=0, the session is
+   * unavailable/suspect, or the reply doesn't parse to a recognised
+   * verdict -- this is a pure prefer-then-fallback onto the unchanged
+   * ollama race below, so the fail-open contract documented on this
+   * function still holds either way. */
+  try {
+    const judged = await askJudge({
+      kind: 'supersede',
+      prompt: questionPrompt,
+      timeoutMs: JUDGE_ASK_TIMEOUT_MS,
+    });
+    const verdict = (judged as { verdict?: unknown } | null)?.verdict;
+    if (verdict === 'contradicts' || verdict === 'independent') {
+      return verdict;
+    }
+  } catch (err) {
+    log(
+      `[expectation-policy] judge session ask threw, falling back to ollama: ${(err as Error).message}`,
+    );
+  }
+
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<SupersedeVerdict>((resolve) => {
@@ -135,7 +174,7 @@ async function classifySupersede(
           { role: 'system', content: EXPECTATION_POLICY_SYSTEM_PROMPT },
           {
             role: 'user',
-            content: `Open instruction: ${openInstruction}\nNew instruction: ${newInstruction}\n\nDoes the new instruction contradict the open one?`,
+            content: questionPrompt,
           },
         ],
         { maxTokens: 60, temperature: 0.1, signal: controller.signal },
@@ -299,6 +338,28 @@ Return STRICT JSON only, no prose:
   "suggested_correction": "one short sentence the brainstorm can inject if drifted; empty when aligned"
 }`;
 
+/* Coerce a parsed reply (from either the judge session or the ollama
+ * fallback) into an EvaluationResult using the same loose acceptance
+ * this function has always used for the ollama path: any object-ish
+ * value is accepted, missing/malformed fields fall back to safe
+ * defaults rather than rejecting the whole reply. Pulled out so the
+ * judge-session path (any object askJudge hands back) and the ollama
+ * path (a parsed {...} block from the reply text) share one coercion
+ * instead of two copies drifting apart. */
+function coerceEvaluationResult(parsedUnknown: unknown): EvaluationResult {
+  const parsed = (parsedUnknown ?? {}) as Partial<EvaluationResult>;
+  return {
+    aligned: Boolean(parsed.aligned),
+    drift_summary: (parsed.drift_summary ?? '').trim(),
+    suggested_correction: (parsed.suggested_correction ?? '').trim(),
+    alignment_score:
+      typeof parsed.alignment_score === 'number' &&
+      Number.isFinite(parsed.alignment_score)
+        ? Math.max(0, Math.min(1, parsed.alignment_score))
+        : 0,
+  };
+}
+
 async function evaluateExpectation(
   row: WorkerExpectationRow,
   log: (msg: string) => void,
@@ -320,6 +381,28 @@ async function evaluateExpectation(
   ]
     .filter((s) => s !== '')
     .join('\n');
+
+  /* Prefer the persistent Max-plan judge session (2026-07-15 operator
+   * directive), same prefer-then-fallback pattern as classifySupersede
+   * above. Any object-shaped reply is accepted -- coerceEvaluationResult
+   * already tolerates missing/malformed fields exactly as loosely as
+   * the ollama path below always has, so this is an additional source,
+   * not a stricter gate. */
+  try {
+    const judged = await askJudge({
+      kind: 'alignment',
+      prompt: user,
+      timeoutMs: JUDGE_ASK_TIMEOUT_MS,
+    });
+    if (judged && typeof judged === 'object') {
+      return coerceEvaluationResult(judged);
+    }
+  } catch (err) {
+    log(
+      `[expectation] judge session ask threw for id=${row.id}, falling back to ollama: ${(err as Error).message}`,
+    );
+  }
+
   let reply;
   try {
     reply = await callVoiceChat(
@@ -338,22 +421,13 @@ async function evaluateExpectation(
   /* Extract first {...} block to tolerate small LLM preamble noise. */
   const match = reply.text.match(/\{[\s\S]*\}/);
   if (!match) return null;
-  let parsed: Partial<EvaluationResult>;
+  let parsed: unknown;
   try {
-    parsed = JSON.parse(match[0]) as Partial<EvaluationResult>;
+    parsed = JSON.parse(match[0]);
   } catch {
     return null;
   }
-  return {
-    aligned: Boolean(parsed.aligned),
-    drift_summary: (parsed.drift_summary ?? '').trim(),
-    suggested_correction: (parsed.suggested_correction ?? '').trim(),
-    alignment_score:
-      typeof parsed.alignment_score === 'number' &&
-      Number.isFinite(parsed.alignment_score)
-        ? Math.max(0, Math.min(1, parsed.alignment_score))
-        : 0,
-  };
+  return coerceEvaluationResult(parsed);
 }
 
 export interface ExpectationTickDeps {

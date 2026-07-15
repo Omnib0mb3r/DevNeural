@@ -25,6 +25,7 @@
  */
 import { callValidated, type LlmProvider } from '../llm/index.js';
 import type { Validator } from '../llm/validator.js';
+import { askJudge } from '../lex/judge-session.js';
 
 const DEFAULT_TIMEOUT_MS = Number(
   process.env.DEVNEURAL_INJECT_VERDICT_TIMEOUT_MS ?? 5000,
@@ -102,6 +103,33 @@ Assistant's reply:
 ${input.replyText.slice(0, 4000)}
 
 Answer used or ignored.`;
+
+  /* Prefer the persistent Max-plan judge session (2026-07-15 operator
+   * directive: keep child sessions open, don't pay per call). Reuses
+   * the SAME validateVerdict validator the provider path below uses,
+   * so a judge-session reply and a provider reply are held to
+   * identical shape rules -- validateVerdict already rejects a null
+   * (askJudge unavailable/timeout) or malformed reply, so this is a
+   * pure prefer-then-fallback onto the unchanged provider path; the
+   * 'unclear' semantics this function documents are unaffected. */
+  try {
+    const judged = await askJudge({
+      kind: 'inject_verdict',
+      prompt: user,
+      timeoutMs,
+    });
+    const validated = validateVerdict(judged);
+    if (validated.ok && validated.value) {
+      return {
+        verdict: validated.value.verdict,
+        reason: validated.value.reason || 'unspecified',
+      };
+    }
+  } catch (err) {
+    log(
+      `[inject-verdict] judge session ask threw, falling back to provider: ${(err as Error).message}`,
+    );
+  }
 
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;

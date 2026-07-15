@@ -29,6 +29,7 @@ import { whisperStatus } from './voice/whisper.js';
 import { piperStatus } from './voice/piper.js';
 import { getVoiceWsStats, setVoiceWsLogger } from './voice/lex-voice-ws.js';
 import { setPtyHostLogger } from './dashboard/pty-host.js';
+import { setJudgeSessionLogger } from './lex/judge-session.js';
 import {
   useVoiceHaiku,
   voiceApiKey,
@@ -128,6 +129,7 @@ async function main(): Promise<void> {
   setEmbedderLogger(logger);
   setVoiceWsLogger(logger);
   setPtyHostLogger(logger);
+  setJudgeSessionLogger(logger);
   logger('opening store...');
   const store = await Store.open(logger);
   logger(
