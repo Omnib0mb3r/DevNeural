@@ -24,6 +24,10 @@ import { getVadModule, resetVadModuleCache } from "@/lib/voice-ort-config";
 import { warmAudioContext } from "@/lib/voice-audio-warm";
 import { buildVadOptionSet, type VadOptionSet } from "@/lib/voice-vad-options";
 import {
+  migrateLegacyMicGain,
+  migrateLegacyVadRedemption,
+} from "@/lib/mic-gain-migration";
+import {
   runWatchdogChecks,
   postVoiceHealth,
   type VoiceHealthEvent,
@@ -225,6 +229,42 @@ const MIC_GAIN_STORAGE_KEY = "lex-mic-gain";
 const MIC_GAIN_MIN = 0;
 const MIC_GAIN_MAX = 3.0;
 const MIC_GAIN_DEFAULT = 1.0;
+
+/* One-time legacy mic-gain correction (see lib/mic-gain-migration.ts):
+ * placebo-era near-mute gains became a real mute once gain started
+ * feeding VAD triggering, leaving the UI stuck on "listening". Any
+ * apply site routes its raw value through this first. */
+function applyMicGainMigration(value: number): number {
+  return migrateLegacyMicGain(value, {
+    storageKey: MIC_GAIN_STORAGE_KEY,
+    postCorrection: (corrected) => {
+      void fetch("/voice/set-mic-gain", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ value: corrected }),
+      }).catch(() => undefined);
+    },
+  });
+}
+
+function applyVadRedemptionMigration(valueMs: number): number {
+  return migrateLegacyVadRedemption(valueMs, {
+    storageKey: VAD_REDEMPTION_STORAGE_KEY,
+    defaultMs: VAD_REDEMPTION_DEFAULT,
+    postCorrection: (correctedMs) => {
+      void fetch("/voice/set-vad-redemption", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        /* This route's body key is ms, not value (see routes.ts
+         * set-vad-redemption; the sibling set-mic-gain route uses
+         * value). */
+        body: JSON.stringify({ ms: correctedMs }),
+      }).catch(() => undefined);
+    },
+  });
+}
 
 /* VAD end-of-utterance redemption window in ms. Higher = more
  * tolerance for mid-sentence pauses before silero declares end-of-
@@ -538,7 +578,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   const [micGain, setMicGain] = useState<number>(() => {
     if (typeof window === "undefined") return MIC_GAIN_DEFAULT;
     const raw = window.localStorage.getItem(MIC_GAIN_STORAGE_KEY);
-    const n = raw ? Number(raw) : NaN;
+    const n = applyMicGainMigration(raw ? Number(raw) : NaN);
     return Number.isFinite(n) && n >= MIC_GAIN_MIN && n <= MIC_GAIN_MAX
       ? n
       : MIC_GAIN_DEFAULT;
@@ -564,7 +604,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   const [vadRedemptionMs, setVadRedemptionMs] = useState<number>(() => {
     if (typeof window === "undefined") return VAD_REDEMPTION_DEFAULT;
     const raw = window.localStorage.getItem(VAD_REDEMPTION_STORAGE_KEY);
-    const n = raw ? Number(raw) : NaN;
+    const n = applyVadRedemptionMigration(raw ? Number(raw) : NaN);
     return Number.isFinite(n) &&
       n >= VAD_REDEMPTION_MIN &&
       n <= VAD_REDEMPTION_MAX
@@ -1436,9 +1476,10 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           typeof j.mic_gain === "number" &&
           Number.isFinite(j.mic_gain)
         ) {
+          const migrated = applyMicGainMigration(j.mic_gain);
           const clamped = Math.max(
             MIC_GAIN_MIN,
-            Math.min(MIC_GAIN_MAX, j.mic_gain),
+            Math.min(MIC_GAIN_MAX, migrated),
           );
           setMicGain(clamped);
           if (typeof window !== "undefined") {
@@ -1452,9 +1493,10 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           typeof j.vad_redemption_ms === "number" &&
           Number.isFinite(j.vad_redemption_ms)
         ) {
+          const migrated = applyVadRedemptionMigration(j.vad_redemption_ms);
           const clamped = Math.max(
             VAD_REDEMPTION_MIN,
-            Math.min(VAD_REDEMPTION_MAX, j.vad_redemption_ms),
+            Math.min(VAD_REDEMPTION_MAX, migrated),
           );
           setVadRedemptionMs(clamped);
           if (typeof window !== "undefined") {
@@ -1877,7 +1919,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                 ) {
                   emitVoiceSettingUpdate({
                     key: "mic_gain",
-                    value: j.mic_gain,
+                    value: applyMicGainMigration(j.mic_gain),
                   });
                 }
                 logVoice(

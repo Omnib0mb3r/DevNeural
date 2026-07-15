@@ -168,6 +168,13 @@ const SCAN_EXCLUDED_DIRS = new Set(['Archive', 'Holding', 'tmp']);
  * infrequently-touched artifact and pulling it in as a data source at
  * runtime would be more machinery than the constant is worth. */
 const RELAUNCH_TASK_NAME = 'DevNeural-Daemon';
+/* On-demand -Force restart task (install-daemon-autostart.ps1). The
+ * safety-net task above runs start-daemon WITHOUT -Force, so firing it
+ * at restart time no-ops against the still-dying daemon and recovery
+ * waits for the next 5-minute tick (live proof: 14:53:40 request ->
+ * 14:57:32 boot, 2026-07-15). The restart task runs -Force, which
+ * skips the alive-probe and waits for the port instead. */
+const RESTART_TASK_NAME = 'DevNeural-Daemon-Restart';
 
 export interface RelaunchDeps {
   /** child_process.spawn injection for tests. */
@@ -232,24 +239,48 @@ export function armRelauncher(
     }
   };
 
-  try {
-    const child = spawnFn('schtasks', ['/run', '/tn', taskName], {
-      windowsHide: true,
-    });
-    child.on('error', (err) => {
+  /* Chain: on-demand -Force restart task first (relaunches in seconds
+   * because start-daemon -Force waits for the port instead of probing
+   * aliveness), then the safety-net task (worst case: next 5-minute
+   * tick), then the direct powershell spawn. Each hop only fires when
+   * the previous spawn itself errors. */
+  const runTask = (
+    tn: string,
+    onError: () => void,
+  ): boolean => {
+    try {
+      const child = spawnFn('schtasks', ['/run', '/tn', tn], {
+        windowsHide: true,
+      });
+      child.on('error', (err) => {
+        relLog(
+          `[admin] RELAUNCH: schtasks spawn error (task ${tn}): ${err.message}; trying next relaunch path`,
+        );
+        onError();
+      });
+      child.unref();
+      return true;
+    } catch (err) {
       relLog(
-        `[admin] RELAUNCH FAILED: schtasks spawn error (task ${taskName}): ${err.message}; falling back to powershell start-daemon.ps1`,
+        `[admin] RELAUNCH: schtasks spawn threw (task ${tn}): ${(err as Error).message}; trying next relaunch path`,
       );
+      return false;
+    }
+  };
+
+  const runSafetyNetThenPowershell = (): boolean =>
+    runTask(taskName, () => {
       spawnPowershellFallback();
-    });
-    child.unref();
+    }) || spawnPowershellFallback();
+
+  if (
+    runTask(RESTART_TASK_NAME, () => {
+      runSafetyNetThenPowershell();
+    })
+  ) {
     return 'schtasks';
-  } catch (err) {
-    relLog(
-      `[admin] RELAUNCH FAILED: schtasks spawn threw: ${(err as Error).message}; falling back to powershell start-daemon.ps1`,
-    );
-    return spawnPowershellFallback() ? 'powershell' : 'failed';
   }
+  return runSafetyNetThenPowershell() ? 'powershell' : 'failed';
 }
 
 export interface ScanAndRegisterResult {

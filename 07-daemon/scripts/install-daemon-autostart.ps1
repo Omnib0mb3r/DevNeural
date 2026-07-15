@@ -138,6 +138,47 @@ try {
 
 Write-Host "[install-daemon-autostart] registered '$taskName' to run at logon"
 Write-Host "[install-daemon-autostart] command: $pwsh $argList"
+
+# Second, on-demand-only task for operator-requested restarts.
+# Root cause (2026-07-15): the /admin/daemon/restart relauncher ran
+# schtasks /run on the safety-net task above, which fires start-daemon
+# WITHOUT -Force. At that moment the old daemon is still tearing down,
+# so the alive-probe sees it and no-ops; recovery then waited for the
+# next 5-minute safety tick (the operator's multi-minute restart hang).
+# This task runs start-daemon.ps1 -Force, which skips the alive-probe
+# and instead waits up to 20s for :3747 to free, so a restart-time
+# schtasks /run lands the relaunch in seconds. NO triggers: the safety
+# net keeps its own semantics; this one only ever fires on demand.
+$restartTaskName = 'DevNeural-Daemon-Restart'
+$innerForce = "$pwsh -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -Force"
+$argListForce = "`"$shim`" `"$innerForce`""
+$actionForce = New-ScheduledTaskAction -Execute $wscript -Argument $argListForce
+
+Unregister-ScheduledTask -TaskName $restartTaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+try {
+    Register-ScheduledTask `
+        -TaskName $restartTaskName `
+        -Description 'DevNeural daemon on-demand restart relauncher. No triggers; fired via schtasks /run by POST /admin/daemon/restart. Runs start-daemon.ps1 -Force (skips the alive-probe, waits for the port) so a restart never waits on the 5-minute safety net.' `
+        -Action $actionForce `
+        -Settings $settings `
+        -Principal $principal `
+        -ErrorAction Stop | Out-Null
+} catch {
+    if ($_.Exception.Message -match 'Access is denied') {
+        Write-Host '[install-daemon-autostart] PowerShell cmdlet access denied for restart task; falling back to schtasks.exe'
+        $schtasksPath = "$env:WINDIR\System32\schtasks.exe"
+        $taskCmdForce = "$wscript $argListForce"
+        & $schtasksPath /Create /F /SC ONCE /ST 00:00 /TN $restartTaskName /TR "`"$taskCmdForce`""
+        if ($LASTEXITCODE -ne 0) {
+            throw 'both Register-ScheduledTask and schtasks.exe failed for the restart task'
+        }
+    } else {
+        throw
+    }
+}
+
+Write-Host "[install-daemon-autostart] registered '$restartTaskName' (on-demand only)"
 Write-Host "[install-daemon-autostart] trigger now: Start-ScheduledTask -TaskName $taskName"
 Write-Host "[install-daemon-autostart] view in UI: taskschd.msc -> Task Scheduler Library -> $taskName"
 Write-Host "[install-daemon-autostart] uninstall: pwsh -File install-daemon-autostart.ps1 -Disable"

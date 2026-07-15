@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { emitVoiceSettingUpdate } from "@/lib/voice-settings-bus";
+import { migrateLegacyMicGain } from "@/lib/mic-gain-migration";
 import { fetchVoiceHealth, type VoiceHealthRow } from "@/lib/voice-watchdog";
 
 const BARGE_STORAGE_KEY = "lex-barge-cooldown-ms";
@@ -21,6 +22,25 @@ const MIC_GAIN_MIN = 0;
 const MIC_GAIN_MAX = 3.0;
 const MIC_GAIN_STEP = 0.05;
 const MIC_GAIN_DEFAULT = 1.0;
+
+/* One-time legacy correction: placebo-era near-mute gains become an
+ * actual mute now that gain feeds VAD triggering. See
+ * lib/mic-gain-migration.ts. Corrections are pushed to the daemon
+ * pref and the live voice client so every source of truth heals. */
+function applyMicGainMigration(value: number): number {
+  return migrateLegacyMicGain(value, {
+    storageKey: MIC_GAIN_STORAGE_KEY,
+    postCorrection: (corrected) => {
+      emitVoiceSettingUpdate({ key: "mic_gain", value: corrected });
+      void fetch("/voice/set-mic-gain", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ value: corrected }),
+      }).catch(() => undefined);
+    },
+  });
+}
 
 interface PiperStatus {
   ok: boolean;
@@ -56,7 +76,7 @@ export function VoiceSettingsPanel() {
   const [micGain, setMicGain] = useState<number>(() => {
     if (typeof window === "undefined") return MIC_GAIN_DEFAULT;
     const raw = window.localStorage.getItem(MIC_GAIN_STORAGE_KEY);
-    const n = raw ? Number(raw) : NaN;
+    const n = applyMicGainMigration(raw ? Number(raw) : NaN);
     return Number.isFinite(n) && n >= MIC_GAIN_MIN && n <= MIC_GAIN_MAX
       ? n
       : MIC_GAIN_DEFAULT;
@@ -129,9 +149,10 @@ export function VoiceSettingsPanel() {
           typeof j.mic_gain === "number" &&
           Number.isFinite(j.mic_gain)
         ) {
+          const migrated = applyMicGainMigration(j.mic_gain);
           const clamped = Math.max(
             MIC_GAIN_MIN,
-            Math.min(MIC_GAIN_MAX, j.mic_gain),
+            Math.min(MIC_GAIN_MAX, migrated),
           );
           setMicGain(clamped);
           if (typeof window !== "undefined") {
