@@ -62,6 +62,7 @@ import {
 import {
   buildLexSystemPrompt,
   buildLexSystemPromptVersioned,
+  type LexPromptWorkerScope,
 } from '../lex/system-prompt.js';
 import { buildLexSpawnPrompt } from '../lex/spawn-prompt.js';
 import { spawnLexSession } from '../lex/spawn-lex-session.js';
@@ -162,13 +163,26 @@ export async function registerDashboardRoutes(
    * of this file. */
   const { registerProjectAnchorRoutes } = await import('./projects-routes.js');
   registerProjectAnchorRoutes(app, store.db, log);
-  const { decodeBridgeMarker } = await import('./bridge-presence.js');
+  const { decodeBridgeMarker, resolveDeliverableBridgeForSession } =
+    await import('./bridge-presence.js');
 
   /* Panic button surface (PANIC-BUTTON.md). POST /panic, POST
    * /projects/:id/interrupt, GET /panic/recent. Bound to the real
-   * ptyInject so a button press lands as \x1b\x1b on the target PTY. */
+   * ptyInject so a button press lands as \x1b\x1b on the target PTY,
+   * with a bridge fallback (control-transport fix, 2026-07-14) so
+   * bridge-attached workers (no daemon-owned PTY) still receive the
+   * interrupt via the suggestion queue when the PTY attempt misses. */
   const { registerPanicRoutes } = await import('./panic-routes.js');
-  registerPanicRoutes(app, store.db, ptyInject, log);
+  registerPanicRoutes(
+    app,
+    store.db,
+    {
+      ptyInject,
+      queueSessionSuggestion,
+      resolveDeliverableBridge: resolveDeliverableBridgeForSession,
+    },
+    log,
+  );
 
   /* Smart-compact surface (SMART-COMPACT.md). Lex polls evaluate,
    * decides to fire, daemon executes /clear + resume summary via the
@@ -297,6 +311,110 @@ export async function registerDashboardRoutes(
       log(`continuous reaper failed: ${(err as Error).message}`);
     }
   }, 30_000);
+
+  /* Anchor-resolved dispatch for the operator-path control-transport
+   * routes (control-transport fix, 2026-07-14). /lex/inject-cross-
+   * session has carried Fix 15's resolveAnchorDispatch redirect since
+   * it shipped (routes.ts ~4900); /lex/steer, /sessions/:id/prompt,
+   * /sessions/:id/suggest, and /sessions/:id/inject did not, so a
+   * caller holding a uuid that went stale across a worker /clear
+   * wrote into a dead target on those four routes instead of being
+   * redirected to the anchor's live session. Shared here so all four
+   * resolve staleness identically and log the same audit-row shapes
+   * Fix 15 already established.
+   *
+   * Returns the live dispatch target on 'pass' / 'live-direct' /
+   * 'redirect' (writing a 'redirected' audit row on the latter), or a
+   * ready-to-return {code, body} pair when the owning anchor is
+   * dormant (writing a 'dispatched_dead_session' audit row). Does NOT
+   * set payload_text on the dormant row: unlike /lex/inject-cross-
+   * session, these operator routes are not part of the smart-compact
+   * parked-inject replay contract, and opting them in was not asked
+   * for — leaving payload_text null keeps the row an audit fact
+   * without accidentally recruiting it into that replay mechanism. */
+  type DispatchGateResult =
+    | { ok: true; dispatchTarget: string; anchorId: string | null; redirected: boolean }
+    | {
+        ok: false;
+        code: number;
+        body: {
+          ok: false;
+          error: string;
+          reason: string;
+          anchor_id: string;
+        };
+      };
+  async function resolveDispatchTarget(
+    targetId: string,
+    text: string,
+    callerLabel: string,
+  ): Promise<DispatchGateResult> {
+    const { resolveAnchorDispatch } = await import('../lex/cross-session-resolve.js');
+    const { randomUUID } = await import('node:crypto');
+    const outcome = resolveAnchorDispatch(store.db, targetId);
+    if (outcome.kind === 'dormant') {
+      try {
+        store.db.insertCrossSessionLog({
+          id: randomUUID(),
+          target_session: targetId,
+          caller_label: callerLabel,
+          text_preview: text.slice(0, 120),
+          text_length: text.length,
+          decision: 'dispatched_dead_session',
+          reject_reason: JSON.stringify({
+            anchor_id: outcome.anchor_id,
+            reason: 'bound-anchor-dormant',
+          }),
+          brainstorm_id: null,
+        });
+      } catch {
+        /* never let audit failures block the response */
+      }
+      return {
+        ok: false,
+        code: 422,
+        body: {
+          ok: false,
+          error:
+            'anchor owning target session is dormant; queue for next live session',
+          reason: 'bound-anchor-dormant',
+          anchor_id: outcome.anchor_id,
+        },
+      };
+    }
+    if (outcome.kind === 'redirect') {
+      try {
+        store.db.insertCrossSessionLog({
+          id: randomUUID(),
+          target_session: targetId,
+          caller_label: callerLabel,
+          text_preview: text.slice(0, 120),
+          text_length: text.length,
+          decision: 'redirected',
+          reject_reason: JSON.stringify({
+            old_session: outcome.old_session,
+            new_session: outcome.dispatch_session,
+            anchor_id: outcome.anchor_id,
+          }),
+          brainstorm_id: null,
+        });
+      } catch {
+        /* never let audit failures block the response */
+      }
+      return {
+        ok: true,
+        dispatchTarget: outcome.dispatch_session,
+        anchorId: outcome.anchor_id,
+        redirected: true,
+      };
+    }
+    return {
+      ok: true,
+      dispatchTarget: outcome.dispatch_session,
+      anchorId: outcome.kind === 'live-direct' ? outcome.anchor_id : null,
+      redirected: false,
+    };
+  }
 
   // ── Dashboard surface ─────────────────────────────────────────────
   app.get('/dashboard/health', async () => {
@@ -760,26 +878,66 @@ export async function registerDashboardRoutes(
      * check entirely. Same contract as steer: a caller declaring a
      * Lex anchor only reaches that anchor's supervised worker. */
     if (typeof body.from_anchor_id === 'string' && body.from_anchor_id) {
-      const { checkLexScope } = await import('../lex/cross-session-inject.js');
+      const { checkLexScope, auditRejectedScope } = await import(
+        '../lex/cross-session-inject.js'
+      );
       const scope = checkLexScope(store.db, body.from_anchor_id, id);
       if (!scope.allowed) {
+        const reason = scope.reason ?? 'target outside this brainstorm worker scope';
+        auditRejectedScope(store.db, {
+          target_session: id,
+          caller_label: body.from_anchor_id,
+          text: body.text,
+          reason,
+        });
+        log(
+          `[scope] rejected prompt from_anchor=${body.from_anchor_id} target=${id} reason=${reason}`,
+        );
         reply.code(403);
-        return {
-          ok: false,
-          decision: 'rejected_scope',
-          error: scope.reason ?? 'target outside this brainstorm worker scope',
-        };
+        return { ok: false, decision: 'rejected_scope', error: reason };
       }
     }
-    const r = queueSessionPrompt(id, body.text);
+    /* Fix 15 (control-transport fix, 2026-07-14): redirect a uuid that
+     * went stale across a worker /clear onto the anchor's live
+     * session before queueing, instead of writing into a dead .in
+     * file no one will ever read. */
+    const dispatch = await resolveDispatchTarget(id, body.text, 'dashboard-prompt');
+    if (!dispatch.ok) {
+      reply.code(dispatch.code);
+      return dispatch.body;
+    }
+    const target = dispatch.dispatchTarget;
+    /* Bug 3e-style deliverability gate: confirm a fresh bridge
+     * presence record actually claims a terminal for this session
+     * before writing the marker, so a prompt to a target with no live
+     * bridge doesn't silently sink into an unread .in file. */
+    const deliverability = resolveDeliverableBridgeForSession(target);
+    if (
+      deliverability.verdict === 'not_claimed' ||
+      deliverability.verdict === 'no_terminal'
+    ) {
+      const reason =
+        deliverability.verdict === 'not_claimed'
+          ? `no fresh bridge presence claims "${target}"`
+          : `bridge presence claims "${target}" but no terminal owns it`;
+      reply.code(422);
+      log(`[dashboard] prompt gate rejected for session ${target}: ${reason}`);
+      return {
+        ok: false,
+        error: reason,
+        decision: 'no_deliverable_bridge',
+        deliverability_verdict: deliverability.verdict,
+      };
+    }
+    const r = queueSessionPrompt(target, body.text);
     if (!r.ok) {
       // Bridge offline: refuse the queue and surface the reason so the
       // dashboard can show a fail toast instead of silently buffering.
       reply.code(503);
-      log(`[dashboard] prompt rejected for session ${id}: ${r.error}`);
+      log(`[dashboard] prompt rejected for session ${target}: ${r.error}`);
       return r;
     }
-    log(`[dashboard] prompt queued for session ${id}`);
+    log(`[dashboard] prompt queued for session ${target}`);
     return r;
   });
 
@@ -800,24 +958,58 @@ export async function registerDashboardRoutes(
     }
     /* Worker scope (2026-07-08): same gate as /sessions/:id/prompt. */
     if (typeof body.from_anchor_id === 'string' && body.from_anchor_id) {
-      const { checkLexScope } = await import('../lex/cross-session-inject.js');
+      const { checkLexScope, auditRejectedScope } = await import(
+        '../lex/cross-session-inject.js'
+      );
       const scope = checkLexScope(store.db, body.from_anchor_id, id);
       if (!scope.allowed) {
+        const reason = scope.reason ?? 'target outside this brainstorm worker scope';
+        auditRejectedScope(store.db, {
+          target_session: id,
+          caller_label: body.from_anchor_id,
+          text: body.text,
+          reason,
+        });
+        log(
+          `[scope] rejected suggest from_anchor=${body.from_anchor_id} target=${id} reason=${reason}`,
+        );
         reply.code(403);
-        return {
-          ok: false,
-          decision: 'rejected_scope',
-          error: scope.reason ?? 'target outside this brainstorm worker scope',
-        };
+        return { ok: false, decision: 'rejected_scope', error: reason };
       }
     }
-    const r = queueSessionSuggestion(id, body.text);
+    /* Fix 15 (control-transport fix, 2026-07-14): same stale-uuid
+     * redirect as /sessions/:id/prompt. */
+    const dispatch = await resolveDispatchTarget(id, body.text, 'dashboard-suggest');
+    if (!dispatch.ok) {
+      reply.code(dispatch.code);
+      return dispatch.body;
+    }
+    const target = dispatch.dispatchTarget;
+    const deliverability = resolveDeliverableBridgeForSession(target);
+    if (
+      deliverability.verdict === 'not_claimed' ||
+      deliverability.verdict === 'no_terminal'
+    ) {
+      const reason =
+        deliverability.verdict === 'not_claimed'
+          ? `no fresh bridge presence claims "${target}"`
+          : `bridge presence claims "${target}" but no terminal owns it`;
+      reply.code(422);
+      log(`[dashboard] suggestion gate rejected for session ${target}: ${reason}`);
+      return {
+        ok: false,
+        error: reason,
+        decision: 'no_deliverable_bridge',
+        deliverability_verdict: deliverability.verdict,
+      };
+    }
+    const r = queueSessionSuggestion(target, body.text);
     if (!r.ok) {
       reply.code(503);
-      log(`[dashboard] suggestion rejected for session ${id}: ${r.error}`);
+      log(`[dashboard] suggestion rejected for session ${target}: ${r.error}`);
       return r;
     }
-    log(`[dashboard] suggestion queued for session ${id}`);
+    log(`[dashboard] suggestion queued for session ${target}`);
     return r;
   });
 
@@ -1921,7 +2113,45 @@ export async function registerDashboardRoutes(
       }
     }
     try {
-      const built = buildLexSystemPromptVersioned();
+      /* Worker scope (R5, control-transport fix, 2026-07-14). This
+       * legacy spawn path built the system prompt with no scope arg
+       * at all, even on the "switch to" reopen flow where
+       * body.brainstorm_id already names an EXISTING anchor that may
+       * carry a supervises_project_anchor_id binding — that anchor
+       * would come back up without the scope contract in its prompt,
+       * silently downgrading a scoped Lex to legacy (global-registry)
+       * behavior on every reopen. Thread scope the same way
+       * /lex/anchor/new's buildSystemPrompt factory does whenever the
+       * anchor id is already known.
+       *
+       * Brand-new anchors (body.brainstorm_id absent) are a real gap
+       * this route cannot close without restructuring: pty-host's
+       * spawnLex mints the brainstorm row's id AFTER this point
+       * (inside spawnLex below), so there is no anchor id yet to
+       * resolve a supervises binding against, and the prompt is built
+       * before that id exists. Fixing that would mean moving this
+       * route onto the newer spawnLexSession / prepareLexSpawn
+       * late-bound-prompt flow (buildSystemPrompt factory receiving
+       * the prepared anchor), which is a bigger structural change
+       * than this fix covers — left as a documented gap rather than
+       * invented behavior. A fresh /pty/spawn-lex anchor only picks
+       * up its scope contract starting from its NEXT spawn (reopen
+       * with brainstorm_id set), not this one. */
+      let scope: LexPromptWorkerScope | null = null;
+      if (typeof body.brainstorm_id === 'string' && body.brainstorm_id.length > 0) {
+        const { supervisedAnchorIdFor } = await import('../lex/cross-session-inject.js');
+        const supervisedId = supervisedAnchorIdFor(store.db, body.brainstorm_id);
+        if (supervisedId) {
+          const supervisedProj = store.db.getProjectSession(supervisedId);
+          scope = {
+            brainstormId: body.brainstorm_id,
+            projectAnchorId: supervisedId,
+            projectSlug: supervisedProj?.project_slug ?? null,
+            workerSessionId: supervisedProj?.current_session_id ?? null,
+          };
+        }
+      }
+      const built = buildLexSystemPromptVersioned(scope ? { scope } : {});
       const systemPrompt = built.prompt;
       const promptVersion = built.version;
       /* Lex's brainstorm cwd is daemon-owned scratch space with no real
@@ -2064,24 +2294,68 @@ export async function registerDashboardRoutes(
     }
     /* Worker scope (2026-07-08): same gate as /lex/steer. */
     if (typeof body.from_anchor_id === 'string' && body.from_anchor_id) {
-      const { checkLexScope } = await import('../lex/cross-session-inject.js');
+      const { checkLexScope, auditRejectedScope } = await import(
+        '../lex/cross-session-inject.js'
+      );
       const scope = checkLexScope(store.db, body.from_anchor_id, id);
       if (!scope.allowed) {
+        const reason = scope.reason ?? 'target outside this brainstorm worker scope';
+        auditRejectedScope(store.db, {
+          target_session: id,
+          caller_label: body.from_anchor_id,
+          text: body.text,
+          reason,
+        });
+        log(
+          `[scope] rejected inject from_anchor=${body.from_anchor_id} target=${id} reason=${reason}`,
+        );
         reply.code(403);
-        return {
-          ok: false,
-          decision: 'rejected_scope',
-          error: scope.reason ?? 'target outside this brainstorm worker scope',
-        };
+        return { ok: false, decision: 'rejected_scope', error: reason };
       }
     }
     const commit = body.commit !== false;
-    const r = ptyInject(id, body.text, commit);
-    if (!r.ok) {
-      reply.code(404);
-      return r;
+    /* Fix 15 (control-transport fix, 2026-07-14): redirect a stale
+     * uuid onto the owning anchor's live session before attempting
+     * delivery. */
+    const dispatch = await resolveDispatchTarget(id, body.text, 'dashboard-inject');
+    if (!dispatch.ok) {
+      reply.code(dispatch.code);
+      return dispatch.body;
     }
-    return r;
+    const target = dispatch.dispatchTarget;
+    const ptyResult = ptyInject(target, body.text, commit);
+    if (ptyResult.ok) {
+      return { ...ptyResult, target, transport: 'pty' as const };
+    }
+    /* Dual transport (control-transport fix, 2026-07-14): the PTY
+     * attempt misses for bridge-attached workers (a VS Code terminal
+     * Lex never spawned as a daemon PTY). Fall through to the
+     * bridge's queue, gated on real deliverability so the text never
+     * sinks into a .in file no bridge is reading, and mirroring the
+     * route's own commit semantics (prompt when commit=true,
+     * suggestion when commit=false — same split crossSessionInject
+     * uses). */
+    const deliverability = resolveDeliverableBridgeForSession(target);
+    if (
+      deliverability.verdict === 'not_claimed' ||
+      deliverability.verdict === 'no_terminal'
+    ) {
+      reply.code(404);
+      return {
+        ok: false,
+        error: ptyResult.error,
+        decision: 'no_deliverable_bridge',
+        deliverability_verdict: deliverability.verdict,
+      };
+    }
+    const bridgeResult = commit
+      ? queueSessionPrompt(target, body.text)
+      : queueSessionSuggestion(target, body.text);
+    if (!bridgeResult.ok) {
+      reply.code(404);
+      return { ok: false, error: bridgeResult.error };
+    }
+    return { ok: true, target, transport: 'bridge' as const };
   });
 
   app.post('/sessions/clear-supersede', async (req, reply) => {
@@ -2565,27 +2839,67 @@ export async function registerDashboardRoutes(
       return { ok: false, error: 'text required' };
     }
     if (typeof body.from_anchor_id === 'string' && body.from_anchor_id) {
-      const { checkLexScope } = await import('../lex/cross-session-inject.js');
+      const { checkLexScope, auditRejectedScope } = await import(
+        '../lex/cross-session-inject.js'
+      );
       const scope = checkLexScope(store.db, body.from_anchor_id, target);
       if (!scope.allowed) {
+        const reason = scope.reason ?? 'target outside this brainstorm worker scope';
+        auditRejectedScope(store.db, {
+          target_session: target,
+          caller_label: body.from_anchor_id,
+          text: body.text,
+          reason,
+        });
+        log(
+          `[scope] rejected steer from_anchor=${body.from_anchor_id} target=${target} reason=${reason}`,
+        );
         reply.code(403);
-        return {
-          ok: false,
-          decision: 'rejected_scope',
-          error: scope.reason ?? 'target outside this brainstorm worker scope',
-        };
+        return { ok: false, decision: 'rejected_scope', error: reason };
       }
     }
-    const result = ptyInject(
-      target,
-      body.text,
-      body.commit !== false,
-    );
-    if (!result.ok) {
-      reply.code(404);
-      return result;
+    const commit = body.commit !== false;
+    /* Fix 15 (control-transport fix, 2026-07-14): redirect a stale
+     * uuid onto the owning anchor's live session before attempting
+     * delivery. sessionOrPty may also be a raw daemon pty_id, in
+     * which case resolveAnchorDispatch finds no anchor mapping and
+     * passes the target through unchanged. */
+    const dispatch = await resolveDispatchTarget(target, body.text, 'lex-steer');
+    if (!dispatch.ok) {
+      reply.code(dispatch.code);
+      return dispatch.body;
     }
-    return { ok: true, target };
+    const dispatchTarget = dispatch.dispatchTarget;
+    const result = ptyInject(dispatchTarget, body.text, commit);
+    if (result.ok) {
+      return { ok: true, target: dispatchTarget, transport: 'pty' as const };
+    }
+    /* Dual transport (control-transport fix, 2026-07-14): bridge-
+     * attached workers have no daemon-owned PTY for Lex's steer to
+     * write into. Fall through to the bridge queue, gated on real
+     * deliverability, using the same commit split crossSessionInject
+     * uses (prompt when commit=true, suggestion when commit=false). */
+    const deliverability = resolveDeliverableBridgeForSession(dispatchTarget);
+    if (
+      deliverability.verdict === 'not_claimed' ||
+      deliverability.verdict === 'no_terminal'
+    ) {
+      reply.code(404);
+      return {
+        ok: false,
+        error: result.error,
+        decision: 'no_deliverable_bridge',
+        deliverability_verdict: deliverability.verdict,
+      };
+    }
+    const bridgeResult = commit
+      ? queueSessionPrompt(dispatchTarget, body.text)
+      : queueSessionSuggestion(dispatchTarget, body.text);
+    if (!bridgeResult.ok) {
+      reply.code(404);
+      return { ok: false, error: bridgeResult.error };
+    }
+    return { ok: true, target: dispatchTarget, transport: 'bridge' as const };
   });
 
   app.post('/lex/capture', async (req, reply) => {

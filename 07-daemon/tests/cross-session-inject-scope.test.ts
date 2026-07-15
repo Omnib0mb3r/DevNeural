@@ -18,6 +18,7 @@ vi.mock('../src/dashboard/auth-secret.js', () => ({
 }));
 
 import {
+  auditRejectedScope,
   checkLexScope,
   crossSessionInject,
   supervisedAnchorIdFor,
@@ -275,5 +276,70 @@ describe('crossSessionInject worker scope', () => {
     );
     expect(result.ok).toBe(true);
     expect(result.decision).toBe('accepted');
+  });
+});
+
+describe('auditRejectedScope (control-transport fix, 2026-07-14)', () => {
+  /* /lex/steer, /sessions/:id/prompt, /sessions/:id/suggest, and
+   * /sessions/:id/inject each run their own checkLexScope gate
+   * outside crossSessionInject and previously dropped the rejection
+   * with no audit trail. auditRejectedScope is the standalone helper
+   * those four routes now call so the row shape matches what
+   * crossSessionInject's internal audit() would have written. */
+  it('writes a rejected_scope row with the given target, caller, and reason', () => {
+    const insertCrossSessionLog = vi.fn();
+    const db = { insertCrossSessionLog } as unknown as IndexDbType;
+    auditRejectedScope(db, {
+      target_session: OTHER_SESSION,
+      caller_label: LEX_ANCHOR,
+      text: 'wrong worker attempt',
+      reason: 'target is outside scope',
+    });
+    expect(insertCrossSessionLog).toHaveBeenCalledTimes(1);
+    const row = insertCrossSessionLog.mock.calls[0]?.[0] as {
+      target_session: string;
+      caller_label: string | null;
+      decision: string;
+      reject_reason: string | null;
+      text_preview: string;
+      text_length: number;
+      brainstorm_id: string | null;
+    };
+    expect(row.target_session).toBe(OTHER_SESSION);
+    expect(row.caller_label).toBe(LEX_ANCHOR);
+    expect(row.decision).toBe('rejected_scope');
+    expect(row.reject_reason).toBe('target is outside scope');
+    expect(row.text_preview).toBe('wrong worker attempt');
+    expect(row.text_length).toBe('wrong worker attempt'.length);
+    expect(row.brainstorm_id).toBeNull();
+  });
+
+  it('defaults caller_label to null when omitted', () => {
+    const insertCrossSessionLog = vi.fn();
+    const db = { insertCrossSessionLog } as unknown as IndexDbType;
+    auditRejectedScope(db, {
+      target_session: OTHER_SESSION,
+      text: 'no caller label',
+      reason: 'out of scope',
+    });
+    const row = insertCrossSessionLog.mock.calls[0]?.[0] as {
+      caller_label: string | null;
+    };
+    expect(row.caller_label).toBeNull();
+  });
+
+  it('never throws when the db write fails', () => {
+    const db = {
+      insertCrossSessionLog: () => {
+        throw new Error('disk full');
+      },
+    } as unknown as IndexDbType;
+    expect(() =>
+      auditRejectedScope(db, {
+        target_session: OTHER_SESSION,
+        text: 'x',
+        reason: 'out of scope',
+      }),
+    ).not.toThrow();
   });
 });

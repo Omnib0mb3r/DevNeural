@@ -288,7 +288,10 @@ export interface PanicLogRow {
   target_session_id: string | null;
   clicked_ms: number;
   caller: string;
-  result: 'accepted' | 'pty_not_found' | 'no_target';
+  /* 'bridge_esc' (control-transport fix, 2026-07-14): the PTY inject
+   * missed but a deliverable bridge accepted the ESC ESC payload via
+   * the suggestion queue. See migration 046. */
+  result: 'accepted' | 'pty_not_found' | 'no_target' | 'bridge_esc';
 }
 
 /* runtime_config row. Wave 2 day 4 step 19 (A15) pause-mode toggle
@@ -679,7 +682,11 @@ export class IndexDb {
     prompt_id: string;
     session_id: string;
     project_slug: string;
-    decision: 'inject' | 'silence';
+    /* 'vetoed' added for R3 of the curator-loop revival: the
+     * DEVNEURAL_CURATOR_VET pre-injection gate rejects a candidate
+     * that already passed the cosine floor. Requires migration 048
+     * (curator_log.decision CHECK constraint). */
+    decision: 'inject' | 'silence' | 'vetoed';
     page_slug: string | null;
     score: number | null;
     threshold: number;
@@ -2921,7 +2928,7 @@ export class IndexDb {
     target_session_id: string | null;
     clicked_ms: number;
     caller: string;
-    result: 'accepted' | 'pty_not_found' | 'no_target';
+    result: 'accepted' | 'pty_not_found' | 'no_target' | 'bridge_esc';
   }): void {
     try {
       this.db

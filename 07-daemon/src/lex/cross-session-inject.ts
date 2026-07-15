@@ -288,6 +288,44 @@ export function checkLexScope(
 }
 
 /**
+ * Standalone audit-row writer for rejected_scope decisions made
+ * OUTSIDE crossSessionInject itself (control-transport fix,
+ * 2026-07-14). /lex/steer, /sessions/:id/prompt, /sessions/:id/suggest,
+ * and /sessions/:id/inject each run their own checkLexScope gate
+ * before reaching (or instead of ever reaching) crossSessionInject,
+ * so a rejection there previously vanished with no audit trail —
+ * exactly the gap this closes. Writes the identical row shape the
+ * internal audit() closure below produces for decision='rejected_scope'
+ * so GET /lex/injection-log reads consistently regardless of which
+ * route produced the row. Never throws; a db write failure must not
+ * block the caller's 403 response.
+ */
+export function auditRejectedScope(
+  db: IndexDb,
+  opts: {
+    target_session: string;
+    caller_label?: string | null;
+    text: string;
+    reason: string;
+  },
+): void {
+  try {
+    db.insertCrossSessionLog({
+      id: randomUUID(),
+      target_session: opts.target_session,
+      caller_label: opts.caller_label ?? null,
+      text_preview: opts.text.slice(0, 120),
+      text_length: opts.text.length,
+      decision: 'rejected_scope',
+      reject_reason: opts.reason,
+      brainstorm_id: null,
+    });
+  } catch {
+    /* db write failure must not affect the caller */
+  }
+}
+
+/**
  * Attempt a cross-session injection.  Always writes an audit row to db.
  * Never throws; errors are returned in InjectResult.
  *

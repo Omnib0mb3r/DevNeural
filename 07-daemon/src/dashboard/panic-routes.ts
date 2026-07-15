@@ -7,9 +7,25 @@
  *   recentPanics         -> GET  /panic/recent           audit panel feed
  *
  * Every fire writes one panic_log row with result in
- * {accepted, pty_not_found, no_target}. The PTY transport is injected
- * so unit tests don't need a real PTY (production binds to ptyInject
- * from pty-host).
+ * {accepted, pty_not_found, no_target, bridge_esc}. The PTY transport
+ * is injected so unit tests don't need a real PTY (production binds
+ * to ptyInject from pty-host).
+ *
+ * Dual transport (control-transport fix, 2026-07-14). Bridge-attached
+ * workers (project_session.current_pty_id null, current_bridge_id
+ * set — a VS Code terminal Lex never spawned as a daemon PTY) have no
+ * daemon-owned PTY for the raw injector to write \x1b\x1b into, so
+ * every panic against one of those anchors used to log
+ * 'pty_not_found' even while the worker was live and reachable. When
+ * the PTY attempt misses, fireOn now retries the SAME 2-byte ESC ESC
+ * payload through the bridge's suggestion queue (commit:false — a raw
+ * escape has nothing to commit) gated on real bridge deliverability
+ * (resolveDeliverableBridgeForSession), same shape as
+ * crossSessionInject's bridge fallback. Bridges only paste-wrap
+ * payloads that need it (newline or >200 chars — see
+ * 09-bridge/src/bridge-payload.ts needsBracketedPaste); ESC ESC ships
+ * unwrapped either way. Result 'bridge_esc' distinguishes this path
+ * in the audit log from a direct PTY 'accepted'.
  *
  * Cooldown is enforced client-side per spec (1s lockout on the
  * button); the daemon side is fire-and-log so a second press during a
@@ -23,6 +39,7 @@ import type {
   ProjectSessionRow,
 } from '../store/index-db.js';
 import { resolvePanicTarget, type ResolveOptions } from './panic-target.js';
+import { resolveDeliverableBridgeForSession } from './bridge-presence.js';
 
 export const PANIC_PAYLOAD = '\x1b\x1b';
 
@@ -34,13 +51,44 @@ export interface PtyInjector {
   ): { ok: true } | { ok: false; error: string };
 }
 
+/** Bridge suggestion-queue writer. Shape matches
+ * dashboard/sessions.js's queueSessionSuggestion; tests stub it so
+ * the fallback path can be exercised without a live bridge dir. */
+export interface BridgeSuggester {
+  (
+    sessionId: string,
+    text: string,
+  ): { ok: true; queued_at: string } | { ok: false; error: string };
+}
+
+/** Bridge deliverability check. Default reads live bridge-presence
+ * state via resolveDeliverableBridgeForSession; tests stub it so the
+ * fallback gate can be exercised without a real presence dir. */
+export interface BridgeDeliverabilityCheck {
+  (ccSessionId: string): {
+    verdict: 'deliverable' | 'legacy-grace' | 'no_terminal' | 'not_claimed';
+  };
+}
+
 export interface FireOptions extends ResolveOptions {
   caller: string;
   clickedMs: number;
   injector: PtyInjector;
+  /** Bridge fallback (control-transport fix, 2026-07-14). Omitted =
+   * legacy PTY-only behavior (existing callers / tests keep working
+   * unchanged). When present, a PTY miss retries through the bridge
+   * suggestion queue provided the target has a deliverable bridge. */
+  bridgeSuggest?: BridgeSuggester;
+  /** Defaults to resolveDeliverableBridgeForSession. Only consulted
+   * when bridgeSuggest is set and the PTY attempt missed. */
+  resolveDeliverableBridge?: BridgeDeliverabilityCheck;
 }
 
-export type PanicResult = 'accepted' | 'pty_not_found' | 'no_target';
+export type PanicResult =
+  | 'accepted'
+  | 'pty_not_found'
+  | 'no_target'
+  | 'bridge_esc';
 
 export interface FireResult {
   ok: boolean;
@@ -101,26 +149,58 @@ function fireOn(
    * exact key we tried so the dashboard can show whichever identifier
    * actually drove the inject. */
   const injectKey = target.current_pty_id ?? target.current_session_id ?? null;
-  if (!injectKey) {
+  let ptyOk = false;
+  if (injectKey) {
+    const inj = opts.injector(injectKey, PANIC_PAYLOAD, false);
+    ptyOk = inj.ok;
+  }
+  if (ptyOk) {
     const logId = writeLog(db, {
       target,
       clickedMs: opts.clickedMs,
       caller: opts.caller,
-      result: 'pty_not_found',
-      ptyId: null,
+      result: 'accepted',
+      ptyId: injectKey,
     });
-    return { ok: false, result: 'pty_not_found', target, log_id: logId };
+    return { ok: true, result: 'accepted', target, log_id: logId };
   }
-  const inj = opts.injector(injectKey, PANIC_PAYLOAD, false);
-  const result: PanicResult = inj.ok ? 'accepted' : 'pty_not_found';
+  /* PTY missed (or there was never a pty/session key to try). Bridge
+   * fallback: only possible when the caller wired bridgeSuggest AND
+   * the anchor has a bound CC session id (bridge presence keys on
+   * that, not the daemon pty id). Bridge-attached anchors always have
+   * current_session_id populated alongside current_bridge_id by
+   * reconcileBridgePresence, so this is the same key injectKey would
+   * have fallen back to. */
+  const bridgeTarget = target.current_session_id;
+  if (opts.bridgeSuggest && bridgeTarget) {
+    const resolveDeliverable =
+      opts.resolveDeliverableBridge ?? resolveDeliverableBridgeForSession;
+    const deliverability = resolveDeliverable(bridgeTarget);
+    if (
+      deliverability.verdict === 'deliverable' ||
+      deliverability.verdict === 'legacy-grace'
+    ) {
+      const bridgeResult = opts.bridgeSuggest(bridgeTarget, PANIC_PAYLOAD);
+      if (bridgeResult.ok) {
+        const logId = writeLog(db, {
+          target,
+          clickedMs: opts.clickedMs,
+          caller: opts.caller,
+          result: 'bridge_esc',
+          ptyId: bridgeTarget,
+        });
+        return { ok: true, result: 'bridge_esc', target, log_id: logId };
+      }
+    }
+  }
   const logId = writeLog(db, {
     target,
     clickedMs: opts.clickedMs,
     caller: opts.caller,
-    result,
+    result: 'pty_not_found',
     ptyId: injectKey,
   });
-  return { ok: inj.ok, result, target, log_id: logId };
+  return { ok: false, result: 'pty_not_found', target, log_id: logId };
 }
 
 /** Global panic: resolver picks the single target. */
@@ -146,12 +226,32 @@ export function recentPanics(db: IndexDb, limit: number = 20): PanicLogRow[] {
   return db.listRecentPanics(limit);
 }
 
+/** Injector deps for registerPanicRoutes (control-transport fix,
+ * 2026-07-14). Mirrors the shape smart-compact-injector.ts /
+ * crossSessionInject already use: a direct PTY transport plus a
+ * bridge fallback gated on real deliverability. Passing only
+ * `ptyInject` (legacy 3-arg call shape) keeps pure-PTY behavior for
+ * any caller that hasn't been updated. */
+export interface PanicInjectorDeps {
+  ptyInject: PtyInjector;
+  queueSessionSuggestion: BridgeSuggester;
+  /** Defaults to resolveDeliverableBridgeForSession. */
+  resolveDeliverableBridge?: BridgeDeliverabilityCheck;
+}
+
 export function registerPanicRoutes(
   app: FastifyInstance,
   db: IndexDb,
-  injector: PtyInjector,
+  deps: PtyInjector | PanicInjectorDeps,
   log: (msg: string) => void = () => undefined,
 ): void {
+  /* Back-compat: a bare PtyInjector function (legacy call shape)
+   * keeps PTY-only behavior with no bridge fallback wired. */
+  const injectorDeps: PanicInjectorDeps =
+    typeof deps === 'function' ? { ptyInject: deps, queueSessionSuggestion: () => ({ ok: false, error: 'bridge fallback not wired' }) } : deps;
+  const injector = injectorDeps.ptyInject;
+  const bridgeSuggest = injectorDeps.queueSessionSuggestion;
+  const resolveDeliverableBridge = injectorDeps.resolveDeliverableBridge;
   app.post('/panic', async (req) => {
     const body = (req.body ?? {}) as {
       caller?: string;
@@ -162,6 +262,8 @@ export function registerPanicRoutes(
       clickedMs:
         typeof body.clicked_ms === 'number' ? body.clicked_ms : Date.now(),
       injector,
+      bridgeSuggest,
+      resolveDeliverableBridge,
     });
     log(
       `[panic] caller=${
@@ -187,6 +289,8 @@ export function registerPanicRoutes(
       clickedMs:
         typeof body.clicked_ms === 'number' ? body.clicked_ms : Date.now(),
       injector,
+      bridgeSuggest,
+      resolveDeliverableBridge,
     });
     log(
       `[panic] caller=${

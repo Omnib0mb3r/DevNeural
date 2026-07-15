@@ -203,6 +203,117 @@ describe('firePanic', () => {
   });
 });
 
+describe('firePanic bridge fallback (control-transport fix, 2026-07-14)', () => {
+  it('retries via the bridge suggestion queue on a PTY miss and logs bridge_esc', () => {
+    /* Bridge-attached anchor: no daemon-owned PTY (current_pty_id
+     * null), reachable only via current_session_id / current_bridge_id
+     * — exactly the R1 shape the fix targets. */
+    seedLive({ id: 'only', pty: null, cc: 'cc-bridge-1' });
+    const injector = vi.fn(() => ({
+      ok: false as const,
+      error: 'pty not found',
+    }));
+    const bridgeSuggest = vi.fn(() => ({
+      ok: true as const,
+      queued_at: new Date().toISOString(),
+    }));
+    const resolveDeliverableBridge = vi.fn(() => ({
+      verdict: 'deliverable' as const,
+    }));
+    const r = firePanic(db, {
+      caller: 'dashboard',
+      clickedMs: 9200,
+      injector,
+      bridgeSuggest,
+      resolveDeliverableBridge,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.result).toBe('bridge_esc');
+    expect(injector).toHaveBeenCalledWith('cc-bridge-1', '\x1b\x1b', false);
+    expect(resolveDeliverableBridge).toHaveBeenCalledWith('cc-bridge-1');
+    expect(bridgeSuggest).toHaveBeenCalledWith('cc-bridge-1', '\x1b\x1b');
+    const log = recentPanics(db)[0]!;
+    expect(log.result).toBe('bridge_esc');
+    expect(log.target_anchor_id).toBe('only');
+    expect(log.target_pty_id).toBe('cc-bridge-1');
+  });
+
+  it('does not attempt the bridge when no fresh presence claims the target (not_claimed)', () => {
+    seedLive({ id: 'only', pty: null, cc: 'cc-bridge-2' });
+    const injector = vi.fn(() => ({ ok: false as const, error: 'pty not found' }));
+    const bridgeSuggest = vi.fn(() => ({ ok: true as const, queued_at: 'x' }));
+    const resolveDeliverableBridge = vi.fn(() => ({
+      verdict: 'not_claimed' as const,
+    }));
+    const r = firePanic(db, {
+      caller: 'dashboard',
+      clickedMs: 9201,
+      injector,
+      bridgeSuggest,
+      resolveDeliverableBridge,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.result).toBe('pty_not_found');
+    expect(bridgeSuggest).not.toHaveBeenCalled();
+    expect(recentPanics(db)[0]!.result).toBe('pty_not_found');
+  });
+
+  it('falls back to pty_not_found when the bridge write itself fails', () => {
+    seedLive({ id: 'only', pty: null, cc: 'cc-bridge-3' });
+    const injector = vi.fn(() => ({ ok: false as const, error: 'pty not found' }));
+    const bridgeSuggest = vi.fn(() => ({
+      ok: false as const,
+      error: 'bridge offline',
+    }));
+    const resolveDeliverableBridge = vi.fn(() => ({
+      verdict: 'legacy-grace' as const,
+    }));
+    const r = firePanic(db, {
+      caller: 'dashboard',
+      clickedMs: 9202,
+      injector,
+      bridgeSuggest,
+      resolveDeliverableBridge,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.result).toBe('pty_not_found');
+    expect(recentPanics(db)[0]!.result).toBe('pty_not_found');
+  });
+
+  it('keeps legacy PTY-only behavior (no bridge_esc) when bridgeSuggest is not wired', () => {
+    /* Existing callers (e.g. lex-voice-ws.ts's voice panic command)
+     * pass only `injector`. Omitting bridgeSuggest must reproduce the
+     * exact pre-fix result so those callers are unaffected. */
+    seedLive({ id: 'only', pty: null, cc: 'cc-bridge-4' });
+    const injector = vi.fn(() => ({ ok: false as const, error: 'pty not found' }));
+    const r = firePanic(db, {
+      caller: 'dashboard',
+      clickedMs: 9203,
+      injector,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.result).toBe('pty_not_found');
+  });
+
+  it('does not reach the bridge fallback when the PTY attempt succeeds', () => {
+    seedLive({ id: 'only', pty: 'pty-1', cc: 'cc-1' });
+    const injector = vi.fn(() => ({ ok: true as const }));
+    const bridgeSuggest = vi.fn();
+    const resolveDeliverableBridge = vi.fn();
+    const r = firePanic(db, {
+      caller: 'dashboard',
+      clickedMs: 9204,
+      injector,
+      bridgeSuggest,
+      resolveDeliverableBridge,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.result).toBe('accepted');
+    expect(bridgeSuggest).not.toHaveBeenCalled();
+    expect(resolveDeliverableBridge).not.toHaveBeenCalled();
+  });
+});
+
 describe('fireProjectInterrupt', () => {
   it('returns 404-style result when anchor id is unknown', () => {
     const injector = vi.fn();
