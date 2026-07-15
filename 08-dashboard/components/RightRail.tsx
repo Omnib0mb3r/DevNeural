@@ -102,13 +102,19 @@ export function RightRail() {
             <Icon name="ListChecks" className="text-brandSoft" size={16} />
             <h2 className="font-display text-sm font-emphasized">Reminders</h2>
           </div>
-          <span className="text-nano text-txt3">{openReminders.length} open</span>
+          <span className="text-nano text-txt3">
+            {remQ.isError ? "—" : `${openReminders.length} open`}
+          </span>
         </div>
         <ul className="divide-y divide-border2">
-          {openReminders.length === 0 && (
-            <li className="px-4 py-3 text-xs text-txt3">All caught up.</li>
+          {remQ.isError ? (
+            <li className="px-4 py-3 text-xs text-err">Daemon not reachable.</li>
+          ) : (
+            openReminders.length === 0 && (
+              <li className="px-4 py-3 text-xs text-txt3">All caught up.</li>
+            )
           )}
-          {openReminders.slice(0, 6).map((r) => (
+          {!remQ.isError && openReminders.slice(0, 6).map((r) => (
             <li
               key={r.id}
               className="px-4 py-2.5 flex items-center gap-2.5 lift cursor-pointer"

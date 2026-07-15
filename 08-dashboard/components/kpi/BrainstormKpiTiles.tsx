@@ -27,6 +27,7 @@ import {
   type BrainstormKpiStats,
 } from "@/lib/daemon-client";
 import { Icon } from "../Icon";
+import { Card } from "../ui/Card";
 
 function fmt(n: number, digits = 0): string {
   if (!Number.isFinite(n)) return "—";
@@ -47,20 +48,32 @@ interface TileProps {
   value: string;
   sub: string;
   loading: boolean;
+  /** True when the underlying metric is a permanent 0 from the daemon
+   * (no backing computation wired up yet - see statsBrainstormKpi
+   * artifacts_per_brainstorm_avg / wiki_lineage_coverage). Renders a
+   * muted "pending" label instead of a zero that reads as a real
+   * measurement. */
+  pending?: boolean;
 }
 
-function Tile({ icon, label, value, sub, loading }: TileProps) {
+function Tile({ icon, label, value, sub, loading, pending }: TileProps) {
   return (
-    <div className="min-w-[148px] flex flex-col gap-1 px-3 py-2.5 rounded-md bg-bg2 border border-bd2">
+    <Card className="min-w-[148px] flex flex-col gap-1 px-3 py-2.5">
       <div className="flex items-center gap-1.5 text-nano text-txt3 font-mono uppercase tracking-wider">
         <Icon name={icon} className="w-3 h-3" />
         {label}
       </div>
-      <div className="text-2xl font-semibold tabular-nums leading-none">
-        {loading ? "—" : value}
+      <div
+        className={`text-2xl font-semibold tabular-nums leading-none ${
+          pending && !loading ? "text-txt3" : ""
+        }`}
+      >
+        {loading ? "—" : pending ? "pending" : value}
       </div>
-      <div className="text-nano text-txt3">{sub}</div>
-    </div>
+      <div className="text-nano text-txt3">
+        {pending && !loading ? "not wired yet" : sub}
+      </div>
+    </Card>
   );
 }
 
@@ -96,6 +109,7 @@ export function BrainstormKpiTiles() {
         value={fmt(d?.artifacts_per_brainstorm_avg ?? 0, 1)}
         sub="avg across all brainstorms"
         loading={loading}
+        pending={(d?.artifacts_per_brainstorm_avg ?? 0) === 0}
       />
       <Tile
         icon="GitBranch"
@@ -103,6 +117,7 @@ export function BrainstormKpiTiles() {
         value={pct(d?.wiki_lineage_coverage ?? 0)}
         sub="pages traceable to a brainstorm"
         loading={loading}
+        pending={(d?.wiki_lineage_coverage ?? 0) === 0}
       />
       <Tile
         icon="Layers"

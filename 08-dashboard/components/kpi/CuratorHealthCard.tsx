@@ -19,6 +19,7 @@ import {
   type CuratorHealthStats,
 } from "@/lib/daemon-client";
 import { Icon } from "../Icon";
+import { Card } from "../ui/Card";
 
 const WINDOW_DAYS = 7;
 const SPARK_W = 88;
@@ -44,7 +45,7 @@ function Sparkline({ values }: { values: number[] }) {
       width={SPARK_W}
       height={SPARK_H}
       viewBox={`0 0 ${SPARK_W} ${SPARK_H}`}
-      className="text-accent2"
+      className="text-brandSoft"
       aria-label={`Injections per day, last ${values.length} days`}
     >
       <polyline
@@ -67,14 +68,26 @@ function pct(n: number): string {
 }
 
 function CanaryPill({ status }: { status: CuratorHealthStats["canary_status"] }) {
+  /* The daemon always returns 'unknown' for canary_status right now (no
+   * canary probe wired up yet on that side - out of scope for this UI
+   * fix). Rendering that as an amber "canary —" pill implies a real,
+   * currently-indeterminate health check exists. It doesn't, so say so
+   * plainly instead of dressing up a stub as a live status. */
+  if (status !== "green" && status !== "red") {
+    return (
+      <span
+        className="text-nano px-1.5 py-0.5 rounded border border-border2 text-txt3 font-mono uppercase tracking-wider"
+        title="No canary probe is wired up on the daemon yet."
+      >
+        canary: not wired
+      </span>
+    );
+  }
   const cls =
     status === "green"
       ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
-      : status === "red"
-        ? "bg-rose-500/15 text-rose-300 border-rose-500/30"
-        : "bg-amber-500/10 text-amber-300 border-amber-500/30";
-  const label =
-    status === "green" ? "canary green" : status === "red" ? "canary red" : "canary —";
+      : "bg-rose-500/15 text-rose-300 border-rose-500/30";
+  const label = status === "green" ? "canary green" : "canary red";
   return (
     <span
       className={`text-nano px-1.5 py-0.5 rounded border font-mono uppercase tracking-wider ${cls}`}
@@ -102,7 +115,7 @@ export function CuratorHealthCard() {
     d?.injections_per_day?.reduce((a, b) => a + b, 0) ?? 0;
 
   return (
-    <div className="min-w-[220px] flex flex-col gap-1.5 px-3 py-2.5 rounded-md bg-bg2 border border-bd2">
+    <Card className="min-w-[220px] flex flex-col gap-1.5 px-3 py-2.5">
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-1.5 text-nano text-txt3 font-mono uppercase tracking-wider">
           <Icon name="Activity" className="w-3 h-3" />
@@ -142,7 +155,7 @@ export function CuratorHealthCard() {
         </div>
         <div className="flex flex-col items-start">
           <span className="text-txt3">clk</span>
-          <span className="tabular-nums text-accent2">
+          <span className="tabular-nums text-brandSoft">
             {q.isLoading ? "—" : pct(d?.click_through_rate ?? 0)}
           </span>
         </div>
@@ -152,6 +165,6 @@ export function CuratorHealthCard() {
           {d.flagged_pages_count} flagged for review
         </div>
       )}
-    </div>
+    </Card>
   );
 }

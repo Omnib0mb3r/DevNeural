@@ -85,6 +85,24 @@ export function ProjectsGrid({ compact = false, limit }: Props = {}) {
     );
   }
 
+  if (projQ.isError) {
+    return (
+      <div className={compact ? "py-3 text-center" : "rounded-panel bg-surface1 hairline p-10 text-center"}>
+        {!compact && <Icon name="WifiOff" className="text-err mx-auto mb-3" size={32} />}
+        {!compact && (
+          <h3 className="font-display text-md font-emphasized mb-1 text-err">
+            Daemon unreachable.
+          </h3>
+        )}
+        <p className="text-txt3 text-sm">
+          {compact
+            ? "Daemon not reachable. Projects can't load right now."
+            : "Couldn't reach the daemon to list projects. Check that it's running, then refresh."}
+        </p>
+      </div>
+    );
+  }
+
   if (all.length === 0) {
     return (
       <div className={compact ? "py-3 text-center" : "rounded-panel bg-surface1 hairline p-10 text-center"}>

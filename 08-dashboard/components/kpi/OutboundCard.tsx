@@ -16,6 +16,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { statsOutbound, type OutboundStats } from "@/lib/daemon-client";
 import { Icon } from "../Icon";
+import { Card } from "../ui/Card";
 
 function fmt(n: number): string {
   if (!Number.isFinite(n)) return "—";
@@ -47,7 +48,7 @@ export function OutboundCard() {
   const brainstormOk = brainstormCount === 0;
 
   return (
-    <div className="min-w-[240px] flex flex-col gap-1.5 px-3 py-2.5 rounded-md bg-bg2 border border-bd2">
+    <Card className="min-w-[240px] flex flex-col gap-1.5 px-3 py-2.5">
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-1.5 text-nano text-txt3 font-mono uppercase tracking-wider">
           <Icon name="ArrowUpRight" className="w-3 h-3" />
@@ -69,14 +70,14 @@ export function OutboundCard() {
       </div>
       {/* Cap remaining bar. Width animates via CSS transition; no
         * extra deps. */}
-      <div className="h-1.5 w-full bg-bd2/60 rounded-full overflow-hidden">
+      <div className="h-1.5 w-full bg-border2/60 rounded-full overflow-hidden">
         <div
           className={`h-full transition-all duration-300 ${
             pct >= 100
               ? "bg-rose-500"
               : pct >= 80
                 ? "bg-amber-500"
-                : "bg-accent2"
+                : "bg-brandSoft"
           }`}
           style={{ width: `${pct}%` }}
         />
@@ -105,6 +106,6 @@ export function OutboundCard() {
         brainstorm outbound: {fmt(brainstormCount)} ever
         {brainstormOk ? ", by design" : " — INVARIANT VIOLATED"}
       </div>
-    </div>
+    </Card>
   );
 }

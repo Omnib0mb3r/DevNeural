@@ -1367,10 +1367,12 @@ export interface ProjectRecord {
   first_seen: string;
   last_seen: string;
 }
-export const projects = () =>
-  request<{ projects: ProjectRecord[] }>("/projects").catch(() => ({
-    projects: [] as ProjectRecord[],
-  }));
+/* Callers must handle the rejection (react-query's isError, etc). A silent
+ * .catch(() => ({ projects: [] })) used to live here, which meant a daemon
+ * that was actually unreachable rendered identically to a daemon with zero
+ * registered projects - ProjectsGrid had no way to tell "empty" from
+ * "broken" and always showed the "No projects registered yet" empty state. */
+export const projects = () => request<{ projects: ProjectRecord[] }>("/projects");
 export const createProject = (input: {
   name: string;
   stage?: "alpha" | "beta" | "deployed" | "archived";

@@ -101,6 +101,12 @@ export function DailyBrief() {
   const summary = q.data?.summary;
   const md = q.data?.whats_new_markdown ?? "";
 
+  /* Staleness badge: the daily brief's "what's new" digest is only useful
+   * if it's actually recent. Past 7 days (168h) it's more likely to
+   * mislead than inform, so flag it instead of presenting it as current. */
+  const staleHours = summary?.whats_new_age_hours ?? null;
+  const isStale = staleHours !== null && staleHours > 168;
+
   const dateLabel = new Date().toLocaleDateString(undefined, {
     weekday: "short",
     month: "short",
@@ -119,6 +125,14 @@ export function DailyBrief() {
             Daily brief
             <span className="text-txt3 font-normal"> · {dateLabel}</span>
           </h2>
+          {isStale && (
+            <span
+              className="text-nano px-1.5 py-0.5 rounded border border-warn/30 bg-warn/10 text-warn font-mono uppercase tracking-wider"
+              title="The wiki digest below hasn't refreshed in over a week."
+            >
+              stale: {Math.floor((staleHours as number) / 24)}d old
+            </span>
+          )}
         </div>
         <button
           type="button"
