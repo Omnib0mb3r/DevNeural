@@ -10,7 +10,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   renderForSpeech,
-  heartbeatLine,
   shouldCaptureAbsorbedAside,
   ABSORBED_ASIDE_RING_MAX,
   _pushAbsorbedAsideImpl,
@@ -42,19 +41,6 @@ describe('renderForSpeech', () => {
   });
 });
 
-describe('heartbeatLine', () => {
-  it('flag OFF: the duration-aware legacy phrase', () => {
-    delete process.env.DEVNEURAL_VOICE_HAIKU;
-    expect(heartbeatLine(65_000)).toBeTruthy();
-  });
-
-  it('flag ON: a grounded first-person line', () => {
-    process.env.DEVNEURAL_VOICE_HAIKU = '1';
-    const line = heartbeatLine(5 * 60_000);
-    expect(line).toBeTruthy();
-    expect(line.toLowerCase()).not.toContain('lex is');
-  });
-});
 
 describe('absorbed-aside helpers', () => {
   const entry = (n: number): AbsorbedAsideEntry => ({

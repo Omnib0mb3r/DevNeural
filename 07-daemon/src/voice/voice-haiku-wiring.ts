@@ -10,8 +10,6 @@
  */
 import { useVoiceHaiku } from './voice-haiku.js';
 import { renderSpoken } from './voice-renderer.js';
-import { composeHeartbeat } from './voice-heartbeat-haiku.js';
-import { heartbeatPhrase } from './lex-voice-heartbeat.js';
 
 /* Spoken-output gate. OFF: the text is returned verbatim (the speak
  * controller's own cleanForTts then runs exactly as today). ON: route
@@ -24,12 +22,9 @@ export function renderForSpeech(text: string): string {
   return renderSpoken(text).spoken;
 }
 
-/* Heartbeat line. OFF: the existing duration-aware phrase, unchanged.
- * ON: the grounded persona-correct line (first-person Lex). */
-export function heartbeatLine(elapsedMs: number): string {
-  if (!useVoiceHaiku()) return heartbeatPhrase(elapsedMs);
-  return composeHeartbeat({ lexElapsedMs: elapsedMs });
-}
+/* heartbeatLine is gone (operator directive 2026-07-15: no hardcoded
+ * talking). The heartbeat pulse line now comes from the brain via
+ * voice-top-layer.ts voiceHeartbeat, or the pulse is skipped. */
 
 /* Absorbed-aside plumbing (2026-07-15, fast-lane transcript hole fix;
  * retained under spec v2 for the top layer's conversational turns).

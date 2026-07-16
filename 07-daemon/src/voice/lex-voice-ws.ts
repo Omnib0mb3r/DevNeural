@@ -91,8 +91,17 @@ import {
 } from './lex-voice-commands.js';
 import {
   topLayerTurn,
+  voiceLexReply,
+  voiceHeartbeat,
   type TopLayerControl,
 } from './voice-top-layer.js';
+import {
+  isSmartTurnEnabled,
+  analyzeTurn,
+  decideCoalesce,
+  emptyCoalescerState,
+  type TurnVerdict,
+} from './smart-turn.js';
 import { runHoldUp } from './lex-voice-hold-up.js';
 import {
   detectContradiction,
@@ -114,7 +123,6 @@ import {
 import { shouldSpeakHeartbeatHaiku } from './voice-heartbeat-haiku.js';
 import {
   renderForSpeech,
-  heartbeatLine,
   shouldCaptureAbsorbedAside,
   _pushAbsorbedAsideImpl,
   _formatAbsorbedAsideBlockImpl,
@@ -1444,7 +1452,16 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         intervalMs: HEARTBEAT_INTERVAL_MS,
       });
       if (fire && state.awaitingResponseSince) {
-        speak(heartbeatLine(now - state.awaitingResponseSince));
+        /* No hardcoded talking: the pulse line comes from the brain or
+         * not at all (a missed pulse is silence, not a canned phrase).
+         * Guard against the ask outliving the wait: only speak if Lex
+         * is STILL mid-turn when the line comes back. */
+        const elapsed = now - state.awaitingResponseSince;
+        void voiceHeartbeat(elapsed).then((line) => {
+          if (line && state.awaitingResponseSince > 0 && !state.closed) {
+            speak(line);
+          }
+        });
       }
     }, HEARTBEAT_TICK_MS);
     if (typeof (heartbeatTimer as { unref?: () => void }).unref === 'function') {
@@ -1752,11 +1769,23 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
            * that used to gate the body behind an extra LLM round trip
            * is gone. */
           if (isPreToolAck) {
-            speak(clampAck(text));
+            /* No hardcoded talking: the 'On it.' literal died with the
+             * grammar (the top layer's forward handoff line already
+             * acknowledged the request out loud). Only a REAL first
+             * sentence from Lex's own text speaks, delivered by the
+             * brain with Lex's words as the miss fallback. */
+            const ack = clampAck(text);
+            if (ack !== 'On it.') speakViaBrain(ack, true);
           } else {
-            for (const sentence of splitForSpeech(text)) {
-              speak(sentence, { continuation: true });
-            }
+            /* TTS is hooked ONLY to the top layer (operator directive
+             * 2026-07-15): the voice brain delivers Lex's body in its
+             * own voice, streamed sentence-by-sentence as its records
+             * land. A miss (session down, 3s timeout) falls back to
+             * speaking the raw body sentence-split - Lex's own words,
+             * never a canned line; Lex is never silenced by the
+             * delivery layer. Fire-and-forget: the post-turn pipeline
+             * below never waits on speech. */
+            speakViaBrain(text, true);
           }
         } else {
           send({ t: 'tts-skipped', reason: 'already-spoken' });
@@ -2027,6 +2056,32 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     const spoken = renderForSpeech(text);
     lastSpokenText = spoken;
     speakCtrl.speak(spoken, opts);
+  }
+
+  /* Everything spoken goes through the brain (operator directive
+   * 2026-07-15: no hardcoded talking). Delivers `text` in the top
+   * layer's own voice, streamed sentence-by-sentence. On a brain miss:
+   * fallbackRaw=true speaks the raw text (Lex's own words - a
+   * protection against the brain silencing Lex, never a canned line);
+   * fallbackRaw=false stays silent (filler like recaps and acks is
+   * dropped rather than replaced by a template). */
+  function speakViaBrain(text: string, fallbackRaw: boolean): void {
+    const raw = (): void => {
+      for (const s of splitForSpeech(text)) speak(s, { continuation: true });
+    };
+    void voiceLexReply(text, {
+      onSpeech: (line) => {
+        for (const s of splitForSpeech(line)) {
+          speak(s, { continuation: true });
+        }
+      },
+    })
+      .then((delivered) => {
+        if (!delivered && fallbackRaw) raw();
+      })
+      .catch(() => {
+        if (fallbackRaw) raw();
+      });
   }
 
   /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
@@ -2516,8 +2571,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
             }
           },
           sendFrame: send,
+          /* No hardcoded talking: runHoldUp's recap template goes
+           * through the brain's own delivery; a miss means the recap
+           * is skipped (the abort effects above already happened). */
           speak: (text) => {
-            void speak(text);
+            speakViaBrain(text, false);
           },
           intendedText: intended,
         });
@@ -2776,6 +2834,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     });
   }
 
+  /* Smart Turn hold/merge state (spec v2 phase 2), per connection. An
+   * utterance the model judges mid-thought is held and merged with the
+   * operator's continuation instead of being answered mid-sentence. */
+  let smartTurnCoalescer = emptyCoalescerState();
+
   async function handleUtteranceEnd(): Promise<void> {
     if (state.micBuf.length === 0) {
       send({ t: 'error', code: 'empty-utterance', message: 'no audio' });
@@ -2808,7 +2871,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * client flips back to ready instead of sitting on "transcribing".
      * Panic + end-session triggers are both 2+ words so this floor
      * does not cut them off. */
-    const trimmed = result.text.trim();
+    let trimmed = result.text.trim();
     const wordCount = trimmed
       ? trimmed.split(/\s+/).filter((w) => w.length > 0).length
       : 0;
@@ -2890,6 +2953,44 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       state.utteranceStartedDuringTts = false;
       return;
     }
+    /* Smart Turn semantic endpointing (spec v2 phase 2). The client's
+     * VAD ends utterances on 450ms of silence now; this decides whether
+     * the operator was actually DONE. 'incomplete' holds the text and
+     * merges the continuation (hold window default 1600ms, evaluated at
+     * the next event); 'complete'/'unavailable' processes immediately,
+     * with any held text prepended. Runs AFTER panic (the kill phrase
+     * is never held) and degrades to a no-op when the model file or
+     * runtime_config toggle says off. */
+    if (isSmartTurnEnabled()) {
+      let verdict: TurnVerdict = 'unavailable';
+      try {
+        verdict = await analyzeTurn(pcm, 16000);
+      } catch {
+        verdict = 'unavailable';
+      }
+      const dec = decideCoalesce(
+        smartTurnCoalescer,
+        verdict,
+        trimmed,
+        Date.now(),
+      );
+      smartTurnCoalescer = dec.nextState;
+      if (dec.action === 'hold') {
+        logFn(
+          `[voice-ws] smart-turn hold (mid-thought): ${JSON.stringify(dec.text.slice(0, 80))}`,
+        );
+        send({ t: 'turn-held', text: dec.text });
+        state.utteranceStartedDuringTts = false;
+        return;
+      }
+      if (dec.text !== trimmed) {
+        logFn(
+          `[voice-ws] smart-turn merged held turn: ${JSON.stringify(dec.text.slice(0, 80))}`,
+        );
+        trimmed = dec.text;
+        result = { text: dec.text, ms: result.ms };
+      }
+    }
     /* Notes/meeting name-gate (2026-07), task 2. Voice commands above
      * always run first regardless of mode (unchanged). In notes mode,
      * either kind (brainstorm or meeting), every OTHER utterance is
@@ -2934,50 +3035,75 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * turn forwards untouched - the top layer can never eat the
      * operator's words. */
     const wasDuringTts = state.utteranceStartedDuringTts;
+    /* Streaming partials (spec v2 phase 2): each directive-free record
+     * from the voice brain speaks the moment it lands; the resolved
+     * result carries only the unspoken remainder (or the directives).
+     * Caller rule per voice-top-layer.ts: speak every onSpeech line as
+     * it arrives, then speak result.speech if non-null. */
+    const earlySpoken: string[] = [];
     const tl = await topLayerTurn(trimmed, {
       lastSpoken: lastSpokenText,
       duringTts: wasDuringTts,
       lexBusy: state.awaitingResponseSince > 0,
+      deps: {
+        onSpeech: (line) => {
+          earlySpoken.push(line);
+          speak(line);
+        },
+      },
     });
     state.utteranceStartedDuringTts = false;
     logFn(
       `[voice-ws] top-layer turn speech=${tl.speech ? JSON.stringify(tl.speech.slice(0, 60)) : 'null'} forward=${tl.forward ? JSON.stringify(tl.forward.slice(0, 60)) : 'null'} control=${tl.control ?? 'none'} duringTts=${wasDuringTts}`,
     );
+    /* On an early-speech mismatch the remainder is the FULL parsed
+     * speech (the model rewrote already-spoken text); speaking it
+     * would double-talk what was streamed. Drop it and log. */
+    const remainderSpeech = tl.earlySpeechMismatch ? null : tl.speech;
+    if (tl.earlySpeechMismatch) {
+      logFn(
+        `[voice-ws] top-layer early-speech mismatch; remainder dropped (${earlySpoken.length} line(s) already spoken)`,
+      );
+    }
     if (tl.control) {
-      applyTopLayerControl(tl.control, tl.speech);
+      applyTopLayerControl(tl.control, remainderSpeech);
       return;
     }
+    const fullReply = [...earlySpoken, remainderSpeech ?? '']
+      .join(' ')
+      .trim();
     if (!tl.forward) {
-      /* Conversational turn (or interpreted echo/noise: speech null).
-       * Speak it and absorb: nothing reaches Lex this turn, so the
-       * exchange is persisted and queued onto the asides ring exactly
-       * as the fast lane used to do. */
-      if (tl.speech) {
-        speak(tl.speech);
-        if (shouldCaptureAbsorbedAside(state.mode)) {
-          captureAbsorbedAside(trimmed, tl.speech);
-          state.absorbedAsides = _pushAbsorbedAsideImpl(
-            state.absorbedAsides,
-            { atMs: Date.now(), aside: trimmed, reply: tl.speech },
-          );
-        }
+      /* Conversational turn (or interpreted echo/noise: nothing said).
+       * Speak the remainder and absorb: nothing reaches Lex this turn,
+       * so the exchange is persisted and queued onto the asides ring
+       * exactly as the fast lane used to do - streamed lines included. */
+      if (remainderSpeech) speak(remainderSpeech);
+      if (fullReply && shouldCaptureAbsorbedAside(state.mode)) {
+        captureAbsorbedAside(trimmed, fullReply);
+        state.absorbedAsides = _pushAbsorbedAsideImpl(
+          state.absorbedAsides,
+          { atMs: Date.now(), aside: trimmed, reply: fullReply },
+        );
       }
       return;
     }
     /* Forward turn. The optional speech is the natural handoff line
      * (the researched latency mask - it replaces the canned bridge
      * pool); it speaks while the inject proceeds below. */
-    if (tl.speech) speak(tl.speech);
+    if (remainderSpeech) speak(remainderSpeech);
     /* AEC-residual guard, fail-safe path only. When the top layer
-     * actually answered (speech, control, or a rewritten forward) it
-     * SAW the during-TTS note and judged the turn real. But when the
-     * session was down/timed out, the forward is the raw fail-safe
-     * echo of the utterance; during TTS that text is most likely
-     * Lex's own audio bleeding back in, and injecting it would derail
-     * the brainstorm. Preserve the old suppression for exactly that
-     * case. */
+     * actually answered (streamed or final speech, a control, or a
+     * rewritten forward) it SAW the during-TTS note and judged the
+     * turn real. But when the session was down/timed out, the forward
+     * is the raw fail-safe echo of the utterance; during TTS that
+     * text is most likely Lex's own audio bleeding back in, and
+     * injecting it would derail the brainstorm. Preserve the old
+     * suppression for exactly that case. */
     const failSafeForward =
-      tl.speech === null && tl.control === null && tl.forward === trimmed;
+      tl.speech === null &&
+      tl.control === null &&
+      earlySpoken.length === 0 &&
+      tl.forward === trimmed;
     if (wasDuringTts && failSafeForward) {
       logFn(
         `[voice-ws] suppressed fail-safe forward during TTS: ${JSON.stringify(result.text.slice(0, 80))}`,

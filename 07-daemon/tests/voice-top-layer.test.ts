@@ -382,3 +382,270 @@ describe('topLayerTurn', () => {
     expect(timeoutMs).toBe(4000);
   });
 });
+
+describe('topLayerTurn streaming (deps.onSpeech)', () => {
+  /* Fake ask mimicking askVoice streaming: fires onPartial once per
+   * record as the jsonl records "land", then resolves with the full
+   * concatenation (or an explicit override, e.g. null for a timeout
+   * that struck after partials already streamed). */
+  function streamAsk(records: string[], resolveWith?: string | null): AskFn {
+    return async (args) => {
+      for (const rec of records) args.onPartial?.(rec);
+      return resolveWith === undefined ? records.join('\n') : resolveWith;
+    };
+  }
+
+  function collect(): { spoken: string[]; onSpeech: (line: string) => void } {
+    const spoken: string[] = [];
+    return { spoken, onSpeech: (line) => spoken.push(line) };
+  }
+
+  it('emits directive-free records in order; remainder speech is null', async () => {
+    const { spoken, onSpeech } = collect();
+    const ask = streamAsk(['First bit.', 'Second bit.']);
+    const r = await topLayerTurn('hi', makeCtx(ask, {}, { onSpeech }));
+    expect(spoken).toEqual(['First bit.', 'Second bit.']);
+    /* Everything was already spoken early; nothing left to say, and
+     * this is NOT the fail-safe (the model did reply). */
+    expect(r).toEqual({ speech: null, forward: null, control: null });
+    expect(r.earlySpeechMismatch).toBeUndefined();
+  });
+
+  it('subtracts the emitted prefix; only the unseen tail comes back as speech', async () => {
+    const { spoken, onSpeech } = collect();
+    const ask: AskFn = async (args) => {
+      args.onPartial?.('Early one.');
+      args.onPartial?.('Early two.');
+      return 'Early one.\nEarly two.\nLate close.';
+    };
+    const r = await topLayerTurn('hi', makeCtx(ask, {}, { onSpeech }));
+    expect(spoken).toEqual(['Early one.', 'Early two.']);
+    expect(r.speech).toBe('Late close.');
+    expect(r.earlySpeechMismatch).toBeUndefined();
+    /* The remainder went through the ring like any final speech. */
+    expect(wasLastSpoken('Late close.')).toBe(true);
+  });
+
+  it('a directive record stops emission; it and later records go through the final parse', async () => {
+    const { spoken, onSpeech } = collect();
+    const ask = streamAsk([
+      'On it.',
+      'Also this.\nFORWARD: dig into the ingest logs\nCONTROL: mute',
+      'Trailing record.',
+    ]);
+    const r = await topLayerTurn('go', makeCtx(ask, {}, { onSpeech }));
+    expect(spoken).toEqual(['On it.']);
+    expect(r.forward).toBe('dig into the ingest logs');
+    expect(r.control).toBe('mute');
+    /* The held record's plain lines and the trailing record surface
+     * only as remainder speech, after prefix subtraction. */
+    expect(r.speech).toBe('Also this.\nTrailing record.');
+    expect(r.earlySpeechMismatch).toBeUndefined();
+  });
+
+  it('a directive in the very first record suppresses all early emission', async () => {
+    const { spoken, onSpeech } = collect();
+    const ask = streamAsk(['On it, boss.\nFORWARD: profile the hot path']);
+    const r = await topLayerTurn('profile it', makeCtx(ask, {}, { onSpeech }));
+    expect(spoken).toEqual([]);
+    expect(r.speech).toBe('On it, boss.');
+    expect(r.forward).toBe('profile the hot path');
+  });
+
+  it('an off-token CONTROL line still stops early emission (held, spoken via final parse)', async () => {
+    const { spoken, onSpeech } = collect();
+    const ask = streamAsk(['CONTROL: self_destruct']);
+    const r = await topLayerTurn('hi', makeCtx(ask, {}, { onSpeech }));
+    /* Raw directive regex gates the stream even though the parse later
+     * classifies the line as plain speech, never a control. */
+    expect(spoken).toEqual([]);
+    expect(r.speech).toBe('CONTROL: self_destruct');
+    expect(r.control).toBeNull();
+  });
+
+  it('single-record turn: one onSpeech emit, remainder speech null', async () => {
+    /* Chosen semantics: the record streams out immediately and the
+     * result carries no speech. The caller keeps one uniform rule -
+     * speak every onSpeech line as it arrives, then speak result.speech
+     * if non-null - with no buffering and no single-vs-multi case. */
+    const { spoken, onSpeech } = collect();
+    const ask = streamAsk(['Just the one line.']);
+    const r = await topLayerTurn('hi', makeCtx(ask, {}, { onSpeech }));
+    expect(spoken).toEqual(['Just the one line.']);
+    expect(r).toEqual({ speech: null, forward: null, control: null });
+    /* Registered in the shared ring exactly as if spoken at the end. */
+    expect(wasLastSpoken('Just the one line.')).toBe(true);
+  });
+
+  it('ring-suppresses an early line repeating the last spoken line, and never resurfaces it', async () => {
+    rememberSpokenLine('Same line.');
+    const { spoken, onSpeech } = collect();
+    const ask = streamAsk(['Same line.', 'New stuff.']);
+    const r = await topLayerTurn('hi', makeCtx(ask, {}, { onSpeech }));
+    expect(spoken).toEqual(['New stuff.']);
+    /* The skipped line counts as consumed: it must not come back as
+     * remainder speech either. */
+    expect(r.speech).toBeNull();
+    expect(r.earlySpeechMismatch).toBeUndefined();
+  });
+
+  it('never-twice within one stream: an identical consecutive record is skipped', async () => {
+    const { spoken, onSpeech } = collect();
+    const ask = streamAsk(['Ditto.', 'Ditto.']);
+    const r = await topLayerTurn('hi', makeCtx(ask, {}, { onSpeech }));
+    expect(spoken).toEqual(['Ditto.']);
+    expect(r.speech).toBeNull();
+  });
+
+  it('flags earlySpeechMismatch and returns the full parsed speech on a rewrite', async () => {
+    const { spoken, onSpeech } = collect();
+    const ask: AskFn = async (args) => {
+      args.onPartial?.('Draft answer.');
+      return 'Final answer, rewritten.';
+    };
+    const r = await topLayerTurn('hi', makeCtx(ask, {}, { onSpeech }));
+    expect(spoken).toEqual(['Draft answer.']);
+    expect(r.speech).toBe('Final answer, rewritten.');
+    expect(r.earlySpeechMismatch).toBe(true);
+    expect(r.forward).toBeNull();
+    expect(r.control).toBeNull();
+  });
+
+  it('fail-safe: ask resolving null after partials still forwards the utterance', async () => {
+    const { spoken, onSpeech } = collect();
+    const ask = streamAsk(['Hang on, checking.'], null);
+    const r = await topLayerTurn(
+      'what broke overnight',
+      makeCtx(ask, {}, { onSpeech }),
+    );
+    expect(spoken).toEqual(['Hang on, checking.']);
+    expect(r).toEqual({
+      speech: null,
+      forward: 'what broke overnight',
+      control: null,
+    });
+  });
+
+  it('fail-safe: ask throwing after partials still forwards the utterance', async () => {
+    const { spoken, onSpeech } = collect();
+    const ask: AskFn = async (args) => {
+      args.onPartial?.('One sec.');
+      throw new Error('session died mid-turn');
+    };
+    const r = await topLayerTurn(
+      'kill the stuck worker',
+      makeCtx(ask, {}, { onSpeech }),
+    );
+    expect(spoken).toEqual(['One sec.']);
+    expect(r).toEqual({
+      speech: null,
+      forward: 'kill the stuck worker',
+      control: null,
+    });
+  });
+
+  it('holds emission at the 500-char speech cap; remainder honors the parse cap', async () => {
+    const { spoken, onSpeech } = collect();
+    const first = 'x'.repeat(400);
+    const ask = streamAsk([first, 'y'.repeat(400)]);
+    const r = await topLayerTurn('hi', makeCtx(ask, {}, { onSpeech }));
+    /* The second record would push the joined stream past the cap the
+     * final parse enforces, so it is held, not streamed. */
+    expect(spoken).toEqual([first]);
+    /* Final parse caps speech at 500 (400 + newline + 99); the emitted
+     * prefix subtracts cleanly, no mismatch. */
+    expect(r.speech).toBe('y'.repeat(99));
+    expect(r.earlySpeechMismatch).toBeUndefined();
+  });
+
+  it('without deps.onSpeech no onPartial reaches the ask', async () => {
+    let seenArgs: Record<string, unknown> | null = null;
+    const ask: AskFn = async (args) => {
+      seenArgs = args as unknown as Record<string, unknown>;
+      return 'ok';
+    };
+    await topLayerTurn('hi', makeCtx(ask));
+    expect(seenArgs).not.toBeNull();
+    expect('onPartial' in seenArgs!).toBe(false);
+  });
+});
+
+describe('voiceLexReply (TTS hooked only to the top layer)', () => {
+  beforeEach(() => _resetGlueHistory());
+
+  it('streams the delivery through onSpeech and reports delivered', async () => {
+    const { voiceLexReply } = await import('../src/voice/voice-top-layer.js');
+    const spoken: string[] = [];
+    const ask: AskFn = async (args) => {
+      args.onPartial?.('The build passed.');
+      args.onPartial?.('Three of three tests are green.');
+      return 'The build passed.\nThree of three tests are green.';
+    };
+    const delivered = await voiceLexReply('build: 3/3 pass', {
+      onSpeech: (l) => spoken.push(l),
+      deps: { ask },
+    });
+    expect(delivered).toBe(true);
+    expect(spoken).toEqual([
+      'The build passed.',
+      'Three of three tests are green.',
+    ]);
+  });
+
+  it('falls back to the resolved text when no partials stream', async () => {
+    const { voiceLexReply } = await import('../src/voice/voice-top-layer.js');
+    const spoken: string[] = [];
+    const ask: AskFn = async () => 'Delivered as one block.';
+    const delivered = await voiceLexReply('body', {
+      onSpeech: (l) => spoken.push(l),
+      deps: { ask },
+    });
+    expect(delivered).toBe(true);
+    expect(spoken).toEqual(['Delivered as one block.']);
+  });
+
+  it('reports a miss on null so the caller speaks the raw body', async () => {
+    const { voiceLexReply } = await import('../src/voice/voice-top-layer.js');
+    const ask: AskFn = async () => null;
+    const delivered = await voiceLexReply('body', {
+      onSpeech: () => undefined,
+      deps: { ask },
+    });
+    expect(delivered).toBe(false);
+  });
+
+  it('reports a miss on a throwing ask, never throws itself', async () => {
+    const { voiceLexReply } = await import('../src/voice/voice-top-layer.js');
+    const ask: AskFn = async () => {
+      throw new Error('session died');
+    };
+    const delivered = await voiceLexReply('body', {
+      onSpeech: () => undefined,
+      deps: { ask },
+    });
+    expect(delivered).toBe(false);
+  });
+
+  it('an empty body is trivially delivered (nothing to speak)', async () => {
+    const { voiceLexReply } = await import('../src/voice/voice-top-layer.js');
+    const spoken: string[] = [];
+    const delivered = await voiceLexReply('   ', {
+      onSpeech: (l) => spoken.push(l),
+      deps: { ask: async () => 'never called' },
+    });
+    expect(delivered).toBe(true);
+    expect(spoken).toEqual([]);
+  });
+
+  it('a directive-shaped delivery is treated as a miss, not spoken', async () => {
+    const { voiceLexReply } = await import('../src/voice/voice-top-layer.js');
+    const spoken: string[] = [];
+    const ask: AskFn = async () => 'FORWARD: do not speak directives';
+    const delivered = await voiceLexReply('body', {
+      onSpeech: (l) => spoken.push(l),
+      deps: { ask },
+    });
+    expect(delivered).toBe(false);
+    expect(spoken).toEqual([]);
+  });
+});
