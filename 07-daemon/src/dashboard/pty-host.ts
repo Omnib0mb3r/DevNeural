@@ -897,6 +897,46 @@ export function buildPtyInjectPayload(text: string, commit: boolean): string {
   return commit ? `${text}\r` : text;
 }
 
+/* Fix: large-inject truncation (2026-07-16, voice smoke test).
+ *
+ * A single pty.write() of more than ~4096 chars into an interactive
+ * claude on Windows ConPTY drops a full 4096-char block of the burst:
+ * the console input event queue holds 4096 records, and a one-shot
+ * multi-KB paste overflows it faster than the raw-mode reader drains.
+ * Reproduced deterministically (scratch harness, 2026-07-16): an
+ * 8937-char single write landed as a 4841-char user record (exactly
+ * 4096 lost); the same payload written in 2048-char slabs 20ms apart
+ * landed complete. Live incident: the 03:27:08Z voice inject lost its
+ * trailing chunk, so the prompt that fired to Lex carried the
+ * live_state snapshot but not the operator's words.
+ *
+ * Contract: payloads that fit one slab keep the exact pre-fix
+ * behavior (single atomic write, Fix 19). Larger payloads are split
+ * into PTY_INJECT_SLAB_CHARS slabs written PTY_INJECT_SLAB_GAP_MS
+ * apart; the final slab carries the trailing \r (when commit=true) so
+ * the paste-close + Enter ordering guarantee of Fix 19 still holds
+ * within one write. Slab boundaries are plain char offsets: the
+ * console queue overflow is byte-rate-driven, not content-driven, so
+ * no need to respect line boundaries. */
+export const PTY_INJECT_SLAB_CHARS = 2048;
+export const PTY_INJECT_SLAB_GAP_MS = 20;
+
+/* Pure split so the regression test can pin the slab contract without
+ * a real PTY: concatenation is identical to the one-shot payload, no
+ * slab exceeds the size, and small payloads come back as exactly one
+ * slab (the byte-identical legacy path). */
+export function splitInjectPayloadIntoSlabs(
+  payload: string,
+  slabChars: number = PTY_INJECT_SLAB_CHARS,
+): string[] {
+  if (payload.length <= slabChars) return [payload];
+  const slabs: string[] = [];
+  for (let off = 0; off < payload.length; off += slabChars) {
+    slabs.push(payload.slice(off, off + slabChars));
+  }
+  return slabs;
+}
+
 export function ptyInject(
   ptyIdOrSession: string,
   text: string,
@@ -910,8 +950,50 @@ export function ptyInject(
     const payload = buildPtyInjectPayload(text, commit);
     handle.lastCommandSent = payload.slice(0, 4096);
     handle.lastCommandAt = Date.now();
-    handle.pty.write(payload);
+    const slabs = splitInjectPayloadIntoSlabs(payload);
+    handle.pty.write(slabs[0]!);
+    if (slabs.length > 1) {
+      /* Trailing slabs are scheduled, not awaited: callers treat the
+       * return as "accepted", and sequential writes on one PTY stay
+       * ordered. Each tick re-checks liveness; a slab write failure
+       * after the first is logged loudly (the paste is already
+       * partially delivered, so silence here would recreate the
+       * exact bug this fixes). */
+      let slabIndex = 1;
+      const writeNextSlab = (): void => {
+        if (handle!.exited) {
+          logFn(
+            `[pty-host] inject slab aborted (pty exited) pty=${handle!.ptyId} slab=${slabIndex}/${slabs.length}`,
+          );
+          return;
+        }
+        try {
+          handle!.pty.write(slabs[slabIndex]!);
+        } catch (err) {
+          logFn(
+            `[pty-host] inject slab write FAILED pty=${handle!.ptyId} slab=${slabIndex}/${slabs.length}: ${(err as Error).message}`,
+          );
+          return;
+        }
+        slabIndex += 1;
+        if (slabIndex < slabs.length) {
+          const t = setTimeout(writeNextSlab, PTY_INJECT_SLAB_GAP_MS);
+          if (typeof (t as { unref?: () => void }).unref === 'function') {
+            (t as { unref: () => void }).unref();
+          }
+        }
+      };
+      const t0 = setTimeout(writeNextSlab, PTY_INJECT_SLAB_GAP_MS);
+      if (typeof (t0 as { unref?: () => void }).unref === 'function') {
+        (t0 as { unref: () => void }).unref();
+      }
+    }
     if (commit) {
+      /* Anchor the nudge to the LAST slab, not the first write, so a
+       * many-slab payload cannot receive its bare-CR mid-paste. */
+      const nudgeDelayMs =
+        PTY_INJECT_COMMIT_NUDGE_MS +
+        (slabs.length - 1) * PTY_INJECT_SLAB_GAP_MS;
       const t = setTimeout(() => {
         if (!handle!.exited) {
           try {
@@ -920,7 +1002,7 @@ export function ptyInject(
             /* nudge is fire-and-forget */
           }
         }
-      }, PTY_INJECT_COMMIT_NUDGE_MS);
+      }, nudgeDelayMs);
       if (typeof (t as { unref?: () => void }).unref === 'function') {
         (t as { unref: () => void }).unref();
       }

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildPtyInjectPayload,
+  splitInjectPayloadIntoSlabs,
   PTY_INJECT_COMMIT_NUDGE_MS,
+  PTY_INJECT_SLAB_CHARS,
 } from '../src/dashboard/pty-host.js';
 
 /**
@@ -43,5 +45,48 @@ describe('buildPtyInjectPayload (Fix 19 regression)', () => {
 
   it('exposes a positive nudge interval so the belt-and-suspenders bare-\\r fires after the atomic write', () => {
     expect(PTY_INJECT_COMMIT_NUDGE_MS).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * Large-inject truncation regression (2026-07-16 voice smoke test).
+ *
+ * A single pty.write of >4096 chars into interactive claude on Windows
+ * ConPTY drops a whole 4096-char block (console input event queue
+ * overflow). Live incident: the 03:27:08Z voice inject lost its
+ * trailing chunk, so Lex received the live_state snapshot but not the
+ * operator's utterance. Reproduced + fix verified against a real
+ * claude PTY: 8937-char single write landed 4841 chars; the same
+ * payload in 2048-char slabs landed complete.
+ */
+describe('splitInjectPayloadIntoSlabs (large-inject truncation regression)', () => {
+  it('returns one slab, byte-identical, for payloads at or under the slab size (legacy path)', () => {
+    const small = 'x'.repeat(PTY_INJECT_SLAB_CHARS);
+    expect(splitInjectPayloadIntoSlabs(small)).toEqual([small]);
+  });
+
+  it('splits an oversized payload so no slab exceeds the slab size', () => {
+    const payload = 'a'.repeat(PTY_INJECT_SLAB_CHARS * 4 + 371);
+    const slabs = splitInjectPayloadIntoSlabs(payload);
+    expect(slabs.length).toBe(5);
+    for (const s of slabs) {
+      expect(s.length).toBeLessThanOrEqual(PTY_INJECT_SLAB_CHARS);
+    }
+  });
+
+  it('loses nothing: slab concatenation equals the original payload', () => {
+    const payload = buildPtyInjectPayload(
+      'line\n'.repeat(2500) + '[voice mode] the operator words ride the tail',
+      true,
+    );
+    const slabs = splitInjectPayloadIntoSlabs(payload);
+    expect(slabs.join('')).toBe(payload);
+  });
+
+  it('keeps the commit \\r on the FINAL slab so paste-close + Enter ordering (Fix 19) holds', () => {
+    const payload = buildPtyInjectPayload('z'.repeat(9000), true);
+    const slabs = splitInjectPayloadIntoSlabs(payload);
+    expect(slabs[slabs.length - 1]!.endsWith('\r')).toBe(true);
+    expect(slabs.slice(0, -1).some((s) => s.includes('\r'))).toBe(false);
   });
 });
