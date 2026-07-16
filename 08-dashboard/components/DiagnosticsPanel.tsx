@@ -76,11 +76,16 @@ export function DiagnosticsPanel() {
                   <span>vec {fmtBytes(c.vec_bytes)}</span>
                   <span>meta {fmtBytes(c.meta_bytes)}</span>
                   {c.dirty && (
+                    /* "dirty" read as a fault (2026-07-16 operator
+                     * audit). It just means new writes since the last
+                     * disk snapshot - normal during capture, and the
+                     * daemon now auto-saves within 5 minutes. Neutral
+                     * copy + tone instead of a warning badge. */
                     <span
-                      className="px-1.5 py-0.5 rounded-pill bg-warn/10 text-warn"
-                      title="In-memory writes pending flush"
+                      className="px-1.5 py-0.5 rounded-pill bg-surface2 text-txt3"
+                      title="New writes since the last disk snapshot. Normal during capture; auto-saves within 5 minutes (and on backup/shutdown)."
                     >
-                      dirty
+                      saving soon
                     </span>
                   )}
                 </span>

@@ -19,6 +19,7 @@ import { startTranscriptWatcher } from './capture/transcript-watcher.js';
 import { startFsWatcher } from './capture/fs-watcher.js';
 import { startGitWatcher } from './capture/git-watcher.js';
 import { Store } from './store/index.js';
+import { startPeriodicVectorFlush } from './store/periodic-flush.js';
 import { runMigrations } from './db/migrate.js';
 import { initGpuQueue } from './gpu/queue.js';
 import { VramMonitor } from './gpu/vram-monitor.js';
@@ -1426,6 +1427,16 @@ async function main(): Promise<void> {
     },
     logger,
   );
+
+  /* Periodic vector-flush safety net (2026-07-16): bounds the "dirty"
+   * window on /system diagnostics to one interval instead of waiting
+   * for a signal pass / backup / shutdown. Dirty-gated + unref'd. */
+  startPeriodicVectorFlush({
+    isDirty: () =>
+      store.rawChunks.stats().dirty || store.wikiPages.stats().dirty,
+    flush: () => store.flush(),
+    log: logger,
+  });
 
   /* Auto-resume an in-flight wiki backfill across daemon restarts.
    * If the cursor file shows incomplete work, kick a new run in the
