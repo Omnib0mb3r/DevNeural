@@ -128,6 +128,9 @@ export interface ReinforcementEvent {
   weight?: number;
   pages_created?: number;
   pages_updated?: number;
+  /** Bounded plain-text preview of what was injected (injection
+   * events written after 2026-07-16; older lines lack it). */
+  preview?: string;
   skipped_reason?: string;
 }
 export interface ReinforcementResponse {

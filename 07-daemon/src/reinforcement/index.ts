@@ -239,12 +239,15 @@ export function recordInjection(
   // Also write a visible "injection" event so the dashboard can surface
   // what the curator decided to send. Without this, the only way to
   // know an injection fired was to read the daemon log or wait for the
-  // hit/correction outcome — opaque to the user.
+  // hit/correction outcome — opaque to the user. `preview` (bounded)
+  // is what the wiki-match-history drill-down shows as "what was
+  // injected" (2026-07-16 operator audit).
   appendReinforcementLog({
     kind: 'injection',
     session: sessionId,
     page: pageId,
     source: 'wiki',
+    preview: summary.slice(0, 280),
   });
 }
 
@@ -274,6 +277,7 @@ export function recordRawInjection(
     chunk: chunkId,
     project: projectId,
     source: 'raw',
+    preview: rawText.slice(0, 280),
   });
 }
 

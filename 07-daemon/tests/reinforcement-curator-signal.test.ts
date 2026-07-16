@@ -303,3 +303,51 @@ describe('R2: curator_signal wiring — correction', () => {
     db.close();
   });
 });
+
+/* 2026-07-16 operator audit: the dashboard "Wiki match history" rows
+ * could not show WHAT was injected - the log line carried only ids.
+ * Injection events now carry a bounded plain-text preview of the
+ * injected summary so the panel's drill-down has real content. */
+describe('injection log preview (wiki match drill-down)', () => {
+  function readLogLines(): Array<Record<string, unknown>> {
+    const file = path.join(tmpDir, 'reinforcement.log.jsonl');
+    return fs
+      .readFileSync(file, 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+  }
+
+  it('wiki injection line carries a preview of the injected summary', async () => {
+    const reinforcement = await import('../src/reinforcement/index.js');
+    reinforcement.recordInjection(
+      'sess-prev',
+      'page-prev',
+      '/x/page-prev.md',
+      'Page Title\n\nthe trigger → the insight',
+      'log-prev',
+      'prompt-prev',
+    );
+    const inj = readLogLines().find(
+      (l) => l.kind === 'injection' && l.session === 'sess-prev',
+    );
+    expect(inj?.preview).toContain('the trigger');
+  });
+
+  it('raw injection preview is bounded to 280 chars', async () => {
+    const reinforcement = await import('../src/reinforcement/index.js');
+    reinforcement.recordRawInjection(
+      'sess-raw-prev',
+      'chunk-prev',
+      'y'.repeat(1000),
+      'proj-a',
+      'log-x',
+      'prompt-x',
+    );
+    const inj = readLogLines().find(
+      (l) => l.kind === 'injection' && l.session === 'sess-raw-prev',
+    );
+    expect(typeof inj?.preview).toBe('string');
+    expect((inj?.preview as string).length).toBeLessThanOrEqual(280);
+  });
+});
