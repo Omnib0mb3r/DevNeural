@@ -792,6 +792,115 @@ export function _flushPendingUtterancesImpl(
   state.awaitingResponseSince = Date.now();
 }
 
+/* Voice->Lex delivery confirmation (2026-07-16 second wave, operator
+ * correction). Live failure at 04:45Z: a committed voice inject sat
+ * at the Lex terminal as unsubmitted [Pasted text #66-71] blocks -
+ * the trailing CR was silently swallowed and NOTHING self-recovered;
+ * the operator had to click into the terminal, type characters, and
+ * press Enter by hand. Same class as the bridge VSIX bracketed-paste
+ * trailing-Enter drop.
+ *
+ * This verifies that a committed inject actually SUBMITTED: the bound
+ * session's jsonl must grow a user record containing a fingerprint of
+ * the injected utterance within the verify interval. Misses fire an
+ * idempotent CR retry (final attempt types ' \r' - a space plus
+ * Enter, mirroring the manual recovery that provably works); retries
+ * exhausted fires onFailure (loud log + client error frame). Pure
+ * impl with injected IO, same seam pattern as
+ * _flushPendingUtterancesImpl above.
+ *
+ * Only run for IDLE-time injects (direct turn inject, turn-boundary
+ * queue flush): a mid-turn steering inject does not produce its user
+ * record until claude picks it up, so confirmation there would false-
+ * alarm. Both call sites in this file satisfy that by construction. */
+export interface _VerifyInjectDeliveryDeps {
+  jsonlPath: string | null;
+  /** Byte offset of the jsonl at inject time; only content appended
+   * after it is scanned. */
+  startOffset: number;
+  /** Slice of the injected utterance used to recognize the submitted
+   * user record. Matched against PARSED record text so JSON escaping
+   * cannot mask a hit. */
+  fingerprint: string;
+  statSize: (p: string) => number | null;
+  readRange: (p: string, start: number, length: number) => string | null;
+  /** Fire a CR retry. attempt is 1-based; the last attempt should
+   * escalate to ' \r'. */
+  retryCr: (attempt: number) => void;
+  onFailure: () => void;
+  sleep: (ms: number) => Promise<void>;
+  log?: (msg: string) => void;
+  /** Interval between checks. Default 4000ms. */
+  intervalMs?: number;
+  /** CR retries before declaring failure. Default 3. */
+  maxAttempts?: number;
+}
+
+function recordContainsFingerprint(
+  rec: Record<string, unknown>,
+  fingerprint: string,
+): boolean {
+  if (rec.type !== 'user') return false;
+  const message = rec.message as
+    | { content?: string | Array<{ type?: string; text?: string }> }
+    | undefined;
+  const c = message?.content;
+  const text =
+    typeof c === 'string'
+      ? c
+      : Array.isArray(c)
+        ? c.map((b) => (typeof b?.text === 'string' ? b.text : '')).join('')
+        : '';
+  return text.includes(fingerprint);
+}
+
+export async function _verifyInjectDeliveryImpl(
+  deps: _VerifyInjectDeliveryDeps,
+): Promise<'confirmed' | 'failed' | 'no-jsonl'> {
+  const { jsonlPath, fingerprint } = deps;
+  if (!jsonlPath || !fingerprint) return 'no-jsonl';
+  const intervalMs = deps.intervalMs ?? 4_000;
+  const maxAttempts = deps.maxAttempts ?? 3;
+  const log = deps.log ?? logFn;
+  let offset = deps.startOffset;
+  for (let attempt = 0; attempt <= maxAttempts; attempt++) {
+    await deps.sleep(intervalMs);
+    const size = deps.statSize(jsonlPath);
+    if (size !== null && size > offset) {
+      const chunk = deps.readRange(jsonlPath, offset, size - offset);
+      offset = size;
+      if (chunk) {
+        for (const line of chunk.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          let rec: Record<string, unknown>;
+          try {
+            rec = JSON.parse(trimmed);
+          } catch {
+            continue;
+          }
+          if (recordContainsFingerprint(rec, fingerprint)) {
+            if (attempt > 0) {
+              log(
+                `[voice-ws] inject delivery confirmed after ${attempt} CR retr${attempt === 1 ? 'y' : 'ies'}`,
+              );
+            }
+            return 'confirmed';
+          }
+        }
+      }
+    }
+    if (attempt < maxAttempts) {
+      log(
+        `[voice-ws] inject delivery unconfirmed ${Math.round(((attempt + 1) * intervalMs) / 1000)}s after commit; firing CR retry ${attempt + 1}/${maxAttempts}`,
+      );
+      deps.retryCr(attempt + 1);
+    }
+  }
+  deps.onFailure();
+  return 'failed';
+}
+
 /* Single meaningful words that must reach Lex despite the wordCount<2
  * whisper-noise floor (2026-06-18). The user steers with terse commands
  * ("go", "stop", "proceed") and the 2-word floor was swallowing them.
@@ -2596,10 +2705,92 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * the start of a new conversation. Voice tag is preserved so Lex's
    * conversational voice contract still applies. */
   function flushPendingUtterances(): void {
+    const firstQueued = state.pendingUserUtterances[0] ?? null;
+    const startOffset = currentJsonlSize();
     _flushPendingUtterancesImpl({
       state,
       ptyInject,
       send,
+    });
+    /* Queue emptied = the flush inject was accepted; verify it
+     * actually SUBMITTED (2026-07-16 stuck-paste failure). */
+    if (firstQueued && state.pendingUserUtterances.length === 0) {
+      verifyInjectDelivery(firstQueued.slice(0, 60), startOffset);
+    }
+  }
+
+  /* Size of the bound session jsonl right now; 0 when unknown. Used
+   * as the scan baseline for delivery verification. */
+  function currentJsonlSize(): number {
+    if (!state.jsonlPath) return 0;
+    try {
+      return fs.statSync(state.jsonlPath).size;
+    } catch {
+      return 0;
+    }
+  }
+
+  /* Fire-and-forget delivery verification for an idle-time commit
+   * inject. See _verifyInjectDeliveryImpl for the contract. */
+  function verifyInjectDelivery(fingerprint: string, startOffset: number): void {
+    const jsonlPath = state.jsonlPath;
+    if (!jsonlPath || !fingerprint.trim()) return;
+    void _verifyInjectDeliveryImpl({
+      jsonlPath,
+      startOffset,
+      fingerprint,
+      statSize: (p) => {
+        try {
+          return fs.statSync(p).size;
+        } catch {
+          return null;
+        }
+      },
+      readRange: (p, start, length) => {
+        try {
+          const fd = fs.openSync(p, 'r');
+          try {
+            const buf = Buffer.alloc(length);
+            fs.readSync(fd, buf, 0, length, start);
+            return buf.toString('utf-8');
+          } finally {
+            fs.closeSync(fd);
+          }
+        } catch {
+          return null;
+        }
+      },
+      retryCr: (attempt) => {
+        if (!state.bindKey || state.closed) return;
+        /* Final attempt escalates to space+Enter - the manual
+         * recovery that provably submits a stuck paste. Earlier
+         * attempts stay a bare CR (idempotent on a clean composer). */
+        const nudge = attempt >= 3 ? ' \r' : '\r';
+        try {
+          ptyInject(state.bindKey, nudge, false);
+        } catch {
+          /* best-effort */
+        }
+      },
+      onFailure: () => {
+        logFn(
+          `[voice-ws] INJECT DELIVERY FAILED: committed prompt never produced a user record after CR retries (stuck paste?) fingerprint=${JSON.stringify(fingerprint.slice(0, 40))}`,
+        );
+        send({
+          t: 'error',
+          code: 'inject-delivery',
+          message:
+            'voice prompt appears stuck at the Lex terminal; press Enter there or re-speak',
+        });
+      },
+      sleep: (ms) =>
+        new Promise((r) => {
+          const t = setTimeout(r, ms);
+          if (typeof (t as { unref?: () => void }).unref === 'function') {
+            (t as { unref: () => void }).unref();
+          }
+        }),
+      log: logFn,
     });
   }
 
@@ -3552,6 +3743,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     if (state.absorbedAsides.length > 0) {
       asideBlock = _formatAbsorbedAsideBlockImpl(state.absorbedAsides) + '\n\n';
     }
+    const preInjectJsonlSize = currentJsonlSize();
     const ir = ptyInject(
       state.bindKey,
       asideBlock + snapshotBlock + gateNote + partialChainBlock + voiceTag + result.text,
@@ -3561,6 +3753,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       send({ t: 'error', code: 'inject', message: ir.error });
       return;
     }
+    /* Idle-time commit inject: verify it actually SUBMITTED (2026-07-16
+     * stuck-paste failure - trailing CR silently swallowed, prompt sat
+     * at the terminal until the operator pressed Enter by hand). */
+    verifyInjectDelivery(result.text.slice(0, 60), preInjectJsonlSize);
     /* Consume the partial chain only after a successful inject. If
      * inject fails, the chain stays so the retry path on the next
      * utterance still carries the partials. Same contract for the

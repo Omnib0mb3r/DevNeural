@@ -913,13 +913,24 @@ export function buildPtyInjectPayload(text: string, commit: boolean): string {
  * Contract: payloads that fit one slab keep the exact pre-fix
  * behavior (single atomic write, Fix 19). Larger payloads are split
  * into PTY_INJECT_SLAB_CHARS slabs written PTY_INJECT_SLAB_GAP_MS
- * apart; the final slab carries the trailing \r (when commit=true) so
- * the paste-close + Enter ordering guarantee of Fix 19 still holds
- * within one write. Slab boundaries are plain char offsets: the
- * console queue overflow is byte-rate-driven, not content-driven, so
- * no need to respect line boundaries. */
+ * apart. Slab boundaries are plain char offsets: the console queue
+ * overflow is byte-rate-driven, not content-driven, so no need to
+ * respect line boundaries.
+ *
+ * Trailing CR (2026-07-16 second-wave correction): on the slab path
+ * the commit \r is written as its OWN write PTY_INJECT_SLAB_SETTLE_MS
+ * after the final slab, never embedded in it. The first slab build
+ * embedded the \r in the final slab; claude's paste coalescer
+ * absorbed it as pasted CONTENT and the prompt sat unsubmitted at the
+ * terminal ([Pasted text #66-71], 04:45Z) until the operator pressed
+ * Enter by hand - the exact trailing-Enter drop Fix 19 fixed, at slab
+ * granularity. The settle delay matches the harness pattern that
+ * verified clean submission against a real claude (slabs 20ms apart,
+ * CR alone after a gap). Small payloads keep the Fix 19 atomic
+ * body+\r single write, which is proven in production. */
 export const PTY_INJECT_SLAB_CHARS = 2048;
 export const PTY_INJECT_SLAB_GAP_MS = 20;
+export const PTY_INJECT_SLAB_SETTLE_MS = 250;
 
 /* Pure split so the regression test can pin the slab contract without
  * a real PTY: concatenation is identical to the one-shot payload, no
@@ -950,16 +961,40 @@ export function ptyInject(
     const payload = buildPtyInjectPayload(text, commit);
     handle.lastCommandSent = payload.slice(0, 4096);
     handle.lastCommandAt = Date.now();
-    const slabs = splitInjectPayloadIntoSlabs(payload);
-    handle.pty.write(slabs[0]!);
-    if (slabs.length > 1) {
+    /* Slabs are built from the TEXT, never the payload: the commit \r
+     * must not ride inside a slab (see the slab-contract comment
+     * above the constants). */
+    const slabs = splitInjectPayloadIntoSlabs(text);
+    if (slabs.length === 1) {
+      /* Fix 19 atomic body(+\r) single write, byte-identical legacy
+       * path. */
+      handle.pty.write(payload);
+    } else {
+      handle.pty.write(slabs[0]!);
       /* Trailing slabs are scheduled, not awaited: callers treat the
        * return as "accepted", and sequential writes on one PTY stay
        * ordered. Each tick re-checks liveness; a slab write failure
        * after the first is logged loudly (the paste is already
        * partially delivered, so silence here would recreate the
-       * exact bug this fixes). */
+       * exact bug this fixes). After the final slab, the commit \r
+       * fires as its OWN write once the paste burst has settled. */
       let slabIndex = 1;
+      const scheduleSlabStep = (fn: () => void, delayMs: number): void => {
+        const t = setTimeout(fn, delayMs);
+        if (typeof (t as { unref?: () => void }).unref === 'function') {
+          (t as { unref: () => void }).unref();
+        }
+      };
+      const fireSettledCommitCr = (): void => {
+        if (handle!.exited) return;
+        try {
+          handle!.pty.write('\r');
+        } catch (err) {
+          logFn(
+            `[pty-host] inject settled-commit CR FAILED pty=${handle!.ptyId}: ${(err as Error).message}`,
+          );
+        }
+      };
       const writeNextSlab = (): void => {
         if (handle!.exited) {
           logFn(
@@ -977,23 +1012,20 @@ export function ptyInject(
         }
         slabIndex += 1;
         if (slabIndex < slabs.length) {
-          const t = setTimeout(writeNextSlab, PTY_INJECT_SLAB_GAP_MS);
-          if (typeof (t as { unref?: () => void }).unref === 'function') {
-            (t as { unref: () => void }).unref();
-          }
+          scheduleSlabStep(writeNextSlab, PTY_INJECT_SLAB_GAP_MS);
+        } else if (commit) {
+          scheduleSlabStep(fireSettledCommitCr, PTY_INJECT_SLAB_SETTLE_MS);
         }
       };
-      const t0 = setTimeout(writeNextSlab, PTY_INJECT_SLAB_GAP_MS);
-      if (typeof (t0 as { unref?: () => void }).unref === 'function') {
-        (t0 as { unref: () => void }).unref();
-      }
+      scheduleSlabStep(writeNextSlab, PTY_INJECT_SLAB_GAP_MS);
     }
     if (commit) {
-      /* Anchor the nudge to the LAST slab, not the first write, so a
-       * many-slab payload cannot receive its bare-CR mid-paste. */
+      /* Anchor the nudge past the LAST slab + the settled commit CR,
+       * so a many-slab payload cannot receive its bare-CR mid-paste. */
       const nudgeDelayMs =
         PTY_INJECT_COMMIT_NUDGE_MS +
-        (slabs.length - 1) * PTY_INJECT_SLAB_GAP_MS;
+        (slabs.length - 1) * PTY_INJECT_SLAB_GAP_MS +
+        (slabs.length > 1 ? PTY_INJECT_SLAB_SETTLE_MS : 0);
       const t = setTimeout(() => {
         if (!handle!.exited) {
           try {

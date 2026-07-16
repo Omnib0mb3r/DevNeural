@@ -4,6 +4,7 @@ import {
   splitInjectPayloadIntoSlabs,
   PTY_INJECT_COMMIT_NUDGE_MS,
   PTY_INJECT_SLAB_CHARS,
+  PTY_INJECT_SLAB_SETTLE_MS,
 } from '../src/dashboard/pty-host.js';
 
 /**
@@ -83,10 +84,15 @@ describe('splitInjectPayloadIntoSlabs (large-inject truncation regression)', () 
     expect(slabs.join('')).toBe(payload);
   });
 
-  it('keeps the commit \\r on the FINAL slab so paste-close + Enter ordering (Fix 19) holds', () => {
-    const payload = buildPtyInjectPayload('z'.repeat(9000), true);
-    const slabs = splitInjectPayloadIntoSlabs(payload);
-    expect(slabs[slabs.length - 1]!.endsWith('\r')).toBe(true);
-    expect(slabs.slice(0, -1).some((s) => s.includes('\r'))).toBe(false);
+  it('slabs are built from the TEXT so no slab ever carries the commit \\r (2026-07-16 correction: an embedded final-slab CR was absorbed as paste content and the prompt sat unsubmitted)', () => {
+    /* ptyInject slabs the raw text and fires the commit \r as its own
+     * write PTY_INJECT_SLAB_SETTLE_MS after the final slab. Pin the
+     * pure parts: text-splitting stays CR-free and the settle constant
+     * leaves room for the paste burst to close before Enter. */
+    const text = 'z'.repeat(9000);
+    const slabs = splitInjectPayloadIntoSlabs(text);
+    expect(slabs.some((s) => s.includes('\r'))).toBe(false);
+    expect(slabs.join('')).toBe(text);
+    expect(PTY_INJECT_SLAB_SETTLE_MS).toBeGreaterThanOrEqual(100);
   });
 });
