@@ -24,8 +24,12 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   isDashboardSupervisorEnabled,
+  isOwnDashboardCommandLine,
+  EADDR_BACKOFF_BASE_MS,
+  EADDR_MAX_ATTEMPTS,
   MIN_BACKOFF_MS,
   startDashboardSupervisor,
+  type PortConflictOps,
 } from '../src/dashboard/dashboard-supervisor.js';
 
 class FakeChild extends EventEmitter {
@@ -300,5 +304,185 @@ describe('startDashboardSupervisor', () => {
      * timer should be queued. The only pending entry would be the
      * stop deadline timer; assert no respawn was triggered. */
     expect(sup.restartCount()).toBe(1);
+  });
+});
+
+/* 2026-07-16 live failure 2: an orphaned next-dev (its daemon was
+ * hard-killed without shutdown) held :3000 and every respawned child
+ * died EADDRINUSE every 30s forever - no detection, no reclaim, no
+ * escalation. These pin the conflict path. */
+describe('EADDRINUSE port-conflict handling', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = makeDashboardDir();
+    delete process.env.CI;
+    delete process.env.DEVNEURAL_DASHBOARD_SUPERVISOR;
+  });
+  afterEach(() => {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  const settle = async (): Promise<void> => {
+    /* handlePortConflict awaits the (resolved) fake ops; drain the
+     * microtask queue so its scheduling lands before assertions. */
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+  };
+
+  function makeConflictOps(opts: {
+    holderPid: number | null;
+    commandLine: string | null;
+    killOk?: boolean;
+  }): { ops: PortConflictOps; killed: number[] } {
+    const killed: number[] = [];
+    return {
+      killed,
+      ops: {
+        findListenerPid: async () => opts.holderPid,
+        getCommandLine: async () => opts.commandLine,
+        killTree: async (pid) => {
+          killed.push(pid);
+          return opts.killOk ?? true;
+        },
+      },
+    };
+  }
+
+  function startRig(ops: PortConflictOps) {
+    const sched = makeScheduler();
+    const children: FakeChild[] = [];
+    const logs: string[] = [];
+    startDashboardSupervisor({
+      db: makeFakeDb('on'),
+      dashboardDir: dir,
+      log: (m) => logs.push(m),
+      spawnImpl: () => {
+        const c = new FakeChild();
+        children.push(c);
+        return c as unknown as ChildProcess;
+      },
+      scheduler: sched.sched,
+      now: () => 0,
+      portConflictOps: ops,
+    });
+    return { sched, children, logs };
+  }
+
+  function crashWithEaddrinuse(c: FakeChild): void {
+    c.stderr.emit(
+      'data',
+      Buffer.from('Error: listen EADDRINUSE: address already in use :::3000'),
+    );
+    c.emit('exit', 0, null);
+  }
+
+  it('reclaims the port from our own orphaned dashboard: tree-kill + immediate respawn', async () => {
+    const { ops, killed } = makeConflictOps({
+      holderPid: 106480,
+      commandLine: `"C:\\Program Files\\nodejs\\node.exe" ${dir}\\node_modules\\next\\dist\\server\\lib\\start-server.js`,
+    });
+    const { sched, children, logs } = startRig(ops);
+    crashWithEaddrinuse(children[0]!);
+    await settle();
+
+    expect(killed).toEqual([106480]);
+    expect(sched.pending.length).toBe(1);
+    expect(sched.pending[0]!.ms).toBe(MIN_BACKOFF_MS);
+    expect(logs.some((l) => l.includes('ORPHANED dashboard'))).toBe(true);
+    sched.runFirst();
+    expect(children.length).toBe(2);
+  });
+
+  it('a foreign holder is never killed; backoff escalates per conflict', async () => {
+    const { ops, killed } = makeConflictOps({
+      holderPid: 4242,
+      commandLine: 'C:\\SomeOtherApp\\server.exe --port 3000',
+    });
+    const { sched, children } = startRig(ops);
+
+    crashWithEaddrinuse(children[0]!);
+    await settle();
+    expect(killed).toEqual([]);
+    expect(sched.pending[0]!.ms).toBe(EADDR_BACKOFF_BASE_MS);
+
+    sched.runFirst();
+    crashWithEaddrinuse(children[1]!);
+    await settle();
+    expect(sched.pending[0]!.ms).toBe(EADDR_BACKOFF_BASE_MS * 2);
+  });
+
+  it('gives up permanently (loud log, no timer) after the attempt cap', async () => {
+    const { ops } = makeConflictOps({
+      holderPid: 4242,
+      commandLine: 'C:\\SomeOtherApp\\server.exe',
+    });
+    const { sched, children, logs } = startRig(ops);
+    for (let i = 0; i < EADDR_MAX_ATTEMPTS; i++) {
+      crashWithEaddrinuse(children[children.length - 1]!);
+      await settle();
+      if (i < EADDR_MAX_ATTEMPTS - 1) {
+        expect(sched.pending.length).toBe(1);
+        sched.runFirst();
+      }
+    }
+    expect(sched.pending.length).toBe(0);
+    expect(logs.some((l) => l.includes('PERMANENTLY UNAVAILABLE'))).toBe(true);
+  });
+
+  it('a failed reclaim kill falls back to the foreign-holder backoff', async () => {
+    const { ops, killed } = makeConflictOps({
+      holderPid: 106480,
+      commandLine: `node ${dir}/node_modules/next/dist/bin/next dev -p 3000`,
+      killOk: false,
+    });
+    const { sched, children } = startRig(ops);
+    crashWithEaddrinuse(children[0]!);
+    await settle();
+    expect(killed).toEqual([106480]);
+    expect(sched.pending[0]!.ms).toBe(EADDR_BACKOFF_BASE_MS);
+  });
+
+  it('no holder found (transient TIME_WAIT) backs off without giving up early', async () => {
+    const { ops } = makeConflictOps({ holderPid: null, commandLine: null });
+    const { sched, children } = startRig(ops);
+    crashWithEaddrinuse(children[0]!);
+    await settle();
+    expect(sched.pending.length).toBe(1);
+    expect(sched.pending[0]!.ms).toBe(EADDR_BACKOFF_BASE_MS);
+  });
+});
+
+describe('isOwnDashboardCommandLine', () => {
+  it('matches the orphan shape from the live incident (start-server.js under the dashboard dir)', () => {
+    expect(
+      isOwnDashboardCommandLine(
+        '"C:\\Program Files\\nodejs\\node.exe" C:\\dev\\Projects\\DevNeural\\08-dashboard\\node_modules\\next\\dist\\server\\lib\\start-server.js',
+        'C:\\dev\\Projects\\DevNeural\\08-dashboard',
+      ),
+    ).toBe(true);
+  });
+
+  it('matches regardless of slash direction and case', () => {
+    expect(
+      isOwnDashboardCommandLine(
+        'node c:/dev/projects/devneural/08-dashboard/node_modules/next/dist/bin/next dev -p 3000',
+        'C:\\dev\\Projects\\DevNeural\\08-dashboard',
+      ),
+    ).toBe(true);
+  });
+
+  it('rejects foreign processes and null command lines', () => {
+    expect(
+      isOwnDashboardCommandLine(
+        'C:\\SomeOtherApp\\server.exe --port 3000',
+        'C:\\dev\\Projects\\DevNeural\\08-dashboard',
+      ),
+    ).toBe(false);
+    expect(
+      isOwnDashboardCommandLine(null, 'C:\\dev\\Projects\\DevNeural\\08-dashboard'),
+    ).toBe(false);
   });
 });

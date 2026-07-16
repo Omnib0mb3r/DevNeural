@@ -26,7 +26,12 @@
  * inherit SIGTERM from npm's shim), and resolves after the child has
  * exited or a 5s deadline elapses.
  */
-import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import {
+  spawn,
+  execFile,
+  type ChildProcess,
+  type SpawnOptions,
+} from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { IndexDb } from '../store/index-db.js';
@@ -37,6 +42,91 @@ export const MIN_BACKOFF_MS = 1_000;
 export const MAX_BACKOFF_MS = 30_000;
 export const FAST_CRASH_THRESHOLD_MS = 5_000;
 export const STOP_GRACE_MS = 5_000;
+
+/* Port-conflict handling (2026-07-16 live failure 2). A daemon that
+ * dies WITHOUT its graceful shutdown (observed: start-daemon.ps1
+ * -Force Stop-Process'ing the healthy successor after reading a
+ * replaced pidfile) leaves its next-dev child alive holding :3000.
+ * Every subsequent daemon's dashboard child then dies EADDRINUSE
+ * every 30s forever - 19+ attempts logged across 04:22-04:34Z with
+ * no detection, no reclaim, and no escalation. These bounds govern
+ * the new conflict path: reclaim our own orphan immediately; back
+ * off exponentially on a foreign holder; stop retrying entirely
+ * after the attempt cap so a permanently-held port cannot spin the
+ * log forever. */
+export const EADDR_BACKOFF_BASE_MS = 30_000;
+export const EADDR_BACKOFF_MAX_MS = 600_000;
+export const EADDR_MAX_ATTEMPTS = 10;
+
+/* True when the command line of the process holding our port is our
+ * own dashboard child (next dev / next start-server under the
+ * dashboard package dir) - safe to kill and reclaim. Anything else is
+ * a foreign process we must never kill. Pure + exported for tests;
+ * comparison is case-insensitive with normalized slashes because
+ * Windows reports either form. */
+export function isOwnDashboardCommandLine(
+  commandLine: string | null,
+  dashboardDir: string,
+): boolean {
+  if (!commandLine) return false;
+  const norm = (s: string): string => s.replace(/\\/g, '/').toLowerCase();
+  const cmd = norm(commandLine);
+  const dir = norm(dashboardDir);
+  if (dir && cmd.includes(dir)) return true;
+  return cmd.includes('/next/dist/') && cmd.includes('node');
+}
+
+/* OS probes for the conflict path, injectable for tests. Defaults
+ * shell out with windowsHide (operator rule: no console flashes). */
+export interface PortConflictOps {
+  /** PID listening on the port, or null when none/undeterminable. */
+  findListenerPid(port: number): Promise<number | null>;
+  /** Full command line of a PID, or null when gone/undeterminable. */
+  getCommandLine(pid: number): Promise<string | null>;
+  /** Tree-kill a PID. True when the kill was issued successfully. */
+  killTree(pid: number): Promise<boolean>;
+}
+
+function defaultPortConflictOps(): PortConflictOps {
+  const run = (cmd: string, args: string[]): Promise<string | null> =>
+    new Promise((resolve) => {
+      execFile(
+        cmd,
+        args,
+        { windowsHide: true, timeout: 10_000 },
+        (err, stdout) => resolve(err ? null : String(stdout)),
+      );
+    });
+  return {
+    findListenerPid: async (port) => {
+      const out = await run('netstat', ['-ano']);
+      if (!out) return null;
+      for (const line of out.split(/\r?\n/)) {
+        /* "  TCP    0.0.0.0:3000   0.0.0.0:0   LISTENING   106480" */
+        if (!/LISTENING/i.test(line)) continue;
+        const m = line.match(/[:.](\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/i);
+        if (m && Number(m[1]) === port) {
+          const pid = Number(m[2]);
+          if (Number.isFinite(pid) && pid > 0) return pid;
+        }
+      }
+      return null;
+    },
+    getCommandLine: async (pid) => {
+      const out = await run('powershell', [
+        '-NoProfile',
+        '-Command',
+        `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`,
+      ]);
+      const trimmed = out?.trim();
+      return trimmed ? trimmed : null;
+    },
+    killTree: async (pid) => {
+      const out = await run('taskkill', ['/F', '/T', '/PID', String(pid)]);
+      return out !== null;
+    },
+  };
+}
 
 /* Truthy/falsy string parser shared by runtime_config + env. Returns
  * null when the string does not parse so the caller can fall through
@@ -83,6 +173,8 @@ export interface DashboardSupervisorOptions {
   };
   /** Used by tests to inject deterministic backoff math. Defaults to Date.now. */
   now?: () => number;
+  /** Test seam for the port-conflict probes. */
+  portConflictOps?: PortConflictOps;
 }
 
 export interface DashboardSupervisorHandle {
@@ -135,6 +227,8 @@ export function startDashboardSupervisor(
     return NOOP_HANDLE(false);
   }
 
+  const conflictOps = opts.portConflictOps ?? defaultPortConflictOps();
+
   let child: ChildProcess | null = null;
   let stopped = false;
   let restarts = 0;
@@ -142,12 +236,30 @@ export function startDashboardSupervisor(
   let lastSpawnAt = 0;
   let respawnTimer: unknown = null;
   let stopResolve: (() => void) | null = null;
+  /* Consecutive EADDRINUSE exits that did NOT end in a reclaim. Drives
+   * the escalating conflict backoff + the permanent give-up cap. */
+  let eaddrStreak = 0;
 
   function clearRespawn(): void {
     if (respawnTimer !== null) {
       sched.clear(respawnTimer);
       respawnTimer = null;
     }
+  }
+
+  function scheduleRespawnIn(delayMs: number, reason: string): void {
+    if (stopped) return;
+    opts.log(
+      `[dashboard-supervisor] respawn in ${delayMs}ms (reason=${reason})`,
+    );
+    const handle = sched.set(() => {
+      respawnTimer = null;
+      spawnChild();
+    }, delayMs);
+    if (typeof (handle as { unref?: () => void }).unref === 'function') {
+      (handle as { unref: () => void }).unref();
+    }
+    respawnTimer = handle;
   }
 
   function scheduleRespawn(reason: string): void {
@@ -158,17 +270,66 @@ export function startDashboardSupervisor(
     } else {
       backoff = MIN_BACKOFF_MS;
     }
-    opts.log(
-      `[dashboard-supervisor] respawn in ${backoff}ms (reason=${reason})`,
-    );
-    const handle = sched.set(() => {
-      respawnTimer = null;
-      spawnChild();
-    }, backoff);
-    if (typeof (handle as { unref?: () => void }).unref === 'function') {
-      (handle as { unref: () => void }).unref();
+    scheduleRespawnIn(backoff, reason);
+  }
+
+  /* EADDRINUSE exit path (2026-07-16 failure 2). Find the port
+   * holder; when it is OUR orphaned dashboard (a prior daemon died
+   * without shutdown and left its next-dev child alive), tree-kill it
+   * and respawn immediately. A foreign holder gets an escalating
+   * backoff and, past EADDR_MAX_ATTEMPTS consecutive conflicts, a
+   * permanent stop with a screaming log line - the pre-fix behavior
+   * was a blind 30s retry loop, forever. */
+  async function handlePortConflict(): Promise<void> {
+    if (stopped) return;
+    eaddrStreak += 1;
+    let holderPid: number | null = null;
+    let holderCmd: string | null = null;
+    try {
+      holderPid = await conflictOps.findListenerPid(port);
+      if (holderPid !== null) {
+        holderCmd = await conflictOps.getCommandLine(holderPid);
+      }
+    } catch (err) {
+      opts.log(
+        `[dashboard-supervisor] port-conflict probe failed: ${(err as Error).message}`,
+      );
     }
-    respawnTimer = handle;
+    if (stopped) return;
+    if (holderPid !== null && isOwnDashboardCommandLine(holderCmd, opts.dashboardDir)) {
+      opts.log(
+        `[dashboard-supervisor] port ${port} held by ORPHANED dashboard pid=${holderPid} (a prior daemon died without shutdown); tree-killing to reclaim`,
+      );
+      let killed = false;
+      try {
+        killed = await conflictOps.killTree(holderPid);
+      } catch {
+        killed = false;
+      }
+      if (killed) {
+        eaddrStreak = 0;
+        backoff = MIN_BACKOFF_MS;
+        scheduleRespawnIn(MIN_BACKOFF_MS, 'port-reclaimed');
+        return;
+      }
+      opts.log(
+        `[dashboard-supervisor] reclaim kill FAILED for pid=${holderPid}; treating as foreign holder`,
+      );
+    }
+    if (eaddrStreak >= EADDR_MAX_ATTEMPTS) {
+      opts.log(
+        `[dashboard-supervisor] PORT ${port} PERMANENTLY UNAVAILABLE after ${eaddrStreak} EADDRINUSE attempts (holder pid=${holderPid ?? 'unknown'} cmd=${JSON.stringify((holderCmd ?? '').slice(0, 160))}); giving up - free the port and toggle ${DASHBOARD_SUPERVISOR_CONFIG_KEY} or restart the daemon to resume`,
+      );
+      return;
+    }
+    const delay = Math.min(
+      EADDR_BACKOFF_MAX_MS,
+      EADDR_BACKOFF_BASE_MS * 2 ** (eaddrStreak - 1),
+    );
+    opts.log(
+      `[dashboard-supervisor] port ${port} in use by pid=${holderPid ?? 'unknown'} (not ours: ${JSON.stringify((holderCmd ?? 'unknown').slice(0, 120))}); conflict ${eaddrStreak}/${EADDR_MAX_ATTEMPTS}`,
+    );
+    scheduleRespawnIn(delay, `eaddrinuse-${eaddrStreak}`);
   }
 
   function spawnChild(): void {
@@ -201,13 +362,20 @@ export function startDashboardSupervisor(
       return;
     }
     child = c;
+    /* Bind-failure detector: next dev prints the EADDRINUSE error to
+     * stderr and then exits 0, so the exit code alone is useless for
+     * telling "port taken" from a clean exit. */
+    let sawEaddrinuse = false;
     c.stdout?.on('data', (buf: Buffer) => {
       const s = buf.toString('utf-8').trimEnd();
       if (s) opts.log(`[dashboard] ${s}`);
     });
     c.stderr?.on('data', (buf: Buffer) => {
       const s = buf.toString('utf-8').trimEnd();
-      if (s) opts.log(`[dashboard-err] ${s}`);
+      if (s) {
+        if (s.includes('EADDRINUSE')) sawEaddrinuse = true;
+        opts.log(`[dashboard-err] ${s}`);
+      }
     });
     c.on('exit', (code, signal) => {
       child = null;
@@ -221,6 +389,15 @@ export function startDashboardSupervisor(
       }
       const reason = signal ? `signal=${signal}` : `code=${code ?? 'unknown'}`;
       opts.log(`[dashboard-supervisor] child exited ${reason}`);
+      if (sawEaddrinuse) {
+        void handlePortConflict();
+        return;
+      }
+      /* A child that ran healthily for a while clears the conflict
+       * streak: the port was genuinely ours in between. */
+      if (now() - lastSpawnAt >= FAST_CRASH_THRESHOLD_MS) {
+        eaddrStreak = 0;
+      }
       scheduleRespawn(reason);
     });
     c.on('error', (err) => {

@@ -100,7 +100,65 @@ if (-not $Force) {
     if (Test-Path -LiteralPath $pidFile) {
         try { $oldPid = [int](Get-Content -LiteralPath $pidFile -ErrorAction Stop | Select-Object -First 1) } catch { $oldPid = $null }
     }
+
+    # Expected-pid handshake (2026-07-16). The restart route writes
+    # daemon.restart.expect with the pid that is SUPPOSED to die before
+    # arming this task. Pre-fix, a late (or duplicate) task run read the
+    # pidfile AFTER the successor daemon had already replaced it, waited
+    # 40s watching a perfectly healthy process "overstay", and
+    # Stop-Process'd it - no graceful shutdown, dashboard child orphaned
+    # on :3000 (observed 04:22:33Z: pid 104048 killed with no [shutdown]
+    # lines). Rules now:
+    #   - expect file present and pidfile matches it: this run owns that
+    #     pid's death; wait + hard-kill as before, then consume the file.
+    #   - expect file present but pidfile differs: a successor already
+    #     took over. NEVER wait on or kill it; probe /health and exit if
+    #     it answers.
+    #   - expect file missing (duplicate run, legacy caller): health-
+    #     gated fallback - only treat the pid as overstaying while
+    #     /health is NOT answering; a daemon that answers /health is
+    #     healthy by definition and this script must not touch it.
+    $expectFile = Join-Path $dataRootForPid 'daemon.restart.expect'
+    $expectedPid = $null
+    if (Test-Path -LiteralPath $expectFile) {
+        try { $expectedPid = [int](Get-Content -LiteralPath $expectFile -ErrorAction Stop | Select-Object -First 1) } catch { $expectedPid = $null }
+    }
+
+    function Test-DaemonHealth {
+        param([int]$ProbePort)
+        try {
+            $r = Invoke-WebRequest -Uri "http://localhost:$ProbePort/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+            return ($r.StatusCode -eq 200)
+        } catch {
+            return $false
+        }
+    }
+
+    if ($expectedPid -and $oldPid -and ($oldPid -ne $expectedPid)) {
+        Write-Host "[start-daemon] pidfile pid=$oldPid != expected dying pid=$expectedPid; a successor already owns the pidfile"
+        if (Test-DaemonHealth -ProbePort $port) {
+            Write-Host "[start-daemon] successor answers /health; nothing to do"
+            try { Remove-Item -LiteralPath $expectFile -Force -ErrorAction Stop } catch { }
+            exit 0
+        }
+        # Successor pid on file but not healthy (may still be booting):
+        # give it a short grace, then re-probe; never kill it.
+        Start-Sleep -Seconds 10
+        if (Test-DaemonHealth -ProbePort $port) {
+            Write-Host "[start-daemon] successor came healthy during grace; nothing to do"
+            try { Remove-Item -LiteralPath $expectFile -Force -ErrorAction Stop } catch { }
+            exit 0
+        }
+        Write-Host "[start-daemon] successor never came healthy; proceeding to spawn (its own singleton check arbitrates)"
+        $oldPid = $null
+    }
+
     if ($oldPid) {
+        $mayHardKill = $false
+        if ($expectedPid -and ($oldPid -eq $expectedPid)) {
+            # We own this pid's death.
+            $mayHardKill = $true
+        }
         $pidDeadline = (Get-Date).AddSeconds(40)
         while ((Get-Date) -lt $pidDeadline) {
             $alive = $false
@@ -112,6 +170,15 @@ if (-not $Force) {
                 # process, which we treat as gone.
             }
             if (-not $alive) { break }
+            if (-not $mayHardKill) {
+                # No expect handshake: health answering means this is a
+                # healthy daemon, not an overstaying shutdown. Leave it
+                # alone entirely.
+                if (Test-DaemonHealth -ProbePort $port) {
+                    Write-Host "[start-daemon] pid=$oldPid answers /health (healthy daemon, no expect handshake); nothing to do"
+                    exit 0
+                }
+            }
             Start-Sleep -Milliseconds 500
         }
         $stillAlive = $false
@@ -120,11 +187,22 @@ if (-not $Force) {
             if ($p -and $p.ProcessName -like 'node*') { $stillAlive = $true }
         } catch { }
         if ($stillAlive) {
-            Write-Host "[start-daemon] old daemon pid=$oldPid overstayed 40s; hard-killing"
-            try { Stop-Process -Id $oldPid -Force -ErrorAction Stop } catch {
-                Write-Host "[start-daemon] Stop-Process failed: $($_.Exception.Message)"
+            if ((-not $mayHardKill) -and (Test-DaemonHealth -ProbePort $port)) {
+                Write-Host "[start-daemon] pid=$oldPid still alive AND healthy after wait; refusing to kill"
+                exit 0
+            }
+            # taskkill /T tears down the whole tree so a legit overstay
+            # kill takes the dashboard child with it instead of
+            # orphaning it on :3000 (Stop-Process killed only the
+            # daemon process itself).
+            Write-Host "[start-daemon] old daemon pid=$oldPid overstayed 40s; hard-killing tree"
+            try { & taskkill /F /T /PID $oldPid | Out-Null } catch {
+                Write-Host "[start-daemon] taskkill failed: $($_.Exception.Message)"
             }
             Start-Sleep -Seconds 2
+        }
+        if ($expectedPid -and ($oldPid -eq $expectedPid)) {
+            try { Remove-Item -LiteralPath $expectFile -Force -ErrorAction Stop } catch { }
         }
     }
     # Belt-and-suspenders: confirm no Fastify still answers before the

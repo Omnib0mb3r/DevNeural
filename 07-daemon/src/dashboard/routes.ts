@@ -4629,6 +4629,26 @@ export async function registerDashboardRoutes(
       reply.code(500);
       return { ok: false, error: `start-daemon.ps1 not found at ${startScript}` };
     }
+    /* Expected-pid handshake (2026-07-16 failure 2 root cause). The
+     * -Force relauncher reads daemon.pid AT TASK-RUN TIME; when the
+     * task fires late (or a duplicate trigger queues), the pidfile
+     * already holds the healthy SUCCESSOR's pid, and the script's
+     * 40s overstay logic hard-killed it - no graceful shutdown, so
+     * the dashboard child was orphaned holding :3000 (the 04:22:33Z
+     * 104048 -> 121548 gap with no [shutdown] lines). Writing the pid
+     * that is SUPPOSED to die lets the script refuse to wait on (or
+     * kill) any other pid. */
+    try {
+      fs.writeFileSync(
+        path.join(DATA_ROOT, 'daemon.restart.expect'),
+        String(process.pid),
+        'utf-8',
+      );
+    } catch (err) {
+      log(
+        `[admin] failed to write daemon.restart.expect: ${(err as Error).message}; -Force will fall back to health-gated behavior`,
+      );
+    }
     /* WP-I-b: schtasks-based relaunch (see armRelauncher above) with
      * the previous direct powershell.exe start-daemon.ps1 spawn kept
      * as a fallback attempt. -Force on start-daemon.ps1 (used by the
