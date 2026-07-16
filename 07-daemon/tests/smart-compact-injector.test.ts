@@ -424,6 +424,85 @@ describe('awaitNewSessionReady', () => {
     expect(r.elapsed_ms).toBeGreaterThanOrEqual(7_000);
   });
 
+  it('default budget covers the observed real-world spawn window (~20s to a new jsonl, 2026-07-16 live)', async () => {
+    /* Live evidence 05:14:05Z: session-ready-wait-timeout at 15078ms
+     * with the new jsonl appearing ~20s after fire; the resume only
+     * shipped via the fallback. The DEFAULT budget (no readyTimeoutMs
+     * passed) must ride out a 20s spawn and still settle on the
+     * SessionStart chain. */
+    const vfs: VirtualFs = {
+      dir: '/p',
+      files: new Map([['/p/old.jsonl', '']]),
+    };
+    const clock = { ms: 1_000_000 };
+    const tickEvents: Array<{ atMs: number; fn: () => void }> = [
+      {
+        atMs: 1_020_000,
+        fn: () => {
+          vfs.files.set('/p/new.jsonl', '');
+        },
+      },
+      {
+        atMs: 1_020_200,
+        fn: () => {
+          vfs.files.set(
+            '/p/new.jsonl',
+            JSON.stringify({
+              type: 'attachment',
+              attachment: { hookEvent: 'SessionStart' },
+            }) + '\n',
+          );
+        },
+      },
+    ];
+    const baseIo = makeVirtualFsIO(vfs, clock);
+    const io: SessionReadyIO = {
+      ...baseIo,
+      sleep: async (ms) => {
+        await baseIo.sleep!(ms);
+        for (const ev of [...tickEvents]) {
+          if (ev.atMs <= clock.ms) {
+            ev.fn();
+            tickEvents.splice(tickEvents.indexOf(ev), 1);
+          }
+        }
+      },
+    };
+    const r = await awaitNewSessionReady({
+      ccProjectsDir: '/p',
+      preClearFiles: new Set(['old.jsonl']),
+      pollIntervalMs: 200,
+      quiescenceMs: 400,
+      io,
+    });
+    expect(r.ready).toBe(true);
+    expect(r.reason).toBe('ready');
+    expect(r.elapsed_ms).toBeGreaterThanOrEqual(20_000);
+  });
+
+  it('DEVNEURAL_SMART_COMPACT_READY_TIMEOUT_MS overrides the default budget', async () => {
+    const vfs: VirtualFs = {
+      dir: '/p',
+      files: new Map([['/p/old.jsonl', '']]),
+    };
+    const clock = { ms: 1_000_000 };
+    const io = makeVirtualFsIO(vfs, clock);
+    process.env.DEVNEURAL_SMART_COMPACT_READY_TIMEOUT_MS = '2000';
+    try {
+      const r = await awaitNewSessionReady({
+        ccProjectsDir: '/p',
+        preClearFiles: new Set(['old.jsonl']),
+        pollIntervalMs: 200,
+        io,
+      });
+      expect(r.ready).toBe(false);
+      expect(r.reason).toBe('timeout-new-jsonl');
+      expect(r.elapsed_ms).toBeLessThan(3_000);
+    } finally {
+      delete process.env.DEVNEURAL_SMART_COMPACT_READY_TIMEOUT_MS;
+    }
+  });
+
   it('falls back to timeout-session-start when SessionStart attachments never arrive', async () => {
     const vfs: VirtualFs = {
       dir: '/p',

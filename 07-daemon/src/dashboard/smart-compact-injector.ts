@@ -197,6 +197,24 @@ export interface AwaitNewSessionReadyOpts {
   io?: SessionReadyIO;
 }
 
+/* Budget for the whole gate (new jsonl + SessionStart quiescence).
+ * Was 15s, tuned to a ~7s spawn; live 2026-07-16 05:14:05Z the
+ * /clear -> new-jsonl gap ran ~20s under load, the gate timed out at
+ * 15078ms, and the resume only shipped via the fallback path. The
+ * default now covers the observed window with margin. Still capped:
+ * the fallback ship stays the safety net when even this expires.
+ * Override per-host via DEVNEURAL_SMART_COMPACT_READY_TIMEOUT_MS. */
+export const DEFAULT_SESSION_READY_TIMEOUT_MS = 45_000;
+
+function envReadyTimeoutMs(): number {
+  const raw = process.env.DEVNEURAL_SMART_COMPACT_READY_TIMEOUT_MS;
+  if (raw) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 1_000) return Math.round(n);
+  }
+  return DEFAULT_SESSION_READY_TIMEOUT_MS;
+}
+
 export function capturePreClearJsonlSet(
   ccProjectsDir: string,
   io: SessionReadyIO = {},
@@ -253,7 +271,7 @@ export async function awaitNewSessionReady(
   const closeSync = io.closeSync ?? fs.closeSync;
 
   const pollIntervalMs = opts.pollIntervalMs ?? 200;
-  const readyTimeoutMs = opts.readyTimeoutMs ?? 15_000;
+  const readyTimeoutMs = opts.readyTimeoutMs ?? envReadyTimeoutMs();
   const quiescenceMs = opts.quiescenceMs ?? 400;
 
   const t0 = now();
