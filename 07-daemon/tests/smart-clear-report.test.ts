@@ -204,6 +204,31 @@ describe('extractWorkerActivity', () => {
     expect(a.nextItems).toEqual([]);
     expect(a.constraints).toEqual([]);
   });
+
+  it('reads operator directives delivered as queue-operation records (live 2026-07-16 shape)', () => {
+    /* Mid-turn operator messages do NOT land as type:"user" records -
+     * they are stored as {type:"queue-operation", operation:"enqueue",
+     * content:"<full text>"}. Verified against the live session jsonl:
+     * every QUEUE ADDITION tonight is one of these; the user-record
+     * scan alone misses all of them. */
+    const tail = [
+      jsonlLine({
+        type: 'user',
+        message: { role: 'user', content: 'an early ordinary user turn long enough to clear the substantial floor' },
+      }),
+      jsonlLine({
+        type: 'queue-operation',
+        operation: 'enqueue',
+        content:
+          'QUEUE ADDITION (operator-approved): fix the replay-on-switch gate next; CONSTRAINTS: additive only, NEVER restart the daemon.',
+      }),
+      jsonlLine({ type: 'queue-operation', operation: 'dequeue' }),
+    ].join('\n');
+    const a = extractWorkerActivity(tail);
+    expect(a.directive).toContain('replay-on-switch gate');
+    expect(a.nextItems.join(' ')).toContain('replay-on-switch');
+    expect(a.constraints.join(' ')).toContain('NEVER restart the daemon');
+  });
 });
 
 describe('buildWorkerActivityBlock', () => {
@@ -282,6 +307,34 @@ describe('assembleSmartClearReport on a WORKER anchor (no brainstorm row)', () =
     });
     const vet = vetReseed(out.reseed);
     expect(vet.ok).toBe(true);
+  });
+
+  it('a reply-only tail (no directive) never leaks the block header into the reseed hints', () => {
+    /* Live 2026-07-16 probe defect: with a tail that yielded only an
+     * assistant reply, the report-wide heuristic fallback grabbed the
+     * worker block HEADER as "Were doing: Worker active context (live
+     * session tail)". Hints must come from structured extraction (or
+     * the investigator block), never from the worker block's own
+     * scaffolding. */
+    const replyOnly = jsonlLine({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Committed the pill fix, suite green.' }],
+      },
+    });
+    const out = assembleSmartClearReport({
+      db: workerDb,
+      anchorId: 'worker-anchor',
+      cwd: '/proj',
+      label: 'DevNeural-433a2f',
+      repoProbe: () => CLEAN,
+      listDir: () => [],
+      readFile: () => replyOnly,
+      workerJsonlPath: '/tail/worker.jsonl',
+    });
+    expect(out.reseed).not.toContain('Worker active context');
+    expect(out.report).toContain('Committed the pill fix');
   });
 
   it('brainstorm-anchored assembly still wins the hint merge when both sources exist', () => {

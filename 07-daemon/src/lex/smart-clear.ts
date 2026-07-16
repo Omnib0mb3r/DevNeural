@@ -288,8 +288,12 @@ export interface WorkerActivity {
  * "ok" / short steering fragments and tool_result-only records whose
  * text extraction is empty. */
 const WORKER_DIRECTIVE_MIN_CHARS = 80;
-/** Tail window scanned for activity; directives live near the end. */
-export const WORKER_TAIL_BYTES = 256 * 1024;
+/** Tail window scanned for activity. 4MB, not 256KB: measured live
+ * 2026-07-16, a tool-heavy worker session put the newest operator
+ * directive >2MB behind EOF (tool_use/tool_result records dominate
+ * the tail), and a 256KB window saw none of it. A bounded fd read of
+ * a few MB is still cheap. */
+export const WORKER_TAIL_BYTES = 4 * 1024 * 1024;
 const WORKER_DIRECTIVE_SLICE = 1200;
 const WORKER_REPLY_SLICE = 240;
 const WORKER_ITEM_SLICE = 160;
@@ -328,14 +332,32 @@ export function extractWorkerActivity(jsonlTail: string): WorkerActivity {
   for (const line of (jsonlTail ?? '').split(/\r?\n/)) {
     const t = line.trim();
     if (!t) continue;
-    let rec: { type?: string; message?: unknown };
+    let rec: { type?: string; message?: unknown; content?: unknown };
     try {
-      rec = JSON.parse(t) as { type?: string; message?: unknown };
+      rec = JSON.parse(t) as {
+        type?: string;
+        message?: unknown;
+        content?: unknown;
+      };
     } catch {
       continue;
     }
     if (rec.type === 'user') {
       const text = stripHarnessNoise(userTextOf(rec.message));
+      if (text.length >= WORKER_DIRECTIVE_MIN_CHARS) {
+        directive = text.slice(0, WORKER_DIRECTIVE_SLICE);
+      }
+    } else if (
+      rec.type === 'queue-operation' &&
+      typeof rec.content === 'string'
+    ) {
+      /* Mid-turn operator messages do NOT land as user records: the
+       * harness stores them as {type:'queue-operation',
+       * operation:'enqueue', content:'<full text>'} (verified live
+       * 2026-07-16 - every QUEUE ADDITION that night was one). They
+       * are directives in the fullest sense; same floor + bounds as
+       * user turns. */
+      const text = stripHarnessNoise(rec.content);
       if (text.length >= WORKER_DIRECTIVE_MIN_CHARS) {
         directive = text.slice(0, WORKER_DIRECTIVE_SLICE);
       }
@@ -513,8 +535,11 @@ export function assembleSmartClearReport(
   const signals = repoProbe(input.cwd);
   const stoppingPoint = draftStoppingPoint(signals);
   /* Hints: structured worker-tail extraction first (deterministic),
-   * report-scan heuristics fill whatever the tail did not provide. */
-  const heuristic = extractThreadHints(report);
+   * heuristics fill gaps from the INVESTIGATOR block only - scanning
+   * the combined report let extractThreadHints' first-line fallback
+   * grab the worker block's own header as "Were doing: Worker active
+   * context (live session tail)" (live probe defect, 2026-07-16). */
+  const heuristic = extractThreadHints(assembled.block);
   const worker = activity
     ? workerHints(activity)
     : { doing: null, next: null, decisions: [] };
