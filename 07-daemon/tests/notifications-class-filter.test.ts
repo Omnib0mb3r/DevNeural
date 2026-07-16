@@ -70,10 +70,39 @@ describe('notify_class surface filter', () => {
     const bell = mod.listNotifications({ surface: 'bell' });
     const titles = bell.map((n) => n.title);
     expect(titles).not.toContain('Lex spoke');
-    expect(titles).toContain('Wiki match');
+    /* 2026-07-16 operator directive: automated signal chatter (info /
+     * warn) stays on the activity rail; the bell is reserved for
+     * reports, followups, and alert-severity emergencies. */
+    expect(titles).not.toContain('Wiki match');
     expect(titles).toContain('Lex needs you');
     expect(titles).toContain('Morning report');
-    expect(bell.length).toBe(3);
+    expect(bell.length).toBe(2);
+  });
+
+  it('signal rows reach the bell only at alert severity (2026-07-16: the bell pinned at 9+ on signal chatter)', async () => {
+    const mod = await import('../src/dashboard/notifications.js');
+    mod.emitNotification({
+      severity: 'info',
+      source: 'reinforcement',
+      notify_class: 'signal',
+      title: 'page reinforced',
+    });
+    mod.emitNotification({
+      severity: 'warn',
+      source: 'supervision',
+      notify_class: 'signal',
+      title: 'worker slow',
+    });
+    mod.emitNotification({
+      severity: 'alert',
+      source: 'daemon',
+      notify_class: 'signal',
+      title: 'daemon degraded',
+    });
+    const bell = mod.listNotifications({ surface: 'bell' });
+    expect(bell.map((n) => n.title)).toEqual(['daemon degraded']);
+    /* The activity rail still carries all three. */
+    expect(mod.listNotifications({ surface: 'activity' }).length).toBe(3);
   });
 
   it('activity surface keeps every row including conversation', async () => {
@@ -142,8 +171,39 @@ describe('notify_class surface filter', () => {
       severity: 'info',
       source: 'curator',
       notify_class: 'signal',
-      title: 'real',
+      title: 'signal chatter (activity rail only)',
+    });
+    mod.emitNotification({
+      severity: 'warn',
+      source: 'lex-attention',
+      notify_class: 'followup',
+      title: 'real followup',
     });
     expect(mod.unreadCount('bell')).toBe(1);
+  });
+
+  it('dismissAllNotifications clears one scope without touching the other', async () => {
+    const mod = await import('../src/dashboard/notifications.js');
+    mod.emitNotification({
+      severity: 'info',
+      source: 'lex',
+      notify_class: 'report',
+      title: 'report one',
+    });
+    mod.emitNotification({
+      severity: 'warn',
+      source: 'lex-attention',
+      notify_class: 'followup',
+      title: 'followup two',
+    });
+    expect(mod.unreadCount('bell')).toBe(2);
+    const cleared = mod.dismissAllNotifications('bell');
+    expect(cleared).toBe(2);
+    expect(mod.unreadCount('bell')).toBe(0);
+    /* Activity scope untouched: both rows still visible there. */
+    const activity = mod
+      .listNotifications({ surface: 'activity' })
+      .filter((n) => !(n.dismissed_scopes ?? []).includes('activity'));
+    expect(activity.length).toBe(2);
   });
 });

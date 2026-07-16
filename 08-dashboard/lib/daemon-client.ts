@@ -1360,6 +1360,13 @@ export const dismissNotification = (
     ...(scope ? { body: { scope } } : {}),
   });
 
+/* Clear-all for one surface (2026-07-16: the bell needs a sweep). */
+export const dismissAllNotifications = (scope: NotificationScope) =>
+  request<{ ok: boolean; cleared: number }>(`/notifications/dismiss-all`, {
+    method: "POST",
+    body: { scope },
+  });
+
 /* One-click correction on a wiki page. Used by the live activity rail
  * when the user spots a curator injection that was bad recall. Daemon
  * lowers weight + increments corrections; archives at 3+ corrections. */

@@ -7,6 +7,7 @@ import {
   dashboardHealth,
   notifications as notificationsClient,
   dismissNotification,
+  dismissAllNotifications,
   type Notification,
 } from "@/lib/daemon-client";
 import { Icon } from "./Icon";
@@ -91,6 +92,14 @@ export function TopBar({ activeTab }: { activeTab: string }) {
     onError: (_err, _id, ctx) => {
       if (ctx?.prev) qc.setQueryData(["notifications", "recent"], ctx.prev);
     },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ["notifications", "recent"] });
+      qc.invalidateQueries({ queryKey: ["dashboard", "health"] });
+    },
+  });
+  /* Clear-all sweep for the bell surface (2026-07-16 operator ask). */
+  const clearAllM = useMutation({
+    mutationFn: () => dismissAllNotifications("bell"),
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ["notifications", "recent"] });
       qc.invalidateQueries({ queryKey: ["dashboard", "health"] });
@@ -282,13 +291,24 @@ export function TopBar({ activeTab }: { activeTab: string }) {
                   <span className="text-nano text-txt3 uppercase tracking-wider">
                     Recent notifications
                   </span>
-                  <Link
-                    href="/reminders"
-                    onClick={() => setNotifOpen(false)}
-                    className="text-[11px] font-mono text-txt3 hover:text-txt1"
-                  >
-                    see all
-                  </Link>
+                  <span className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      data-testid="bell-clear-all"
+                      onClick={() => clearAllM.mutate()}
+                      disabled={clearAllM.isPending || recent.length === 0}
+                      className="text-[11px] font-mono text-txt3 hover:text-txt1 disabled:opacity-50"
+                    >
+                      clear all
+                    </button>
+                    <Link
+                      href="/reminders"
+                      onClick={() => setNotifOpen(false)}
+                      className="text-[11px] font-mono text-txt3 hover:text-txt1"
+                    >
+                      see all
+                    </Link>
+                  </span>
                 </div>
                 <ul className="max-h-96 overflow-y-auto divide-y divide-border2">
                   {recent.length === 0 && (

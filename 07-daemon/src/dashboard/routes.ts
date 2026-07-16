@@ -139,6 +139,7 @@ import {
 import {
   listNotifications,
   dismissNotification,
+  dismissAllNotifications,
   emitNotification,
   unreadCount,
   events as notificationEvents,
@@ -3526,6 +3527,19 @@ export async function registerDashboardRoutes(
       body.scope === 'bell' || body.scope === 'activity' ? body.scope : undefined;
     dismissNotification(id, scope);
     return { ok: true };
+  });
+
+  /* Clear-all for one surface (2026-07-16 operator ask: the bell
+   * needs a single sweep). Scope required so a stray call can never
+   * blank both surfaces at once. */
+  app.post('/notifications/dismiss-all', async (req, reply) => {
+    const body = (req.body ?? {}) as { scope?: string };
+    if (body.scope !== 'bell' && body.scope !== 'activity') {
+      reply.code(400);
+      return { ok: false, error: "scope must be 'bell' or 'activity'" };
+    }
+    const cleared = dismissAllNotifications(body.scope);
+    return { ok: true, cleared };
   });
 
   // ── Web push (VAPID) ────────────────────────────────────────────

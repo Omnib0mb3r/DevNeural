@@ -205,7 +205,14 @@ function passesSurfaceFilter(
   /* Default to 'conversation' for un-tagged legacy rows so they get
    * filtered out of the bell. */
   const cls: NotifyClass = n.notify_class ?? 'conversation';
-  return BELL_NOTIFY_CLASSES.has(cls);
+  if (!BELL_NOTIFY_CLASSES.has(cls)) return false;
+  /* 2026-07-16 operator directive: the bell pinned at 9+ because
+   * automated 'signal' chatter (reinforcement hits, supervision
+   * noise) counted as unread. The bell is reserved for reports,
+   * followups (reminders / Lex needs-you items), and alert-severity
+   * emergencies; info/warn signals live on the activity rail. */
+  if (cls === 'signal' && n.severity !== 'alert') return false;
+  return true;
 }
 
 export function listNotifications(
@@ -267,4 +274,17 @@ export function unreadCount(scope: NotificationScope = 'bell'): number {
   return listNotifications({ surface: scope }).filter(
     (n) => !(n.dismissed_scopes ?? []).includes(scope),
   ).length;
+}
+
+/** Clear-all for one surface (2026-07-16 operator ask). Appends one
+ * dismiss op per undismissed row in the scope; the other surface's
+ * visibility is untouched. Returns how many rows were cleared. */
+export function dismissAllNotifications(scope: NotificationScope): number {
+  const undismissed = listNotifications({ surface: scope }).filter(
+    (n) => !(n.dismissed_scopes ?? []).includes(scope),
+  );
+  for (const n of undismissed) {
+    dismissNotification(n.id, scope);
+  }
+  return undismissed.length;
 }
