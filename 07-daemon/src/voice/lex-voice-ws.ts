@@ -58,6 +58,7 @@ import {
   ptyKill,
 } from '../dashboard/pty-host.js';
 import { getLexSession, setLexSessionStatus } from '../lex/lex-session-store.js';
+import { prewarmVoiceBrainSession } from '../lex/voice-brain-session.js';
 import {
   getBrainstormByClaudeSessionId,
   getBrainstormByPty,
@@ -1003,6 +1004,17 @@ export function _captureAbsorbedAsideImpl(
 
 export function attachLexVoiceWs(socket: FastifyWS): void {
   logFn(`[voice-ws] client connected (attach)`);
+  /* 2026-07-16 smoke-test fix 3: boot the voice brain the moment a
+   * voice client connects, not lazily on the first ask. Claude takes
+   * 4-20s to boot; prewarming here means the first operator utterance
+   * meets a WARM brain (real speech + handoff acks) instead of the
+   * fail-safe null path (speech=null, forward-only) that made the
+   * whole 2026-07-16 session mute. No-op when already warm/disabled. */
+  try {
+    prewarmVoiceBrainSession();
+  } catch {
+    /* prewarm is best-effort; the ask path retains its own spawn */
+  }
   const state: ConnState = {
     ws: socket,
     bindKey: null,
@@ -1455,10 +1467,19 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         /* No hardcoded talking: the pulse line comes from the brain or
          * not at all (a missed pulse is silence, not a canned phrase).
          * Guard against the ask outliving the wait: only speak if Lex
-         * is STILL mid-turn when the line comes back. */
+         * is STILL mid-turn when the line comes back. A missed pulse
+         * is logged LOUDLY (2026-07-16 smoke-test fix 2): pre-fix a
+         * dead voice brain produced four minutes of dead air with
+         * zero log evidence on the heartbeat path. */
         const elapsed = now - state.awaitingResponseSince;
         void voiceHeartbeat(elapsed).then((line) => {
-          if (line && state.awaitingResponseSince > 0 && !state.closed) {
+          if (!line) {
+            logFn(
+              `[voice-ws] HEARTBEAT MISSED: voice brain returned no pulse (lex mid-turn ${Math.round(elapsed / 1000)}s); operator hears silence`,
+            );
+            return;
+          }
+          if (state.awaitingResponseSince > 0 && !state.closed) {
             speak(line);
           }
         });

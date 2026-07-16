@@ -22,13 +22,22 @@
  *   - replies read by tailing the session's
  *     ~/.claude/projects/<slug>/<sessionId>.jsonl from a stored byte
  *     offset, 200ms poll interval
- *   - never throws: null on disabled, unavailable, inject failure, or
- *     timeout, so the caller's fail-safe (FORWARD everything to Lex,
- *     an utterance is never eaten) always fires
- *   - two consecutive timed-out asks, or a PTY found dead externally,
- *     kill the session; respawn attempts are bounded to one per
- *     DEVNEURAL_VOICE_BRAIN_SESSION_RESPAWN_COOLDOWN_MS (default
- *     5 minutes) so a broken environment cannot hot-loop spawns
+ *   - never throws: null on disabled, unavailable, warming, inject
+ *     failure, or timeout, so the caller's fail-safe (FORWARD
+ *     everything to Lex, an utterance is never eaten) always fires
+ *   - warmup gate (2026-07-16): a fresh spawn accepts NO asks until a
+ *     boot-time probe has seen a real assistant reply. Pre-fix the
+ *     tight ask timeouts could never cover claude's 4-20s interactive
+ *     boot, so the first two asks after any lazy spawn timed out, the
+ *     liveness rule killed the booting session (the 0xC000013A
+ *     pty-host exits in the 2026-07-16 smoke-test log), and the
+ *     cooldown then nulled every ask for its whole window - the
+ *     session never answered a single ask all night
+ *   - two consecutive timed-out asks on a WARM session, or a PTY
+ *     found dead externally, kill the session; respawn attempts are
+ *     bounded to one per
+ *     DEVNEURAL_VOICE_BRAIN_SESSION_RESPAWN_COOLDOWN_MS (default 60s)
+ *     so a broken environment cannot hot-loop spawns
  *   - never idle-reaped: same Max-plan flat-rate rationale as
  *     judge-session, the session stays open indefinitely by design
  *
@@ -183,8 +192,14 @@ function defaultDeps(): VoiceBrainSessionDeps {
     cwd: process.env.DEVNEURAL_VOICE_BRAIN_SESSION_CWD ?? process.cwd(),
     homeDir: os.homedir(),
     pollIntervalMs: 200,
+    /* 2026-07-16 smoke-test fix 2/3: default was 5 minutes, which
+     * turned any session kill into 5 minutes of total voice silence
+     * (every ask nulls instantly during cooldown). With the warmup
+     * gate below, a genuinely broken environment costs one bounded
+     * warmup attempt per window instead of a hot-loop, so the window
+     * can be short. Env override unchanged. */
     respawnCooldownMs: Number(
-      process.env.DEVNEURAL_VOICE_BRAIN_SESSION_RESPAWN_COOLDOWN_MS ?? 5 * 60 * 1000,
+      process.env.DEVNEURAL_VOICE_BRAIN_SESSION_RESPAWN_COOLDOWN_MS ?? 60_000,
     ),
   };
 }
@@ -208,6 +223,22 @@ interface VoiceBrainSessionState {
   jsonlPath: string | null;
   consecutiveTimeouts: number;
   lastSpawnAttemptAt: number;
+  /* Warmup gate (2026-07-16 smoke-test fix 2/3). An interactive
+   * claude takes 4-20s to boot; the tight per-ask timeouts (3-6s) can
+   * never cover that, so pre-fix the first two asks after a lazy
+   * spawn ALWAYS timed out, the two-strike liveness rule killed the
+   * booting session (the 0xC000013A pty-host exits in the smoke-test
+   * log ARE those kills), and the respawn cooldown then nulled every
+   * ask for its whole window. Net effect observed live: the session
+   * never answered a single ask all night; speech=null on every turn,
+   * zero heartbeats, delivery always on raw fallback. `warm` flips
+   * true only once the warmup probe has seen a real assistant reply;
+   * asks made before that return null immediately WITHOUT injecting
+   * (nothing lands in a booting composer, nothing counts as a
+   * timeout). */
+  warm: boolean;
+  warmupRunning: boolean;
+  spawnedAt: number;
 }
 
 function initialState(): VoiceBrainSessionState {
@@ -223,6 +254,9 @@ function initialState(): VoiceBrainSessionState {
      * has never attempted a spawn, clearing the gate with no separate
      * boolean flag. */
     lastSpawnAttemptAt: -Infinity,
+    warm: false,
+    warmupRunning: false,
+    spawnedAt: 0,
   };
 }
 
@@ -245,6 +279,7 @@ function killCurrent(reason: string): void {
   state.ccSessionId = null;
   state.jsonlPath = null;
   state.consecutiveTimeouts = 0;
+  state.warm = false;
 }
 
 /* Ensure a live voice-brain session exists, spawning (or respawning)
@@ -284,14 +319,152 @@ function ensureSpawned(): boolean {
     state.ccSessionId = ccSessionId;
     state.jsonlPath = jsonlPath;
     state.consecutiveTimeouts = 0;
+    state.warm = false;
+    state.spawnedAt = deps.now();
     deps.log(
-      `[voice-brain] spawned ptyId=${spawned.ptyId} pid=${spawned.pid} ccSessionId=${ccSessionId.slice(0, 8)} cwd=${deps.cwd}`,
+      `[voice-brain] spawned ptyId=${spawned.ptyId} pid=${spawned.pid} ccSessionId=${ccSessionId.slice(0, 8)} cwd=${deps.cwd}; warmup starting`,
     );
+    warmupPromise = runWarmup(spawned.ptyId).catch((err) => {
+      deps.log(
+        `[voice-brain] WARMUP FAILED: warmup threw: ${(err as Error).message}`,
+      );
+      killCurrent('warmup-threw');
+    });
     return true;
   } catch (err) {
-    deps.log(`[voice-brain] spawn failed: ${(err as Error).message}`);
+    deps.log(`[voice-brain] spawn FAILED: ${(err as Error).message}`);
     return false;
   }
+}
+
+/* Warmup probe timings. The boot delay covers claude's TUI coming up
+ * before anything is pasted (text pasted into a booting TUI sits in
+ * the composer while boot overlays eat the committing CR - observed
+ * live 2026-07-16: the first ask's text committed 25 SECONDS late,
+ * when a later ask's CR finally pushed it through). The two early
+ * bare CRs mirror seedFirstTurn's banner pre-dismiss. The re-nudge
+ * interval keeps firing idempotent bare CRs so a probe whose commit
+ * CR was eaten by a late overlay still submits. */
+const WARMUP_BOOT_DELAY_MS = 3_000;
+const WARMUP_RENUDGE_MS = 5_000;
+const DEFAULT_WARMUP_TIMEOUT_MS = 45_000;
+
+/* In-flight warmup, exposed to tests so the background boot can be
+ * driven to completion deterministically on the virtual clock. */
+let warmupPromise: Promise<void> | null = null;
+
+function warmupTimeoutMs(): number {
+  const raw = Number(process.env.DEVNEURAL_VOICE_BRAIN_WARMUP_TIMEOUT_MS ?? '');
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_WARMUP_TIMEOUT_MS;
+}
+
+/* Boot-gate warmup (2026-07-16 smoke-test fix 2/3). Runs once per
+ * spawn, outside the ask queue: dismiss boot banners, inject a tiny
+ * self-contained probe, and wait (generously - this is boot, not a
+ * voice turn) for the FIRST assistant record to land in the session
+ * jsonl. Only then does the session accept real asks. Every outcome
+ * is logged loudly; a failed warmup kills the session so the cooldown
+ * gate meters retry attempts. */
+async function runWarmup(ptyId: string): Promise<void> {
+  if (state.warmupRunning) return;
+  state.warmupRunning = true;
+  const startedAt = deps.now();
+  try {
+    /* Banner pre-dismiss, same shape as pty-host's seedFirstTurn. */
+    await deps.sleep(1_500);
+    if (state.ptyId !== ptyId) return;
+    try { deps.ptyInject(ptyId, '\r', false); } catch { /* best-effort */ }
+    await deps.sleep(600);
+    if (state.ptyId !== ptyId) return;
+    try { deps.ptyInject(ptyId, '\r', false); } catch { /* best-effort */ }
+    await deps.sleep(Math.max(0, WARMUP_BOOT_DELAY_MS - 2_100));
+    if (state.ptyId !== ptyId) return;
+
+    const jsonlPath = state.jsonlPath;
+    if (!jsonlPath) return;
+    let sinceOffset = 0;
+    try {
+      sinceOffset = deps.statSync(jsonlPath).size;
+    } catch {
+      sinceOffset = 0;
+    }
+    const probe = deps.ptyInject(
+      ptyId,
+      'Warmup check. Reply with exactly: OK',
+      true,
+    );
+    if (!probe.ok) {
+      deps.log(`[voice-brain] WARMUP FAILED: probe inject error: ${probe.error}`);
+      killCurrent('warmup-inject-failed');
+      return;
+    }
+    const deadline = deps.now() + warmupTimeoutMs();
+    let lastNudgeAt = deps.now();
+    for (;;) {
+      if (state.ptyId !== ptyId) return; /* killed/replaced mid-warmup */
+      const handle = deps.getPty(ptyId);
+      if (!handle || handle.exited) {
+        deps.log('[voice-brain] WARMUP FAILED: pty died during boot');
+        killCurrent('warmup-pty-died');
+        return;
+      }
+      let stat: { size: number } | null;
+      try {
+        stat = deps.statSync(jsonlPath);
+      } catch {
+        stat = null;
+      }
+      if (stat && stat.size > sinceOffset) {
+        const chunk = deps.readRange(jsonlPath, sinceOffset, stat.size - sinceOffset);
+        sinceOffset = stat.size;
+        for (const line of chunk.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          let rec: Record<string, unknown>;
+          try {
+            rec = JSON.parse(trimmed);
+          } catch {
+            continue;
+          }
+          if (extractAssistantText(rec)) {
+            state.warm = true;
+            state.consecutiveTimeouts = 0;
+            deps.log(
+              `[voice-brain] warm: first reply after ${deps.now() - startedAt}ms; session ready for asks`,
+            );
+            return;
+          }
+        }
+      }
+      const now = deps.now();
+      if (now >= deadline) {
+        deps.log(
+          `[voice-brain] WARMUP FAILED: no assistant reply within ${warmupTimeoutMs()}ms; killing session (respawn gated by cooldown)`,
+        );
+        killCurrent('warmup-timeout');
+        return;
+      }
+      if (now - lastNudgeAt >= WARMUP_RENUDGE_MS) {
+        lastNudgeAt = now;
+        /* Idempotent bare CR: commits a probe whose original CR a boot
+         * overlay swallowed; a no-op on an empty ready composer. */
+        try { deps.ptyInject(ptyId, '\r', false); } catch { /* best-effort */ }
+      }
+      await deps.sleep(deps.pollIntervalMs);
+    }
+  } finally {
+    state.warmupRunning = false;
+  }
+}
+
+/* Fire-and-forget prewarm so the FIRST operator utterance of a voice
+ * session already has a warm brain instead of paying the boot cost
+ * (and pre-fix, the boot death spiral) on the first real turn. Called
+ * by the voice WS on bind. Safe to call repeatedly. */
+export function prewarmVoiceBrainSession(): void {
+  if (!isVoiceBrainSessionEnabled()) return;
+  if (state.ptyId && state.warm) return;
+  ensureSpawned();
 }
 
 function handleTimeout(): void {
@@ -402,6 +575,17 @@ async function askVoiceInner(input: AskVoiceInput): Promise<string | null> {
   const deadline = deps.now() + timeoutMs;
 
   if (!ensureSpawned()) return null;
+  /* Warmup gate: never inject into a booting session. The ask nulls
+   * fast (caller fail-safe fires: forward-to-Lex, skipped pulse), the
+   * composer stays clean for the warmup probe, and nothing here can
+   * count as a liveness timeout against a session that is still
+   * booting. */
+  if (!state.warm) {
+    deps.log(
+      `[voice-brain] ask skipped: session warming (${deps.now() - state.spawnedAt}ms since spawn)`,
+    );
+    return null;
+  }
   const ptyId = state.ptyId!;
   const jsonlPath = state.jsonlPath!;
 
@@ -419,6 +603,7 @@ async function askVoiceInner(input: AskVoiceInput): Promise<string | null> {
     return null;
   }
 
+  const askStartedAt = deps.now();
   const result = await waitForVoiceReply(jsonlPath, sinceOffset, deadline, input.onPartial);
   if (result.timedOut) {
     handleTimeout();
@@ -426,6 +611,9 @@ async function askVoiceInner(input: AskVoiceInput): Promise<string | null> {
   }
   /* A reply landed: the session is alive and responsive. Reset the
    * failure streak. */
+  deps.log(
+    `[voice-brain] ask replied in ${deps.now() - askStartedAt}ms chars=${result.text.length}`,
+  );
   state.consecutiveTimeouts = 0;
   /* A degenerate end_turn with zero text blocks concatenates to the
    * empty string; the top layer treats that the same as no answer, so
@@ -483,6 +671,13 @@ export function _setVoiceBrainSessionDepsForTests(
 export function _resetVoiceBrainSessionStateForTests(): void {
   state = initialState();
   queueTail = Promise.resolve();
+  warmupPromise = null;
+}
+
+/** Await the in-flight warmup (resolved immediately when none). Tests
+ * only: production callers never wait on boot. */
+export function _voiceBrainWarmupForTests(): Promise<void> {
+  return warmupPromise ?? Promise.resolve();
 }
 
 export function _voiceBrainSessionSnapshotForTests(): Readonly<VoiceBrainSessionState> {

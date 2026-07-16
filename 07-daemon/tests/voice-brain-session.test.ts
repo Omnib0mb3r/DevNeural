@@ -9,14 +9,22 @@
  * scheduled record can carry a stop_reason so the phase 2 onPartial
  * streaming path (per-record delivery, end_turn resolution) is
  * exercised against realistic jsonl shapes.
+ *
+ * Warmup lifecycle (2026-07-16 smoke-test fix 2/3): a fresh spawn
+ * accepts no asks until its boot probe has seen a real assistant
+ * reply, so every scenario that needs a live session first drives
+ * warmSession() below - the same spawn -> probe -> warm dance
+ * production runs.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   askVoice,
   isVoiceBrainSessionEnabled,
+  prewarmVoiceBrainSession,
   _resetVoiceBrainSessionStateForTests,
   _setVoiceBrainSessionDepsForTests,
   _voiceBrainSessionSnapshotForTests,
+  _voiceBrainWarmupForTests,
   type VoiceBrainSessionDeps,
 } from '../src/lex/voice-brain-session.js';
 import { transcriptPathFor } from '../src/lex/spawn-lex-session.js';
@@ -215,12 +223,128 @@ function pathForSession(n: number): string {
   });
 }
 
+/* Warmup traffic = banner/re-nudge bare CRs + the boot probe. Every
+ * REAL ask inject is what's left. */
+function askInjectCalls(
+  pty: ReturnType<typeof makeFakePtyLayer>,
+): Array<{ ptyId: string; text: string; commit?: boolean }> {
+  return pty.injectCalls.filter(
+    (c) => c.text !== '\r' && !c.text.startsWith('Warmup check'),
+  );
+}
+
+/* Drive a cold state through spawn + boot probe to a warm session.
+ * The probe reply is scheduled to land after the warmup baseline read
+ * (boot delay is 3000ms on the virtual clock); the trigger ask itself
+ * must resolve null - that IS the warming gate. */
+async function warmSession(
+  io: ReturnType<typeof makeVirtualIo>,
+  pty: ReturnType<typeof makeFakePtyLayer>,
+  sessionN: number,
+): Promise<void> {
+  io.scheduleAssistantRecord(pathForSession(sessionN), 3_500, 'OK');
+  const trigger = await askVoice({ prompt: 'warm trigger', timeoutMs: 100 });
+  expect(trigger).toBeNull();
+  await _voiceBrainWarmupForTests();
+  expect(_voiceBrainSessionSnapshotForTests().warm).toBe(true);
+}
+
+describe('warmup gate (2026-07-16 smoke-test fix 2/3)', () => {
+  it('asks made while the session is warming resolve null, inject nothing, and count no timeouts', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+
+    const r1 = await askVoice({ prompt: 'cold ask', timeoutMs: 100 });
+    const r2 = await askVoice({ prompt: 'still cold', timeoutMs: 100 });
+
+    expect(r1).toBeNull();
+    expect(r2).toBeNull();
+    expect(askInjectCalls(pty).length).toBe(0);
+    /* The pre-fix death spiral: these nulls used to count as timeouts
+     * and the two-strike rule killed the BOOTING session. */
+    expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(0);
+    expect(pty.killCalls.length).toBe(0);
+    expect(pty.spawnCalls.length).toBe(1);
+  });
+
+  it('after the boot probe sees a reply, the session is warm and answers normally', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+
+    await warmSession(io, pty, 1);
+    io.scheduleAssistantRecord(pathForSession(1), 10, 'real answer');
+    const result = await askVoice({ prompt: 'real ask', timeoutMs: 5000 });
+
+    expect(result).toBe('real answer');
+    /* Warmup traffic: two banner CRs + the probe, all on the same pty. */
+    const probe = pty.injectCalls.find((c) => c.text.startsWith('Warmup check'));
+    expect(probe).toBeDefined();
+    expect(probe!.commit).toBe(true);
+  });
+
+  it('a warmup that never sees a reply kills the session; the cooldown gates the respawn', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty, { respawnCooldownMs: 100_000 }));
+
+    const r = await askVoice({ prompt: 'cold ask', timeoutMs: 100 });
+    expect(r).toBeNull();
+    await _voiceBrainWarmupForTests(); // burns the 45s warmup window
+
+    expect(pty.killCalls.length).toBe(1);
+    const snap = _voiceBrainSessionSnapshotForTests();
+    expect(snap.ptyId).toBeNull();
+    expect(snap.warm).toBe(false);
+
+    const r2 = await askVoice({ prompt: 'again', timeoutMs: 100 });
+    expect(r2).toBeNull();
+    expect(pty.spawnCalls.length).toBe(1); // cooldown suppressed the respawn
+  });
+
+  it('re-nudges an idempotent bare CR while waiting out a slow boot', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+
+    /* Reply lands 9.5s in: probe at 3s, one re-nudge due at 8s. */
+    io.scheduleAssistantRecord(pathForSession(1), 9_500, 'OK');
+    await askVoice({ prompt: 'trigger', timeoutMs: 100 });
+    await _voiceBrainWarmupForTests();
+
+    expect(_voiceBrainSessionSnapshotForTests().warm).toBe(true);
+    const bareCrs = pty.injectCalls.filter((c) => c.text === '\r');
+    /* 2 banner pre-dismiss CRs + at least one re-nudge. */
+    expect(bareCrs.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('prewarmVoiceBrainSession spawns and warms with no ask in sight', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+
+    io.scheduleAssistantRecord(pathForSession(1), 3_500, 'OK');
+    prewarmVoiceBrainSession();
+    await _voiceBrainWarmupForTests();
+
+    expect(_voiceBrainSessionSnapshotForTests().warm).toBe(true);
+    expect(pty.spawnCalls.length).toBe(1);
+    expect(askInjectCalls(pty).length).toBe(0);
+
+    io.scheduleAssistantRecord(pathForSession(1), 10, 'first real reply');
+    const result = await askVoice({ prompt: 'first real ask', timeoutMs: 5000 });
+    expect(result).toBe('first real reply');
+  });
+});
+
 describe('askVoice: ask/reply round trip', () => {
   it('resolves with the first assistant record text when onPartial is not provided', async () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
-    io.scheduleAssistantRecord(pathForSession(1), 0, 'On it, boss.');
+    await warmSession(io, pty, 1);
+    io.scheduleAssistantRecord(pathForSession(1), 10, 'On it, boss.');
 
     const result = await askVoice({
       system: 'Reply in one short spoken sentence.',
@@ -233,21 +357,23 @@ describe('askVoice: ask/reply round trip', () => {
     expect(pty.spawnCalls[0]!.args).toContain('--session-id');
     expect(pty.spawnCalls[0]!.args).toContain('cc-session-1');
     expect(pty.spawnCalls[0]!.sessionId).toBe('cc-session-1');
-    expect(pty.injectCalls.length).toBe(1);
-    expect(pty.injectCalls[0]!.text).toContain('Reply in one short spoken sentence.');
-    expect(pty.injectCalls[0]!.text).toContain('Say hello.');
-    expect(pty.injectCalls[0]!.commit).toBe(true);
+    const asks = askInjectCalls(pty);
+    expect(asks.length).toBe(1);
+    expect(asks[0]!.text).toContain('Reply in one short spoken sentence.');
+    expect(asks[0]!.text).toContain('Say hello.');
+    expect(asks[0]!.commit).toBe(true);
   });
 
   it('sends the bare prompt when no system framing is given', async () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
-    io.scheduleAssistantRecord(pathForSession(1), 0, 'Sure.');
+    await warmSession(io, pty, 1);
+    io.scheduleAssistantRecord(pathForSession(1), 10, 'Sure.');
 
     await askVoice({ prompt: 'Just the prompt.', timeoutMs: 5000 });
 
-    expect(pty.injectCalls[0]!.text).toBe('Just the prompt.');
+    expect(askInjectCalls(pty)[0]!.text).toBe('Just the prompt.');
   });
 });
 
@@ -256,25 +382,28 @@ describe('session spawn deduplication', () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
     const path1 = pathForSession(1);
-    io.scheduleAssistantRecord(path1, 0, 'first reply');
+    io.scheduleAssistantRecord(path1, 10, 'first reply');
 
     const r1 = await askVoice({ prompt: 'one', timeoutMs: 5000 });
-    io.scheduleAssistantRecord(path1, 0, 'second reply');
+    io.scheduleAssistantRecord(path1, 10, 'second reply');
     const r2 = await askVoice({ prompt: 'two', timeoutMs: 5000 });
 
     expect(r1).toBe('first reply');
     expect(r2).toBe('second reply');
     expect(pty.spawnCalls.length).toBe(1);
-    expect(pty.injectCalls.length).toBe(2);
-    expect(pty.injectCalls[0]!.ptyId).toBe('pty-1');
-    expect(pty.injectCalls[1]!.ptyId).toBe('pty-1');
+    const asks = askInjectCalls(pty);
+    expect(asks.length).toBe(2);
+    expect(asks[0]!.ptyId).toBe('pty-1');
+    expect(asks[1]!.ptyId).toBe('pty-1');
   });
 
   it('serializes concurrent asks onto the one session: second ask waits, no second spawn', async () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
     const path1 = pathForSession(1);
     io.scheduleAssistantRecord(path1, 100, 'first reply');
     io.scheduleAssistantRecord(path1, 250, 'second reply');
@@ -295,7 +424,7 @@ describe('session spawn deduplication', () => {
     expect(r1).toBe('first reply');
     expect(r2).toBe('second reply');
     expect(pty.spawnCalls.length).toBe(1);
-    expect(pty.injectCalls.length).toBe(2);
+    expect(askInjectCalls(pty).length).toBe(2);
   });
 });
 
@@ -304,6 +433,7 @@ describe('timeout: resolves null, never throws', () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
     // No record ever scheduled: the poll loop exhausts its deadline.
 
     const result = await askVoice({ prompt: 'anyone home?', timeoutMs: 300 });
@@ -318,37 +448,42 @@ describe('timeout: resolves null, never throws', () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
 
+    const t0 = io.now();
     const result = await askVoice({ prompt: 'q' });
 
     expect(result).toBeNull();
     // The poll loop slept exactly up to the 300ms env-configured
     // deadline (poll interval 50ms divides it evenly), so the virtual
     // clock pins the default that was actually applied.
-    expect(io.now()).toBe(300);
+    expect(io.now() - t0).toBe(300);
   });
 
   it('falls back to the 6000ms built-in default when the env var is unset', async () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
 
+    const t0 = io.now();
     const result = await askVoice({ prompt: 'q' });
 
     expect(result).toBeNull();
-    expect(io.now()).toBe(6000);
+    expect(io.now() - t0).toBe(6000);
   });
 
   it('a successful reply after a timeout resets the streak to zero', async () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
 
     const missed = await askVoice({ prompt: 'q1', timeoutMs: 200 });
     expect(missed).toBeNull();
     expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(1);
 
-    io.scheduleAssistantRecord(pathForSession(1), 0, 'still here');
+    io.scheduleAssistantRecord(pathForSession(1), 10, 'still here');
     const ok = await askVoice({ prompt: 'q2', timeoutMs: 5000 });
 
     expect(ok).toBe('still here');
@@ -361,6 +496,7 @@ describe('onPartial: per-record streaming, end_turn resolution', () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
     const path1 = pathForSession(1);
     io.scheduleAssistantRecord(path1, 10, 'Checking the build now.');
     io.scheduleAssistantRecord(path1, 120, 'Two workers are still running.');
@@ -387,6 +523,7 @@ describe('onPartial: per-record streaming, end_turn resolution', () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
     const path1 = pathForSession(1);
     // A partial lands but no end_turn ever arrives: the ask must time
     // out (null) rather than resolve early with the fragment.
@@ -408,6 +545,7 @@ describe('onPartial: per-record streaming, end_turn resolution', () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
     const path1 = pathForSession(1);
     io.scheduleAssistantRecord(path1, 10, 'All done.');
     io.scheduleAssistantRecord(path1, 60, null, 'end_turn');
@@ -427,6 +565,7 @@ describe('onPartial: per-record streaming, end_turn resolution', () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
     const path1 = pathForSession(1);
     io.scheduleAssistantRecord(path1, 10, 'First.');
     io.scheduleAssistantRecord(path1, 60, 'Second.', 'end_turn');
@@ -446,7 +585,8 @@ describe('onPartial: per-record streaming, end_turn resolution', () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
-    io.scheduleAssistantRecord(pathForSession(1), 0, 'Quick answer.', 'end_turn');
+    await warmSession(io, pty, 1);
+    io.scheduleAssistantRecord(pathForSession(1), 10, 'Quick answer.', 'end_turn');
 
     const result = await askVoice({ prompt: 'q', timeoutMs: 5000 });
 
@@ -458,38 +598,41 @@ describe('liveness: respawn after two consecutive timeouts, bounded by cooldown'
   it('kills the session on the second consecutive timeout, then suppresses a respawn attempt inside the cooldown window', async () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
-    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty, { respawnCooldownMs: 10_000 }));
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty, { respawnCooldownMs: 100_000 }));
+    await warmSession(io, pty, 1);
 
     const t1 = await askVoice({ prompt: 'q1', timeoutMs: 100 });
     const t2 = await askVoice({ prompt: 'q2', timeoutMs: 100 });
     expect(t1).toBeNull();
     expect(t2).toBeNull();
-    // Two consecutive timeouts: the session was killed.
+    // Two consecutive timeouts ON A WARM SESSION: the session was killed.
     expect(pty.killCalls.length).toBe(1);
     expect(_voiceBrainSessionSnapshotForTests().ptyId).toBeNull();
     expect(pty.spawnCalls.length).toBe(1); // still just the original spawn
 
-    // Cooldown has not elapsed (virtual clock advanced ~200ms of the
-    // 10s window): a third ask must NOT trigger a second spawn.
+    // Cooldown has not elapsed: a third ask must NOT trigger a second spawn.
     const t3 = await askVoice({ prompt: 'q3', timeoutMs: 50 });
     expect(t3).toBeNull();
     expect(pty.spawnCalls.length).toBe(1);
   });
 
-  it('respawns once the cooldown window has elapsed, and the fresh session answers normally', async () => {
+  it('respawns once the cooldown window has elapsed, and the fresh session answers after its own warmup', async () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty, { respawnCooldownMs: 10_000 }));
+    await warmSession(io, pty, 1);
 
     await askVoice({ prompt: 'q1', timeoutMs: 100 });
     await askVoice({ prompt: 'q2', timeoutMs: 100 });
     expect(pty.killCalls.length).toBe(1);
     expect(pty.spawnCalls.length).toBe(1);
 
-    // Fast-forward past the cooldown window.
+    // Fast-forward past the cooldown window; the next spawn runs the
+    // same warmup dance before answering.
     io.advanceClock(10_000);
+    await warmSession(io, pty, 2);
 
-    io.scheduleAssistantRecord(pathForSession(2), 0, 'fresh session speaking');
+    io.scheduleAssistantRecord(pathForSession(2), 10, 'fresh session speaking');
     const result = await askVoice({ prompt: 'q3', timeoutMs: 5000 });
 
     expect(result).toBe('fresh session speaking');
@@ -500,8 +643,9 @@ describe('liveness: respawn after two consecutive timeouts, bounded by cooldown'
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty, { respawnCooldownMs: 10_000 }));
+    await warmSession(io, pty, 1);
 
-    io.scheduleAssistantRecord(pathForSession(1), 0, 'alive');
+    io.scheduleAssistantRecord(pathForSession(1), 10, 'alive');
     await askVoice({ prompt: 'q1', timeoutMs: 5000 });
     expect(pty.spawnCalls.length).toBe(1);
 
@@ -509,8 +653,9 @@ describe('liveness: respawn after two consecutive timeouts, bounded by cooldown'
     // going through two timeouts.
     pty.killedPtys.add('pty-1');
     io.advanceClock(10_000); // clear the cooldown so the respawn is allowed
+    await warmSession(io, pty, 2);
 
-    io.scheduleAssistantRecord(pathForSession(2), 0, 'back again');
+    io.scheduleAssistantRecord(pathForSession(2), 10, 'back again');
     const result = await askVoice({ prompt: 'q2', timeoutMs: 5000 });
 
     expect(result).toBe('back again');
@@ -546,5 +691,8 @@ describe('DEVNEURAL_VOICE_BRAIN_SESSION flag', () => {
     expect(result).toBeNull();
     expect(pty.spawnCalls.length).toBe(0);
     expect(pty.injectCalls.length).toBe(0);
+
+    prewarmVoiceBrainSession();
+    expect(pty.spawnCalls.length).toBe(0);
   });
 });

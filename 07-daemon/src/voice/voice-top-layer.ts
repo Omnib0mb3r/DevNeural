@@ -441,6 +441,22 @@ export interface VoiceLexReplyCtx {
   deps?: Pick<TopLayerDeps, 'ask' | 'timeoutMs'>;
 }
 
+/* Heartbeat ask timeout. Deliberately looser than the render/turn
+ * timeouts (2026-07-16 smoke-test fix 2): a still-on-it pulse that
+ * lands 8s late is still a valid pulse (the caller re-checks that Lex
+ * is STILL mid-turn before speaking it), whereas a 3s bound made every
+ * pulse a coin flip against normal claude turn latency. */
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 10_000;
+
+function heartbeatTimeoutMs(override?: number): number {
+  if (override !== undefined) return override;
+  const raw = Number(
+    process.env.DEVNEURAL_VOICE_HEARTBEAT_TIMEOUT_MS ??
+      DEFAULT_HEARTBEAT_TIMEOUT_MS,
+  );
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_HEARTBEAT_TIMEOUT_MS;
+}
+
 /* Heartbeat through the brain (operator directive 2026-07-15: no
  * hardcoded talking, everything spoken comes from the top layer). One
  * short grounded still-on-it line in Lex's voice; null on any miss -
@@ -466,7 +482,7 @@ export async function voiceHeartbeat(
         '\n\n' +
         `It is ${buildLocalContext(now).timeLabel}. Your deeper reasoning ` +
         `has been on the current turn for about ${minutes} minute${minutes === 1 ? '' : 's'}.`,
-      timeoutMs: renderTimeoutMs(deps?.timeoutMs),
+      timeoutMs: heartbeatTimeoutMs(deps?.timeoutMs),
     });
   } catch {
     raw = null;

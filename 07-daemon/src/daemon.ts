@@ -30,6 +30,7 @@ import { piperStatus } from './voice/piper.js';
 import { getVoiceWsStats, setVoiceWsLogger } from './voice/lex-voice-ws.js';
 import { setPtyHostLogger } from './dashboard/pty-host.js';
 import { setJudgeSessionLogger } from './lex/judge-session.js';
+import { setVoiceBrainSessionLogger } from './lex/voice-brain-session.js';
 import {
   useVoiceHaiku,
   voiceApiKey,
@@ -130,6 +131,11 @@ async function main(): Promise<void> {
   setVoiceWsLogger(logger);
   setPtyHostLogger(logger);
   setJudgeSessionLogger(logger);
+  /* 2026-07-16 smoke-test fix 2: this wiring was missing, so every
+   * voice-brain lifecycle event (spawn, ask timeout, liveness kill,
+   * cooldown suppression) went to the default no-op logger and the
+   * session's death spiral was invisible in daemon.log. */
+  setVoiceBrainSessionLogger(logger);
   logger('opening store...');
   const store = await Store.open(logger);
   logger(
