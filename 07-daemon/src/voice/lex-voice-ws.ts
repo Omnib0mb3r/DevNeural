@@ -739,10 +739,12 @@ function _defaultScheduleFollowupCr(fn: () => void, delayMs: number): void {
  * exercises the same code path as production. */
 export function _flushPendingUtterancesImpl(
   deps: _FlushPendingUtterancesDeps,
-): void {
+): string | null {
+  /* Returns the injected payload text (for delivery/integrity
+   * verification by the caller) or null when nothing was injected. */
   const { state, ptyInject, send } = deps;
-  if (state.pendingUserUtterances.length === 0) return;
-  if (!state.bindKey) return;
+  if (state.pendingUserUtterances.length === 0) return null;
+  if (!state.bindKey) return null;
   const queued = state.pendingUserUtterances.slice();
   state.pendingUserUtterances = [];
   const header =
@@ -754,7 +756,8 @@ export function _flushPendingUtterancesImpl(
     state.mode === 'notes'
       ? '[voice mode: notes, silent reply, capture as artifact] '
       : '[voice mode] ';
-  const ir = ptyInject(state.bindKey, body + voiceTag, true);
+  const flushPayload = body + voiceTag;
+  const ir = ptyInject(state.bindKey, flushPayload, true);
   if (!ir.ok) {
     send({
       t: 'error',
@@ -762,7 +765,7 @@ export function _flushPendingUtterancesImpl(
       message: `flush-mid-turn-queue: ${ir.error}`,
     });
     state.pendingUserUtterances = queued.concat(state.pendingUserUtterances);
-    return;
+    return null;
   }
   /* Bare-CR follow-up. Mirrors cross-session-inject.ts:297-306: bridge-
    * attached workers sometimes receive the primary atomic write into
@@ -790,6 +793,7 @@ export function _flushPendingUtterancesImpl(
     count: queued.length,
   });
   state.awaitingResponseSince = Date.now();
+  return flushPayload;
 }
 
 /* Voice->Lex delivery confirmation (2026-07-16 second wave, operator
@@ -822,6 +826,21 @@ export interface _VerifyInjectDeliveryDeps {
    * user record. Matched against PARSED record text so JSON escaping
    * cannot mask a hit. */
   fingerprint: string;
+  /** Content-integrity probes (2026-07-16 third wave: FRONT truncation
+   * of pasted payloads - the lead of the payload got eaten while the
+   * tail landed, three times live, so submission alone proves
+   * nothing about completeness). head = a slice of the payload's
+   * first non-empty line, tail = a slice of its last non-empty line
+   * (single-line probes so composer newline normalization cannot mask
+   * a hit). When provided, a landed user record must carry EVERY
+   * provided probe to count as confirmed; a record carrying some but
+   * not all classifies as a PARTIAL landing and triggers repaste. */
+  headFingerprint?: string;
+  tailFingerprint?: string;
+  /** Re-inject the FULL payload after a partial landing. Fired at
+   * most once per verification; the loop keeps scanning for an
+   * intact record afterwards. */
+  repaste?: () => void;
   statSize: (p: string) => number | null;
   readRange: (p: string, start: number, length: number) => string | null;
   /** Fire a CR retry. attempt is 1-based; the last attempt should
@@ -836,22 +855,34 @@ export interface _VerifyInjectDeliveryDeps {
   maxAttempts?: number;
 }
 
-function recordContainsFingerprint(
-  rec: Record<string, unknown>,
-  fingerprint: string,
-): boolean {
-  if (rec.type !== 'user') return false;
+/* Single-line head/tail probes for a pasted payload. First and last
+ * non-empty lines, bounded, never crossing a newline - the jsonl
+ * record preserves the payload's own line structure but probes that
+ * span lines would be brittle against any composer normalization. */
+export function payloadIntegrityFingerprints(payload: string): {
+  head: string;
+  tail: string;
+} {
+  const lines = (payload ?? '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  const first = lines[0] ?? '';
+  const last = lines[lines.length - 1] ?? '';
+  return { head: first.slice(0, 60), tail: last.slice(-40) };
+}
+
+function userRecordText(rec: Record<string, unknown>): string | null {
+  if (rec.type !== 'user') return null;
   const message = rec.message as
     | { content?: string | Array<{ type?: string; text?: string }> }
     | undefined;
   const c = message?.content;
-  const text =
-    typeof c === 'string'
-      ? c
-      : Array.isArray(c)
-        ? c.map((b) => (typeof b?.text === 'string' ? b.text : '')).join('')
-        : '';
-  return text.includes(fingerprint);
+  return typeof c === 'string'
+    ? c
+    : Array.isArray(c)
+      ? c.map((b) => (typeof b?.text === 'string' ? b.text : '')).join('')
+      : '';
 }
 
 export async function _verifyInjectDeliveryImpl(
@@ -862,9 +893,20 @@ export async function _verifyInjectDeliveryImpl(
   const intervalMs = deps.intervalMs ?? 4_000;
   const maxAttempts = deps.maxAttempts ?? 3;
   const log = deps.log ?? logFn;
+  /* Every provided probe must land in ONE user record for an intact
+   * confirm; a record carrying some but not all is a PARTIAL landing
+   * (front/tail truncation between the paste writer and the
+   * terminal - the daemon-side text was intact all three times live). */
+  const probes = [
+    fingerprint,
+    ...(deps.headFingerprint ? [deps.headFingerprint] : []),
+    ...(deps.tailFingerprint ? [deps.tailFingerprint] : []),
+  ].filter((p) => p.length > 0);
   let offset = deps.startOffset;
+  let repasteUsed = false;
   for (let attempt = 0; attempt <= maxAttempts; attempt++) {
     await deps.sleep(intervalMs);
+    let sawPartial = false;
     const size = deps.statSize(jsonlPath);
     if (size !== null && size > offset) {
       const chunk = deps.readRange(jsonlPath, offset, size - offset);
@@ -879,16 +921,36 @@ export async function _verifyInjectDeliveryImpl(
           } catch {
             continue;
           }
-          if (recordContainsFingerprint(rec, fingerprint)) {
-            if (attempt > 0) {
+          const text = userRecordText(rec);
+          if (text === null || text === '') continue;
+          const hits = probes.filter((p) => text.includes(p)).length;
+          if (hits === probes.length) {
+            if (repasteUsed) {
+              log(
+                '[voice-ws] inject delivery confirmed INTACT after repaste (partial landing repaired)',
+              );
+            } else if (attempt > 0) {
               log(
                 `[voice-ws] inject delivery confirmed after ${attempt} CR retr${attempt === 1 ? 'y' : 'ies'}`,
               );
             }
             return 'confirmed';
           }
+          if (hits > 0) sawPartial = true;
         }
       }
+    }
+    if (sawPartial && deps.repaste && !repasteUsed) {
+      /* Partial landing: the turn SUBMITTED but arrived truncated
+       * (2026-07-16 front-truncation wave). A CR cannot repair lost
+       * content - re-paste the full payload once and keep scanning
+       * for an intact record. */
+      repasteUsed = true;
+      log(
+        '[voice-ws] INJECT PARTIAL DELIVERY: landed user record is missing payload head/tail; repasting the full payload',
+      );
+      deps.repaste();
+      continue;
     }
     if (attempt < maxAttempts) {
       log(
@@ -2707,15 +2769,20 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   function flushPendingUtterances(): void {
     const firstQueued = state.pendingUserUtterances[0] ?? null;
     const startOffset = currentJsonlSize();
-    _flushPendingUtterancesImpl({
+    const flushPayload = _flushPendingUtterancesImpl({
       state,
       ptyInject,
       send,
     });
     /* Queue emptied = the flush inject was accepted; verify it
-     * actually SUBMITTED (2026-07-16 stuck-paste failure). */
-    if (firstQueued && state.pendingUserUtterances.length === 0) {
-      verifyInjectDelivery(firstQueued.slice(0, 60), startOffset);
+     * actually SUBMITTED (2026-07-16 stuck-paste failure) and landed
+     * INTACT (third wave front truncation; partial landings repaste). */
+    if (firstQueued && flushPayload) {
+      verifyInjectDelivery(
+        firstQueued.slice(0, 60),
+        startOffset,
+        flushPayload,
+      );
     }
   }
 
@@ -2731,14 +2798,37 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   }
 
   /* Fire-and-forget delivery verification for an idle-time commit
-   * inject. See _verifyInjectDeliveryImpl for the contract. */
-  function verifyInjectDelivery(fingerprint: string, startOffset: number): void {
+   * inject. See _verifyInjectDeliveryImpl for the contract. When the
+   * full pasted payload is provided, head/tail integrity probes are
+   * derived from it and a partial landing (front truncation between
+   * the paste writer and the terminal, 2026-07-16 third wave) gets
+   * ONE full repaste instead of pointless CR nudges. */
+  function verifyInjectDelivery(
+    fingerprint: string,
+    startOffset: number,
+    payload?: string,
+  ): void {
     const jsonlPath = state.jsonlPath;
     if (!jsonlPath || !fingerprint.trim()) return;
+    const fps = payload ? payloadIntegrityFingerprints(payload) : null;
     void _verifyInjectDeliveryImpl({
       jsonlPath,
       startOffset,
       fingerprint,
+      ...(fps?.head ? { headFingerprint: fps.head } : {}),
+      ...(fps?.tail ? { tailFingerprint: fps.tail } : {}),
+      ...(payload
+        ? {
+            repaste: () => {
+              if (!state.bindKey || state.closed) return;
+              try {
+                ptyInject(state.bindKey, payload, true);
+              } catch {
+                /* best-effort; the loop's failure path stays loud */
+              }
+            },
+          }
+        : {}),
       statSize: (p) => {
         try {
           return fs.statSync(p).size;
@@ -3744,19 +3834,19 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       asideBlock = _formatAbsorbedAsideBlockImpl(state.absorbedAsides) + '\n\n';
     }
     const preInjectJsonlSize = currentJsonlSize();
-    const ir = ptyInject(
-      state.bindKey,
-      asideBlock + snapshotBlock + gateNote + partialChainBlock + voiceTag + result.text,
-      true,
-    );
+    const injectPayload =
+      asideBlock + snapshotBlock + gateNote + partialChainBlock + voiceTag + result.text;
+    const ir = ptyInject(state.bindKey, injectPayload, true);
     if (!ir.ok) {
       send({ t: 'error', code: 'inject', message: ir.error });
       return;
     }
     /* Idle-time commit inject: verify it actually SUBMITTED (2026-07-16
      * stuck-paste failure - trailing CR silently swallowed, prompt sat
-     * at the terminal until the operator pressed Enter by hand). */
-    verifyInjectDelivery(result.text.slice(0, 60), preInjectJsonlSize);
+     * at the terminal until the operator pressed Enter by hand) AND
+     * landed INTACT (third wave: payload lead eaten by the paste path
+     * while the daemon-side text was fine; partial landings repaste). */
+    verifyInjectDelivery(result.text.slice(0, 60), preInjectJsonlSize, injectPayload);
     /* Consume the partial chain only after a successful inject. If
      * inject fails, the chain stays so the retry path on the next
      * utterance still carries the partials. Same contract for the
