@@ -297,6 +297,19 @@ interface Props {
   sessionId: string;
 }
 
+/* Header label naming what this mirror is actually watching
+ * (2026-07-16 operator audit: landing here from a feed click gave no
+ * clue which project/session the terminal belonged to, or that it is
+ * read-only). Exported for tests. */
+export function mirrorWatchLabel(
+  projectSlug: string | null | undefined,
+  sessionId: string,
+): string {
+  const proj = projectSlug?.trim() ? projectSlug : "unknown project";
+  const sess = sessionId ? sessionId.slice(0, 8) : "unbound";
+  return `watching ${proj} · session ${sess} · read-only`;
+}
+
 export function TerminalMirror({ sessionId }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<unknown>(null);
@@ -312,9 +325,10 @@ export function TerminalMirror({ sessionId }: Props) {
     queryFn: sessionsClient,
     refetchInterval: 5_000,
   });
-  const ctx =
-    sessionsQ.data?.sessions?.find((s) => s.session_id === sessionId)?.context ??
-    null;
+  const sessionEntry = sessionsQ.data?.sessions?.find(
+    (s) => s.session_id === sessionId,
+  );
+  const ctx = sessionEntry?.context ?? null;
 
   /* Detect daemon-PTY ownership so the bridge-status pill can show
    * "host: daemon-pty" instead of misleading bridge-mirror warnings.
@@ -737,6 +751,13 @@ export function TerminalMirror({ sessionId }: Props) {
     <section className="rounded-panel bg-surface1 hairline overflow-hidden">
       <div className="px-5 py-3 border-b border-border1 flex items-center gap-2 flex-wrap">
         <span className="font-display text-sm font-emphasized">Terminal mirror</span>
+        <span
+          data-testid="mirror-watch-label"
+          className="text-nano font-mono text-txt3"
+          title="A live read-only view of this session's terminal. Nothing you type here is sent to the worker."
+        >
+          {mirrorWatchLabel(sessionEntry?.project_slug ?? null, sessionId)}
+        </span>
         <span
           className={`text-nano font-mono ml-2 ${
             status === "live"

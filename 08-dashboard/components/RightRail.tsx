@@ -8,6 +8,7 @@ import {
   notifications as notificationsClient,
   completeReminder,
   dismissNotification,
+  dismissAllNotifications,
   correctWikiPage,
 } from "@/lib/daemon-client";
 import { Icon } from "./Icon";
@@ -16,6 +17,17 @@ import { lexMotd } from "@/lib/lex";
 
 type ActivityFilter = "all" | "info" | "warn" | "alert";
 const FILTER_CYCLE: ActivityFilter[] = ["all", "info", "warn", "alert"];
+
+/* Plain-English destination for a clickable feed row (2026-07-16
+ * operator audit: clicking a curator item dropped him into a terminal
+ * mirror with no warning of where the link led). Exported for tests. */
+export function feedDestinationLabel(link: string | undefined): string | null {
+  if (!link) return null;
+  if (link.includes("/wiki")) return "opens wiki page";
+  if (link.includes("/lex") || link.includes("session"))
+    return "opens live terminal";
+  return "opens link";
+}
 
 export function RightRail() {
   const qc = useQueryClient();
@@ -50,6 +62,13 @@ export function RightRail() {
       return r;
     },
     onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["notifications", "recent"] }),
+  });
+  /* Clear-all sweep for the activity feed (2026-07-16 operator ask).
+   * Scope 'activity' only: the bell keeps its own rows. */
+  const clearFeedM = useMutation({
+    mutationFn: () => dismissAllNotifications("activity"),
+    onSettled: () =>
       qc.invalidateQueries({ queryKey: ["notifications", "recent"] }),
   });
 
@@ -148,15 +167,27 @@ export function RightRail() {
             <Icon name="Brain" className="text-brandSoft" size={16} />
             <h2 className="font-display text-sm font-emphasized">Curator feed</h2>
           </div>
-          <button
-            type="button"
-            onClick={cycleFilter}
-            className="text-[11px] font-mono text-txt3 hover:text-txt1 flex items-center gap-1"
-            aria-label={`Filter curator feed (current: ${filter}). Click to cycle.`}
-            title="Click to cycle: all → info → warn → alert"
-          >
-            <Icon name="Filter" size={12} /> {filter}
-          </button>
+          <span className="flex items-center gap-3">
+            <button
+              type="button"
+              data-testid="curator-feed-clear-all"
+              onClick={() => clearFeedM.mutate()}
+              disabled={clearFeedM.isPending || allEvents.length === 0}
+              className="text-[11px] font-mono text-txt3 hover:text-txt1 disabled:opacity-50"
+              aria-label="Clear all curator feed items"
+            >
+              clear all
+            </button>
+            <button
+              type="button"
+              onClick={cycleFilter}
+              className="text-[11px] font-mono text-txt3 hover:text-txt1 flex items-center gap-1"
+              aria-label={`Filter curator feed (current: ${filter}). Click to cycle.`}
+              title="Click to cycle: all → info → warn → alert"
+            >
+              <Icon name="Filter" size={12} /> {filter}
+            </button>
+          </span>
         </div>
         <ul className="divide-y divide-border2">
           {events.length === 0 && (
@@ -217,6 +248,11 @@ export function RightRail() {
                   {n.body && (
                     <div className="text-[11px] font-mono text-txt3 mt-0.5 line-clamp-3 break-words">
                       {n.body}
+                    </div>
+                  )}
+                  {clickable && (
+                    <div className="text-nano text-txt3 mt-0.5">
+                      → {feedDestinationLabel(n.link)}
                     </div>
                   )}
                 </div>
