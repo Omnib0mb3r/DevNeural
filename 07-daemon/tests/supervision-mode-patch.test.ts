@@ -60,9 +60,9 @@ afterEach(() => {
 });
 
 describe('patchProjectAnchor supervision_mode', () => {
-  it('defaults to polling when no patch supplied', () => {
+  it('defaults to event when no patch supplied (2026-07-16 operator directive)', () => {
     const view = patchProjectAnchor(db, 'anchor-A', {});
-    expect(view?.supervision_mode).toBe('polling');
+    expect(view?.supervision_mode).toBe('event');
   });
 
   it('persists polling -> event', () => {

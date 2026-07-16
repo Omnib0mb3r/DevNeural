@@ -77,7 +77,7 @@ export interface ProjectAnchorView {
 
 export function toAnchorView(
   row: ProjectSessionRow,
-  defaultSupervisionMode: 'polling' | 'event' | 'off' = 'polling',
+  defaultSupervisionMode: 'polling' | 'event' | 'off' = 'event',
 ): ProjectAnchorView {
   const decoded = decodeBridgeMarker(row.current_bridge_id);
   let exists = false;
@@ -407,8 +407,16 @@ export function registerProjectAnchorRoutes(
   /* Stream Deck feed. One tile per live anchor, deduped so multiple
    * VS Code windows on the same cwd render as a single tile with a
    * bridge_connection_count badge. Mirrors /lex/anchor-tiles. */
-  app.get('/projects/anchor-tiles', async () => {
-    return { ok: true, tiles: listProjectAnchorTiles(db) };
+  app.get('/projects/anchor-tiles', async (req) => {
+    /* ?status=all includes dormant anchors (dashboard ProjectsGrid:
+     * the supervision toggle must render on every anchored project).
+     * Default stays 'live' - the Stream Deck tile contract. */
+    const q = (req.query ?? {}) as { status?: string };
+    const status = q.status === 'all' ? 'all' : undefined;
+    return {
+      ok: true,
+      tiles: listProjectAnchorTiles(db, status ? { status } : {}),
+    };
   });
 
   /* GET /projects (bare list) collides with the legacy registry-backed

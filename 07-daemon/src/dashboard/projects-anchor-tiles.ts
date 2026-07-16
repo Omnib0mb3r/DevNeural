@@ -73,6 +73,13 @@ export interface BuildTileOptions {
   ) => ProjectAnchorTile['phase'];
   /** Pending-prompt resolver. Defaults to getPending. */
   pendingResolver?: (ccSessionId: string) => PendingPrompt | null;
+  /** Anchor status filter. Default 'live' (the Stream Deck contract:
+   * one tile per LIVE anchor). 'all' includes dormant anchors - the
+   * dashboard ProjectsGrid needs those so the supervision toggle
+   * renders on every anchored project, not just ones with a live
+   * session (2026-07-16: most tiles showed no selector because 31 of
+   * 33 anchors sat dormant). */
+  status?: 'live' | 'all';
 }
 
 export function buildProjectAnchorTile(
@@ -124,7 +131,10 @@ export function listProjectAnchorTiles(
   db: IndexDb,
   opts: BuildTileOptions = {},
 ): ProjectAnchorTile[] {
-  const rows = db.listProjectSessions({ status: 'live', limit: 200 });
+  const rows =
+    opts.status === 'all'
+      ? db.listProjectSessions({ limit: 200 })
+      : db.listProjectSessions({ status: 'live', limit: 200 });
   const tiles = rows.map((row) => buildProjectAnchorTile(db, row, opts));
   tiles.sort((a, b) => b.last_activity_ms - a.last_activity_ms);
   return tiles;

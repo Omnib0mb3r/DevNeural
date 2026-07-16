@@ -488,21 +488,21 @@ export const VALID_SUPERVISION_MODES: ReadonlySet<SupervisionMode> = new Set([
   'off',
 ]);
 
-/* runtime_config key that overrides the hard-coded 'polling' default
+/* runtime_config key that overrides the hard-coded 'event' default
  * applied to anchor rows whose supervision_mode is NULL (legacy
  * pre-migration rows, project_session inserts that omit the field,
  * and the 5+ read-side fallbacks scattered across routes + the
- * event-driven supervisor). Setting this key to 'event' makes new
- * anchors auto-enroll into event-driven supervision instead of
- * needing a manual PATCH per anchor. The killswitch still flips to
- * 'polling' on overflow regardless of this default; the default
- * governs the steady state, not the safety valve.
+ * event-driven supervisor). Event-driven supervision is the default
+ * everywhere (operator directive 2026-07-16); set this key to
+ * 'polling' to opt back into the legacy cron path. The killswitch
+ * still flips to 'polling' on overflow regardless of this default;
+ * the default governs the steady state, not the safety valve.
  *
  * Parser tolerates leading/trailing whitespace + any case so a
  * shell `sqlite3 ... UPDATE runtime_config SET value='EVENT'` does
  * not silently bypass the validator and leave the daemon reading
  * garbage. Invalid values fall through to the hard-coded
- * 'polling' default so a bad write cannot ever flip the daemon
+ * 'event' default so a bad write cannot ever flip the daemon
  * into an undefined mode. */
 export const DEFAULT_SUPERVISION_MODE_CONFIG_KEY = 'default_supervision_mode';
 
@@ -1354,13 +1354,15 @@ export class IndexDb {
   }
 
   /* Resolve the operator-configured default supervision_mode for
-   * new / null-mode anchors. Falls back to 'polling' when the
-   * runtime_config row is unset or carries an unparseable value.
-   * Centralised so every read-side fallback and the
-   * project_session insert default agree. */
+   * new / null-mode anchors. Falls back to 'event' when the
+   * runtime_config row is unset or carries an unparseable value
+   * (operator directive 2026-07-16: event-driven supervision is the
+   * default everywhere; polling is the legacy opt-in). Centralised
+   * so every read-side fallback and the project_session insert
+   * default agree. */
   getDefaultSupervisionMode(): SupervisionMode {
     const raw = this.getRuntimeConfig(DEFAULT_SUPERVISION_MODE_CONFIG_KEY);
-    return parseSupervisionModeValue(raw) ?? 'polling';
+    return parseSupervisionModeValue(raw) ?? 'event';
   }
 
   setRuntimeConfig(key: string, value: string, updatedBy?: string): void {

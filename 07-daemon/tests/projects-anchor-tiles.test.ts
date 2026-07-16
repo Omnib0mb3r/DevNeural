@@ -119,6 +119,31 @@ describe('listProjectAnchorTiles', () => {
     expect(tiles.map((t) => t.anchor_id)).toEqual(['live-1']);
   });
 
+  it("status:'all' includes dormant anchors (dashboard supervision toggle needs every anchor)", () => {
+    liveAnchor('live-1', 'C:/p/1', 'b1');
+    db.insertProjectSession({
+      id: 'dormant-1',
+      project_slug: 'd1',
+      cwd: 'C:/p/2',
+      title: 'd1',
+      status: 'dormant',
+      current_session_id: null,
+      current_bridge_id: null,
+      current_pty_id: null,
+      created_ms: 1,
+      last_seen_ms: 1,
+    });
+    const tiles = listProjectAnchorTiles(db, { ...stubs, status: 'all' });
+    expect(tiles.map((t) => t.anchor_id).sort()).toEqual([
+      'dormant-1',
+      'live-1',
+    ]);
+    /* Dormant tiles still carry a resolvable supervision_mode so the
+     * toggle can render + PATCH against them. */
+    const dormant = tiles.find((t) => t.anchor_id === 'dormant-1');
+    expect(['polling', 'event', 'off']).toContain(dormant!.supervision_mode);
+  });
+
   it('decodes connection count from current_bridge_id marker', () => {
     liveAnchor('a1', 'C:/p/1', 'bridge-x|4');
     const [tile] = listProjectAnchorTiles(db, stubs);

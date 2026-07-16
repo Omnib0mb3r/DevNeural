@@ -3,11 +3,13 @@
  * Pins the contracts:
  *   1. parseSupervisionModeValue tolerates whitespace + any case;
  *      invalid strings return null so the caller can fall back.
- *   2. getDefaultSupervisionMode returns 'polling' when the
- *      runtime_config row is absent.
- *   3. Setting runtime_config to 'event' flips the default.
+ *   2. getDefaultSupervisionMode returns 'event' when the
+ *      runtime_config row is absent (operator directive 2026-07-16:
+ *      event-driven supervision is the default everywhere; polling
+ *      is the legacy opt-in).
+ *   3. Setting runtime_config to 'polling'/'off' flips the default.
  *   4. Invalid runtime_config values fall through to the
- *      hard-coded 'polling' default (a bad write cannot ever
+ *      hard-coded 'event' default (a bad write cannot ever
  *      flip the daemon into an undefined mode).
  *   5. project_session insert without an explicit supervision_mode
  *      honors the runtime default.
@@ -82,13 +84,13 @@ describe('parseSupervisionModeValue', () => {
 });
 
 describe('IndexDb.getDefaultSupervisionMode', () => {
-  it('defaults to polling when the runtime_config row is absent', () => {
-    expect(db.getDefaultSupervisionMode()).toBe('polling');
+  it('defaults to event when the runtime_config row is absent (2026-07-16 operator directive)', () => {
+    expect(db.getDefaultSupervisionMode()).toBe('event');
   });
 
-  it('returns the runtime_config value when set to event', () => {
-    db.setRuntimeConfig(DEFAULT_SUPERVISION_MODE_CONFIG_KEY, 'event', 'test');
-    expect(db.getDefaultSupervisionMode()).toBe('event');
+  it('returns the runtime_config value when set to polling', () => {
+    db.setRuntimeConfig(DEFAULT_SUPERVISION_MODE_CONFIG_KEY, 'polling', 'test');
+    expect(db.getDefaultSupervisionMode()).toBe('polling');
   });
 
   it('returns the runtime_config value when set to off', () => {
@@ -96,9 +98,9 @@ describe('IndexDb.getDefaultSupervisionMode', () => {
     expect(db.getDefaultSupervisionMode()).toBe('off');
   });
 
-  it('falls back to polling for unparseable runtime_config values', () => {
+  it('falls back to event for unparseable runtime_config values', () => {
     db.setRuntimeConfig(DEFAULT_SUPERVISION_MODE_CONFIG_KEY, 'garbage', 'test');
-    expect(db.getDefaultSupervisionMode()).toBe('polling');
+    expect(db.getDefaultSupervisionMode()).toBe('event');
   });
 
   it('tolerates whitespace + uppercase in the stored value', () => {
@@ -127,7 +129,7 @@ describe('insertProjectSession default', () => {
     expect(row?.supervision_mode).toBe('event');
   });
 
-  it('falls back to polling when the runtime row is unset', () => {
+  it('falls back to event when the runtime row is unset', () => {
     const id = 'test-anchor-default';
     db.insertProjectSession({
       id,
@@ -142,7 +144,7 @@ describe('insertProjectSession default', () => {
       last_seen_ms: Date.now(),
     } as unknown as Parameters<typeof db.insertProjectSession>[0]);
     const row = db.getProjectSession(id);
-    expect(row?.supervision_mode).toBe('polling');
+    expect(row?.supervision_mode).toBe('event');
   });
 
   it('still honours an explicit supervision_mode in the insert', () => {
@@ -184,11 +186,11 @@ describe('toAnchorView default', () => {
     const v1 = toAnchorView(
       row as unknown as Parameters<typeof toAnchorView>[0],
     );
-    expect(v1.supervision_mode).toBe('polling');
+    expect(v1.supervision_mode).toBe('event');
     const v2 = toAnchorView(
       row as unknown as Parameters<typeof toAnchorView>[0],
-      'event',
+      'polling',
     );
-    expect(v2.supervision_mode).toBe('event');
+    expect(v2.supervision_mode).toBe('polling');
   });
 });

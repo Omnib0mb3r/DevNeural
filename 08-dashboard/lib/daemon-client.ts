@@ -1674,9 +1674,11 @@ export interface ProjectAnchorTile {
   transcript_count: number;
   supervision_mode: SupervisionMode;
 }
-export const listProjectAnchorTiles = () =>
+export const listProjectAnchorTiles = (opts?: { status?: "live" | "all" }) =>
   request<{ ok: boolean; tiles: ProjectAnchorTile[] }>(
-    "/projects/anchor-tiles",
+    opts?.status === "all"
+      ? "/projects/anchor-tiles?status=all"
+      : "/projects/anchor-tiles",
   );
 
 // ── Smart-compact audit ─────────────────────────────────────────

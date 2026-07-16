@@ -3,8 +3,8 @@
 /**
  * Three-state supervision_mode toggle for a project anchor.
  *
- * polling — legacy cron supervision (default).
- * event   — daemon-driven push to Lex (newer pipeline).
+ * polling — legacy cron supervision (opt-in fallback).
+ * event   — daemon-driven push to Lex (the default).
  * off     — supervision disabled entirely (the kill-switch).
  *
  * Mounted on each ProjectsGrid tile that maps to a known anchor.
@@ -46,8 +46,8 @@ const LABEL: Record<SupervisionMode, string> = {
 };
 
 const TITLE: Record<SupervisionMode, string> = {
-  polling: "Legacy cron supervision (default)",
-  event: "Daemon-driven event supervision (newer pipeline)",
+  polling: "Legacy cron supervision (opt-in fallback)",
+  event: "Daemon-driven event supervision (default)",
   off: "Supervision disabled (kill-switch)",
 };
 

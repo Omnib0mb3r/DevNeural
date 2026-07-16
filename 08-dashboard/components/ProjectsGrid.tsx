@@ -49,10 +49,13 @@ export function ProjectsGrid({ compact = false, limit }: Props = {}) {
   });
   /* Anchor feed carries supervision_mode + status + phase. Joined to
    * the legacy project record by lowercased cwd so the toggle only
-   * renders on tiles that map to a known anchor. */
+   * renders on tiles that map to a known anchor. status=all so
+   * DORMANT anchors render the toggle too - with the default live
+   * filter, 31 of 33 anchored projects showed no supervision
+   * selector at all (2026-07-16 operator report). */
   const anchorsQ = useQuery({
-    queryKey: ["project-anchor-tiles"],
-    queryFn: listProjectAnchorTiles,
+    queryKey: ["project-anchor-tiles", "all"],
+    queryFn: () => listProjectAnchorTiles({ status: "all" }),
     refetchInterval: 10_000,
   });
   const anchorByCwd = new Map<string, ProjectAnchorTile>();
@@ -158,7 +161,12 @@ export function ProjectsGrid({ compact = false, limit }: Props = {}) {
               <span>{relTimeIso(p.last_seen)} ago</span>
             </div>
             {anchor && (
-              <div className="mt-3 pt-2 border-t border-border2 flex items-center justify-between gap-2 min-w-0">
+              /* flex-wrap: on narrow tiles (small screens / compact
+               * home grid) the toggle wraps onto its own row instead
+               * of being clipped by the tile's overflow-hidden - the
+               * selector used to vanish entirely at small form
+               * factors (2026-07-16 operator report). */
+              <div className="mt-3 pt-2 border-t border-border2 flex flex-wrap items-center justify-between gap-x-2 gap-y-1 min-w-0">
                 <span className="text-nano text-txt3 uppercase tracking-wider shrink-0">
                   supervision
                 </span>
