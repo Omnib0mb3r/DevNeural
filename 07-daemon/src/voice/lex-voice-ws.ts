@@ -1002,6 +1002,66 @@ export function _captureAbsorbedAsideImpl(
   }
 }
 
+/* Fix 24 live repro (2026-07-16): phantom-barge stash resume, pure
+ * impl. Mirrors the _flushPendingUtterancesImpl seam: the closure in
+ * attachLexVoiceWs delegates here so the resume rules (freshness
+ * window, superseded-by-new-speech, partial-chain un-interrupt,
+ * interrupted-segment-first ordering) are unit-testable without a
+ * live socket. Returns true when speech was resumed. */
+export const BARGE_RESUME_WINDOW_MS = 30_000;
+
+export interface BargeStashEntry {
+  interruptedSegment: string | null;
+  queuedSegments: string[];
+  atMs: number;
+  ctrlCPending: boolean;
+}
+
+export interface _ResumeBargedSpeechDeps {
+  stash: BargeStashEntry;
+  nowMs: number;
+  /** True when fresh speech started after the barge (in-flight ctx,
+   * running drain, or queued segments): the stash is superseded. */
+  ttsBusy: boolean;
+  partialChain: Array<{
+    intended_text: string;
+    started_at_ms: number;
+    cancelled_at_ms: number;
+  }>;
+  speak: (text: string) => void;
+  reason: string;
+  log?: (msg: string) => void;
+  windowMs?: number;
+}
+
+export function _resumeBargedSpeechImpl(deps: _ResumeBargedSpeechDeps): boolean {
+  const windowMs = deps.windowMs ?? BARGE_RESUME_WINDOW_MS;
+  if (deps.nowMs - deps.stash.atMs > windowMs) return false;
+  if (deps.ttsBusy) return false;
+  const segments = [
+    ...(deps.stash.interruptedSegment ? [deps.stash.interruptedSegment] : []),
+    ...deps.stash.queuedSegments,
+  ];
+  if (segments.length === 0) return false;
+  /* The kill pushed the interrupted segment onto partialChain as an
+   * "interrupted reply". We are un-interrupting it; leaving the entry
+   * would tell Lex a line was cut that the operator actually heard in
+   * full. */
+  const lastPartial = deps.partialChain[deps.partialChain.length - 1];
+  if (
+    deps.stash.interruptedSegment &&
+    lastPartial &&
+    lastPartial.intended_text === deps.stash.interruptedSegment
+  ) {
+    deps.partialChain.pop();
+  }
+  (deps.log ?? logFn)(
+    `[voice-ws] resuming barged TTS after phantom utterance (${deps.reason}): segments=${segments.length}`,
+  );
+  for (const seg of segments) deps.speak(seg);
+  return true;
+}
+
 export function attachLexVoiceWs(socket: FastifyWS): void {
   logFn(`[voice-ws] client connected (attach)`);
   /* 2026-07-16 smoke-test fix 3: boot the voice brain the moment a
@@ -2096,6 +2156,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           speak(s, { continuation: true });
         }
       },
+      log: logFn,
     })
       .then((delivered) => {
         if (!delivered && fallbackRaw) raw();
@@ -2355,6 +2416,76 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * handleUtteranceEnd and dispatched at the next natural turn
    * boundary (when handleJsonlLine clears awaitingResponseSince on
    * the end_turn record). */
+  /* Fix 24 live repro, 2026-07-16 smoke test: phantom barge stash.
+   *
+   * The AEC rework leaves the mic hot during playback, so VAD can fire
+   * utterance-start on Lex's own audio or room noise. Pre-fix that
+   * killed the ENTIRE remaining spoken body (in-flight segment + every
+   * queued sentence) and nothing ever resumed: a phantom transcript
+   * ([BLANK_AUDIO], noise words, suppressed echo) is dropped before it
+   * can inject, so the partial chain never reached Lex and the queued
+   * sentences were simply gone. Observed live at 03:28:30Z: the
+   * 1031-char reply body cut mid-playback, whisper then logged the
+   * barging "utterance" as [BLANK_AUDIO], and the operator called out
+   * the unfinished statement.
+   *
+   * New contract (words-not-energy barge-in, per the spec v2
+   * research): audio still stops INSTANTLY on utterance-start (barge
+   * latency is untouched), but what was playing is stashed. When the
+   * utterance resolves as phantom, the stash resumes (interrupted
+   * sentence restarts, queued sentences follow). When words confirm a
+   * real operator turn, the stash is dropped and the deferred PTY
+   * Ctrl+C fires - so phantom noise can no longer abort Lex's
+   * in-flight turn either. */
+  let bargeStash: BargeStashEntry | null = null;
+
+  /* The barging utterance resolved as phantom (blank audio, noise
+   * floor, or the top layer judged it Lex's own echo): put the barged
+   * speech back. The interrupted segment restarts from its beginning -
+   * a half-repeated sentence reads as a natural resume. Skips (and
+   * drops) the stash when fresh speech has started since or the stash
+   * is stale. Logic lives in _resumeBargedSpeechImpl (exported, unit-
+   * tested); this closure only supplies the live state. */
+  function resumeBargedSpeech(reason: string): void {
+    const stash = bargeStash;
+    if (!stash) return;
+    bargeStash = null;
+    _resumeBargedSpeechImpl({
+      stash,
+      nowMs: Date.now(),
+      ttsBusy: Boolean(
+        state.ttsActive || state.ttsQueueRunning || state.ttsQueue.length > 0,
+      ),
+      partialChain: state.partialChain,
+      speak: (text) => speak(text),
+      reason,
+    });
+  }
+
+  /* Words confirmed a real operator turn behind the barge: drop the
+   * stash (no resume) and fire the deferred PTY Ctrl+C so the worker
+   * drops the rest of the interrupted turn - the same effect the old
+   * unconditional utterance-start kill had, minus the phantom
+   * misfires. `withCtrlC=false` for interpreted controls like
+   * stop_speaking, whose contract is "silence the voice, Lex keeps
+   * working". */
+  function confirmRealBarge(withCtrlC: boolean): void {
+    const stash = bargeStash;
+    if (!stash) return;
+    bargeStash = null;
+    if (!withCtrlC || !stash.ctrlCPending) return;
+    if (state.bindKey) {
+      const handle = getPty(state.bindKey) || getPtyBySession(state.bindKey);
+      if (handle && !handle.exited) {
+        try {
+          handle.pty.write('\x03');
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
   function killActiveTts(reason: 'utterance-start' | 'barge-in'): void {
     /* Fix 40 (2026-05-26): controller owns the ctx + queue + partial-
      * chain bookkeeping. It returns true when a real in-flight ctx
@@ -2363,15 +2494,26 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * real cancellation per the existing Fix 20 contract — an
      * idle-state kill is just a queue-clear and should be silent
      * on the wire. */
+    const interruptedSegment = state.currentTtsText;
+    const queuedSegments = state.ttsQueue.map((q) => q.cleanText);
     const cancelled = speakCtrl.killActive();
     if (!cancelled) return;
     send({ t: 'tts-cancel', reason });
-    /* Only abort the PTY turn when TTS was actually in flight. The
-     * user is interrupting Lex's spoken reply; the worker should
-     * drop the rest of the turn. When TTS is null we DO NOT abort
-     * because the user may be stacking follow-on context onto an
-     * in-flight reasoning/tool sequence (handled in
-     * handleUtteranceEnd via pendingUserUtterances). */
+    if (reason === 'utterance-start') {
+      /* VAD energy, not yet words: stop the audio now, defer the
+       * destructive parts (queue loss + PTY Ctrl+C) until the
+       * transcript proves the barge real. See bargeStash above. */
+      bargeStash = {
+        interruptedSegment,
+        queuedSegments,
+        atMs: Date.now(),
+        ctrlCPending: true,
+      };
+      return;
+    }
+    /* Explicit barge-in frame: a deliberate client action (hotkey /
+     * legacy path), no phantom risk. Old behavior: abort the PTY turn
+     * immediately. */
     if (state.bindKey) {
       const handle = getPty(state.bindKey) || getPtyBySession(state.bindKey);
       if (handle && !handle.exited) {
@@ -2913,6 +3055,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         `[voice-ws] dropped whisper utterance: reason=${reason} words=${wordCount} text=${JSON.stringify(trimmed)}`,
       );
       send({ t: 'transcript', text: '', ms: result.ms });
+      /* Fix 24 live repro (2026-07-16): this drop is the phantom-barge
+       * signature - VAD fired on echo/noise, killed the spoken body,
+       * and whisper heard nothing real. Put the barged speech back. */
+      resumeBargedSpeech(reason);
       return;
     }
     send({ t: 'transcript', text: result.text, ms: result.ms });
@@ -2970,6 +3116,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * dashboard buttons. */
     if (matchPanicCommand(result.text)) {
       logFn('[voice-ws] panic phrase matched; dispatching');
+      confirmRealBarge(true);
       dispatchVoiceCommand('panic', 'transcript');
       state.utteranceStartedDuringTts = false;
       return;
@@ -3001,6 +3148,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           `[voice-ws] smart-turn hold (mid-thought): ${JSON.stringify(dec.text.slice(0, 80))}`,
         );
         send({ t: 'turn-held', text: dec.text });
+        /* Real words, just mid-thought: the barge is genuine, so the
+         * stash must not resume over the operator's continuation. */
+        confirmRealBarge(true);
         state.utteranceStartedDuringTts = false;
         return;
       }
@@ -3087,6 +3237,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       );
     }
     if (tl.control) {
+      /* Real interpreted control: drop any barge stash (never resume
+       * over an explicit instruction) but without the PTY Ctrl+C -
+       * stop_speaking's contract is "silence the voice, Lex keeps
+       * working" and the other controls run their own effects. */
+      confirmRealBarge(false);
       applyTopLayerControl(tl.control, remainderSpeech);
       return;
     }
@@ -3094,6 +3249,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       .join(' ')
       .trim();
     if (!tl.forward) {
+      confirmRealBarge(true);
       /* Conversational turn (or interpreted echo/noise: nothing said).
        * Speak the remainder and absorb: nothing reaches Lex this turn,
        * so the exchange is persisted and queued onto the asides ring
@@ -3129,8 +3285,16 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       logFn(
         `[voice-ws] suppressed fail-safe forward during TTS: ${JSON.stringify(result.text.slice(0, 80))}`,
       );
+      /* Judged to be Lex's own audio bleeding back in: the barge was
+       * phantom, so the interrupted body resumes instead of staying
+       * half-spoken (Fix 24 live repro, 2026-07-16). */
+      resumeBargedSpeech('echo-suppressed');
       return;
     }
+    /* Words confirmed a real operator turn: no resume, and the
+     * deferred barge Ctrl+C (if the turn started over live TTS)
+     * fires now so Lex drops the interrupted reply. */
+    confirmRealBarge(true);
     result = { text: tl.forward, ms: result.ms };
     /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
      * Direct-llm branch: no PTY, no jsonl watch. Build the system

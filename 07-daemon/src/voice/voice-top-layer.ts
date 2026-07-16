@@ -438,7 +438,30 @@ function lexReplySystem(): string {
 export interface VoiceLexReplyCtx {
   /** Sink for each spoken line as the brain streams its delivery. */
   onSpeech: (line: string) => void;
+  /** Optional log channel for delivery anomalies (the module itself
+   * is logger-less by design; the WS caller passes its logFn). */
+  log?: (msg: string) => void;
   deps?: Pick<TopLayerDeps, 'ask' | 'timeoutMs'>;
+}
+
+/* Delivery deadline scaled to the body (2026-07-16 smoke-test fix 4,
+ * brain-path half). The flat 3s render bound is fine as a "did the
+ * brain even pick this up" gate, but a long body streams from the
+ * brain for many seconds; cutting the ask at 3s after partials had
+ * already flowed truncated the spoken reply mid-delivery while
+ * voiceLexReply still reported delivered=true (first-partial latch),
+ * so the raw fallback never fired either. ~15ms per char of body
+ * generation headroom, floored at the render bound, capped at 30s. An
+ * explicit deps.timeoutMs override still wins untouched (tests). */
+const LEX_REPLY_TIMEOUT_CAP_MS = 30_000;
+
+export function lexReplyTimeoutMs(bodyChars: number, override?: number): number {
+  if (override !== undefined) return renderTimeoutMs(override);
+  const base = renderTimeoutMs();
+  return Math.min(
+    LEX_REPLY_TIMEOUT_CAP_MS,
+    Math.max(base, 2_000 + Math.round(bodyChars * 15)),
+  );
 }
 
 /* Heartbeat ask timeout. Deliberately looser than the render/turn
@@ -525,13 +548,26 @@ export async function voiceLexReply(
         'Deliver this reply from your deeper reasoning, verbatim on all ' +
         'facts:\n\n' +
         text,
-      timeoutMs: renderTimeoutMs(ctx.deps?.timeoutMs),
+      timeoutMs: lexReplyTimeoutMs(text.length, ctx.deps?.timeoutMs),
       onPartial,
     });
   } catch {
     raw = null;
   }
-  if (delivered) return true;
+  if (delivered) {
+    if (raw === null) {
+      /* Partials flowed but the ask never closed (timeout / session
+       * death mid-stream): the tail of Lex's reply was NOT spoken.
+       * Falling back raw here would re-speak the whole body over what
+       * the operator already heard, so we stay with what went out -
+       * but LOUDLY, because a silent version of this is exactly the
+       * Fix 24 "never finishes" symptom. */
+      ctx.log?.(
+        `[voice-top-layer] LEX REPLY DELIVERY CUT MID-STREAM: partials spoken but ask never closed (body=${text.length} chars); tail unspoken`,
+      );
+    }
+    return true;
+  }
   /* Non-streaming session path (or a single empty partial): fall back
    * to the resolved text. */
   const spoken = raw?.trim();
