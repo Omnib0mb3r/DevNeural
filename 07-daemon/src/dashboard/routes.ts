@@ -1976,7 +1976,12 @@ export async function registerDashboardRoutes(
    * action on the deck side. Phase reuses the /sessions vocab so
    * the deck's existing tile colour mapping just works. */
   app.get('/lex/anchor-tiles', async () => {
-    return { ok: true, tiles: listAnchorTiles() };
+    return {
+      ok: true,
+      tiles: listAnchorTiles(
+        (anchorId) => store.db.getProjectSession(anchorId)?.project_slug ?? null,
+      ),
+    };
   });
 
   app.delete('/lex/anchors/:id', async (req, reply) => {

@@ -35,9 +35,30 @@ export interface AnchorTile {
   pending_prompt: PendingPrompt | null;
   last_activity_ms: number;
   transcript_count: number;
+  /** project_slug of the worker anchor this brainstorm supervises
+   * (lex_session.supervises_project_anchor_id resolved), or null when
+   * unbound. The Stream Deck nests the supervised worker's session
+   * tiles under the brainstorm tile (2026-07-16 operator ask). */
+  supervised_project_slug: string | null;
 }
 
-export function listAnchorTiles(): AnchorTile[] {
+/** Resolve the supervised worker's project_slug for one lex session
+ * row. Pure over the injected resolver so it pins without a store. */
+export function supervisedSlugFor(
+  row: { supervises_project_anchor_id?: string | null },
+  resolveProjectSlug?: (anchorId: string) => string | null,
+): string | null {
+  if (!row.supervises_project_anchor_id || !resolveProjectSlug) return null;
+  try {
+    return resolveProjectSlug(row.supervises_project_anchor_id) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export function listAnchorTiles(
+  resolveProjectSlug?: (anchorId: string) => string | null,
+): AnchorTile[] {
   const live = listLexSessions({ status: 'live', limit: 200 });
   const liveSet = getLivePtyIds();
   const tiles: AnchorTile[] = [];
@@ -76,6 +97,7 @@ export function listAnchorTiles(): AnchorTile[] {
       pending_prompt: pending,
       last_activity_ms: lastActivity,
       transcript_count: refs.length,
+      supervised_project_slug: supervisedSlugFor(row, resolveProjectSlug),
     });
   }
   tiles.sort((a, b) => b.last_activity_ms - a.last_activity_ms);

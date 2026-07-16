@@ -235,13 +235,43 @@ export function StreamDeck() {
                   {tiles.length} live
                 </span>
               </div>
-              {tiles.map((t) => (
-                <AnchorDeckTile key={t.anchor_id} tile={t} />
-              ))}
+              {tiles.map((t) => {
+                /* Nest the supervised worker's session tiles slightly
+                 * under the brainstorm that drives them (2026-07-16
+                 * operator ask) so the pair reads as one unit. Groups
+                 * consumed here are dropped from the flat list below. */
+                const nested = t.supervised_project_slug
+                  ? groups.find((g) => g.slug === t.supervised_project_slug)
+                  : undefined;
+                return (
+                  <div key={t.anchor_id} className="space-y-1.5">
+                    <AnchorDeckTile tile={t} />
+                    {nested && (
+                      <div
+                        data-testid="deck-nested-worker"
+                        className="ml-4 pl-2 border-l border-border2 space-y-1.5"
+                      >
+                        {nested.sessions.map((s) => (
+                          <DeckTile
+                            key={s.session_id}
+                            session={s}
+                            onTap={handleTileTap}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
 
-          {groups.map(({ slug, label, sessions }) => (
+          {groups
+            .filter(
+              ({ slug }) =>
+                !tiles.some((t) => t.supervised_project_slug === slug),
+            )
+            .map(({ slug, label, sessions }) => (
             <div key={slug} className="space-y-2">
               {sessions.length > 1 && (
                 <div className="flex items-center justify-between px-1 pt-1">
