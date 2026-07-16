@@ -129,6 +129,7 @@ import {
   getDailyBrief,
   shouldRegenerateWhatsNew,
 } from './daily-brief.js';
+import { computeBrainstormKpis } from './brainstorm-kpi.js';
 import { generateWhatsNew } from '../wiki/whats-new.js';
 import { searchAll } from './search-all.js';
 import {
@@ -4432,44 +4433,11 @@ export async function registerDashboardRoutes(
 
   /* /stats/brainstorm-kpi drives the BrainstormKpiTiles. Counts come
    * from brainstorm_sessions (not brainstorm_chunks because the
-   * intent is sessions-as-records, not chunks-as-records). */
+   * intent is sessions-as-records, not chunks-as-records); the
+   * artifact + lineage KPIs come from wiki_drafts (2026-07-16: they
+   * were hardcoded 0 and the tiles said "pending" forever). */
   app.get('/stats/brainstorm-kpi', async () => {
-    const counts = (
-      store.db as unknown as {
-        db: {
-          prepare: (s: string) => { get: () => Record<string, number | string | null> };
-        };
-      }
-    ).db
-      .prepare(
-        `SELECT
-           COUNT(*)                                              AS total,
-           SUM(CASE WHEN ended_ms IS NOT NULL THEN (ended_ms - started_ms) / 1000.0 ELSE 0 END) / 3600.0
-                                                                 AS hours,
-           SUM(CASE WHEN project_slug IS NULL THEN 1 ELSE 0 END) AS project_less,
-           SUM(CASE WHEN substr(strftime('%Y-%m-%dT%H:%M:%SZ', started_ms / 1000.0, 'unixepoch'), 1, 10)
-                       = strftime('%Y-%m-%d', 'now') THEN 1 ELSE 0 END)
-                                                                 AS active_today
-         FROM brainstorm_sessions
-         WHERE COALESCE(kind, 'brainstorm') = 'brainstorm'`,
-      )
-      .get() as {
-      total: number;
-      hours: number;
-      project_less: number;
-      active_today: number;
-    };
-    const total = Number(counts.total ?? 0);
-    return {
-      ok: true,
-      total_brainstorms: total,
-      hours_captured: Number(counts.hours ?? 0),
-      artifacts_per_brainstorm_avg: 0,
-      wiki_lineage_coverage: 0,
-      project_less_ratio:
-        total > 0 ? Number(counts.project_less ?? 0) / total : 0,
-      active_today: Number(counts.active_today ?? 0),
-    };
+    return { ok: true, ...computeBrainstormKpis(store.db) };
   });
 
   /* /stats/outbound drives the OutboundCard. brainstorm_outbound_count

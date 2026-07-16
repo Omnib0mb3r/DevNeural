@@ -103,21 +103,22 @@ export function BrainstormKpiTiles() {
         sub="cumulative voice + notes"
         loading={loading}
       />
+      {/* Wired for real (2026-07-16): the daemon now computes both
+       * from wiki_drafts, so a zero is an honest zero - no more
+       * permanent "pending" badges. */}
       <Tile
         icon="Sparkles"
         label="Artifacts / brainstorm"
         value={fmt(d?.artifacts_per_brainstorm_avg ?? 0, 1)}
-        sub="avg across all brainstorms"
+        sub="wiki drafts per brainstorm"
         loading={loading}
-        pending={(d?.artifacts_per_brainstorm_avg ?? 0) === 0}
       />
       <Tile
         icon="GitBranch"
         label="Wiki lineage"
         value={pct(d?.wiki_lineage_coverage ?? 0)}
-        sub="pages traceable to a brainstorm"
+        sub="brainstorms with wiki drafts"
         loading={loading}
-        pending={(d?.wiki_lineage_coverage ?? 0) === 0}
       />
       <Tile
         icon="Layers"
