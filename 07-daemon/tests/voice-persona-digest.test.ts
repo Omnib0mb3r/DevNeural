@@ -118,5 +118,34 @@ describe('persona prompt', () => {
     const p = buildHaikuPersonaPrompt(null);
     expect(p.toLowerCase()).toMatch(/no digest yet/);
   });
+
+  /* 2026-07-16 fabrication fix: session 074b63b4 showed the talk model
+   * recombining raw digest fragments ("fresh start" in lastDecision,
+   * "Say it again?" as openQuestion, an empty last-line) into an
+   * invented first-person memory claim spoken as Lex. The digest lines
+   * must land contextualized as third-party WORK notes, and empty
+   * fields must read as explicit absence, never as bare fragments. */
+  it('renders empty digest fields as (none), never bare blanks', () => {
+    const p = buildHaikuPersonaPrompt({
+      currentTask: '',
+      lastDecision: 'Pill fix committed, ten minutes after his fresh start.',
+      openQuestion: '  ',
+      workerStatus: '',
+      nextSteps: '',
+    });
+    expect(p).toContain('Current task: (none)');
+    expect(p).toContain('Open question: (none)');
+    expect(p).toContain('Worker status: (none)');
+    expect(p).toContain(
+      'Pill fix committed, ten minutes after his fresh start.',
+    );
+  });
+
+  it('contextualizes digest lines as work notes, never self-description', () => {
+    const p = buildHaikuPersonaPrompt(DIGEST).toLowerCase();
+    expect(p).toMatch(/status notes/);
+    expect(p).toMatch(/not things you said/);
+    expect(p).toMatch(/never (quote|echo)/);
+  });
 });
 

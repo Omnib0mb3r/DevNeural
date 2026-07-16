@@ -10,6 +10,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   parseTopLayerReply,
   topLayerTurn,
+  isRepeatRequest,
+  referencesPriorTurns,
+  guardTopLayerSpeech,
   type AskFn,
   type TopLayerControl,
   type TopLayerCtx,
@@ -380,6 +383,185 @@ describe('topLayerTurn', () => {
     };
     await topLayerTurn('hi', makeCtx(ask));
     expect(timeoutMs).toBe(8000);
+  });
+});
+
+/* Fabrication guards (2026-07-16, kill-canned-glue mandate). Live
+ * failures: the talk layer invented "I can't see the last thing I said
+ * - if it's in a chat I can't access it because you have a fresh
+ * start" (a line Lex never wrote; session 074b63b4 shows the digest
+ * fragments - "fresh start", "Say it again?", empty last-line - it was
+ * recombined from), and in session ed330939 it answered an operator
+ * complaint IN LEX'S VOICE, promising supervisor actions it cannot
+ * take. These pin the deterministic guards: substance forwards without
+ * ever reaching the talk model, self-memory claims and action promises
+ * are stripped from speech, and the utterance always reaches Lex. */
+describe('topLayerTurn fabrication guards', () => {
+  it('an operator complaint about a prior line never reaches the talk model: silent forward', async () => {
+    let askCalled = false;
+    const ask: AskFn = async () => {
+      askCalled = true;
+      return 'Understood, and you are right to call it out.';
+    };
+    const utterance =
+      'You keep saying that line about a fresh start. I never heard you say that.';
+    const r = await topLayerTurn(utterance, makeCtx(ask));
+    expect(askCalled).toBe(false);
+    expect(r).toEqual({ speech: null, forward: utterance, control: null });
+  });
+
+  it('a repeat request with NOTHING to repeat forwards silently instead of inventing an excuse', async () => {
+    let askCalled = false;
+    const ask: AskFn = async () => {
+      askCalled = true;
+      return 'I cannot see my last message.';
+    };
+    const r = await topLayerTurn(
+      'can you say that again?',
+      makeCtx(ask, { lastSpoken: null }),
+    );
+    expect(askCalled).toBe(false);
+    expect(r).toEqual({
+      speech: null,
+      forward: 'can you say that again?',
+      control: null,
+    });
+  });
+
+  it('a repeat request WITH a last-spoken line still goes to the talk model', async () => {
+    let askCalled = false;
+    const ask: AskFn = async () => {
+      askCalled = true;
+      return 'The tests are green.';
+    };
+    const r = await topLayerTurn(
+      'say that again please',
+      makeCtx(ask, { lastSpoken: 'The tests are green.' }),
+    );
+    expect(askCalled).toBe(true);
+    expect(r.speech).toBe('The tests are green.');
+  });
+
+  it('strips a fabricated self-memory claim and forwards the utterance (the invented line, verbatim class)', async () => {
+    const ask: AskFn = async () =>
+      "I can't see the last thing I said - if it's in a chat I can't " +
+      'access it because you have a fresh start.';
+    const r = await topLayerTurn('hello there', makeCtx(ask));
+    expect(r.speech).toBeNull();
+    expect(r.forward).toBe('hello there');
+    expect(r.control).toBeNull();
+  });
+
+  it('strips an action promise but keeps the model-supplied FORWARD (the ed330939 shape)', async () => {
+    const ask: AskFn = async () =>
+      "Understood, you're right to call it out. I'll flag it with the supervisor.\n" +
+      'FORWARD: the operator says a canned line about a fresh start keeps repeating';
+    const r = await topLayerTurn('something is off with the voice', makeCtx(ask));
+    expect(r.speech).toBeNull();
+    expect(r.forward).toBe(
+      'the operator says a canned line about a fresh start keeps repeating',
+    );
+  });
+
+  it('digest-grounded benign speech is untouched (guards do not overfire)', async () => {
+    pushDigest(
+      {
+        currentTask: 'voice pill fix',
+        lastDecision: 'pill fix committed',
+        openQuestion: '',
+        workerStatus: 'worker is mid-build',
+        nextSteps: 'smart-clear fix next',
+      },
+      Date.now(),
+    );
+    const ask: AskFn = async () =>
+      'Pill fix is committed; the worker is mid-build.';
+    const r = await topLayerTurn('where are we', makeCtx(ask));
+    expect(r.speech).toBe('Pill fix is committed; the worker is mid-build.');
+  });
+
+  it('streaming: a fabricated self-memory claim never streams out loud', async () => {
+    const spoken: string[] = [];
+    const ask: AskFn = async (args) => {
+      const line =
+        "I can't see the last thing I said, you have a fresh start.";
+      args.onPartial?.(line);
+      return line;
+    };
+    const r = await topLayerTurn(
+      'hello',
+      makeCtx(ask, {}, { onSpeech: (l) => spoken.push(l) }),
+    );
+    expect(spoken).toEqual([]);
+    expect(r.speech).toBeNull();
+    expect(r.forward).toBe('hello');
+  });
+
+  it('streaming: a promise record is held mid-stream and stripped from the remainder', async () => {
+    const spoken: string[] = [];
+    const ask: AskFn = async (args) => {
+      args.onPartial?.('On it.');
+      args.onPartial?.("I'll flag it with the supervisor.");
+      return "On it.\nI'll flag it with the supervisor.";
+    };
+    const r = await topLayerTurn(
+      'the voice keeps glitching',
+      makeCtx(ask, {}, { onSpeech: (l) => spoken.push(l) }),
+    );
+    expect(spoken).toEqual(['On it.']);
+    expect(r.speech).toBeNull();
+    expect(r.forward).toBe('the voice keeps glitching');
+  });
+
+  it('guardTopLayerSpeech classifies the fabrication classes and passes benign lines', () => {
+    expect(
+      guardTopLayerSpeech("I can't see the last thing I said."),
+    ).not.toBeNull();
+    expect(guardTopLayerSpeech('you have a fresh start.')).not.toBeNull();
+    expect(
+      guardTopLayerSpeech("I'll flag it with the supervisor."),
+    ).not.toBeNull();
+    expect(guardTopLayerSpeech('I will look into the daemon logs.')).not.toBeNull();
+    expect(guardTopLayerSpeech('Pill fix is committed.')).toBeNull();
+    expect(guardTopLayerSpeech('Morning. Coffee first.')).toBeNull();
+    expect(guardTopLayerSpeech("I'll check.")).toBeNull();
+  });
+
+  it('referencesPriorTurns matches complaints and prior-turn meta, not ordinary asks', () => {
+    expect(
+      referencesPriorTurns('why do you keep saying that'),
+    ).toBe(true);
+    expect(referencesPriorTurns("that's not what you said")).toBe(true);
+    expect(referencesPriorTurns('you never said that')).toBe(true);
+    expect(referencesPriorTurns("you didn't finish that last statement")).toBe(
+      true,
+    );
+    expect(referencesPriorTurns('what broke overnight')).toBe(false);
+    expect(referencesPriorTurns('can you profile the ingest hot path')).toBe(
+      false,
+    );
+    expect(referencesPriorTurns('kill the stuck worker')).toBe(false);
+  });
+
+  it('isRepeatRequest matches repeat phrasings only', () => {
+    expect(isRepeatRequest('say that again')).toBe(true);
+    expect(isRepeatRequest('can you repeat that?')).toBe(true);
+    expect(isRepeatRequest('what did you just say')).toBe(true);
+    expect(isRepeatRequest('one more time')).toBe(true);
+    expect(isRepeatRequest('say hello to the team')).toBe(false);
+    expect(isRepeatRequest('repeat the build with verbose logging')).toBe(false);
+  });
+
+  it('system contract forbids self-answering complaints, promises, and memory talk', async () => {
+    let system = '';
+    const ask: AskFn = async (args) => {
+      system = args.system;
+      return 'ok';
+    };
+    await topLayerTurn('hi', makeCtx(ask));
+    expect(system.toLowerCase()).toContain('previous turn');
+    expect(system.toLowerCase()).toContain('never promise');
+    expect(system.toLowerCase()).toContain('memory');
   });
 });
 

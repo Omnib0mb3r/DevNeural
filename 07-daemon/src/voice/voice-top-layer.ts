@@ -141,6 +141,79 @@ const defaultAsk: AskFn = async (args) => {
 const FORWARD_LINE = /^\s*forward:(.*)$/i;
 const CONTROL_LINE = /^\s*control:(.*)$/i;
 
+/* ── fabrication guards (2026-07-16, kill-canned-glue mandate) ───────
+ *
+ * Live failures: the talk layer recombined digest fragments ("fresh
+ * start" in lastDecision, "Say it again?" as openQuestion, an empty
+ * last-spoken line) into an invented first-person memory claim ("I
+ * can't see the last thing I said - if it's in a chat I can't access
+ * it because you have a fresh start") and spoke it as Lex, repeatedly;
+ * it also answered an operator complaint in Lex's voice, promising
+ * supervisor actions it cannot take. Prompts alone cannot pin this -
+ * these deterministic guards do:
+ *
+ *   1. Substance never reaches the talk model: complaints and
+ *      prior-turn meta pre-bypass the ask entirely (silent forward),
+ *      as does a repeat request when there is nothing to repeat.
+ *   2. Speech that makes first-person memory/visibility claims or
+ *      promises actions is stripped (held mid-stream, stripped from
+ *      the final parse) and the utterance still reaches Lex. */
+
+const REPEAT_REQUEST_RE =
+  /\b(?:say|read)\s+(?:that|it)\s+again\b|\brepeat\s+(?:that|it|yourself)\b|\bsay\s+again\b|\bone\s+more\s+time\b|\bwhat\s+did\s+you\s+(?:just\s+)?say\b/i;
+
+const PRIOR_TURN_RES: readonly RegExp[] = [
+  /\byou\s+(?:just\s+|never\s+|already\s+)?(?:said|saying|told|claimed|promised|mentioned)\b/i,
+  /\byou\s+(?:keep|kept)\b/i,
+  /\byou\s+didn'?t\s+(?:say|finish|answer|reply|respond)\b/i,
+  /\bwhy\s+(?:do|did|are|would)\s+you\b/i,
+  /\b(?:that'?s|that\s+is)\s+not\s+what\s+(?:you|i)\s+(?:said|asked|meant)\b/i,
+  /\blast\s+(?:thing|line|message|reply|answer)\s+(?:you|i)\b/i,
+  /\bnever\s+(?:said|wrote|heard)\b/i,
+];
+
+/* First-person claims about own memory / visibility / session state.
+ * The talk layer has no such state to talk about; every one of these
+ * is fabrication (the live invented line hits three of them). */
+const SELF_CLAIM_RES: readonly RegExp[] = [
+  /\bI\s+(?:can'?t|cannot|don'?t|do\s+not|no\s+longer)\s+(?:see|access|recall|remember|view|find|read)\b/i,
+  /\b(?:my|your)\s+(?:memory|context|chat|history)\b/i,
+  /\bfresh\s+start\b/i,
+  /\bI\s+(?:don'?t|do\s+not)\s+have\s+(?:access|visibility)\b/i,
+];
+
+/* First-person commitments to actions. Only Lex (the deep brain)
+ * commits to actions; the talk layer hands off via FORWARD. A bare
+ * "I'll check" stays legal - it IS the sanctioned handoff phrasing -
+ * so the pattern requires a concrete action verb. */
+const ACTION_PROMISE_RE =
+  /\bI\s*(?:'ll|\s+will|'m\s+going\s+to|\s+am\s+going\s+to)\s+(?:flag|report|file|log|escalate|raise|notify|alert|tell|restart|fix|patch|update|investigate|look\s+into|follow\s+up|make\s+sure|check\s+with|take\s+care)\b/i;
+
+/** True for repeat phrasings ("say that again", "what did you just
+ * say"). With a last-spoken line these are answered verbatim by the
+ * model; with nothing to repeat they forward silently. */
+export function isRepeatRequest(utterance: string): boolean {
+  return REPEAT_REQUEST_RE.test(utterance);
+}
+
+/** True when the utterance is a complaint or otherwise references a
+ * prior turn / what was or was not said - substance the talk layer
+ * must never answer itself. */
+export function referencesPriorTurns(utterance: string): boolean {
+  return PRIOR_TURN_RES.some((re) => re.test(utterance));
+}
+
+/** Classify speech the talk layer must never say: a first-person
+ * memory/visibility claim or an action promise. Returns the reason
+ * (for logs/tests) or null for benign speech. */
+export function guardTopLayerSpeech(speech: string): string | null {
+  if (SELF_CLAIM_RES.some((re) => re.test(speech))) {
+    return 'self-memory-claim';
+  }
+  if (ACTION_PROMISE_RE.test(speech)) return 'action-promise';
+  return null;
+}
+
 /* True when any line of a record's text matches a directive regex.
  * Deliberately the RAW regexes, not the validated parse: an off-token
  * CONTROL: line stays plain text in the final parse, but mid-stream it
@@ -239,7 +312,12 @@ function topLayerSystem(): string {
     'CONTROL: <name> from exactly: mute unmute standby listen disable ' +
     'end_session stop_speaking interrupt_work. When in doubt: FORWARD. ' +
     'Never invent facts not in the digest. Asked to repeat: speak the ' +
-    'exact last-spoken line given below.'
+    'exact last-spoken line given below. Complaints, corrections, and ' +
+    'anything about a previous turn or what was or was not said: do ' +
+    'not answer yourself - output ONLY a FORWARD line, no speech. ' +
+    'Never promise actions ("I will flag it"): actions belong to your ' +
+    'deeper reasoning, via FORWARD. Never talk about your own memory, ' +
+    'context, or what you can or cannot see.'
   );
 }
 
@@ -328,6 +406,20 @@ export async function topLayerTurn(
   const ask = ctx.deps?.ask ?? defaultAsk;
   const onSpeech = ctx.deps?.onSpeech;
 
+  /* Fabrication guards, pre-ask (2026-07-16). A repeat request with
+   * nothing to repeat, and any complaint / prior-turn meta, forward
+   * silently WITHOUT the talk model ever seeing the turn - answering
+   * either from digest fragments is exactly how the invented
+   * "I can't see my last message" line was born. Repeat WITH a
+   * last-spoken line stays a model turn (it repeats verbatim). */
+  const repeatAsk = isRepeatRequest(utterance);
+  if (repeatAsk && !(ctx.lastSpoken && ctx.lastSpoken.trim())) {
+    return { speech: null, forward: utterance, control: null };
+  }
+  if (!repeatAsk && referencesPriorTurns(utterance)) {
+    return { speech: null, forward: utterance, control: null };
+  }
+
   /* Early-speech state. `consumed` holds every record text handled in
    * the early phase - emitted out loud OR ring-skipped - because
    * either way that text must not be spoken again from the final
@@ -345,6 +437,14 @@ export async function topLayerTurn(
           const text = recordText.trim();
           if (!text) return;
           if (containsDirectiveLine(text)) {
+            stopped = true;
+            return;
+          }
+          if (guardTopLayerSpeech(text) !== null) {
+            /* Fabrication class (self-memory claim / action promise):
+             * never streamed out loud. Held for the final parse, where
+             * the guard strips it from speech; NOT consumed, so the
+             * subtraction cannot mask the strip. */
             stopped = true;
             return;
           }
@@ -401,6 +501,17 @@ export async function topLayerTurn(
       result.speech = remainder || null;
     } else {
       result.earlySpeechMismatch = true;
+    }
+  }
+  /* Fabrication guard, post-parse: speech carrying a self-memory
+   * claim or an action promise is never spoken. The strip must not
+   * eat the operator's words - when it leaves no forward and no
+   * control, the utterance forwards (same shape as the fail-safe). */
+  if (result.speech !== null && guardTopLayerSpeech(result.speech) !== null) {
+    result.speech = null;
+    delete result.earlySpeechMismatch;
+    if (result.forward === null && result.control === null) {
+      result.forward = utterance;
     }
   }
   if (result.speech !== null) {

@@ -27,15 +27,36 @@ const PERSONA_RULES = [
   'spoken; preserve numbers, decisions, negations, and blockers verbatim.',
 ].join('\n');
 
+/* Fabrication fix (2026-07-16): the talk model recombined RAW digest
+ * fragments ("fresh start" inside lastDecision, a quoted "Say it
+ * again?" as openQuestion, an empty last-spoken line) into an invented
+ * first-person memory claim and spoke it as Lex. The digest lines are
+ * therefore contextualized as third-party notes about the WORK, and an
+ * empty field reads as explicit absence instead of a bare fragment. */
+const DIGEST_CONTEXT_NOTE = [
+  'These are status notes about the current WORK, written in passing.',
+  'They are NOT things you said, NOT your own history, and NOT events',
+  'that happened to you. Never quote or paraphrase a fragment of them',
+  'as a claim about yourself (a note mentioning a "fresh start" or',
+  'carrying a question mark describes the work, never you). A field',
+  'marked (none) means you know nothing there - say nothing about it.',
+].join('\n');
+
+function digestField(value: string): string {
+  const v = value.trim();
+  return v.length > 0 ? v : '(none)';
+}
+
 export function buildHaikuPersonaPrompt(digest?: LexDigest | null): string {
   const parts = [PERSONA_RULES, '', '--- LIVE DIGEST (your only source of fact) ---'];
   if (digest) {
     parts.push(
-      `Current task: ${digest.currentTask}`,
-      `Last decision: ${digest.lastDecision}`,
-      `Open question: ${digest.openQuestion}`,
-      `Worker status: ${digest.workerStatus}`,
-      `Next steps: ${digest.nextSteps}`,
+      DIGEST_CONTEXT_NOTE,
+      `Current task: ${digestField(digest.currentTask)}`,
+      `Last decision: ${digestField(digest.lastDecision)}`,
+      `Open question: ${digestField(digest.openQuestion)}`,
+      `Worker status: ${digestField(digest.workerStatus)}`,
+      `Next steps: ${digestField(digest.nextSteps)}`,
     );
   } else {
     parts.push(
