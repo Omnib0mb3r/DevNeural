@@ -98,6 +98,7 @@ import {
   voiceLexReply,
   voiceHeartbeat,
   type TopLayerControl,
+  type LexReplyOutcome,
 } from './voice-top-layer.js';
 import {
   isSmartTurnEnabled,
@@ -385,6 +386,86 @@ const REPLAY_ON_SWITCH =
 const REPLAY_WINDOW_MS = Number(
   process.env.DEVNEURAL_VOICE_REPLAY_WINDOW_MS ?? 8 * 60 * 1000,
 );
+
+/* Stale-replay gate (2026-07-16). Four firings in one night (ages 2s,
+ * 76s, 43s, 93s): the operator stop/started voice repeatedly and every
+ * reconnect re-spoke the previous reply, including ones he had already
+ * fully heard ("why do you keep saying that"). The AUDIO replay now
+ * requires BOTH: the reply is fresh (<= ~10s, not the 8-min window,
+ * which remains the digest-seeding recency), AND the reply was NOT
+ * fully delivered - the delivered/cut/miss outcome from the delivery
+ * layer is the signal; only cut or miss (or no record at all: the
+ * reply landed while no client was attached) may replay. Delivery
+ * outcomes live in a MODULE-level map keyed by session jsonl so they
+ * survive the per-connection closure across reconnects. */
+export const REPLAY_MAX_AGE_MS = Number(
+  process.env.DEVNEURAL_VOICE_REPLAY_MAX_AGE_MS ?? 10_000,
+);
+
+export interface ReplyDeliveryRecord {
+  outcome: LexReplyOutcome;
+  ms: number;
+}
+
+const lastReplyDeliveryBySession = new Map<string, ReplyDeliveryRecord>();
+
+export function _recordReplyDelivery(
+  sessionKey: string | null,
+  outcome: LexReplyOutcome,
+  ms: number,
+): void {
+  if (!sessionKey) return;
+  lastReplyDeliveryBySession.set(sessionKey, { outcome, ms });
+}
+
+export function _getReplyDelivery(
+  sessionKey: string | null,
+): ReplyDeliveryRecord | null {
+  if (!sessionKey) return null;
+  return lastReplyDeliveryBySession.get(sessionKey) ?? null;
+}
+
+export function _resetReplyDeliveryTracking(): void {
+  lastReplyDeliveryBySession.clear();
+}
+
+export interface ShouldReplayOnBindInput {
+  lastTurn: { text: string; mtimeMs: number } | null;
+  /** Most recent delivery outcome recorded for this session, if any. */
+  lastDelivery: ReplyDeliveryRecord | null;
+  now: number;
+  /** Default REPLAY_MAX_AGE_MS. */
+  maxAgeMs?: number;
+}
+
+export function _shouldReplayOnBindImpl(input: ShouldReplayOnBindInput): {
+  replay: boolean;
+  reason: string;
+} {
+  const maxAgeMs = input.maxAgeMs ?? REPLAY_MAX_AGE_MS;
+  if (!input.lastTurn || !input.lastTurn.text) {
+    return { replay: false, reason: 'no-last-turn' };
+  }
+  const ageMs = input.now - input.lastTurn.mtimeMs;
+  if (ageMs > maxAgeMs) {
+    return {
+      replay: false,
+      reason: `stale (age=${Math.round(ageMs / 1000)}s > ${Math.round(maxAgeMs / 1000)}s)`,
+    };
+  }
+  const d = input.lastDelivery;
+  /* A record older than the turn covered the PREVIOUS reply; only a
+   * record stamped at/after the turn speaks for this one. */
+  if (d && d.ms >= input.lastTurn.mtimeMs && d.outcome === 'delivered') {
+    return { replay: false, reason: 'already fully delivered' };
+  }
+  return {
+    replay: true,
+    reason: d && d.ms >= input.lastTurn.mtimeMs
+      ? `undelivered (${d.outcome})`
+      : 'no delivery record (client was away)',
+  };
+}
 
 export interface LastAssistantTurn {
   text: string;
@@ -1668,9 +1749,22 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       return;
     }
     if (!last || !last.text) return;
-    if (Date.now() - last.mtimeMs > REPLAY_WINDOW_MS) return;
+    /* Stale-replay gate (2026-07-16): fresh (<= ~10s) AND not already
+     * fully delivered. See _shouldReplayOnBindImpl for the contract. */
+    const decision = _shouldReplayOnBindImpl({
+      lastTurn: last,
+      lastDelivery: _getReplyDelivery(state.jsonlPath),
+      now: Date.now(),
+    });
+    const ageS = Math.round((Date.now() - last.mtimeMs) / 1000);
+    if (!decision.replay) {
+      logFn(
+        `[voice-ws] replay-on-switch: SKIPPED (${decision.reason}) age=${ageS}s bindKey=${state.bindKey ?? 'null'}`,
+      );
+      return;
+    }
     logFn(
-      `[voice-ws] replay-on-switch: speaking last reply (age=${Math.round((Date.now() - last.mtimeMs) / 1000)}s) bindKey=${state.bindKey ?? 'null'}`,
+      `[voice-ws] replay-on-switch: speaking last reply (${decision.reason}) age=${ageS}s bindKey=${state.bindKey ?? 'null'}`,
     );
     speak(last.text);
   }
@@ -2336,6 +2430,13 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   function speakViaBrain(text: string, fallbackRaw: boolean): void {
     deliverySeq += 1;
     const seq = deliverySeq;
+    /* Stamp the final delivery outcome per session (module-level, keyed
+     * by jsonl) so replay-on-switch on a LATER connection knows whether
+     * this reply was fully heard. raw() enqueues the complete body to
+     * TTS, so a raw fallback counts as delivered for replay purposes -
+     * replaying it seconds later would double-speak. */
+    const record = (o: LexReplyOutcome): void =>
+      _recordReplyDelivery(state.jsonlPath, o, Date.now());
     const raw = (): void => {
       for (const s of splitForSpeech(text)) speak(s, { continuation: true });
     };
@@ -2367,6 +2468,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
               `[voice-ws] redelivery ${second}; speaking raw body as final fallback`,
             );
             raw();
+            record('delivered');
+          } else if (second === 'delivered') {
+            record('delivered');
+          } else {
+            record(second);
           }
           return;
         }
@@ -2382,15 +2488,30 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           '[voice-ws] redelivery gave up waiting for warm brain; speaking raw body',
         );
         raw();
+        record('delivered');
       }
     };
     void deliver()
       .then((outcome) => {
-        if (outcome === 'miss' && fallbackRaw) raw();
-        else if (outcome === 'cut') void redeliverAfterRespawn();
+        if (outcome === 'miss' && fallbackRaw) {
+          raw();
+          record('delivered');
+        } else if (outcome === 'cut') {
+          record('cut');
+          void redeliverAfterRespawn();
+        } else if (outcome === 'miss') {
+          record('miss');
+        } else {
+          record('delivered');
+        }
       })
       .catch(() => {
-        if (fallbackRaw) raw();
+        if (fallbackRaw) {
+          raw();
+          record('delivered');
+        } else {
+          record('miss');
+        }
       });
   }
 

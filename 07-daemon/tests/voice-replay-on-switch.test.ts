@@ -1,7 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import {
   readLastAssistantTurn,
   _seedDigestFromLastTurnImpl,
+  _shouldReplayOnBindImpl,
+  _recordReplyDelivery,
+  _getReplyDelivery,
+  _resetReplyDeliveryTracking,
+  REPLAY_MAX_AGE_MS,
 } from '../src/voice/lex-voice-ws.js';
 import type { LexDigest } from '../src/voice/voice-digest.js';
 
@@ -178,5 +183,125 @@ describe('_seedDigestFromLastTurnImpl (fast-lane cold-start-on-switch fix)', () 
       buildVoiceDigest: () => digest(),
     });
     expect(out).toBeNull();
+  });
+});
+
+/**
+ * Stale-replay gate (2026-07-16). Four replay-on-switch firings in one
+ * night (04:33 age=2s, 04:39 age=76s, 04:48 age=43s, 04:59 age=93s):
+ * the operator stop/started voice repeatedly and every reconnect
+ * re-spoke the previous reply, including ones he had fully heard, up
+ * to 93s stale ("why do you keep saying that"). The old gate was age
+ * alone with an 8-MINUTE window and no notion of whether the reply had
+ * already been delivered. New gate: age under ~10s AND the reply was
+ * NOT fully delivered - the 3e37d8d delivered/cut/miss outcome is the
+ * signal; replay only cut or miss (or no record at all: the reply
+ * landed while no client was attached), never delivered.
+ */
+describe('_shouldReplayOnBindImpl (stale-replay gate)', () => {
+  const TURN = { text: 'the reply body', mtimeMs: 100_000 };
+
+  it('replays a fresh reply whose delivery was CUT mid-speech', () => {
+    const d = _shouldReplayOnBindImpl({
+      lastTurn: TURN,
+      lastDelivery: { outcome: 'cut', ms: 100_500 },
+      now: 103_000,
+    });
+    expect(d.replay).toBe(true);
+  });
+
+  it('replays a fresh reply whose delivery MISSED entirely', () => {
+    const d = _shouldReplayOnBindImpl({
+      lastTurn: TURN,
+      lastDelivery: { outcome: 'miss', ms: 100_500 },
+      now: 103_000,
+    });
+    expect(d.replay).toBe(true);
+  });
+
+  it('never replays a fully delivered reply, even seconds old (the 04:33Z age=2s firing)', () => {
+    const d = _shouldReplayOnBindImpl({
+      lastTurn: TURN,
+      lastDelivery: { outcome: 'delivered', ms: 100_800 },
+      now: 102_000,
+    });
+    expect(d.replay).toBe(false);
+    expect(d.reason).toContain('delivered');
+  });
+
+  it('age gate: a 76s-old reply never replays regardless of outcome (the 04:39Z firing)', () => {
+    const d = _shouldReplayOnBindImpl({
+      lastTurn: TURN,
+      lastDelivery: { outcome: 'cut', ms: 100_500 },
+      now: TURN.mtimeMs + 76_000,
+    });
+    expect(d.replay).toBe(false);
+    expect(d.reason).toContain('stale');
+  });
+
+  it('no delivery record within the window still replays (reply landed while no client was attached)', () => {
+    const d = _shouldReplayOnBindImpl({
+      lastTurn: TURN,
+      lastDelivery: null,
+      now: TURN.mtimeMs + 3_000,
+    });
+    expect(d.replay).toBe(true);
+  });
+
+  it('a delivery record that predates the turn is ignored (it covered the PREVIOUS reply)', () => {
+    const d = _shouldReplayOnBindImpl({
+      lastTurn: TURN,
+      lastDelivery: { outcome: 'delivered', ms: 99_000 },
+      now: TURN.mtimeMs + 3_000,
+    });
+    expect(d.replay).toBe(true);
+  });
+
+  it('no last turn never replays', () => {
+    const d = _shouldReplayOnBindImpl({
+      lastTurn: null,
+      lastDelivery: null,
+      now: 0,
+    });
+    expect(d.replay).toBe(false);
+  });
+
+  it('the default window is ~10s', () => {
+    expect(REPLAY_MAX_AGE_MS).toBe(10_000);
+    const inWindow = _shouldReplayOnBindImpl({
+      lastTurn: TURN,
+      lastDelivery: null,
+      now: TURN.mtimeMs + 9_000,
+    });
+    const outOfWindow = _shouldReplayOnBindImpl({
+      lastTurn: TURN,
+      lastDelivery: null,
+      now: TURN.mtimeMs + 11_000,
+    });
+    expect(inWindow.replay).toBe(true);
+    expect(outOfWindow.replay).toBe(false);
+  });
+});
+
+describe('reply delivery tracking (module-level, survives reconnects)', () => {
+  beforeEach(() => {
+    _resetReplyDeliveryTracking();
+  });
+
+  it('records and returns the latest outcome per session key', () => {
+    _recordReplyDelivery('a.jsonl', 'cut', 1_000);
+    _recordReplyDelivery('a.jsonl', 'delivered', 2_000);
+    _recordReplyDelivery('b.jsonl', 'miss', 3_000);
+    expect(_getReplyDelivery('a.jsonl')).toEqual({
+      outcome: 'delivered',
+      ms: 2_000,
+    });
+    expect(_getReplyDelivery('b.jsonl')).toEqual({ outcome: 'miss', ms: 3_000 });
+  });
+
+  it('null keys are a no-op and unknown keys return null', () => {
+    _recordReplyDelivery(null, 'delivered', 1_000);
+    expect(_getReplyDelivery(null)).toBeNull();
+    expect(_getReplyDelivery('never-seen.jsonl')).toBeNull();
   });
 });
