@@ -259,12 +259,202 @@ export function draftReseed(input: DraftReseedInput): string {
   return parts.join('\n');
 }
 
+/* ── worker-anchored activity (2026-07-16) ──────────────────────────
+ *
+ * Smart-clear plans against a WORKER anchor (a project_session id).
+ * Worker anchors have NO brainstorm row, so the brainstorm-anchored
+ * investigator fails closed and the sweep used to come back empty:
+ * the 05:11:01Z live draft carried only git signals and vetReseed
+ * rightly rejected it for "no next step". The worker's live jsonl
+ * tail is the active-work source - the latest substantial user
+ * directive carries the current task, the queued next items, and the
+ * standing constraints verbatim; the latest assistant text shows
+ * where the worker actually is. Extraction is deterministic and
+ * bounded; when the tail yields nothing the draft degrades exactly
+ * as before and the (unchanged) vet gate keeps rejecting it. */
+
+export interface WorkerActivity {
+  /** Latest substantial user directive (reminder-stripped, bounded). */
+  directive: string | null;
+  /** Latest assistant text (bounded). */
+  reply: string | null;
+  /** Directive lines that read as queued / next work. */
+  nextItems: string[];
+  /** Directive lines that read as standing constraints. */
+  constraints: string[];
+}
+
+/* A user turn must clear this to count as a directive; filters out
+ * "ok" / short steering fragments and tool_result-only records whose
+ * text extraction is empty. */
+const WORKER_DIRECTIVE_MIN_CHARS = 80;
+/** Tail window scanned for activity; directives live near the end. */
+export const WORKER_TAIL_BYTES = 256 * 1024;
+const WORKER_DIRECTIVE_SLICE = 1200;
+const WORKER_REPLY_SLICE = 240;
+const WORKER_ITEM_SLICE = 160;
+const WORKER_ITEM_CAP = 5;
+
+const WORKER_NEXT_LINE_RE =
+  /\b(next|queue|queued|todo|to-do|remaining|then|after (this|that|the))\b/i;
+const WORKER_CONSTRAINT_LINE_RE =
+  /\b(constraints?|do not|don't|never|must|additive)\b/i;
+
+function stripHarnessNoise(text: string): string {
+  return text
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+    .trim();
+}
+
+function assistantTextOf(msg: unknown): string {
+  const m = msg as { content?: unknown } | undefined;
+  if (!m || !Array.isArray(m.content)) return '';
+  return m.content
+    .map((c) => {
+      const block = c as { type?: string; text?: string };
+      return block?.type === 'text' && typeof block.text === 'string'
+        ? block.text
+        : '';
+    })
+    .join(' ')
+    .trim();
+}
+
+/* Pure over the jsonl tail text. Never throws; unparseable lines are
+ * skipped the same way confirmResumeOnTask skips them. */
+export function extractWorkerActivity(jsonlTail: string): WorkerActivity {
+  let directive: string | null = null;
+  let reply: string | null = null;
+  for (const line of (jsonlTail ?? '').split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t) continue;
+    let rec: { type?: string; message?: unknown };
+    try {
+      rec = JSON.parse(t) as { type?: string; message?: unknown };
+    } catch {
+      continue;
+    }
+    if (rec.type === 'user') {
+      const text = stripHarnessNoise(userTextOf(rec.message));
+      if (text.length >= WORKER_DIRECTIVE_MIN_CHARS) {
+        directive = text.slice(0, WORKER_DIRECTIVE_SLICE);
+      }
+    } else if (rec.type === 'assistant') {
+      const text = assistantTextOf(rec.message);
+      if (text) reply = text.slice(0, WORKER_REPLY_SLICE);
+    }
+  }
+  const nextItems: string[] = [];
+  const constraints: string[] = [];
+  if (directive) {
+    for (const raw of directive.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      if (
+        nextItems.length < WORKER_ITEM_CAP &&
+        WORKER_NEXT_LINE_RE.test(line)
+      ) {
+        nextItems.push(line.slice(0, WORKER_ITEM_SLICE));
+      }
+      if (
+        constraints.length < WORKER_ITEM_CAP &&
+        WORKER_CONSTRAINT_LINE_RE.test(line)
+      ) {
+        constraints.push(line.slice(0, WORKER_ITEM_SLICE));
+      }
+    }
+  }
+  return { directive, reply, nextItems, constraints };
+}
+
+/* Report section rendered from the activity. Empty when the tail
+ * yielded nothing - the assembler must never fabricate content the
+ * vet gate would then bless. */
+export function buildWorkerActivityBlock(activity: WorkerActivity): string {
+  if (!activity.directive && !activity.reply) return '';
+  const lines: string[] = ['# Worker active context (live session tail)'];
+  if (activity.directive) {
+    const firstLine =
+      activity.directive
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .find((l) => l.length > 0) ?? '';
+    lines.push(`Current task: ${firstLine.slice(0, 200)}`);
+  }
+  if (activity.nextItems.length > 0) {
+    lines.push(`Queued next: ${activity.nextItems.join('; ').slice(0, 300)}`);
+  }
+  if (activity.constraints.length > 0) {
+    lines.push(
+      `Constraints in force: ${activity.constraints.join('; ').slice(0, 300)}`,
+    );
+  }
+  if (activity.reply) {
+    lines.push(`Recent worker reply: ${activity.reply}`);
+  }
+  if (activity.directive) {
+    lines.push('', 'Latest directive (verbatim, bounded):', activity.directive);
+  }
+  return lines.join('\n');
+}
+
+/* Structured hints straight from the activity - no heuristic line
+ * scan needed for the live-tail source. Null fields defer to the
+ * report-scan heuristics in assembleSmartClearReport. */
+export function workerHints(activity: WorkerActivity): ThreadHints {
+  const doingLine = activity.directive
+    ? (activity.directive
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .find((l) => l.length > 0) ?? null)
+    : null;
+  return {
+    doing: doingLine ? doingLine.slice(0, 200) : null,
+    next:
+      activity.nextItems.length > 0
+        ? activity.nextItems.join('; ').slice(0, 200)
+        : null,
+    decisions: activity.constraints.slice(0, 3).map((c) => c.slice(0, 160)),
+  };
+}
+
+/* Tail-read the worker jsonl (multi-MB files; only the end matters).
+ * A readFile seam (tests) reads whole-body then slices; prod does a
+ * bounded fd read. Never throws. */
+function readWorkerTail(
+  p: string,
+  readFile?: (p: string) => string | null,
+): string | null {
+  if (readFile) {
+    const body = readFile(p);
+    return body ? body.slice(-WORKER_TAIL_BYTES) : null;
+  }
+  try {
+    const stat = nodeFs.statSync(p);
+    const len = Math.min(stat.size, WORKER_TAIL_BYTES);
+    if (len <= 0) return null;
+    const fd = nodeFs.openSync(p, 'r');
+    try {
+      const buf = Buffer.alloc(len);
+      nodeFs.readSync(fd, buf, 0, len, stat.size - len);
+      return buf.toString('utf8');
+    } finally {
+      nodeFs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
 export interface AssembleSmartClearInput {
   db: IndexDb;
   anchorId: string;
   cwd: string;
   label?: string | null;
   projectScopeId?: string | null;
+  /** The worker's live session jsonl (resolved by the route via
+   * jsonlForAnchor). Optional: absent behaves exactly as before. */
+  workerJsonlPath?: string | null;
   /** Test seam: repo state probe. Defaults to a git subprocess. */
   repoProbe?: RepoProbe;
   /** Test seams passed through to assembleInvestigatorContext. */
@@ -306,9 +496,34 @@ export function assembleSmartClearReport(
   } catch {
     assembled = { block: '', hasContent: false, anchorId: input.anchorId };
   }
+  /* Worker-anchored activity: the live jsonl tail is the primary
+   * active-work source for smart-clear (worker anchors have no
+   * brainstorm row, so the investigator above legitimately comes back
+   * empty for them). The tail block LEADS the report - the freshest
+   * signal of what to resume on. */
+  let activity: WorkerActivity | null = null;
+  if (input.workerJsonlPath) {
+    const tail = readWorkerTail(input.workerJsonlPath, input.readFile);
+    if (tail) activity = extractWorkerActivity(tail);
+  }
+  const workerBlock = activity ? buildWorkerActivityBlock(activity) : '';
+  const report = [workerBlock, assembled.block]
+    .filter((s) => s.trim().length > 0)
+    .join('\n\n');
   const signals = repoProbe(input.cwd);
   const stoppingPoint = draftStoppingPoint(signals);
-  const hints = extractThreadHints(assembled.block);
+  /* Hints: structured worker-tail extraction first (deterministic),
+   * report-scan heuristics fill whatever the tail did not provide. */
+  const heuristic = extractThreadHints(report);
+  const worker = activity
+    ? workerHints(activity)
+    : { doing: null, next: null, decisions: [] };
+  const hints: ThreadHints = {
+    doing: worker.doing ?? heuristic.doing,
+    next: worker.next ?? heuristic.next,
+    decisions:
+      worker.decisions.length > 0 ? worker.decisions : heuristic.decisions,
+  };
   const reseed = draftReseed({
     label: input.label ?? null,
     signals,
@@ -317,8 +532,8 @@ export function assembleSmartClearReport(
   });
   return {
     anchorId: input.anchorId,
-    hasContent: assembled.hasContent,
-    report: assembled.block,
+    hasContent: assembled.hasContent || workerBlock.trim().length > 0,
+    report,
     stoppingPoint,
     reseed,
     signals,

@@ -168,11 +168,17 @@ export function registerSmartClearRoutes(
     }
     const cwd = (body.cwd ?? ps?.cwd ?? bsCwd ?? '').replace(/\\/g, '/');
     const label = bsLabel ?? ps?.title ?? null;
+    /* Worker anchors (project_session ids) have no brainstorm row, so
+     * the investigator sweep inside assembleSmartClearReport fails
+     * closed for them; the worker's live jsonl tail is their
+     * active-work source (2026-07-16 content-empty draft fix). */
+    const workerJsonlPath = jsonlForAnchor(db, body.anchor_id);
     const report = assembleSmartClearReport({
       db,
       anchorId: body.anchor_id,
       cwd,
       label,
+      workerJsonlPath,
     });
     const vet = vetReseed(report.reseed);
     const cfg = smartClearConfig(db);
