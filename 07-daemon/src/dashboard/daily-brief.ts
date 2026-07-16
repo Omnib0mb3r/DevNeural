@@ -26,6 +26,21 @@ export interface DailyBriefResponse {
   whats_new_markdown: string;
 }
 
+/* Staleness regeneration (2026-07-16 operator audit: the brief sat
+ * stale for days because whats-new only regenerated on the weekly
+ * lint cycle). Regeneration is cheap file aggregation, no LLM, so
+ * the route re-runs it whenever the digest is missing or older than
+ * this threshold. */
+export const WHATS_NEW_REGEN_THRESHOLD_HOURS = 24;
+
+export function shouldRegenerateWhatsNew(
+  ageHours: number | null,
+  thresholdHours: number = WHATS_NEW_REGEN_THRESHOLD_HOURS,
+): boolean {
+  if (ageHours === null) return true;
+  return ageHours > thresholdHours;
+}
+
 export function getDailyBrief(): DailyBriefResponse {
   const projects = listProjects();
   const sessions = listSessions();

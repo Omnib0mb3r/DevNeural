@@ -1,7 +1,7 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
-import { dailyBrief } from "@/lib/daemon-client";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { dailyBrief, regenerateWhatsNew } from "@/lib/daemon-client";
 import { Icon } from "./Icon";
 
 function greeting(): string {
@@ -97,6 +97,16 @@ export function DailyBrief() {
     queryFn: dailyBrief,
     refetchInterval: 60_000,
   });
+  /* Refresh = real regeneration (2026-07-16 operator audit: the old
+   * button only refetched the GET, which re-served the same stale
+   * digest file). POST /whats-new rebuilds the digest daemon-side
+   * (cheap file aggregation), then the refetch picks it up. */
+  const regenM = useMutation({
+    mutationFn: () => regenerateWhatsNew(7),
+    onSettled: () => {
+      void q.refetch();
+    },
+  });
 
   const summary = q.data?.summary;
   const md = q.data?.whats_new_markdown ?? "";
@@ -137,10 +147,16 @@ export function DailyBrief() {
         <button
           type="button"
           aria-label="Refresh brief"
-          onClick={() => q.refetch()}
-          className="flex items-center gap-1.5 text-nano text-txt3 hover:text-txt1"
+          onClick={() => regenM.mutate()}
+          disabled={regenM.isPending}
+          className="flex items-center gap-1.5 text-nano text-txt3 hover:text-txt1 disabled:opacity-50"
         >
-          <Icon name="RefreshCw" size={12} /> refresh
+          <Icon
+            name="RefreshCw"
+            size={12}
+            className={regenM.isPending ? "animate-spin" : ""}
+          />{" "}
+          {regenM.isPending ? "rebuilding…" : "refresh"}
         </button>
       </div>
       <div className="relative px-7 py-6">

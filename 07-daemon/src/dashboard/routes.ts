@@ -125,7 +125,11 @@ import {
   resetBackfill,
 } from '../wiki/backfill.js';
 import { repairWikiCrossRefs } from '../wiki/repair.js';
-import { getDailyBrief } from './daily-brief.js';
+import {
+  getDailyBrief,
+  shouldRegenerateWhatsNew,
+} from './daily-brief.js';
+import { generateWhatsNew } from '../wiki/whats-new.js';
 import { searchAll } from './search-all.js';
 import {
   listReminders,
@@ -707,7 +711,22 @@ export async function registerDashboardRoutes(
     };
   });
 
-  app.get('/dashboard/daily-brief', async () => getDailyBrief());
+  app.get('/dashboard/daily-brief', async () => {
+    let brief = getDailyBrief();
+    /* Self-healing staleness (2026-07-16): regenerate the whats-new
+     * digest when missing or older than the threshold - pure file
+     * aggregation, no LLM, so doing it inline is cheap. Best-effort:
+     * a failed regen still serves the stale copy. */
+    if (shouldRegenerateWhatsNew(brief.summary.whats_new_age_hours)) {
+      try {
+        generateWhatsNew(7);
+        brief = getDailyBrief();
+      } catch (err) {
+        log(`[daily-brief] whats-new regen failed: ${(err as Error).message}`);
+      }
+    }
+    return brief;
+  });
 
   /* Fix 34 diagnostics. Per-stage counters + recent 20 rows from the
    * worker_event_diagnostic_log so an operator can curl the wire and

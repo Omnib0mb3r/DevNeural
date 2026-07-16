@@ -1367,6 +1367,14 @@ export const dismissAllNotifications = (scope: NotificationScope) =>
     body: { scope },
   });
 
+/* Regenerate the whats-new digest behind the daily brief (cheap file
+ * aggregation daemon-side; the brief's refresh button drives this). */
+export const regenerateWhatsNew = (days: number = 7) =>
+  request<{ ok: boolean }>(`/whats-new`, {
+    method: "POST",
+    body: { days },
+  });
+
 /* One-click correction on a wiki page. Used by the live activity rail
  * when the user spots a curator injection that was bad recall. Daemon
  * lowers weight + increments corrections; archives at 3+ corrections. */
