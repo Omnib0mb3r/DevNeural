@@ -58,13 +58,15 @@ export function MeetingList() {
         <p className="text-sm text-txt3">loading…</p>
       ) : rows.length === 0 ? (
         <div className="rounded border border-dashed border-border1 bg-surface1 p-6 text-center text-sm text-txt3">
-          <p>no meetings yet</p>
+          <p>No meetings yet.</p>
           <p className="mt-1">
-            audio retention only starts after consent is acked. start one with{" "}
-            <Link href="/sessions/new" className="text-brandSoft underline">
-              new session
-            </Link>{" "}
-            in notes mode.
+            Start one from the{" "}
+            <Link href="/lex" className="text-brandSoft underline">
+              voice panel
+            </Link>
+            : switch to notes mode and turn on the meeting toggle before
+            speaking. The session lands here as a meeting, and audio is only
+            retained after you acknowledge consent.
           </p>
         </div>
       ) : (

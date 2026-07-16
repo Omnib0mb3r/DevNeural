@@ -160,12 +160,40 @@ export function ProjectsGrid({ compact = false, limit }: Props = {}) {
               </span>
               <span>{relTimeIso(p.last_seen)} ago</span>
             </div>
-            {anchor && (
-              /* flex-wrap: on narrow tiles (small screens / compact
-               * home grid) the toggle wraps onto its own row instead
-               * of being clipped by the tile's overflow-hidden - the
-               * selector used to vanish entirely at small form
-               * factors (2026-07-16 operator report). */
+            {anchor && compact && (
+              /* Home tiles are GLANCE surfaces (2026-07-16 operator
+               * audit: duplicating the projects page's supervision
+               * control here was redundant). Read-only status instead:
+               * worker phase + current supervision mode; the actual
+               * toggle lives once, on /projects. */
+              <div
+                data-testid="projects-grid-compact-status"
+                className="mt-3 pt-2 border-t border-border2 flex flex-wrap items-center gap-x-3 gap-y-1 min-w-0 text-nano font-mono text-txt3"
+              >
+                <span className="inline-flex items-center gap-1.5">
+                  <StatusDot
+                    status={
+                      anchor.phase === "permission"
+                        ? "warn"
+                        : anchor.phase === "thinking" || anchor.phase === "tool"
+                          ? "ai"
+                          : anchor.status === "live"
+                            ? "live"
+                            : "idle"
+                    }
+                  />
+                  {anchor.phase !== "unknown" ? anchor.phase : anchor.status}
+                </span>
+                <span title="Supervision mode (change it on the Projects page)">
+                  supervision: {anchor.supervision_mode}
+                </span>
+              </div>
+            )}
+            {anchor && !compact && (
+              /* flex-wrap: on narrow tiles the toggle wraps onto its
+               * own row instead of being clipped by the tile's
+               * overflow-hidden - the selector used to vanish entirely
+               * at small form factors (2026-07-16 operator report). */
               <div className="mt-3 pt-2 border-t border-border2 flex flex-wrap items-center justify-between gap-x-2 gap-y-1 min-w-0">
                 <span className="text-nano text-txt3 uppercase tracking-wider shrink-0">
                   supervision
