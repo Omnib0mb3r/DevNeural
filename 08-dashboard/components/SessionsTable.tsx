@@ -115,28 +115,50 @@ export function SessionsTable() {
         </div>
       )}
 
-      {idleProjects.length > 0 && (
-        <div className="border-b border-border1">
-          <div className="px-5 py-2 text-nano text-txt3 uppercase tracking-[0.16em]">
-            Ready to start ({idleProjects.length})
-          </div>
-          <ul className="divide-y divide-border2">
+      {/* ONE table (2026-07-16 operator directive): live/idle sessions
+       * and ready-to-start projects are rows of the same table - the
+       * start button doubles as the status indicator for projects with
+       * no session, and every session row carries id + state inline. */}
+      {(visible.length > 0 || idleProjects.length > 0) && (
+        <table className="w-full">
+          <thead>
+            <tr className="text-left text-nano text-txt3 border-b border-border2">
+              <th className="px-5 py-2 font-normal">Project</th>
+              <th className="px-3 py-2 font-normal">Session ID</th>
+              <th className="px-3 py-2 font-normal">Status</th>
+              <th className="px-3 py-2 font-normal">Captured state</th>
+              <th className="px-3 py-2 font-normal text-right">Last activity</th>
+              <th className="px-5 py-2 font-normal text-right">Action</th>
+            </tr>
+          </thead>
+          <tbody>
             {idleProjects.map((p) => {
               const pending = pendingStart.has(p.id);
               return (
-                <li
-                  key={p.id}
-                  className="px-5 py-3 flex items-center justify-between gap-3"
+                <tr
+                  key={`startable-${p.id}`}
+                  data-testid="sessions-startable-row"
+                  className="border-b border-border2"
                 >
-                  <div className="min-w-0">
+                  <td className="px-5 py-3">
                     <div className="text-sm text-txt1 font-emphasized truncate">
                       {p.name}
                     </div>
                     <div className="text-nano text-txt3 font-mono truncate">
                       {p.root}
                     </div>
-                  </div>
-                  <div className="flex items-center gap-2 flex-shrink-0">
+                  </td>
+                  <td className="px-3 py-3 font-mono text-xs text-txt3">—</td>
+                  <td className="px-3 py-3">
+                    <span className="inline-flex items-center gap-1.5 text-xs text-txt3">
+                      <StatusDot status="idle" /> not running
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 text-xs text-txt3">—</td>
+                  <td className="px-3 py-3 text-right text-[11px] font-mono text-txt3">
+                    —
+                  </td>
+                  <td className="px-5 py-3 text-right">
                     <button
                       type="button"
                       disabled={pending}
@@ -145,26 +167,10 @@ export function SessionsTable() {
                     >
                       {pending ? "starting…" : "Start Claude"}
                     </button>
-                  </div>
-                </li>
+                  </td>
+                </tr>
               );
             })}
-          </ul>
-        </div>
-      )}
-
-      {visible.length > 0 && (
-        <table className="w-full">
-          <thead>
-            <tr className="text-left text-nano text-txt3 border-b border-border2">
-              <th className="px-5 py-2 font-normal">Project</th>
-              <th className="px-3 py-2 font-normal">Session ID</th>
-              <th className="px-3 py-2 font-normal">Status</th>
-              <th className="px-3 py-2 font-normal">Captured state</th>
-              <th className="px-5 py-2 font-normal text-right">Last activity</th>
-            </tr>
-          </thead>
-          <tbody>
             {visible.map((s) => {
               const href = `/sessions/detail?id=${encodeURIComponent(s.session_id)}`;
               return (
@@ -219,8 +225,17 @@ export function SessionsTable() {
                       {!s.has_task && !s.has_summary && <span className="text-txt3">—</span>}
                     </span>
                   </td>
-                  <td className="px-5 py-3 text-right text-[11px] font-mono text-txt3">
+                  <td className="px-3 py-3 text-right text-[11px] font-mono text-txt3">
                     {relTime(s.last_modified_ms)} ago
+                  </td>
+                  <td className="px-5 py-3 text-right">
+                    <Link
+                      href={href}
+                      onClick={(e) => e.stopPropagation()}
+                      className="text-xs font-mono text-txt3 hover:text-txt1"
+                    >
+                      open
+                    </Link>
                   </td>
                 </tr>
               );
