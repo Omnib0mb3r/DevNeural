@@ -214,6 +214,13 @@ export function armRelauncher(
   const spawnPowershellFallback = (): boolean => {
     const inline = `Start-Sleep -Seconds 2; & '${startScript.replace(/'/g, "''")}' -Force`;
     try {
+      /* NOT detached: powershell.exe spawned with detached:true never
+       * initializes on this box (DETACHED_PROCESS strips the console a
+       * console host needs) - verified in isolation 2026-07-15, and the
+       * mechanism behind both the "47% silent relauncher death" and the
+       * sidecar hard-kill that never landed. Non-detached still dies if
+       * the daemon's console closes mid-sleep, so this remains
+       * best-effort; the schtasks paths above are the reliable ones. */
       const fallback = spawnFn(
         'powershell.exe',
         [
@@ -222,7 +229,7 @@ export function armRelauncher(
           '-WindowStyle', 'Hidden',
           '-Command', inline,
         ],
-        { detached: true, stdio: 'ignore', windowsHide: true },
+        { stdio: 'ignore', windowsHide: true },
       );
       fallback.on('error', (err) => {
         relLog(
@@ -252,11 +259,25 @@ export function armRelauncher(
       const child = spawnFn('schtasks', ['/run', '/tn', tn], {
         windowsHide: true,
       });
-      child.on('error', (err) => {
+      /* Hop the chain on BOTH failure shapes: spawn error (schtasks.exe
+       * missing) and non-zero exit (task not registered / disabled -
+       * `schtasks /run` reports that via exit code, not a spawn error).
+       * Before this, a missing task made the whole chain silently
+       * no-op: spawn succeeded, exit code was ignored, and recovery
+       * waited on the 5-minute safety net. Guard so error+exit on the
+       * same child can't fire the fallback twice. */
+      let hopped = false;
+      const hop = (why: string): void => {
+        if (hopped) return;
+        hopped = true;
         relLog(
-          `[admin] RELAUNCH: schtasks spawn error (task ${tn}): ${err.message}; trying next relaunch path`,
+          `[admin] RELAUNCH: schtasks (task ${tn}) ${why}; trying next relaunch path`,
         );
         onError();
+      };
+      child.on('error', (err) => hop(`spawn error: ${err.message}`));
+      child.on('exit', (code) => {
+        if (code !== 0) hop(`exited with code ${code}`);
       });
       child.unref();
       return true;
@@ -4610,16 +4631,14 @@ export async function registerDashboardRoutes(
     }
     /* WP-I-b: schtasks-based relaunch (see armRelauncher above) with
      * the previous direct powershell.exe start-daemon.ps1 spawn kept
-     * as a fallback attempt. -Force on start-daemon.ps1 (used by both
-     * the fallback here and by the Scheduled Task's own action when
-     * schtasks succeeds — the task action itself doesn't pass -Force,
-     * see install-daemon-autostart.ps1) matters because without it
-     * the "already alive" probe at t+2s can see the old Fastify still
-     * answering /health (chokidar watcher close + app close + store
-     * close take 2-6s on Windows) and skip the respawn. The sidecar
-     * Stop-Process below then kills the old daemon at t+6s and
-     * nothing is left to bind :3747 until the next Scheduled Task
-     * safety-net tick — average wait ~2.5min, worst ~5min. */
+     * as a fallback attempt. -Force on start-daemon.ps1 (used by the
+     * DevNeural-Daemon-Restart task action and the fallback here)
+     * matters because without it the "already alive" probe can see
+     * the old Fastify still answering /health during graceful
+     * shutdown and skip the respawn. -Force waits for the old PID to
+     * actually die (hard-killing at 40s) before spawning node, so the
+     * new process never loses the PID-file singleton race that
+     * stranded the 2026-07-15 restarts on the 5-minute safety net. */
     const strategy = armRelauncher(RELAUNCH_TASK_NAME, startScript, { log });
     if (strategy === 'failed') {
       reply.code(500);
@@ -4630,60 +4649,28 @@ export async function registerDashboardRoutes(
       };
     }
     log(`[admin] daemon restart relauncher armed via ${strategy}`);
-    /* Exit path with EXTERNAL hard-kill watchdog.
-     *
-     * process.exit(0) alone hangs on Windows when a worker thread
-     * (pino transport, @xenova embedder, node-pty) holds a native
-     * handle. The C++ exit hook never returns. The process stays
-     * alive forever; the dashboard restart loop times out.
-     *
-     * A naive in-process setTimeout watchdog DOES NOT work — once
-     * process.exit is called the event loop is torn down and JS
-     * timers never fire. The watchdog must live in another process.
-     *
-     * So we spawn a detached PowerShell sidecar BEFORE process.exit.
-     * The sidecar sleeps 3s then unconditionally taskkill /F's our
-     * PID. If we exited cleanly the kill is a no-op (PID is gone or
-     * already reused — Stop-Process tolerates either). If we hung,
-     * the sidecar drags us down via TerminateProcess.
-     *
-     * Also: app.close() is awaited so the listen socket is released
-     * before exit, and the PID file is unlinked, so the relauncher's
-     * health probe at t+2s sees a dead daemon and respawns instead
-     * of "already alive". */
     /* Trigger the real graceful shutdown.
      *
      * Root cause of past restart hangs: process.exit(0) on Windows
      * waits for libuv to release every open native handle. chokidar's
      * recursive watch on C:/dev/Projects holds ReadDirectoryChangesW
      * handles that never get cleaned up unless watcher.close() runs
-     * first. The daemon's existing `shutdown()` (registered for
-     * SIGTERM/SIGINT) awaits watcher.close, app.close, transcripts,
-     * gitWatcher, store, then unlinks the PID file, then exits.
+     * first. The daemon's `shutdown()` (registered for SIGTERM/SIGINT)
+     * time-boxes every step (app force-closes SSE, watchers, store),
+     * unlinks the PID file, then exits, with a 45s in-process dead-man
+     * as backstop.
      *
-     * We surface that via app.decorate('shutdownDaemon', ...) in
-     * daemon.ts. If it's missing for any reason (older build, test
-     * harness without main()) fall back to process.exit.
-     *
-     * Belt-and-suspenders: a detached PowerShell sidecar Stop-Process
-     * us after 6s. Long enough for shutdown to finish on a healthy
-     * system; short enough that a stuck shutdown does not leave the
-     * daemon zombie-alive after the relauncher spawns its
-     * replacement. */
-    try {
-      const selfPid = process.pid;
-      const killCmd =
-        `Start-Sleep -Seconds 6; ` +
-        `try { Stop-Process -Id ${selfPid} -Force -ErrorAction SilentlyContinue } catch {}`;
-      spawn(
-        'powershell.exe',
-        ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', killCmd],
-        { detached: true, stdio: 'ignore', windowsHide: true },
-      ).unref();
-    } catch {
-      /* sidecar is the safety net; if it fails to spawn the
-       * graceful path still runs */
-    }
+     * HARD-KILL OWNERSHIP: there is deliberately NO self-spawned
+     * PowerShell kill sidecar here anymore. That sidecar never worked:
+     * powershell.exe with detached:true never initializes (no console
+     * under DETACHED_PROCESS), and non-detached dies with the daemon's
+     * console - both verified in isolation 2026-07-15, matching two
+     * live restarts where the "6s hard-kill" let the old daemon run
+     * 2-4 more minutes. The kill now lives in start-daemon.ps1 -Force,
+     * which the DevNeural-Daemon-Restart scheduled task runs under the
+     * Task Scheduler service - a context that provably survives this
+     * process's death. It waits for our PID to die and Stop-Processes
+     * it if we overstay. */
     setTimeout(() => {
       log('[admin] daemon restart requested via /admin/daemon/restart; exiting');
       if (hasShutdownHook()) {

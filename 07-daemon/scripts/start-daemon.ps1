@@ -22,14 +22,14 @@
 [CmdletBinding()]
 param(
     [string]$DaemonRoot,
-    # When set, skip the "already alive" health probe and always
-    # spawn node. Used by the /admin/daemon/restart route: the old
-    # daemon may still be answering /health during its graceful
-    # shutdown window (chokidar watcher close + app.close + store
-    # close take 2-6s on Windows), so a probe at relauncher-spawn
-    # time would self-skip and leave nothing alive once the sidecar
-    # hard-kill fires at +6s. Task Scheduler autostart MUST NOT pass
-    # this flag; it relies on the probe to no-op when healthy.
+    # When set, skip the "already alive" health probe, wait for the
+    # old daemon PID to die (hard-killing it if it overstays 40s),
+    # then spawn node. Used by the /admin/daemon/restart route via
+    # the DevNeural-Daemon-Restart scheduled task: the old daemon may
+    # still be answering /health during its graceful shutdown window,
+    # so a probe at relauncher-spawn time would self-skip and leave
+    # nothing alive. Task Scheduler autostart MUST NOT pass this
+    # flag; it relies on the probe to no-op when healthy.
     [switch]$Force
 )
 
@@ -75,12 +75,61 @@ if (-not $Force) {
     }
 } else {
     Write-Host "[start-daemon] -Force set; bypassing already-alive probe"
-    # When called from /admin/daemon/restart, the old daemon may still
-    # hold :$port during its graceful shutdown. Spawning node now would
-    # EADDRINUSE the listen socket. Wait up to 20s for the port to free.
-    # The restart route's sidecar kill fires at +6s so the worst-case
-    # ungraceful exit still clears the port well inside this window.
-    $portFreeDeadline = (Get-Date).AddSeconds(20)
+    # Restart path (/admin/daemon/restart fires the DevNeural-Daemon-Restart
+    # task, which runs this script -Force under the Task Scheduler service).
+    # This block OWNS the old daemon's death:
+    #
+    #   1. Wait for the old PID (daemon.pid) to exit - the graceful
+    #      shutdown is time-boxed to ~37s worst case, typically <6s.
+    #   2. If it overstays 40s, Stop-Process it. This is the hard-kill
+    #      that used to live in a daemon-spawned PowerShell sidecar and
+    #      never worked (detached powershell never starts; non-detached
+    #      dies with the daemon's console). Task Scheduler context
+    #      survives the daemon's death, so the kill lands from here.
+    #   3. Then confirm nothing answers /health before binding.
+    #
+    # Waiting on the PID (not just the port) also closes the relaunch
+    # race from the 2026-07-15 restarts: the port frees within ~1s of
+    # app.close() while the old process still holds daemon.pid, so a
+    # port-only wait spawned node into the PID-file singleton check,
+    # which exited 0, and nothing retried until the 5-minute safety
+    # net (23:57:08Z request -> 00:01:16Z boot).
+    $dataRootForPid = if ($env:DEVNEURAL_DATA_ROOT) { $env:DEVNEURAL_DATA_ROOT } else { 'C:\dev\data\skill-connections' }
+    $pidFile = Join-Path $dataRootForPid 'daemon.pid'
+    $oldPid = $null
+    if (Test-Path -LiteralPath $pidFile) {
+        try { $oldPid = [int](Get-Content -LiteralPath $pidFile -ErrorAction Stop | Select-Object -First 1) } catch { $oldPid = $null }
+    }
+    if ($oldPid) {
+        $pidDeadline = (Get-Date).AddSeconds(40)
+        while ((Get-Date) -lt $pidDeadline) {
+            $alive = $false
+            try {
+                $p = Get-Process -Id $oldPid -ErrorAction Stop
+                if ($p -and $p.ProcessName -like 'node*') { $alive = $true }
+            } catch {
+                # Process gone; PID may even be reused by a non-node
+                # process, which we treat as gone.
+            }
+            if (-not $alive) { break }
+            Start-Sleep -Milliseconds 500
+        }
+        $stillAlive = $false
+        try {
+            $p = Get-Process -Id $oldPid -ErrorAction Stop
+            if ($p -and $p.ProcessName -like 'node*') { $stillAlive = $true }
+        } catch { }
+        if ($stillAlive) {
+            Write-Host "[start-daemon] old daemon pid=$oldPid overstayed 40s; hard-killing"
+            try { Stop-Process -Id $oldPid -Force -ErrorAction Stop } catch {
+                Write-Host "[start-daemon] Stop-Process failed: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds 2
+        }
+    }
+    # Belt-and-suspenders: confirm no Fastify still answers before the
+    # bind attempt. With the PID dead this exits on the first probe.
+    $portFreeDeadline = (Get-Date).AddSeconds(10)
     while ((Get-Date) -lt $portFreeDeadline) {
         $stillBound = $false
         try {

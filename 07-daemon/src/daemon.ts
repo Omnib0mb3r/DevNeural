@@ -859,7 +859,14 @@ async function main(): Promise<void> {
   // land within minutes of the session that produced them.
   initLintQueue(store, logger);
 
-  const app = Fastify({ logger: false });
+  /* forceCloseConnections: the /dashboard/events SSE stream pings every
+   * 15s, so Fastify's default ('idle') never reclaims it and app.close()
+   * blocks until the client's TCP dies. Live proof: both 2026-07-15
+   * admin restarts hung 2-4 minutes inside app.close() with a phone tab
+   * holding the stream (14:53:40Z request -> 14:57:32Z boot; 23:57:08Z
+   * -> 00:01:16Z). `true` destroys active connections at close so
+   * shutdown is bounded regardless of connected dashboards. */
+  const app = Fastify({ logger: false, forceCloseConnections: true });
   await app.register(fastifyCookie);
   await app.register(fastifyMultipart, {
     limits: {
@@ -1537,55 +1544,69 @@ async function main(): Promise<void> {
   });
 
   let shuttingDown = false;
+  /* Every step is time-boxed and its duration logged. Before 2026-07-15
+   * the steps were unbounded awaits; app.close() alone blocked 2-4
+   * minutes on live SSE connections and the whole restart stalled with
+   * zero evidence of where. A step that overruns its budget is logged
+   * and abandoned - restart latency beats a perfect teardown, and the
+   * stores flush atomically (.tmp + fsync + rename) so a later hard
+   * kill cannot corrupt them. */
+  const shutdownStep = async (
+    name: string,
+    budgetMs: number,
+    fn: () => unknown,
+  ): Promise<void> => {
+    const t0 = Date.now();
+    try {
+      await Promise.race([
+        Promise.resolve().then(fn),
+        new Promise((_, reject) => {
+          const t = setTimeout(
+            () => reject(new Error('step timeout')),
+            budgetMs,
+          );
+          if (typeof t.unref === 'function') t.unref();
+        }),
+      ]);
+      logger(`[shutdown] ${name} done in ${Date.now() - t0}ms`);
+    } catch (err) {
+      const why =
+        (err as Error).message === 'step timeout'
+          ? `TIMED OUT (budget ${budgetMs}ms)`
+          : `failed: ${(err as Error).message}`;
+      logger(`[shutdown] ${name} ${why} after ${Date.now() - t0}ms; continuing`);
+    }
+  };
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     logger(`received ${signal}; shutting down`);
-    try {
-      await app.close();
-    } catch {
-      /* ignore */
-    }
-    try {
-      await transcripts.stop();
-    } catch {
-      /* ignore */
-    }
-    try {
-      await fsWatcher.stop();
-    } catch {
-      /* ignore */
-    }
-    try {
-      gitWatcher.stop();
-    } catch {
-      /* ignore */
-    }
-    try {
-      if (dashboardSupervisor) await dashboardSupervisor.stop();
-    } catch {
-      /* ignore */
-    }
-    try {
-      if (cancelledToolRecoveryHandle) cancelledToolRecoveryHandle.stop();
-    } catch {
-      /* ignore */
-    }
-    try {
-      if (groomingHandle) groomingHandle.stop();
-    } catch {
-      /* ignore */
-    }
-    try {
-      projectsWatcherStop();
-    } catch {
-      /* ignore */
-    }
-    try {
-      await store.close();
-    } catch {
-      /* ignore */
-    }
+    /* In-process dead man's switch. Fires only if the bounded steps
+     * below somehow wedge the event loop's timers don't - budgets sum
+     * to ~37s, so 45s means something is deeply wrong. Runs while the
+     * event loop is still alive (this is NOT the post-process.exit
+     * timer trap documented in routes.ts - exit hasn't been called
+     * yet). unref'd so it never keeps a healthy shutdown alive. */
+    const deadMan = setTimeout(() => {
+      logger('[shutdown] dead-man watchdog fired at 45s; forcing exit');
+      process.exit(0);
+    }, 45_000);
+    if (typeof deadMan.unref === 'function') deadMan.unref();
+    await shutdownStep('app.close', 5_000, () => app.close());
+    await shutdownStep('transcripts.stop', 8_000, () => transcripts.stop());
+    await shutdownStep('fs-watcher.stop', 8_000, () => fsWatcher.stop());
+    await shutdownStep('git-watcher.stop', 2_000, () => gitWatcher.stop());
+    await shutdownStep('dashboard-supervisor.stop', 6_000, () =>
+      dashboardSupervisor ? dashboardSupervisor.stop() : undefined,
+    );
+    await shutdownStep('cancelled-tool-recovery.stop', 2_000, () =>
+      cancelledToolRecoveryHandle ? cancelledToolRecoveryHandle.stop() : undefined,
+    );
+    await shutdownStep('grooming.stop', 2_000, () =>
+      groomingHandle ? groomingHandle.stop() : undefined,
+    );
+    await shutdownStep('projects-watcher.stop', 2_000, () => projectsWatcherStop());
+    await shutdownStep('store.close', 10_000, () => store.close());
     try {
       const pid = readPid();
       if (pid === process.pid) {
@@ -1594,6 +1615,7 @@ async function main(): Promise<void> {
     } catch {
       /* ignore */
     }
+    logger('[shutdown] complete; exiting');
     process.exit(0);
   };
 
