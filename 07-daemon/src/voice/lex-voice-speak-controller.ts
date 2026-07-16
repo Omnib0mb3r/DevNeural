@@ -58,7 +58,7 @@ export interface SpeakControllerState {
     started_at_ms: number;
     cancelled_at_ms: number;
   }>;
-  ttsQueue: Array<{ cleanText: string; render?: boolean }>;
+  ttsQueue: Array<{ cleanText: string; continuation?: boolean }>;
   ttsQueueRunning: boolean;
 }
 
@@ -71,11 +71,6 @@ export interface SpeakControllerDeps {
   onTtsEnd?: () => void;
   /** Optional log channel. */
   log?: (msg: string) => void;
-  /** DRIVE-QUEUE 1b: live-haiku spoken render for segments flagged
-   * render:true (Lex's reply body only). Returns the restyled spoken
-   * text; on any miss it must return the input unchanged so playback is
-   * never lost. Omitted (or flag off) = no render, current behavior. */
-  renderSegment?: (text: string) => Promise<string>;
   /** Pillar 3.1: label this controller as a mouth source. Each speak
    * source (Lex reply, heartbeat, glue, a second connection) gets a
    * distinct id so the single-mouth lock can keep exactly one stream
@@ -87,9 +82,10 @@ export interface SpeakController {
   /** Push text onto the speak queue. Idempotent on empty input.
    * The first call kicks off the drain loop; subsequent calls land
    * onto the same queue and are serialized after the in-flight ctx
-   * finishes naturally. opts.render flags a segment for the live-haiku
-   * spoken render (Lex's reply body); default false = no render. */
-  speak(text: string, opts?: { render?: boolean }): void;
+   * finishes naturally. Segments that join an active, uncancelled
+   * drain are marked continuation so the client chains their audio
+   * gaplessly onto the existing playhead instead of resetting it. */
+  speak(text: string, opts?: { continuation?: boolean }): void;
   /** Cancel any in-flight ctx + clear the queue. Returns true if a
    * ctx was actually cancelled (so the caller can decide whether to
    * fire the tts-cancel WS frame + the PTY Ctrl+C). Partial-chain
@@ -121,14 +117,25 @@ export function createSpeakController(
   deps: SpeakControllerDeps,
 ): SpeakController {
   const ownerId = deps.mouthOwnerId ?? `speak-${++mouthOwnerSeq}`;
-  /* Bumped on every killActive (barge / turn boundary). speakOne captures
-   * it before the live render await and bails if it changed, so a body
-   * segment barged mid-render is never synthesized. */
-  let killGen = 0;
-  function speak(text: string, opts?: { render?: boolean }): void {
+  /* Set by killActive so a segment queued right after a barge is never
+   * marked continuation off the cancelled chain; cleared the next time
+   * a fresh (non-continuation) segment starts a new logical turn. */
+  let chainBroken = false;
+  function speak(text: string, opts?: { continuation?: boolean }): void {
     const clean = cleanForTts(text);
     if (!clean) return;
-    state.ttsQueue.push({ cleanText: clean, render: opts?.render === true });
+    /* A segment joining an active drain (or a non-empty queue) is part
+     * of the same logical turn as the segment ahead of it: the client
+     * should chain its audio onto the existing playhead, not reset it.
+     * Explicit opts.continuation forces the flag for callers that know
+     * (sentence-split bodies). A barge breaks the chain. */
+    const continuation =
+      !chainBroken &&
+      (opts?.continuation === true ||
+        state.ttsQueueRunning ||
+        state.ttsQueue.length > 0);
+    if (!continuation) chainBroken = false;
+    state.ttsQueue.push({ cleanText: clean, continuation });
     if (!state.ttsQueueRunning) {
       void runQueue();
     }
@@ -140,14 +147,14 @@ export function createSpeakController(
     try {
       while (state.ttsQueue.length > 0) {
         const seg = state.ttsQueue.shift()!;
-        await speakOne(seg.cleanText, seg.render === true);
+        await speakOne(seg.cleanText, seg.continuation === true);
       }
     } finally {
       state.ttsQueueRunning = false;
     }
   }
 
-  async function speakOne(clean: string, render: boolean): Promise<void> {
+  async function speakOne(clean: string, continuation: boolean): Promise<void> {
     /* Pillar 3.1 single mouth: only one TTS stream may be live across
      * the whole daemon. With the haiku tier OFF this grant is a no-op
      * (current behavior). With it ON, a null grant means another source
@@ -158,32 +165,16 @@ export function createSpeakController(
     const grant = acquireMouth(ownerId);
     if (!grant) {
       deps.log?.(`[voice-mouth] busy (held elsewhere); deferring segment`);
-      state.ttsQueue.unshift({ cleanText: clean, render });
+      state.ttsQueue.unshift({ cleanText: clean, continuation });
       await new Promise<void>((r) => setTimeout(r, 25));
       return;
     }
-    /* DRIVE-QUEUE 1b: live-haiku spoken render of Lex's reply body. Only
-     * render:true segments (never acks / glue / heartbeats). The mouth is
-     * already granted; if the user barges during the render await, killGen
-     * advances and we drop this segment rather than speak stale content.
-     * renderSegment returns the input unchanged on any miss, so playback
-     * is never lost. */
-    if (render && deps.renderSegment) {
-      const gen = killGen;
-      let rendered = clean;
-      try {
-        rendered = await deps.renderSegment(clean);
-      } catch {
-        rendered = clean;
-      }
-      if (killGen !== gen) {
-        /* Barged mid-render: release the mouth and skip synthesis. The
-         * queue was already cleared by killActive. */
-        grant.release();
-        return;
-      }
-      clean = rendered && rendered.trim() ? rendered : clean;
-    }
+    /* The live-haiku restyle that used to run here (renderSegment on
+     * render:true bodies) is gone: it inserted a full LLM round trip
+     * between Lex's reply landing and the first PCM byte, the verified
+     * dominant latency on the reply path (spec v2, 2026-07-15). The
+     * body now goes to piper as-is; cleanForTts already stripped
+     * markdown at enqueue time. */
     let handle: SynthLikeHandle;
     try {
       handle = deps.synthesize(clean);
@@ -196,7 +187,15 @@ export function createSpeakController(
     state.ttsActive = ttsCtx;
     state.currentTtsText = clean;
     state.currentTtsStartedAtMs = Date.now();
-    deps.send({ t: 'tts-start', rate: handle.sampleRate });
+    /* continuation tells the client this segment belongs to the same
+     * logical turn as the audio already scheduled: chain onto the
+     * existing playhead instead of resetting it (gapless ack -> body,
+     * gapless sentence-split bodies). */
+    deps.send({
+      t: 'tts-start',
+      rate: handle.sampleRate,
+      ...(continuation ? { continuation: true } : {}),
+    });
     handle.pcm.on('data', (chunk: Buffer) => {
       /* Drop chunks that arrive after a forced cancel — the piper
        * child has been killed but stdout can flush a tail chunk
@@ -256,10 +255,10 @@ export function createSpeakController(
   }
 
   function killActive(): boolean {
-    /* Advance the kill generation so a body segment that is mid live-
-     * render (between shift and synthesize) is dropped instead of spoken
-     * after the barge. */
-    killGen += 1;
+    /* Break the continuation chain: anything queued after this barge
+     * starts a fresh logical turn and must not chain onto the audio
+     * that was just cancelled. */
+    chainBroken = true;
     /* Clear the queue regardless of whether a ctx is in flight. The
      * queued segments belong to the same logical turn that just got
      * barged; they must not replay after the barge resolves. */
@@ -299,3 +298,37 @@ export function createSpeakController(
 }
 
 export { cleanForTts as _cleanForTtsForTests };
+
+/* Sentence-boundary split for spoken bodies (spec v2, the confirmed
+ * producer-consumer TTS pattern). Lex's reply text arrives as one
+ * complete block, so this is a plain split rather than a token buffer:
+ * each sentence becomes its own speak() segment, which starts piper on
+ * sentence one while the rest queue behind it (continuation-chained,
+ * so playback is gapless) and lets a barge-in kill mid-body cleanly.
+ * Fragments shorter than MIN_SENTENCE_CHARS merge into their
+ * predecessor so abbreviations and clipped interjections do not spawn
+ * per-word piper calls. */
+const MIN_SENTENCE_CHARS = 12;
+
+export function splitForSpeech(text: string): string[] {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+  const rawParts = trimmed
+    .split(/(?<=[.!?])\s+/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+  const merged: string[] = [];
+  for (const part of rawParts) {
+    const prev = merged[merged.length - 1];
+    if (
+      prev !== undefined &&
+      (part.length < MIN_SENTENCE_CHARS ||
+        prev.length < MIN_SENTENCE_CHARS)
+    ) {
+      merged[merged.length - 1] = `${prev} ${part}`;
+    } else {
+      merged.push(part);
+    }
+  }
+  return merged;
+}

@@ -1,10 +1,12 @@
 /**
- * Persona + digest + front-desk composition (pillar 3, sliver V7).
+ * Persona + digest composition (pillar 3, sliver V7; trimmed for spec
+ * v2, 2026-07-15).
  *
  * Pins: digest push/get/freshness fail-safe; persona prompt is one-Lex
  * first-person with the worker as the only "he" and embeds the live
- * digest; the front desk composes control -> whitelist -> lane with the
- * digest-freshness gate.
+ * digest. The front-desk composition pins died with voice-frontdesk.ts
+ * (spec-v2 teardown): the voice top layer owns routing now and carries
+ * its own tests (voice-top-layer.test.ts).
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
@@ -16,7 +18,6 @@ import {
   type LexDigest,
 } from '../src/voice/voice-digest.js';
 import { buildHaikuPersonaPrompt } from '../src/voice/voice-persona.js';
-import { frontDeskDecision } from '../src/voice/voice-frontdesk.js';
 
 const DIGEST: LexDigest = {
   currentTask: 'pillar 3 voice build',
@@ -89,12 +90,11 @@ describe('buildVoiceDigest (DRIVE-QUEUE 1b deriver)', () => {
     expect(d.nextSteps).toBe('');
   });
 
-  it('feeds the fast lane: pushed deriver output is fresh and in the persona', () => {
+  it('feeds the persona: pushed deriver output is fresh and embedded', () => {
     pushDigest(buildVoiceDigest('Shipped the digest push.'), 2_000);
     expect(isDigestFresh(2_000)).toBe(true);
-    const d = frontDeskDecision('nice', { lastTurnMs: 2_000 });
-    expect(d.route.lane).toBe('fast');
-    expect(d.personaPrompt).toContain('Shipped the digest push.');
+    const p = buildHaikuPersonaPrompt(getDigest()?.digest ?? null);
+    expect(p).toContain('Shipped the digest push.');
   });
 });
 
@@ -120,30 +120,3 @@ describe('persona prompt', () => {
   });
 });
 
-describe('front desk composition', () => {
-  it('control short-circuits regardless of digest', () => {
-    const d = frontDeskDecision('quiet', { lastTurnMs: 1_000 });
-    expect(d.route.lane).toBe('control');
-  });
-
-  it('glue + fresh digest -> fast lane', () => {
-    pushDigest(DIGEST, 1_000);
-    const d = frontDeskDecision('thanks', { lastTurnMs: 1_000 });
-    expect(d.digestFresh).toBe(true);
-    expect(d.route.lane).toBe('fast');
-  });
-
-  it('glue + stale digest -> slow lane (never answer off a stale digest)', () => {
-    pushDigest(DIGEST, 500); // older than the turn
-    const d = frontDeskDecision('thanks', { lastTurnMs: 1_000 });
-    expect(d.digestFresh).toBe(false);
-    expect(d.route.lane).toBe('slow');
-  });
-
-  it('a project/state question -> slow lane and carries the persona prompt', () => {
-    pushDigest(DIGEST, 1_000);
-    const d = frontDeskDecision('how many tests pass', { lastTurnMs: 1_000 });
-    expect(d.route.lane).toBe('slow');
-    expect(d.personaPrompt).toContain('pillar 3 voice build');
-  });
-});

@@ -85,10 +85,14 @@ import { callVoiceChat } from '../llm/voice-chat.js';
 import { detectDeferral } from '../lex/deferral-detector.js';
 import { randomUUID } from 'node:crypto';
 import {
-  matchVoiceCommand,
+  matchPanicCommand,
   ALL_VOICE_COMMAND_KINDS,
   type VoiceCommandKind,
 } from './lex-voice-commands.js';
+import {
+  topLayerTurn,
+  type TopLayerControl,
+} from './voice-top-layer.js';
 import { runHoldUp } from './lex-voice-hold-up.js';
 import {
   detectContradiction,
@@ -111,15 +115,12 @@ import { shouldSpeakHeartbeatHaiku } from './voice-heartbeat-haiku.js';
 import {
   renderForSpeech,
   heartbeatLine,
-  haikuRoute,
-  composeGlueReply,
-  composeBridgeReply,
-  renderReplyForSpeech,
   shouldCaptureAbsorbedAside,
   _pushAbsorbedAsideImpl,
   _formatAbsorbedAsideBlockImpl,
   type AbsorbedAsideEntry,
 } from './voice-haiku-wiring.js';
+import { splitForSpeech } from './lex-voice-speak-controller.js';
 import { useVoiceHaiku } from './voice-haiku.js';
 import {
   pushDigest,
@@ -1062,10 +1063,8 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       lastTtsEndMs = Date.now();
       lastSpeechMs = Date.now();
     },
-    /* DRIVE-QUEUE 1b: live-haiku spoken render for body segments. Flag
-     * off / no key -> renderReplyForSpeech returns the text unchanged, so
-     * this is inert until the operator opts in. */
-    renderSegment: (t) => renderReplyForSpeech(t),
+    /* The live-haiku renderSegment restyle is gone (spec v2): it cost a
+     * full LLM round trip before the reply body reached piper. */
   });
 
   function send(msg: Record<string, unknown>): void {
@@ -1743,14 +1742,22 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
            * only, never the answer. The answer is spoken once, at
            * end_turn. Structural enforcement so a fat ack can never be
            * heard as a second response. The visual frame + chunk above
-           * still carry the full text. DRIVE-QUEUE 1b: the end_turn body
-           * (not the ack) gets the live-haiku spoken render; gated on the
-           * flag so the flag-off path is byte-identical. */
-          const renderBody = !isPreToolAck && useVoiceHaiku();
-          speak(
-            isPreToolAck ? clampAck(text) : text,
-            renderBody ? { render: true } : undefined,
-          );
+           * still carry the full text.
+           *
+           * Spec v2: the end_turn body is sentence-split before
+           * queueing (the confirmed producer-consumer TTS pattern) so
+           * piper starts on sentence one instead of the whole block,
+           * the segments chain gaplessly via continuation frames, and
+           * a barge-in kills mid-body cleanly. The live-haiku restyle
+           * that used to gate the body behind an extra LLM round trip
+           * is gone. */
+          if (isPreToolAck) {
+            speak(clampAck(text));
+          } else {
+            for (const sentence of splitForSpeech(text)) {
+              speak(sentence, { continuation: true });
+            }
+          }
         } else {
           send({ t: 'tts-skipped', reason: 'already-spoken' });
         }
@@ -2007,15 +2014,16 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * contract. Same-turn segments (pre-tool ack + end_turn body)
    * queue and play back-to-back; barge / hold-up clears the queue
    * and cancels the in-flight ctx as one atomic boundary. */
-  function speak(text: string, opts?: { render?: boolean }): void {
+  function speak(text: string, opts?: { continuation?: boolean }): void {
     /* Reset the heartbeat silence clock on any real speech (ack, body,
      * or a heartbeat pulse itself) so a pulse only fires after a genuine
      * gap of silence. */
     lastSpeechMs = Date.now();
     /* Pillar 3: route spoken output through the renderer (preserve-list
-     * verbatim guard). Passthrough when the flag is off. opts.render asks
-     * the controller for the live-haiku warm render (Lex's reply body
-     * only); the markdown strip here still runs as the safe base. */
+     * verbatim guard). Passthrough when the flag is off. The safe
+     * markdown strip is the only render now; the live-haiku restyle
+     * died in spec v2. opts.continuation marks a segment that chains
+     * gaplessly onto the audio already scheduled client-side. */
     const spoken = renderForSpeech(text);
     lastSpokenText = spoken;
     speakCtrl.speak(spoken, opts);
@@ -2329,6 +2337,46 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * the most recent fire timestamp per kind and the source tag is
    * surfaced in the log so audit can tell which path won the race. */
   const VOICE_CMD_DEDUPE_MS = 1500;
+  /* Interpreted-control dispatch (spec v2). The voice top layer reads
+   * intent ("be quiet", "we're done here") and returns one of eight
+   * control names; this maps each onto the SAME effects the keyword
+   * grammar used to fire, so client frames and downstream behavior
+   * are unchanged. The optional ack line is spoken only for controls
+   * that leave the mouth on; acking a mute with more speech would
+   * defeat the point. */
+  function applyTopLayerControl(
+    control: TopLayerControl,
+    ack: string | null,
+  ): void {
+    switch (control) {
+      case 'stop_speaking': {
+        /* Quiet: silence the voice locally, zero Lex round-trip. NOT a
+         * PTY Ctrl+C; Lex keeps working. Same semantics as the old
+         * control lane's kill-tts action. */
+        const cancelled = speakCtrl.killActive();
+        if (cancelled) send({ t: 'tts-cancel', reason: 'quiet' });
+        return;
+      }
+      case 'interrupt_work':
+        /* Hard abort of Lex's current activity with recap, the old
+         * "lex hold up" behavior. */
+        dispatchVoiceCommand('hold_up', 'transcript');
+        return;
+      case 'mute':
+      case 'disable':
+      case 'end_session':
+        dispatchVoiceCommand(control, 'transcript');
+        return;
+      case 'unmute':
+      case 'standby':
+      case 'listen': {
+        dispatchVoiceCommand(control, 'transcript');
+        if (ack) speak(ack);
+        return;
+      }
+    }
+  }
+
   function dispatchVoiceCommand(
     kind: VoiceCommandKind,
     source: 'transcript' | 'wake',
@@ -2830,33 +2878,15 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * the client to tear down. Notes-mode users who want the dictation
      * summary should press Stop instead — voice command is an
      * immediate close. */
-    /* Unified Lex voice-command dispatch. Every command requires the
-     * literal "lex" prefix so meeting chatter cannot false-fire any
-     * branch. The dispatcher resolves the longest-match-wins
-     * precedence (panic > end_session > mute > unmute > disable) in
-     * one place so the wire frames below stay deterministic.
-     *
-     *   panic       -> firePanic + 'panic-fired' frame (no inject)
-     *   end_session -> 'session-end' frame + run end-session pipeline
-     *   mute        -> 'voice-mute' frame; client halts TTS, keeps
-     *                  rendering transcript turns with a silent flag
-     *   unmute      -> 'voice-unmute' frame; client resumes TTS, no
-     *                  auto-replay of messages received during mute
-     *   disable     -> 'voice-disable' frame; client teardown
-     *                  equivalent to clicking the stop button (in-
-     *                  flight Lex thinking + worker actions both
-     *                  continue; the user must re-engage via the UI
-     *                  to get TTS back) */
-    const cmd = matchVoiceCommand(result.text);
-    logFn(
-      `[voice-ws] matcher result kind=${cmd?.kind ?? 'none'} duringTts=${state.utteranceStartedDuringTts}`,
-    );
-    if (cmd) {
-      dispatchVoiceCommand(
-        cmd.kind,
-        'transcript',
-        cmd.kind === 'start_project' ? { project_name: cmd.project_name } : undefined,
-      );
+    /* The ONE mechanical keyword (spec v2): "lex emergency stop". An
+     * emergency kill must not depend on a model round trip, so it is
+     * checked before anything else. Every other former keyword (mute,
+     * standby, end session, hold up, start project...) is interpreted
+     * intent now, handled by the voice top layer below or by the
+     * dashboard buttons. */
+    if (matchPanicCommand(result.text)) {
+      logFn('[voice-ws] panic phrase matched; dispatching');
+      dispatchVoiceCommand('panic', 'transcript');
       state.utteranceStartedDuringTts = false;
       return;
     }
@@ -2893,120 +2923,68 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
        * direct-llm below. Nothing extra is written here; see the
        * guard note above. */
     }
-    /* Pillar 3 capstone: haiku front desk. When DEVNEURAL_VOICE_HAIKU is
-     * on, every inbound utterance routes through frontDeskDecision -
-     * control jumps the data lane (never queued), glue is answered alone
-     * (zero Opus), a question gets an instant bridge line then falls
-     * through to the normal Lex inject (rendered on reply by speak()).
-     * Flag off: haikuRoute returns null and this whole block is skipped,
-     * so the path below is byte-identical. lex-prefixed ops above still
-     * take precedence. DRIVE-QUEUE 1b: the fast-lane glue now answers
-     * from the LIVE digest (1a made it model-backed), so the WS no longer
-     * assumes freshness - it passes the real last-turn timestamp. A
-     * digest at/after that boundary is fresh and glue stays on the fast
-     * lane; a stale or absent digest (e.g. before Lex's first reply)
-     * forces the turn to queue to Lex rather than answer off stale facts. */
-    if (useVoiceHaiku()) {
-      const dec = haikuRoute(trimmed, { lastTurnMs: lastLexTurnMs });
-      if (dec) {
-        if (dec.route.lane === 'control') {
-          const c = dec.route.control!;
-          if (c.action === 'interrupt-then-inject' && c.payload) {
-            /* redirect: free Lex, then inject the new instruction as this
-             * turn (falls through to the normal inject path below). */
-            killActiveTts('barge-in');
-            result = { text: c.payload, ms: result.ms };
-            state.utteranceStartedDuringTts = false;
-          } else {
-            if (c.action === 'kill-tts') {
-              /* quiet / ambiguous stop: silence the voice locally, zero
-               * Lex round-trip. NOT a PTY Ctrl+C - Lex keeps working. */
-              const cancelled = speakCtrl.killActive();
-              if (cancelled) send({ t: 'tts-cancel', reason: 'quiet' });
-            } else {
-              /* stop-work / abort: interrupt Lex + worker (TTS + Ctrl+C). */
-              killActiveTts('barge-in');
-            }
-            state.utteranceStartedDuringTts = false;
-            return;
-          }
-        } else if (dec.route.lane === 'fast') {
-          /* zero Opus round-trip: answer glue with askText on the
-           * persistent Max-plan judge session (2026-07-15 rework,
-           * src/lex/judge-session.ts), in persona and grounded in the
-           * live digest, warm and varied - no metered per-call cost,
-           * since that session is kept open for exactly this. On
-           * disabled/unavailable/timeout composeGlueReply falls back to
-           * its own tiny deterministic guard. A bare ack returns null
-           * and is absorbed silently either way. */
-          const reply = await composeGlueReply(trimmed, lastSpokenText);
-          if (reply) {
-            speak(reply);
-            /* Fast-lane transcript hole fix (2026-07-15): this
-             * exchange (glue reply spoken, nothing forwarded) is
-             * about to vanish unless recorded here. Persist both
-             * sides now - durable even if the session ends before
-             * Lex's next real turn - and queue it onto the ring so
-             * Lex learns about it on her NEXT real inject (see the
-             * ptyInject call below in the cc-pty branch). Gated to
-             * conversation mode per shouldCaptureAbsorbedAside; an
-             * addressed notes-mode utterance can reach this same
-             * branch but must not touch either the ring or this
-             * capture. */
-            if (shouldCaptureAbsorbedAside(state.mode)) {
-              captureAbsorbedAside(trimmed, reply);
-              state.absorbedAsides = _pushAbsorbedAsideImpl(
-                state.absorbedAsides,
-                { atMs: Date.now(), aside: trimmed, reply },
-              );
-            }
-          }
-          state.utteranceStartedDuringTts = false;
-          return;
-        } else {
-          /* slow: an instant deterministic bridge line now (dec.route.bridge,
-           * voice-lane-router.ts's pickBridgeLine), Lex reasons below, reply
-           * rendered through the preserve-list when it lands. composeBridgeReply
-           * (2026-07-15 rework) is a synchronous passthrough of that fallback -
-           * no model call, live or persistent - because the bridge exists to
-           * fill the silence the INSTANT Lex starts reasoning; any round trip
-           * here would be the delay it exists to hide. Still fired WITHOUT
-           * awaiting (kept async/`.then()`-shaped) so Lex's inject below is
-           * never delayed by it either way. speak() serialises via the TTS
-           * queue, so the bridge and the eventual reply never overlap. */
-          if (dec.route.bridge) {
-            const fallbackBridge = dec.route.bridge;
-            const bridgeUtterance = trimmed;
-            void composeBridgeReply(bridgeUtterance, fallbackBridge)
-              .then((line) => {
-                if (line) speak(line);
-              })
-              .catch(() => {
-                /* never let the bridge composition break the turn */
-                speak(fallbackBridge);
-              });
-          }
-          state.utteranceStartedDuringTts = false;
-          /* fall through to the existing inject path */
-        }
-      }
-    }
-    /* Wake-during-TTS gate (path 1 of the voice-cmd-blocked-during-
-     * TTS audit). If this utterance began while Lex was streaming TTS
-     * and the wake matcher did NOT match a command, drop the inject.
-     * The most likely source of such a transcript is AEC residual:
-     * Lex's own audio bleeding into the mic, transcribed by whisper
-     * as nonsense or as a fragment of Lex's reply. Injecting that as
-     * a user turn would derail the brainstorm. The transcript frame
-     * already went to the client so the operator can see what
-     * happened; only the daemon-side inject is suppressed. */
-    if (state.utteranceStartedDuringTts) {
-      logFn(
-        `[voice-ws] suppressed non-wake utterance during TTS: ${JSON.stringify(result.text.slice(0, 80))}`,
-      );
-      state.utteranceStartedDuringTts = false;
+    /* Voice top layer (spec v2, 2026-07-15): the one conversational
+     * brain the operator talks to. Every utterance that survived the
+     * panic check and the notes gate gets ONE speech-first turn from
+     * the dedicated persistent session: whatever it says is spoken;
+     * a trailing FORWARD: line hands substance to Lex through the
+     * normal inject path below; a trailing CONTROL: line fires the
+     * existing dispatch effects. No lanes, no whitelist, no canned
+     * lines. Fail-safe: session down/timeout/unparseable means the
+     * turn forwards untouched - the top layer can never eat the
+     * operator's words. */
+    const wasDuringTts = state.utteranceStartedDuringTts;
+    const tl = await topLayerTurn(trimmed, {
+      lastSpoken: lastSpokenText,
+      duringTts: wasDuringTts,
+      lexBusy: state.awaitingResponseSince > 0,
+    });
+    state.utteranceStartedDuringTts = false;
+    logFn(
+      `[voice-ws] top-layer turn speech=${tl.speech ? JSON.stringify(tl.speech.slice(0, 60)) : 'null'} forward=${tl.forward ? JSON.stringify(tl.forward.slice(0, 60)) : 'null'} control=${tl.control ?? 'none'} duringTts=${wasDuringTts}`,
+    );
+    if (tl.control) {
+      applyTopLayerControl(tl.control, tl.speech);
       return;
     }
+    if (!tl.forward) {
+      /* Conversational turn (or interpreted echo/noise: speech null).
+       * Speak it and absorb: nothing reaches Lex this turn, so the
+       * exchange is persisted and queued onto the asides ring exactly
+       * as the fast lane used to do. */
+      if (tl.speech) {
+        speak(tl.speech);
+        if (shouldCaptureAbsorbedAside(state.mode)) {
+          captureAbsorbedAside(trimmed, tl.speech);
+          state.absorbedAsides = _pushAbsorbedAsideImpl(
+            state.absorbedAsides,
+            { atMs: Date.now(), aside: trimmed, reply: tl.speech },
+          );
+        }
+      }
+      return;
+    }
+    /* Forward turn. The optional speech is the natural handoff line
+     * (the researched latency mask - it replaces the canned bridge
+     * pool); it speaks while the inject proceeds below. */
+    if (tl.speech) speak(tl.speech);
+    /* AEC-residual guard, fail-safe path only. When the top layer
+     * actually answered (speech, control, or a rewritten forward) it
+     * SAW the during-TTS note and judged the turn real. But when the
+     * session was down/timed out, the forward is the raw fail-safe
+     * echo of the utterance; during TTS that text is most likely
+     * Lex's own audio bleeding back in, and injecting it would derail
+     * the brainstorm. Preserve the old suppression for exactly that
+     * case. */
+    const failSafeForward =
+      tl.speech === null && tl.control === null && tl.forward === trimmed;
+    if (wasDuringTts && failSafeForward) {
+      logFn(
+        `[voice-ws] suppressed fail-safe forward during TTS: ${JSON.stringify(result.text.slice(0, 80))}`,
+      );
+      return;
+    }
+    result = { text: tl.forward, ms: result.ms };
     /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
      * Direct-llm branch: no PTY, no jsonl watch. Build the system
      * prompt + brainstorm chunks history, call ollama, stream the
@@ -3163,26 +3141,17 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * "barge over Lex's reply" and is already handled by
      * killActiveTts (PTY Ctrl+C + tts-cancel + partialChain). */
     if (state.awaitingResponseSince > 0 && !state.ttsActive) {
-      /* Addendum 2026-05-24: belt-and-suspenders voice-command
-       * punch-through. matchVoiceCommand already ran at the top of
-       * handleUtteranceEnd, but re-check at the queue's edge so any
+      /* Addendum 2026-05-24, narrowed by spec v2: belt-and-suspenders
+       * panic punch-through. The panic phrase already ran at the top
+       * of handleUtteranceEnd, but re-check at the queue's edge so any
        * future refactor that lands command text here cannot silently
-       * swallow it. lex panic / end_session / mute / unmute /
-       * disable / hold_up MUST interrupt mid-tool-use; queueing them
-       * would defer the interrupt to the next turn boundary, which
-       * defeats the wake-word contract. */
-      const lateCmd = matchVoiceCommand(result.text);
-      if (lateCmd) {
+       * swallow the one mechanical keyword. Interpreted controls were
+       * already handled by the top layer before this point. */
+      if (matchPanicCommand(result.text)) {
         logFn(
-          `[voice-ws] mid-turn-queue: lex command "${lateCmd.kind}" punches through, dispatching synchronously`,
+          '[voice-ws] mid-turn-queue: panic phrase punches through, dispatching synchronously',
         );
-        dispatchVoiceCommand(
-          lateCmd.kind,
-          'transcript',
-          lateCmd.kind === 'start_project'
-            ? { project_name: lateCmd.project_name }
-            : undefined,
-        );
+        dispatchVoiceCommand('panic', 'transcript');
         return;
       }
       state.pendingUserUtterances.push(result.text);
@@ -3446,15 +3415,20 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
          * whisper transcript carrying the same phrase no longer
          * fires twice. */
         const kind = (msg as { kind?: unknown }).kind;
-        if (!isVoiceCommandKind(kind)) {
+        /* Spec v2: the wake path is the panic escape hatch only (mic
+         * gated during TTS, so the always-on client listener is how
+         * "lex emergency stop" gets through). Every other kind died
+         * with the keyword grammar; reject so a stale client cannot
+         * resurrect it. */
+        if (kind !== 'panic') {
           send({
             t: 'error',
             code: 'bad-wake-kind',
-            message: 'wake-command requires a valid kind',
+            message: 'wake-command accepts only kind=panic',
           });
           break;
         }
-        dispatchVoiceCommand(kind, 'wake');
+        dispatchVoiceCommand('panic', 'wake');
         break;
       }
       case 'barge-in':

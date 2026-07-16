@@ -1,19 +1,22 @@
 /**
- * Client-side wake-word matcher for the Lex voice-command suite.
+ * Client-side wake-word matcher for the Lex panic phrase.
  *
- * The daemon already owns the canonical matcher
- * (07-daemon/src/voice/lex-voice-commands.ts), but the daemon's path
- * is gated by silero VAD + the micGated flag, both of which pause
- * during TTS playback. To let "Lex shut up" / "Lex disable" / etc.
- * actually halt Lex mid-sentence, this module powers a second
- * always-on pipeline in the browser: a small Web Speech API
- * recognizer (and a keyboard hotkey fallback) feeds short transcript
- * fragments into matchWakeWord, and the VoiceClient dispatches the
- * matched command directly.
+ * 2026-07-15 voice top layer v2 (docs/superpowers/specs/
+ * 2026-07-15-voice-top-layer-design.md): the spoken keyword grammar
+ * is gone. Control phrases ("lex mute", "lex stand by", ...) are now
+ * interpreted by the speech-first voice brain's CONTROL lines instead
+ * of a regex grammar. The ONE surviving mechanical keyword is the
+ * panic phrase "lex emergency stop", which must keep working even
+ * when every smarter layer is down. This module used to be a byte-
+ * for-byte port of the daemon's full matcher; it is now panic-only,
+ * mirroring the daemon's shrunk matcher.
  *
- * The matcher is intentionally a byte-for-byte port of the daemon's
- * matcher so both paths agree on phrasing and precedence; if either
- * is loosened we want the other to follow in the same commit.
+ * The daemon's transcript path is gated by silero VAD + the micGated
+ * flag, both of which pause during TTS playback. To let the panic
+ * phrase halt Lex mid-sentence, this module powers a second always-on
+ * pipeline in the browser: a small Web Speech API recognizer feeds
+ * short transcript fragments into matchWakeWord, and the VoiceClient
+ * posts the match as a {t:'wake-command', kind:'panic'} frame.
  *
  * createDedupe returns a guard that suppresses a second fire for the
  * same command within the configured window. Used to keep the always-
@@ -22,40 +25,16 @@
  * ConnState dedupe).
  */
 
-export type VoiceCommandKind =
-  | "disable"
-  | "mute"
-  | "unmute"
-  | "panic"
-  | "end_session"
-  | "standby"
-  | "listen"
-  | "hold_up";
+/* "panic" is the only kind the wake-word matcher can produce and the
+ * only kind ever posted to the daemon. The disable/mute/unmute kinds
+ * survive solely for the VoiceClient keyboard-hotkey fallback
+ * (Ctrl+Alt+D/M/U), which dispatches them locally and never puts them
+ * on the wire. */
+export type VoiceCommandKind = "disable" | "mute" | "unmute" | "panic";
 
 const LEX_PREFIX = String.raw`\blex\s+`;
 
 const PANIC_RE = new RegExp(LEX_PREFIX + String.raw`emergency\s+stop\b`);
-const END_SESSION_RE = new RegExp(LEX_PREFIX + String.raw`end\s+session\b`);
-const MUTE_RE = new RegExp(
-  LEX_PREFIX + String.raw`(?:mute|shut\s+up|be\s+quiet|stop\s+talking)\b`,
-);
-/* Unmute synonyms. Mirrors the daemon-side matcher; see
- * 07-daemon/src/voice/lex-voice-commands.ts for the canonical doc. */
-const UNMUTE_RE = new RegExp(
-  LEX_PREFIX +
-    String.raw`(?:unmute|resume(?!\s+listening)|come\s+back|you\s+can\s+talk|start\s+talking\s+again)\b`,
-);
-const STANDBY_RE = new RegExp(
-  LEX_PREFIX + String.raw`(?:stand\s+by|pause\s+listening|hold\s+on)\b`,
-);
-const LISTEN_RE = new RegExp(
-  LEX_PREFIX + String.raw`(?:listen|resume\s+listening|i\s+m\s+back)\b`,
-);
-const DISABLE_RE = new RegExp(LEX_PREFIX + String.raw`disable\b`);
-/* Hold-up = hard abort of Lex's current activity (TTS + pending tool
- * calls) without touching the worker. Mirrors the daemon-side regex
- * in 07-daemon/src/voice/lex-voice-commands.ts. */
-const HOLD_UP_RE = new RegExp(LEX_PREFIX + String.raw`(?:hold\s*up|holdup)\b`);
 
 function normalize(text: string): string {
   return text
@@ -70,18 +49,6 @@ export function matchWakeWord(text: string): VoiceCommandKind | null {
   const norm = normalize(text);
   if (!norm) return null;
   if (PANIC_RE.test(norm)) return "panic";
-  if (END_SESSION_RE.test(norm)) return "end_session";
-  /* hold_up before mute so "lex hold up" cannot be misread as part of
-   * the mute family, and before standby so it never gets absorbed by
-   * the "hold on" standby pattern when whisper drops a phoneme. */
-  if (HOLD_UP_RE.test(norm)) return "hold_up";
-  if (MUTE_RE.test(norm)) return "mute";
-  /* STANDBY + LISTEN before UNMUTE so qualified "resume listening"
-   * lands on listen and bare "lex resume" lands on unmute. */
-  if (STANDBY_RE.test(norm)) return "standby";
-  if (LISTEN_RE.test(norm)) return "listen";
-  if (UNMUTE_RE.test(norm)) return "unmute";
-  if (DISABLE_RE.test(norm)) return "disable";
   return null;
 }
 

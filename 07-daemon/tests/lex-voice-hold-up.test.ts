@@ -21,7 +21,6 @@ import {
   runHoldUp,
   buildHoldUpRecap,
 } from '../src/voice/lex-voice-hold-up.js';
-import { matchVoiceCommand } from '../src/voice/lex-voice-commands.js';
 
 describe('buildHoldUpRecap', () => {
   it('uses intended text when present and appends "What is up?"', () => {
@@ -179,36 +178,12 @@ describe('runHoldUp', () => {
     expect(ctrlCLexPty).toHaveBeenCalled();
   });
 
-  /* Punch-through pin (Addendum 2026-05-24). lex-voice-ws.ts re-runs
-   * matchVoiceCommand at the mid-turn-no-tts queue site so that every
-   * lex command interrupts immediately instead of being deferred to
-   * the next turn boundary. If matchVoiceCommand returns non-null for
-   * any of these phrases, the queue site's `if (lateCmd) dispatch +
-   * return` branch fires and the command bypasses the queue. The
-   * matcher is therefore the source of truth for which utterances
-   * punch through; this test pins that source of truth covers every
-   * documented command. */
-  it.each([
-    ['lex emergency stop', 'panic'],
-    ['lex end session', 'end_session'],
-    ['lex mute', 'mute'],
-    ['lex shut up', 'mute'],
-    ['lex be quiet', 'mute'],
-    ['lex stop talking', 'mute'],
-    ['lex unmute', 'unmute'],
-    ['lex resume', 'unmute'],
-    ['lex come back', 'unmute'],
-    ['lex disable', 'disable'],
-    ['lex hold up', 'hold_up'],
-    ['lex holdup', 'hold_up'],
-  ])(
-    'mid-turn-no-tts queue site: "%s" punches through as kind=%s',
-    (phrase, expectedKind) => {
-      const m = matchVoiceCommand(phrase);
-      expect(m, `${phrase} must dispatch, not queue`).not.toBeNull();
-      expect(m!.kind).toBe(expectedKind);
-    },
-  );
+  /* The Addendum 2026-05-24 punch-through pin (an it.each over the
+   * full keyword grammar) was retired with the grammar itself in the
+   * 2026-07-15 voice-top-layer teardown: only the panic phrase is
+   * matched mechanically now, and the hold_up dispatch is reachable
+   * only via the wake path or an interpreted CONTROL line from the
+   * voice top layer. */
 
   /* Fix 29 (2026-05-25): hold-up dispatch must clear mid-turn
    * state because runHoldUp's Ctrl+C kills the Lex PTY before any

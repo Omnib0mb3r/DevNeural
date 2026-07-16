@@ -1,23 +1,21 @@
 /**
  * Client-side wake-word matcher + dedupe guard.
  *
- * The wake-word path runs in parallel with the silero VAD pipeline
- * so the Lex command suite still fires while TTS playback has
- * paused the gated mic capture. These tests pin both halves:
- *   - matchWakeWord agrees with the daemon's matcher on the five
- *     command kinds, the precedence (mute > disable for "lex stop
- *     talking"), case insensitivity, and the no-prefix negatives.
+ * 2026-07-15 voice top layer v2: the spoken keyword grammar is gone;
+ * control phrases are interpreted by the speech-first voice brain's
+ * CONTROL lines instead. The ONE surviving mechanical keyword is the
+ * panic phrase "lex emergency stop". These tests pin:
+ *   - matchWakeWord recognizes ONLY the panic phrase (lex prefix
+ *     required, case-insensitive, tolerant of leading filler and
+ *     whisper punctuation) and returns null for every retired
+ *     keyword the old grammar used to match.
  *   - createDedupe blocks a same-kind re-fire within the window so
  *     a tight burst of interim Web Speech results + a trailing
  *     whisper transcript carrying the same phrase do not double-
  *     dispatch.
- *
- * "Lex shut up" during simulated TTS playback ends up as one
- * unsuppressed mute fire here; the VoiceClient maps that to
- * setSoftMuted(true), which cancels the in-flight TTS via
- * resetTtsPlayback regardless of the micGated state that gates the
- * VAD-driven path. That's the end-to-end behaviour the spec asked
- * for.
+ *   - processWakeResults walks only NEW results (the resultIndex
+ *     cursor) and bails on the first matching alternative per
+ *     result.
  */
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -44,85 +42,49 @@ function fakeEvent(
 }
 
 describe("matchWakeWord", () => {
-  it("matches the disable phrase", () => {
-    expect(matchWakeWord("lex disable")).toBe("disable");
-    expect(matchWakeWord("Lex, disable.")).toBe("disable");
-  });
-
-  it("matches the full mute family", () => {
-    expect(matchWakeWord("lex mute")).toBe("mute");
-    expect(matchWakeWord("lex shut up")).toBe("mute");
-    expect(matchWakeWord("lex be quiet")).toBe("mute");
-    expect(matchWakeWord("lex stop talking")).toBe("mute");
-  });
-
-  it('"lex stop talking" falls through to mute, not disable', () => {
-    expect(matchWakeWord("lex stop talking")).toBe("mute");
-  });
-
-  it("matches the full unmute family including the 'resume' synonyms", () => {
-    /* Fix 10 regression: "lex resume" used to return null and the
-     * user had to press stop+start to recover TTS after a mute. */
-    expect(matchWakeWord("lex unmute")).toBe("unmute");
-    expect(matchWakeWord("lex resume")).toBe("unmute");
-    expect(matchWakeWord("lex come back")).toBe("unmute");
-    expect(matchWakeWord("lex you can talk")).toBe("unmute");
-    expect(matchWakeWord("lex start talking again")).toBe("unmute");
-  });
-
-  it("matches the standby family (soft mic pause)", () => {
-    expect(matchWakeWord("lex stand by")).toBe("standby");
-    expect(matchWakeWord("lex pause listening")).toBe("standby");
-    expect(matchWakeWord("lex hold on")).toBe("standby");
-  });
-
-  it("matches the listen family (rearm mic after standby)", () => {
-    expect(matchWakeWord("lex listen")).toBe("listen");
-    expect(matchWakeWord("lex resume listening")).toBe("listen");
-    expect(matchWakeWord("lex i'm back")).toBe("listen");
-  });
-
-  it("'lex resume listening' disambiguates to listen, not unmute", () => {
-    /* Bare "lex resume" is the unmute TTS-axis synonym; qualifying
-     * with "listening" picks the STT-axis listen command. */
-    expect(matchWakeWord("lex resume listening")).toBe("listen");
-    expect(matchWakeWord("lex resume")).toBe("unmute");
-  });
-
-  it("matches panic and end_session", () => {
+  it("matches the panic phrase", () => {
     expect(matchWakeWord("lex emergency stop")).toBe("panic");
-    expect(matchWakeWord("lex end session")).toBe("end_session");
+    expect(matchWakeWord("Lex, emergency stop!")).toBe("panic");
+    expect(matchWakeWord("LEX EMERGENCY STOP")).toBe("panic");
   });
 
-  it("matches the hold_up family (Fix 2026-05-24)", () => {
-    expect(matchWakeWord("lex hold up")).toBe("hold_up");
-    expect(matchWakeWord("lex holdup")).toBe("hold_up");
-    expect(matchWakeWord("okay lex hold up wait")).toBe("hold_up");
-    expect(matchWakeWord("LEX HOLD UP!")).toBe("hold_up");
+  it("tolerates leading filler and sloppy whisper spacing", () => {
+    expect(matchWakeWord("uh lex emergency stop please")).toBe("panic");
+    expect(matchWakeWord("okay LEX  EMERGENCY  STOP!")).toBe("panic");
   });
 
-  it("does NOT confuse 'lex hold on' (standby) with hold_up", () => {
-    expect(matchWakeWord("lex hold on")).toBe("standby");
-    expect(matchWakeWord("lex hold up")).toBe("hold_up");
-  });
-
-  it("does NOT match bare 'hold up' without the lex prefix", () => {
-    expect(matchWakeWord("hold up")).toBeNull();
-  });
-
-  it("requires the lex prefix on every command", () => {
+  it("requires the lex prefix", () => {
     expect(matchWakeWord("emergency stop")).toBeNull();
-    expect(matchWakeWord("shut up")).toBeNull();
-    expect(matchWakeWord("disable")).toBeNull();
-    expect(matchWakeWord("end session")).toBeNull();
   });
 
-  it("survives mid-TTS interim transcripts that the Web Speech recognizer emits", () => {
-    /* Web Speech results during simulated TTS playback look like
-     * partial fragments while the user is still speaking. The
-     * matcher does not care about leading filler. */
-    expect(matchWakeWord("uh lex shut up please")).toBe("mute");
-    expect(matchWakeWord("okay LEX  SHUT  UP!")).toBe("mute");
+  it("does NOT match any retired keyword from the old grammar", () => {
+    /* voice top layer v2: everything below is now interpreted by the
+     * speech-first voice brain, not a client regex. The matcher must
+     * stay dumb to all of it so the brain gets the utterance. */
+    const retired = [
+      "lex disable",
+      "lex mute",
+      "lex shut up",
+      "lex be quiet",
+      "lex stop talking",
+      "lex unmute",
+      "lex resume",
+      "lex come back",
+      "lex you can talk",
+      "lex start talking again",
+      "lex stand by",
+      "lex pause listening",
+      "lex hold on",
+      "lex listen",
+      "lex resume listening",
+      "lex i'm back",
+      "lex end session",
+      "lex hold up",
+      "lex holdup",
+    ];
+    for (const phrase of retired) {
+      expect(matchWakeWord(phrase), phrase).toBeNull();
+    }
   });
 
   it("returns null on empty / whitespace input", () => {
@@ -134,18 +96,20 @@ describe("matchWakeWord", () => {
 describe("createDedupe", () => {
   it("returns true on the first fire and false within the window for the same kind", () => {
     const guard = createDedupe(1500);
-    expect(guard.shouldFire("mute", 1000)).toBe(true);
-    expect(guard.shouldFire("mute", 1500)).toBe(false);
-    expect(guard.shouldFire("mute", 2499)).toBe(false);
+    expect(guard.shouldFire("panic", 1000)).toBe(true);
+    expect(guard.shouldFire("panic", 1500)).toBe(false);
+    expect(guard.shouldFire("panic", 2499)).toBe(false);
   });
 
   it("allows the same kind again after the window has passed", () => {
     const guard = createDedupe(1500);
-    expect(guard.shouldFire("mute", 1000)).toBe(true);
-    expect(guard.shouldFire("mute", 2500)).toBe(true);
+    expect(guard.shouldFire("panic", 1000)).toBe(true);
+    expect(guard.shouldFire("panic", 2500)).toBe(true);
   });
 
   it("tracks each kind independently", () => {
+    /* mute/unmute/disable still flow through the dedupe via the
+     * keyboard-hotkey fallback, so the guard stays kind-scoped. */
     const guard = createDedupe(1500);
     expect(guard.shouldFire("mute", 1000)).toBe(true);
     expect(guard.shouldFire("disable", 1000)).toBe(true);
@@ -167,32 +131,30 @@ describe("processWakeResults", () => {
   /* Regression for bug 2026-05-14: Web Speech in continuous mode
    * never trims event.results; every finalised fragment from the
    * lifetime of the recognizer stays at its original index. The
-   * walker now reads from event.resultIndex so only NEW finals on
-   * THIS event are dispatched. */
-  it("only dispatches the NEW result when prior 'lex shut up' final stays at index 0 and 'lex unmute' lands at index 1", () => {
+   * walker reads from event.resultIndex so only NEW finals on THIS
+   * event are dispatched. */
+  it("only dispatches the NEW result when a prior panic final stays at index 0", () => {
     const dispatch = vi.fn();
     /* Simulates Chromium's second onresult after the user already
-     * said 'lex shut up' (now sitting permanently at results[0]
-     * isFinal=true) and just finished 'lex unmute' at results[1]
-     * isFinal=true. resultIndex=1 marks results[1] as the only
-     * new fragment. The buggy 0-based walk re-dispatched mute
-     * here; the fixed walker only dispatches unmute. */
-    processWakeResults(fakeEvent(["lex shut up", "lex unmute"], 1), {
-      dispatch,
-    });
+     * said the panic phrase once (now sitting permanently at
+     * results[0] isFinal=true) and just said it again at results[1].
+     * resultIndex=1 marks results[1] as the only new fragment; a
+     * 0-based walk would dispatch twice. */
+    processWakeResults(
+      fakeEvent(["lex emergency stop", "lex emergency stop"], 1),
+      { dispatch },
+    );
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(dispatch).toHaveBeenCalledWith("unmute");
+    expect(dispatch).toHaveBeenCalledWith("panic");
   });
 
-  it("dispatches both kinds when resultIndex=0 and both fragments are new", () => {
+  it("dispatches each new matching fragment when resultIndex=0 and both are new", () => {
     const dispatch = vi.fn();
-    processWakeResults(fakeEvent(["lex shut up", "lex unmute"], 0), {
-      dispatch,
-    });
-    expect(dispatch.mock.calls.map((c) => c[0])).toEqual([
-      "mute",
-      "unmute",
-    ]);
+    processWakeResults(
+      fakeEvent(["lex emergency stop", "lex emergency stop"], 0),
+      { dispatch },
+    );
+    expect(dispatch.mock.calls.map((c) => c[0])).toEqual(["panic", "panic"]);
   });
 
   it("defaults to resultIndex=0 when the event omits the field (older builds)", () => {
@@ -207,11 +169,22 @@ describe("processWakeResults", () => {
   it("ignores already-delivered results before resultIndex even when they match", () => {
     const dispatch = vi.fn();
     processWakeResults(
-      fakeEvent(["lex shut up", "background noise", "lex disable"], 2),
+      fakeEvent(
+        ["lex emergency stop", "background noise", "lex emergency stop"],
+        2,
+      ),
       { dispatch },
     );
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(dispatch).toHaveBeenCalledWith("disable");
+    expect(dispatch).toHaveBeenCalledWith("panic");
+  });
+
+  it("does not dispatch retired keywords even as new results", () => {
+    const dispatch = vi.fn();
+    processWakeResults(fakeEvent(["lex shut up", "lex disable"], 0), {
+      dispatch,
+    });
+    expect(dispatch).not.toHaveBeenCalled();
   });
 
   it("walks alternatives within one result and bails on the first match", () => {
@@ -220,15 +193,15 @@ describe("processWakeResults", () => {
       Object.assign(
         [
           { transcript: "background", confidence: 0.4 },
-          { transcript: "lex mute", confidence: 0.92 },
-          { transcript: "lex disable", confidence: 0.5 },
+          { transcript: "lex emergency stop", confidence: 0.92 },
+          { transcript: "lex emergency stop please", confidence: 0.5 },
         ],
         { isFinal: true },
       ) as SpeechRecognitionResultLike,
     ];
     processWakeResults({ results, resultIndex: 0 }, { dispatch });
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(dispatch).toHaveBeenCalledWith("mute");
+    expect(dispatch).toHaveBeenCalledWith("panic");
   });
 
   it("fires onCandidate for every alternative the walker visits, with the matcher's verdict", () => {
@@ -236,18 +209,15 @@ describe("processWakeResults", () => {
       transcript: string;
       matched: string | null;
     }> = [];
-    processWakeResults(
-      fakeEvent(["hello there", "lex unmute"], 0),
-      {
-        dispatch: () => {},
-        onCandidate: ({ transcript, matched }) => {
-          candidates.push({ transcript, matched });
-        },
+    processWakeResults(fakeEvent(["hello there", "lex emergency stop"], 0), {
+      dispatch: () => {},
+      onCandidate: ({ transcript, matched }) => {
+        candidates.push({ transcript, matched });
       },
-    );
+    });
     expect(candidates).toEqual([
       { transcript: "hello there", matched: null },
-      { transcript: "lex unmute", matched: "unmute" },
+      { transcript: "lex emergency stop", matched: "panic" },
     ]);
   });
 });

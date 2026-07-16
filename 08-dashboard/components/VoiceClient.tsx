@@ -284,7 +284,11 @@ function applyVadRedemptionMigration(valueMs: number): number {
 const VAD_REDEMPTION_STORAGE_KEY = "lex-vad-redemption-ms";
 const VAD_REDEMPTION_MIN = 200;
 const VAD_REDEMPTION_MAX = 6000;
-const VAD_REDEMPTION_DEFAULT = 768;
+/* 2026-07-15 voice top layer v2: default lowered 768 -> 450ms for
+ * snappier endpointing. Only the never-touched-the-slider default
+ * changes; the tunable range, slider mapping, and persisted user
+ * values are honored exactly as before. */
+const VAD_REDEMPTION_DEFAULT = 450;
 
 /* Rolling probability floor for stuck-open VAD recovery. While the
  * listener is open we average silero's per-frame isSpeech probability
@@ -905,9 +909,12 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * empty the array so the next reply starts clean. */
   const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   /* Generation counter so late-arriving binary PCM chunks from a
-   * barged-in TTS stream don't get scheduled into the new reply. Each
-   * barge-in / new tts-start bumps the gen; chunk handlers compare
-   * against a captured value at receive-time. */
+   * cancelled TTS stream don't get scheduled into the new reply. Only
+   * the cancel paths bump the gen (barge-in, tts-cancel, soft mute,
+   * audio-sink reset); tts-start deliberately does NOT, so all the
+   * segments of one reply share a generation and their chunks chain
+   * gaplessly onto the same playhead. Chunk handlers compare against
+   * a value captured at receive-time. */
   const ttsGenRef = useRef<number>(0);
   /* Voice-output watchdog state. The 10s probe loop reads these
    * refs to decide whether the audio path is healthy and whether
@@ -969,11 +976,13 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   /* Reset playhead, hard-stop every scheduled source, and bump the
    * generation counter so any in-flight binary chunks from the now-
    * cancelled reply get discarded instead of scheduled into the next
-   * one. Used on barge-in and on the next tts-start. The bump is what
-   * fixes "two voices at once": the server cancels piper, but TCP
-   * frames already in flight still arrive client-side; without this
-   * gen guard those frames would schedule fresh sources just as the
-   * new reply's chunks start landing. */
+   * one. Used on barge-in, tts-cancel, and soft mute; tts-start
+   * deliberately does NOT call this (segments of one reply chain onto
+   * the live playhead instead, see the tts-start handler). The bump
+   * is what fixes "two voices at once": the server cancels piper, but
+   * TCP frames already in flight still arrive client-side; without
+   * this gen guard those frames would schedule fresh sources just as
+   * the new reply's chunks start landing. */
   function resetTtsPlayback(): void {
     ttsGenRef.current += 1;
     for (const src of activeSourcesRef.current) {
@@ -1155,16 +1164,17 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     }
   }
 
-  /* Always-on wake-word dispatch. Driven by the Web Speech API
-   * listener and the keyboard-hotkey listener below. Local kinds
-   * (disable, mute, unmute) update client state directly so the UI
-   * responds instantly even mid-TTS. Server kinds (panic, end_session)
-   * route through the daemon's `wake-command` WS message so the same
-   * audit log + end-session pipeline that the transcript path runs
-   * still fires. The daemon dedupes wake-command vs. the trailing
-   * whisper transcript within a 1.5s window per kind; the client
-   * keeps its own dedupe so the keyboard hotkey + Web Speech don't
-   * double-dispatch the same intent in the same instant. */
+  /* Always-on wake-word dispatch. The Web Speech matcher is panic-
+   * only (voice top layer v2 spec): "lex emergency stop" is the sole
+   * surviving spoken keyword, and panic is the ONLY kind ever posted
+   * to the daemon as a `wake-command` frame. The local kinds
+   * (disable, mute, unmute) arrive exclusively from the keyboard-
+   * hotkey fallback below and update client state directly so the UI
+   * responds instantly even mid-TTS; they never cross the WS. The
+   * daemon dedupes wake-command vs. the trailing whisper transcript
+   * within a 1.5s window per kind; the client keeps its own dedupe so
+   * the keyboard hotkey + Web Speech don't double-dispatch the same
+   * intent in the same instant. */
   const wakeDedupeRef = useRef(createDedupe(1500));
   function dispatchWakeCommand(kind: VoiceCommandKind): void {
     /* Probe dedupe first WITHOUT mutating state so we can log
@@ -1186,7 +1196,6 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         setSoftMuted(false);
         return;
       case "panic":
-      case "end_session":
         sendJson({ t: "wake-command", kind });
         return;
     }
@@ -2206,6 +2215,12 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             }
             const rate = Number(msg.rate) || 22050;
             ttsRateRef.current = rate;
+            /* Segment chaining (2026-07-15 gapless fix). The server
+             * tags tts-start frames that belong to the same logical
+             * reply turn (pre-tool ack then body; sentence-serialized
+             * body segments) with continuation:true. Daemons that
+             * predate the flag omit it; a missing flag means false. */
+            const continuation = msg.continuation === true;
             /* AudioContext is warmed inside the toggleEnabled() click
              * handler (a user gesture), not here. Lazy-creating in
              * this network callback used to ship a context iOS
@@ -2221,11 +2236,40 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             if (ctx && ctx.state === "suspended") {
               void ctx.resume().catch(() => undefined);
             }
-            playheadRef.current = ctx?.currentTime ?? 0;
+            /* Playhead policy. The old code reset playheadRef to
+             * ctx.currentTime on EVERY tts-start, which laid the new
+             * segment's first chunk on top of the previous segment's
+             * still-scheduled tail (overlap) or, after a full drain,
+             * restarted with an audible seam (gap). Now:
+             *  - continuation:true never touches the playhead: the
+             *    incoming chunks chain onto the existing schedule so
+             *    consecutive segments of one reply play gaplessly.
+             *    (schedulePcmChunk clamps a stale playhead forward
+             *    itself, so a fully-drained chain restarts cleanly.)
+             *  - continuation absent/false only rewinds a playhead
+             *    that has fallen into the past (previous audio fully
+             *    drained). A playhead still ahead of currentTime
+             *    means earlier audio is still scheduled; chain behind
+             *    it instead of resetting so two segments can never
+             *    overlap.
+             * The generation counter is deliberately NOT bumped here:
+             * chunks still in flight from the previous segment were
+             * never cancelled and must keep scheduling onto the
+             * shared chain. Cancellation (barge-in, tts-cancel, soft
+             * mute) still goes through resetTtsPlayback, which stops
+             * every scheduled source (chained segments included),
+             * resets the playhead, and bumps the generation. */
+            if (
+              ctx &&
+              !continuation &&
+              playheadRef.current < ctx.currentTime
+            ) {
+              playheadRef.current = ctx.currentTime;
+            }
             speakingRef.current = true;
-            /* Fresh reply: reset the server-finished flag so an
-             * onended for THIS reply only finalises after this reply's
-             * own tts-end has landed. */
+            /* Fresh segment: reset the server-finished flag so an
+             * onended for THIS segment only finalises after this
+             * segment's own tts-end has landed. */
             streamFinishedRef.current = false;
             /* Watchdog gates: a TTS request is now in flight, and the
              * buffer-progress clock restarts from this instant so the

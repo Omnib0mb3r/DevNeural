@@ -1,0 +1,550 @@
+/**
+ * Dedicated voice-brain session (src/lex/voice-brain-session.ts).
+ *
+ * Never spawns a real `claude` process: every pty-host / fs primitive
+ * is replaced via _setVoiceBrainSessionDepsForTests. Timing is driven
+ * by a virtual clock (makeVirtualIo below, same rig as
+ * judge-session.test.ts) so timeout/respawn scenarios run instantly
+ * and deterministically. The one addition over the judge rig: a
+ * scheduled record can carry a stop_reason so the phase 2 onPartial
+ * streaming path (per-record delivery, end_turn resolution) is
+ * exercised against realistic jsonl shapes.
+ */
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import {
+  askVoice,
+  isVoiceBrainSessionEnabled,
+  _resetVoiceBrainSessionStateForTests,
+  _setVoiceBrainSessionDepsForTests,
+  _voiceBrainSessionSnapshotForTests,
+  type VoiceBrainSessionDeps,
+} from '../src/lex/voice-brain-session.js';
+import { transcriptPathFor } from '../src/lex/spawn-lex-session.js';
+
+const CWD = 'C:/fake/voice-brain-cwd';
+const HOME_DIR = 'C:/fake/home';
+
+/* Virtual filesystem + clock. statSync/readRange only ever see content
+ * that has "arrived" as of the current virtual time, so a scheduled
+ * record with a nonzero delay genuinely isn't visible until enough
+ * sleep() calls (or an explicit advanceClock) have elapsed past it. */
+function makeVirtualIo(): {
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  statSync: (path: string) => { size: number };
+  readRange: (path: string, start: number, length: number) => string;
+  scheduleAssistantRecord: (
+    path: string,
+    delayMs: number,
+    text: string | null,
+    stopReason?: string,
+  ) => void;
+  advanceClock: (ms: number) => void;
+} {
+  let ms = 0;
+  const files = new Map<string, string>();
+  const pending: Array<{ path: string; arrivesAt: number; line: string }> = [];
+
+  function flush(): void {
+    for (let i = pending.length - 1; i >= 0; i--) {
+      const p = pending[i]!;
+      if (p.arrivesAt <= ms) {
+        files.set(p.path, (files.get(p.path) ?? '') + p.line);
+        pending.splice(i, 1);
+      }
+    }
+  }
+
+  return {
+    now: () => ms,
+    sleep: async (dur: number) => {
+      ms += dur;
+    },
+    statSync: (path: string) => {
+      flush();
+      const content = files.get(path);
+      if (content === undefined) {
+        const err = new Error(`ENOENT: ${path}`) as NodeJS.ErrnoException;
+        err.code = 'ENOENT';
+        throw err;
+      }
+      return { size: Buffer.byteLength(content, 'utf-8') };
+    },
+    readRange: (path: string, start: number, length: number) => {
+      flush();
+      const content = files.get(path) ?? '';
+      return Buffer.from(content, 'utf-8')
+        .subarray(start, start + length)
+        .toString('utf-8');
+    },
+    scheduleAssistantRecord: (
+      path: string,
+      delayMs: number,
+      text: string | null,
+      stopReason?: string,
+    ) => {
+      const message: {
+        content: Array<{ type: string; text: string }>;
+        stop_reason?: string;
+      } = {
+        content: text === null ? [] : [{ type: 'text', text }],
+      };
+      if (stopReason !== undefined) message.stop_reason = stopReason;
+      const rec = { type: 'assistant', message };
+      /* Math.max(delayMs, 1): a delay of exactly 0 must still land
+       * STRICTLY after "now" at schedule time, otherwise it would
+       * already be visible to the pre-inject baseline statSync read
+       * and get folded into the baseline offset instead of being seen
+       * as new content by the poll loop. */
+      pending.push({
+        path,
+        arrivesAt: ms + Math.max(delayMs, 1),
+        line: `${JSON.stringify(rec)}\n`,
+      });
+    },
+    advanceClock: (dur: number) => {
+      ms += dur;
+    },
+  };
+}
+
+interface SpawnCall {
+  cwd: string;
+  systemPrompt?: string;
+  args?: string[];
+  sessionId?: string;
+}
+
+function makeFakePtyLayer(): {
+  spawnLex: VoiceBrainSessionDeps['spawnLex'];
+  ptyInject: VoiceBrainSessionDeps['ptyInject'];
+  ptyKill: VoiceBrainSessionDeps['ptyKill'];
+  getPty: VoiceBrainSessionDeps['getPty'];
+  randomUUID: () => string;
+  spawnCalls: SpawnCall[];
+  injectCalls: Array<{ ptyId: string; text: string; commit?: boolean }>;
+  killCalls: string[];
+  killedPtys: Set<string>;
+} {
+  const spawnCalls: SpawnCall[] = [];
+  const injectCalls: Array<{ ptyId: string; text: string; commit?: boolean }> = [];
+  const killCalls: string[] = [];
+  const killedPtys = new Set<string>();
+  let ptyCounter = 0;
+  let uuidCounter = 0;
+
+  return {
+    spawnCalls,
+    injectCalls,
+    killCalls,
+    killedPtys,
+    spawnLex: (opts) => {
+      spawnCalls.push(opts);
+      ptyCounter += 1;
+      return { ptyId: `pty-${ptyCounter}`, pid: 1000 + ptyCounter };
+    },
+    ptyInject: (ptyId, text, commit) => {
+      injectCalls.push({ ptyId, text, commit });
+      if (killedPtys.has(ptyId)) {
+        return { ok: false, error: 'pty has exited' };
+      }
+      return { ok: true };
+    },
+    ptyKill: (ptyId) => {
+      killCalls.push(ptyId);
+      killedPtys.add(ptyId);
+      return true;
+    },
+    getPty: (ptyId) => ({ exited: killedPtys.has(ptyId) }),
+    randomUUID: () => {
+      uuidCounter += 1;
+      return `cc-session-${uuidCounter}`;
+    },
+  };
+}
+
+let priorFlag: string | undefined;
+let priorTimeout: string | undefined;
+
+beforeEach(() => {
+  priorFlag = process.env.DEVNEURAL_VOICE_BRAIN_SESSION;
+  priorTimeout = process.env.DEVNEURAL_VOICE_BRAIN_TIMEOUT_MS;
+  delete process.env.DEVNEURAL_VOICE_BRAIN_SESSION;
+  delete process.env.DEVNEURAL_VOICE_BRAIN_TIMEOUT_MS;
+  _resetVoiceBrainSessionStateForTests();
+});
+
+afterEach(() => {
+  if (priorFlag === undefined) delete process.env.DEVNEURAL_VOICE_BRAIN_SESSION;
+  else process.env.DEVNEURAL_VOICE_BRAIN_SESSION = priorFlag;
+  if (priorTimeout === undefined) delete process.env.DEVNEURAL_VOICE_BRAIN_TIMEOUT_MS;
+  else process.env.DEVNEURAL_VOICE_BRAIN_TIMEOUT_MS = priorTimeout;
+  _setVoiceBrainSessionDepsForTests(null);
+  _resetVoiceBrainSessionStateForTests();
+});
+
+function baseDeps(
+  io: ReturnType<typeof makeVirtualIo>,
+  pty: ReturnType<typeof makeFakePtyLayer>,
+  extra: Partial<VoiceBrainSessionDeps> = {},
+): VoiceBrainSessionDeps {
+  return {
+    spawnLex: pty.spawnLex,
+    ptyInject: pty.ptyInject,
+    ptyKill: pty.ptyKill,
+    getPty: pty.getPty,
+    statSync: io.statSync,
+    readRange: io.readRange,
+    now: io.now,
+    randomUUID: pty.randomUUID,
+    sleep: io.sleep,
+    log: () => undefined,
+    cwd: CWD,
+    homeDir: HOME_DIR,
+    pollIntervalMs: 50,
+    respawnCooldownMs: 5 * 60 * 1000,
+    ...extra,
+  };
+}
+
+function pathForSession(n: number): string {
+  return transcriptPathFor({
+    cwd: CWD,
+    ccSessionId: `cc-session-${n}`,
+    homeDir: HOME_DIR,
+  });
+}
+
+describe('askVoice: ask/reply round trip', () => {
+  it('resolves with the first assistant record text when onPartial is not provided', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    io.scheduleAssistantRecord(pathForSession(1), 0, 'On it, boss.');
+
+    const result = await askVoice({
+      system: 'Reply in one short spoken sentence.',
+      prompt: 'Say hello.',
+      timeoutMs: 5000,
+    });
+
+    expect(result).toBe('On it, boss.');
+    expect(pty.spawnCalls.length).toBe(1);
+    expect(pty.spawnCalls[0]!.args).toContain('--session-id');
+    expect(pty.spawnCalls[0]!.args).toContain('cc-session-1');
+    expect(pty.spawnCalls[0]!.sessionId).toBe('cc-session-1');
+    expect(pty.injectCalls.length).toBe(1);
+    expect(pty.injectCalls[0]!.text).toContain('Reply in one short spoken sentence.');
+    expect(pty.injectCalls[0]!.text).toContain('Say hello.');
+    expect(pty.injectCalls[0]!.commit).toBe(true);
+  });
+
+  it('sends the bare prompt when no system framing is given', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    io.scheduleAssistantRecord(pathForSession(1), 0, 'Sure.');
+
+    await askVoice({ prompt: 'Just the prompt.', timeoutMs: 5000 });
+
+    expect(pty.injectCalls[0]!.text).toBe('Just the prompt.');
+  });
+});
+
+describe('session spawn deduplication', () => {
+  it('spawns once and reuses the live PTY across sequential asks', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    const path1 = pathForSession(1);
+    io.scheduleAssistantRecord(path1, 0, 'first reply');
+
+    const r1 = await askVoice({ prompt: 'one', timeoutMs: 5000 });
+    io.scheduleAssistantRecord(path1, 0, 'second reply');
+    const r2 = await askVoice({ prompt: 'two', timeoutMs: 5000 });
+
+    expect(r1).toBe('first reply');
+    expect(r2).toBe('second reply');
+    expect(pty.spawnCalls.length).toBe(1);
+    expect(pty.injectCalls.length).toBe(2);
+    expect(pty.injectCalls[0]!.ptyId).toBe('pty-1');
+    expect(pty.injectCalls[1]!.ptyId).toBe('pty-1');
+  });
+
+  it('serializes concurrent asks onto the one session: second ask waits, no second spawn', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    const path1 = pathForSession(1);
+    io.scheduleAssistantRecord(path1, 100, 'first reply');
+    io.scheduleAssistantRecord(path1, 250, 'second reply');
+
+    const order: string[] = [];
+    const p1 = askVoice({ prompt: 'one', timeoutMs: 5000 }).then((r) => {
+      order.push('resolved-1');
+      return r;
+    });
+    const p2 = askVoice({ prompt: 'two', timeoutMs: 5000 }).then((r) => {
+      order.push('resolved-2');
+      return r;
+    });
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+
+    expect(order).toEqual(['resolved-1', 'resolved-2']);
+    expect(r1).toBe('first reply');
+    expect(r2).toBe('second reply');
+    expect(pty.spawnCalls.length).toBe(1);
+    expect(pty.injectCalls.length).toBe(2);
+  });
+});
+
+describe('timeout: resolves null, never throws', () => {
+  it('a timed-out ask resolves null and increments consecutive_timeouts', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    // No record ever scheduled: the poll loop exhausts its deadline.
+
+    const result = await askVoice({ prompt: 'anyone home?', timeoutMs: 300 });
+
+    expect(result).toBeNull();
+    expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(1);
+    expect(pty.killCalls.length).toBe(0); // one timeout alone does not kill
+  });
+
+  it('uses DEVNEURAL_VOICE_BRAIN_TIMEOUT_MS as the default deadline when timeoutMs is omitted', async () => {
+    process.env.DEVNEURAL_VOICE_BRAIN_TIMEOUT_MS = '300';
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+
+    const result = await askVoice({ prompt: 'q' });
+
+    expect(result).toBeNull();
+    // The poll loop slept exactly up to the 300ms env-configured
+    // deadline (poll interval 50ms divides it evenly), so the virtual
+    // clock pins the default that was actually applied.
+    expect(io.now()).toBe(300);
+  });
+
+  it('falls back to the 6000ms built-in default when the env var is unset', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+
+    const result = await askVoice({ prompt: 'q' });
+
+    expect(result).toBeNull();
+    expect(io.now()).toBe(6000);
+  });
+
+  it('a successful reply after a timeout resets the streak to zero', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+
+    const missed = await askVoice({ prompt: 'q1', timeoutMs: 200 });
+    expect(missed).toBeNull();
+    expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(1);
+
+    io.scheduleAssistantRecord(pathForSession(1), 0, 'still here');
+    const ok = await askVoice({ prompt: 'q2', timeoutMs: 5000 });
+
+    expect(ok).toBe('still here');
+    expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(0);
+  });
+});
+
+describe('onPartial: per-record streaming, end_turn resolution', () => {
+  it('delivers each record text to onPartial as it lands and resolves with the concatenation on end_turn', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    const path1 = pathForSession(1);
+    io.scheduleAssistantRecord(path1, 10, 'Checking the build now.');
+    io.scheduleAssistantRecord(path1, 120, 'Two workers are still running.');
+    io.scheduleAssistantRecord(path1, 240, 'Nothing needs you yet.', 'end_turn');
+
+    const partials: string[] = [];
+    const result = await askVoice({
+      prompt: 'status?',
+      timeoutMs: 5000,
+      onPartial: (text) => partials.push(text),
+    });
+
+    expect(partials).toEqual([
+      'Checking the build now.',
+      'Two workers are still running.',
+      'Nothing needs you yet.',
+    ]);
+    expect(result).toBe(
+      'Checking the build now.\nTwo workers are still running.\nNothing needs you yet.',
+    );
+  });
+
+  it('does NOT resolve on a text record without end_turn; the deadline still governs', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    const path1 = pathForSession(1);
+    // A partial lands but no end_turn ever arrives: the ask must time
+    // out (null) rather than resolve early with the fragment.
+    io.scheduleAssistantRecord(path1, 10, 'Well, the thing is');
+
+    const partials: string[] = [];
+    const result = await askVoice({
+      prompt: 'q',
+      timeoutMs: 300,
+      onPartial: (text) => partials.push(text),
+    });
+
+    expect(partials).toEqual(['Well, the thing is']);
+    expect(result).toBeNull();
+    expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(1);
+  });
+
+  it('an end_turn record with no text blocks still closes the ask with the accumulated text', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    const path1 = pathForSession(1);
+    io.scheduleAssistantRecord(path1, 10, 'All done.');
+    io.scheduleAssistantRecord(path1, 60, null, 'end_turn');
+
+    const partials: string[] = [];
+    const result = await askVoice({
+      prompt: 'q',
+      timeoutMs: 5000,
+      onPartial: (text) => partials.push(text),
+    });
+
+    expect(partials).toEqual(['All done.']);
+    expect(result).toBe('All done.');
+  });
+
+  it('a throwing onPartial is swallowed; the ask still resolves with the full text', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    const path1 = pathForSession(1);
+    io.scheduleAssistantRecord(path1, 10, 'First.');
+    io.scheduleAssistantRecord(path1, 60, 'Second.', 'end_turn');
+
+    const result = await askVoice({
+      prompt: 'q',
+      timeoutMs: 5000,
+      onPartial: () => {
+        throw new Error('speaker exploded');
+      },
+    });
+
+    expect(result).toBe('First.\nSecond.');
+  });
+
+  it('without onPartial, a single end_turn record resolves on its text alone (fallback parity)', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    io.scheduleAssistantRecord(pathForSession(1), 0, 'Quick answer.', 'end_turn');
+
+    const result = await askVoice({ prompt: 'q', timeoutMs: 5000 });
+
+    expect(result).toBe('Quick answer.');
+  });
+});
+
+describe('liveness: respawn after two consecutive timeouts, bounded by cooldown', () => {
+  it('kills the session on the second consecutive timeout, then suppresses a respawn attempt inside the cooldown window', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty, { respawnCooldownMs: 10_000 }));
+
+    const t1 = await askVoice({ prompt: 'q1', timeoutMs: 100 });
+    const t2 = await askVoice({ prompt: 'q2', timeoutMs: 100 });
+    expect(t1).toBeNull();
+    expect(t2).toBeNull();
+    // Two consecutive timeouts: the session was killed.
+    expect(pty.killCalls.length).toBe(1);
+    expect(_voiceBrainSessionSnapshotForTests().ptyId).toBeNull();
+    expect(pty.spawnCalls.length).toBe(1); // still just the original spawn
+
+    // Cooldown has not elapsed (virtual clock advanced ~200ms of the
+    // 10s window): a third ask must NOT trigger a second spawn.
+    const t3 = await askVoice({ prompt: 'q3', timeoutMs: 50 });
+    expect(t3).toBeNull();
+    expect(pty.spawnCalls.length).toBe(1);
+  });
+
+  it('respawns once the cooldown window has elapsed, and the fresh session answers normally', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty, { respawnCooldownMs: 10_000 }));
+
+    await askVoice({ prompt: 'q1', timeoutMs: 100 });
+    await askVoice({ prompt: 'q2', timeoutMs: 100 });
+    expect(pty.killCalls.length).toBe(1);
+    expect(pty.spawnCalls.length).toBe(1);
+
+    // Fast-forward past the cooldown window.
+    io.advanceClock(10_000);
+
+    io.scheduleAssistantRecord(pathForSession(2), 0, 'fresh session speaking');
+    const result = await askVoice({ prompt: 'q3', timeoutMs: 5000 });
+
+    expect(result).toBe('fresh session speaking');
+    expect(pty.spawnCalls.length).toBe(2); // the bounded respawn happened
+  });
+
+  it('also respawns when the PTY is found exited externally (not just on timeout)', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty, { respawnCooldownMs: 10_000 }));
+
+    io.scheduleAssistantRecord(pathForSession(1), 0, 'alive');
+    await askVoice({ prompt: 'q1', timeoutMs: 5000 });
+    expect(pty.spawnCalls.length).toBe(1);
+
+    // Simulate an external death (claude process crashed) without
+    // going through two timeouts.
+    pty.killedPtys.add('pty-1');
+    io.advanceClock(10_000); // clear the cooldown so the respawn is allowed
+
+    io.scheduleAssistantRecord(pathForSession(2), 0, 'back again');
+    const result = await askVoice({ prompt: 'q2', timeoutMs: 5000 });
+
+    expect(result).toBe('back again');
+    expect(pty.spawnCalls.length).toBe(2);
+  });
+});
+
+describe('DEVNEURAL_VOICE_BRAIN_SESSION flag', () => {
+  it('under Vitest, stays disabled until a test explicitly overrides deps (safety backstop)', () => {
+    /* No _setVoiceBrainSessionDepsForTests call in THIS test: proves
+     * the Vitest-detection guard, not the env var, is what gates this.
+     * Same incident class judge-session's backstop exists for: a test
+     * file that merely calls into a voice call site must never launch
+     * a real `claude --dangerously-skip-permissions` subprocess. */
+    expect(isVoiceBrainSessionEnabled()).toBe(false);
+  });
+
+  it('once a test overrides deps, the flag defaults to enabled', () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    expect(isVoiceBrainSessionEnabled()).toBe(true);
+  });
+
+  it('"0" disables the session even with deps overridden; askVoice resolves null without ever spawning', async () => {
+    process.env.DEVNEURAL_VOICE_BRAIN_SESSION = '0';
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+
+    const result = await askVoice({ prompt: 'q', timeoutMs: 5000 });
+
+    expect(result).toBeNull();
+    expect(pty.spawnCalls.length).toBe(0);
+    expect(pty.injectCalls.length).toBe(0);
+  });
+});
