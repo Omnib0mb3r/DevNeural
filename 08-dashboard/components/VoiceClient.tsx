@@ -41,6 +41,10 @@ import {
   type WatchdogCheckKind,
 } from "@/lib/voice-watchdog";
 import { VoiceErrorPill } from "./VoiceErrorPill";
+import {
+  resolveVoiceStatusLabel,
+  type VoiceStatus,
+} from "@/lib/voice-status";
 
 /* Wake-word debug badge gating. The badge is dev-only: set
  * NEXT_PUBLIC_LEX_DEBUG_VOICE=1 in .env.local to surface the
@@ -161,15 +165,11 @@ const PANEL_MOUNT_ID = "voice-panel-mount";
  * latency. AudioBufferSourceNode lets us schedule each ~50-200ms
  * chunk as it arrives.
  */
-type Status =
-  | "idle"
-  | "connecting"
-  | "ready"
-  | "listening"
-  | "transcribing"
-  | "thinking"
-  | "speaking"
-  | "error";
+/* Canonical status union + display labels live in lib/voice-status
+ * so the panel header and the TopBar pill resolve through one map
+ * and cannot drift. The local alias keeps the file's existing
+ * Record<Status, ...> annotations intact. */
+type Status = VoiceStatus;
 
 type Mode = "conversation" | "notes" | "push-to-talk";
 
@@ -3112,16 +3112,14 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     setEnabled(false);
   }
 
-  const statusLabel: Record<Status, string> = {
-    idle: "off",
-    connecting: "connecting…",
-    ready: "ready",
-    listening: "listening",
-    transcribing: "transcribing…",
-    thinking: "Lex thinking…",
-    speaking: "Lex speaking",
-    error: "error",
-  };
+  /* Label resolved through the shared map in lib/voice-status - the
+   * same call the TopBar pill makes - so the two surfaces cannot
+   * drift. The panel used to carry its own decorated copy ("Lex
+   * thinking…"); decoration was the drift vector, so it's gone. */
+  const resolvedStatus = resolveVoiceStatusLabel(status, {
+    softMuted,
+    micGated,
+  });
 
   const statusTone: Record<Status, string> = {
     idle: "text-txt3",
@@ -3133,14 +3131,20 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     speaking: "text-brandSoft",
     error: "text-err",
   };
+  const panelStatusTone =
+    resolvedStatus.overlay === "soft-muted"
+      ? "text-attn"
+      : resolvedStatus.overlay === "mic-paused"
+        ? "text-txt3"
+        : statusTone[status];
 
   const fullPanel = (
     <section className="rounded-panel bg-surface1 hairline">
       <div className="px-5 py-3 border-b border-border1 flex items-center gap-3">
         <Icon name="Mic" className="text-brandSoft" size={16} />
         <h2 className="font-display text-sm font-emphasized">Voice</h2>
-        <span className={`text-nano font-mono ${statusTone[status]}`}>
-          {statusLabel[status]}
+        <span className={`text-nano font-mono ${panelStatusTone}`}>
+          {resolvedStatus.label}
         </span>
         {enabled && status === "listening" && utteranceMs > 0 && (
           <span className="text-nano text-txt3 font-mono">
@@ -3512,32 +3516,26 @@ export function VoicePillView(props: VoicePillViewProps): React.ReactElement {
           : status === "speaking"
             ? "text-brandSoft"
             : "text-txt3";
-  const baseLabel =
-    status === "idle"
-      ? "off"
-      : status === "connecting"
-        ? "connecting"
-        : status === "ready"
-          ? "ready"
-          : status === "listening"
-            ? "listening"
-            : status === "transcribing"
-              ? "transcribing"
-              : status === "thinking"
-                ? "thinking"
-                : status === "speaking"
-                  ? "speaking"
-                  : "error";
-  /* Soft mute communicates the strongest signal: TTS is silenced
-   * until the user explicitly unmutes. Override the transient
-   * status label so the pill never reads "speaking" while Lex's
-   * audio is being dropped on the floor. */
-  const statusLabel = softMuted
-    ? "muted (voice)"
-    : micGated
-      ? "muted (tts)"
-      : baseLabel;
-  const finalStatusTone = softMuted ? "text-attn" : statusTone;
+  /* Label comes from the shared resolver in lib/voice-status - the
+   * same call the full panel header makes. Precedence lives there:
+   * softMuted wins (TTS silenced until explicit unmute, so the pill
+   * never reads "speaking" while audio is dropped on the floor),
+   * "speaking" is never masked by micGated (the gate accompanies
+   * every TTS window; labelling it "muted (tts)" while Lex was
+   * audibly talking was the inverted-label bug), and a gate that
+   * outlives playback reads "mic paused" - what the gate actually
+   * does. */
+  const resolvedStatus = resolveVoiceStatusLabel(status, {
+    softMuted,
+    micGated,
+  });
+  const statusLabel = resolvedStatus.label;
+  const finalStatusTone =
+    resolvedStatus.overlay === "soft-muted"
+      ? "text-attn"
+      : resolvedStatus.overlay === "mic-paused"
+        ? "text-txt3"
+        : statusTone;
   const pillTitle = softMuted
     ? `Lex is muted. ${silentMessageCount} silent message${
         silentMessageCount === 1 ? "" : "s"

@@ -226,6 +226,50 @@ describe("VoicePillView", () => {
     ).toBe("0.65x");
   });
 
+  it("shows 'speaking' while Lex is audibly speaking even though the mic gate is up", () => {
+    /* The old overlay ternary rendered "muted (tts)" whenever
+     * micGated was true. micGated is true for the entire TTS
+     * playback window, so the pill masked "speaking" with a label
+     * that read as if Lex's TTS were muted - the exact inverse of
+     * what was happening. Speaking must always win over the gate. */
+    render(
+      <VoicePillView
+        {...defaultProps()}
+        status="speaking"
+        micGated={true}
+        softMuted={false}
+      />,
+    );
+    const status = screen.getByTestId("voice-pill-status");
+    expect(status.textContent?.trim().toUpperCase()).toBe("SPEAKING");
+  });
+
+  it("labels a mic gate that outlives playback as 'mic paused'", () => {
+    render(
+      <VoicePillView
+        {...defaultProps()}
+        status="ready"
+        micGated={true}
+        softMuted={false}
+      />,
+    );
+    const status = screen.getByTestId("voice-pill-status");
+    expect(status.textContent?.trim().toUpperCase()).toBe("MIC PAUSED");
+  });
+
+  it("labels soft mute as 'muted (voice)' and outranks every other state", () => {
+    render(
+      <VoicePillView
+        {...defaultProps()}
+        status="speaking"
+        micGated={true}
+        softMuted={true}
+      />,
+    );
+    const status = screen.getByTestId("voice-pill-status");
+    expect(status.textContent?.trim().toUpperCase()).toBe("MUTED (VOICE)");
+  });
+
   it("speed slider fires setSpeed on input change", () => {
     const setSpeed = vi.fn();
     render(
