@@ -108,4 +108,29 @@ describe("SmartCompactPanel", () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(setSmartCompactToggle).not.toHaveBeenCalled();
   });
+
+  /* 2026-07-16 operator audit: the card was headed "Auto-reset for
+   * stuck workers" (reads as a different feature than the auto-clear
+   * it actually is) and footed with raw "runtime: ... env:
+   * DEVNEURAL_SMART_COMPACT_ENABLED=(unset -> shadow)" lines that
+   * made a correctly-live system look half-configured. */
+  it("is headed as the worker auto-clear, not 'auto-reset'", async () => {
+    renderWithQuery(<SmartCompactPanel />);
+    expect(await screen.findByText(/worker auto-clear/i)).toBeInTheDocument();
+    expect(screen.queryByText(/auto-reset for stuck workers/i)).toBeNull();
+  });
+
+  it("explains the effective mode in plain English instead of raw runtime/env dumps", async () => {
+    renderWithQuery(<SmartCompactPanel />);
+    /* runtime + env both unset in the mock: built-in default wins.
+     * waitFor: the line renders "…" until the toggle query resolves. */
+    await waitFor(() => {
+      const line = screen.getByTestId("smart-compact-effective-mode");
+      expect(line.textContent).toMatch(/effective mode: shadow/i);
+      expect(line.textContent).toMatch(/built-in default/i);
+    });
+    expect(
+      screen.queryByText(/DEVNEURAL_SMART_COMPACT_ENABLED=/),
+    ).toBeNull();
+  });
 });

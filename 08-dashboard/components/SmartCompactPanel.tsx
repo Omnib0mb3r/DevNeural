@@ -90,10 +90,10 @@ export function SmartCompactPanel() {
       <header className="px-4 py-3 border-b border-border1 flex items-center justify-between">
         <div className="flex flex-col gap-0.5">
           <h2 className="text-sm font-emphasized text-txt1">
-            Auto-reset for stuck workers
+            Worker auto-clear
           </h2>
           <p className="text-nano text-txt3">
-            When a worker fills its context, Lex resets it and resumes with a summary so work continues.
+            When a worker fills its context window, it gets /cleared and re-seeded with a resume summary so work continues. (Internally: smart-compact.)
           </p>
         </div>
         <span
@@ -133,21 +133,25 @@ export function SmartCompactPanel() {
           })}
         </div>
         <p className="text-nano text-txt3">{MODE_BLURB[mode]}</p>
-        <div className="text-nano text-txt3 font-mono space-y-0.5">
-          <div>
-            runtime:{" "}
-            <span className="text-txt2">
-              {runtimeValue ?? "(unset → shadow)"}
-            </span>
-          </div>
-          <div>
-            env:{" "}
-            <span className="text-txt2">
-              DEVNEURAL_SMART_COMPACT_ENABLED=
-              {envValue ?? "(unset → shadow)"}
-            </span>
-          </div>
-        </div>
+        {/* One plain-English line instead of raw runtime/env dumps.
+         * The old footer printed "runtime: live" next to "env:
+         * DEVNEURAL_SMART_COMPACT_ENABLED=(unset -> shadow)", which
+         * made a correctly-live system look half-configured
+         * (2026-07-16 operator audit). Precedence: the dashboard
+         * toggle (runtime config) wins; env only seeds boot; else
+         * the built-in default. */}
+        <p
+          data-testid="smart-compact-effective-mode"
+          className="text-nano text-txt3"
+        >
+          {q.isLoading
+            ? "…"
+            : runtimeValue
+              ? `Effective mode: ${mode} — set from this dashboard toggle.`
+              : envValue
+                ? `Effective mode: ${mode} — from the environment variable; the toggle above overrides it.`
+                : `Effective mode: ${mode} — built-in default; the toggle above overrides it.`}
+        </p>
       </div>
     </section>
   );

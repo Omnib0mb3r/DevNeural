@@ -1689,7 +1689,17 @@ export interface SmartCompactLogRow {
   cc_session_id: string | null;
   caller: string;
   reason: string;
-  action: "fire" | "wrap" | "shadow" | "noop";
+  /* clear-and-paste / wrap-paste are the Lex-driven v2 actions the
+   * daemon has written since the policy-out endpoints landed; the
+   * union previously missed them and the audit panel fell through
+   * to unstyled raw tokens. */
+  action:
+    | "fire"
+    | "wrap"
+    | "shadow"
+    | "noop"
+    | "clear-and-paste"
+    | "wrap-paste";
   pre_ctx_pct: number | null;
   post_ctx_pct: number | null;
   summary_preview: string | null;

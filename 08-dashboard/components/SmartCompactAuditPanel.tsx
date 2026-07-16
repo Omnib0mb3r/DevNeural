@@ -30,6 +30,20 @@ const TONE: Record<Action, string> = {
   fire: "text-ok",
   wrap: "text-warn",
   noop: "text-err",
+  "clear-and-paste": "text-ok",
+  "wrap-paste": "text-warn",
+};
+
+/* Plain-English action labels (2026-07-16 operator audit: raw tokens
+ * like noop / clear-and-paste explained nothing). The raw token stays
+ * available as the tooltip for log-grepping. */
+const ACTION_LABEL: Record<Action, string> = {
+  shadow: "logged only",
+  fire: "cleared + resumed",
+  wrap: "asked to wrap up",
+  noop: "no action",
+  "clear-and-paste": "cleared + resumed",
+  "wrap-paste": "asked to wrap up",
 };
 
 function fmtTs(ts: string): string {
@@ -84,6 +98,18 @@ export function SmartCompactAuditPanel() {
         </div>
       ) : (
         <ul className="divide-y divide-border2 max-h-96 overflow-y-auto">
+          <li
+            aria-hidden
+            data-testid="smart-compact-audit-headers"
+            className="px-4 py-1.5 flex items-start gap-3 text-[10px] uppercase tracking-wider text-txt3 sticky top-0 bg-surface1"
+          >
+            <span className="w-32 shrink-0">when</span>
+            <span className="w-28 shrink-0">what happened</span>
+            <span className="w-40 shrink-0">why</span>
+            <span className="w-24 shrink-0">context</span>
+            <span className="flex-1 min-w-0">worker</span>
+            <span className="ml-auto shrink-0">by</span>
+          </li>
           {rows.map((r) => {
             const isOpen = expanded === r.id;
             const body = r.payload_text ?? r.summary_preview ?? "";
@@ -104,10 +130,11 @@ export function SmartCompactAuditPanel() {
                     {fmtTs(r.ts)}
                   </span>
                   <span
-                    className={`font-emphasized w-20 shrink-0 ${TONE[r.action]}`}
+                    className={`font-emphasized w-28 shrink-0 ${TONE[r.action] ?? "text-txt2"}`}
                     data-testid="smart-compact-action"
+                    title={r.action}
                   >
-                    {r.action}
+                    {ACTION_LABEL[r.action] ?? r.action}
                   </span>
                   <span className="font-mono text-txt2 w-40 shrink-0 truncate">
                     {r.reason}

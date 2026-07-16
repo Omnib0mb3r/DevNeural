@@ -141,21 +141,20 @@ export function AutoAdvanceModePanel() {
           })}
         </div>
         <p className="text-nano text-txt3">{MODE_BLURB[mode]}</p>
-        <div className="text-nano text-txt3 font-mono space-y-0.5">
-          <div>
-            runtime:{" "}
-            <span className="text-txt2">
-              {runtimeValue ?? "(unset → off)"}
-            </span>
-          </div>
-          <div>
-            env:{" "}
-            <span className="text-txt2">
-              DEVNEURAL_AUTO_ADVANCE_MODE=
-              {envValue ?? "(unset → off)"}
-            </span>
-          </div>
-        </div>
+        {/* Same plain-English effective-mode line as SmartCompactPanel
+         * (2026-07-16 operator audit killed the raw runtime/env dump). */}
+        <p
+          data-testid="auto-advance-effective-mode"
+          className="text-nano text-txt3"
+        >
+          {q.isLoading
+            ? "…"
+            : runtimeValue
+              ? `Effective mode: ${mode} — set from this dashboard toggle.`
+              : envValue
+                ? `Effective mode: ${mode} — from the environment variable; the toggle above overrides it.`
+                : `Effective mode: ${mode} — built-in default; the toggle above overrides it.`}
+        </p>
       </div>
     </section>
   );

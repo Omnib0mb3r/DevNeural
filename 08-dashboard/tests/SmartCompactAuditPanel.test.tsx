@@ -35,7 +35,7 @@ type Row = {
   cc_session_id: string | null;
   caller: string;
   reason: string;
-  action: "fire" | "wrap" | "shadow" | "noop";
+  action: "fire" | "wrap" | "shadow" | "noop" | "clear-and-paste" | "wrap-paste";
   pre_ctx_pct: number | null;
   post_ctx_pct: number | null;
   summary_preview: string | null;
@@ -111,6 +111,44 @@ describe("SmartCompactAuditPanel - render", () => {
     expect(actionEls[1]!.className).toMatch(/text-ok/);
     expect(actionEls[2]!.className).toMatch(/text-warn/);
     expect(actionEls[3]!.className).toMatch(/text-err/);
+  });
+
+  /* 2026-07-16 operator audit: the table had no column headers and
+   * showed raw action tokens (noop / wrap / clear-and-paste) with no
+   * explanation of what actually happened. */
+  it("renders a column-header row over the history table", async () => {
+    mock.mockResolvedValue({ ok: true, rows: [row()] });
+    renderWithQuery();
+    const head = await screen.findByTestId("smart-compact-audit-headers");
+    const text = head.textContent!.toLowerCase();
+    for (const col of ["when", "what happened", "why", "context", "worker", "by"]) {
+      expect(text).toContain(col);
+    }
+  });
+
+  it("shows plain-English action labels with the raw token as tooltip", async () => {
+    mock.mockResolvedValue({
+      ok: true,
+      rows: [
+        row({ id: "f", action: "fire" }),
+        row({ id: "n", action: "noop" }),
+        row({ id: "cp", action: "clear-and-paste" }),
+        row({ id: "wp", action: "wrap-paste" }),
+      ],
+    });
+    renderWithQuery();
+    await waitFor(() => {
+      expect(screen.getAllByTestId("smart-compact-row")).toHaveLength(4);
+    });
+    const labels = screen
+      .getAllByTestId("smart-compact-action")
+      .map((el) => el.textContent);
+    expect(labels[0]).toMatch(/cleared \+ resumed/i);
+    expect(labels[1]).toMatch(/no action/i);
+    expect(labels[2]).toMatch(/cleared \+ resumed/i);
+    expect(labels[3]).toMatch(/wrap/i);
+    const first = screen.getAllByTestId("smart-compact-action")[0]!;
+    expect(first.getAttribute("title")).toContain("fire");
   });
 });
 
