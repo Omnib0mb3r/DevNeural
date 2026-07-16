@@ -100,12 +100,24 @@ function severityForAction(kind: LintAction['kind']): 'low' | 'medium' | 'high' 
   }
 }
 
-function findingId(pageId: string, kind: string, detail: string): string {
-  /* Stable id keyed on (page, kind, detail) so re-runs are idempotent
-   * — INSERT OR IGNORE on the same content collapses to one row.
-   * Detail is included so a different shape failure on the same page
-   * still surfaces as a new finding. */
-  const h = createHash('sha1').update(`${pageId}|${kind}|${detail}`).digest('hex').slice(0, 16);
+/* Stable id keyed on (page, kind, digit-normalized detail) so re-runs
+ * are idempotent — INSERT OR IGNORE on the same content collapses to
+ * one row. Detail is included so a different shape failure on the same
+ * page still surfaces as a new finding, but NUMBERS are normalized
+ * out: 2026-07-16 audit found 6,972 duplicate open rows because the
+ * stale-age detail carries a day counter ("pending 73d, no hits") that
+ * increments every run and minted a fresh id per day per page.
+ * Exported for tests. */
+export function stableLintFindingId(
+  pageId: string,
+  kind: string,
+  detail: string,
+): string {
+  const stableDetail = detail.replace(/\d+/g, '#');
+  const h = createHash('sha1')
+    .update(`${pageId}|${kind}|${stableDetail}`)
+    .digest('hex')
+    .slice(0, 16);
   return `lint-${h}`;
 }
 
@@ -231,7 +243,7 @@ export async function runLint(opts: LintOptions = {}): Promise<LintResult> {
       if (a.applied && a.kind === 'shape-fix') continue;
       try {
         opts.db.insertAuditFinding({
-          id: findingId(a.page_id, a.kind, a.detail),
+          id: stableLintFindingId(a.page_id, a.kind, a.detail),
           source: 'lint',
           severity: severityForAction(a.kind),
           page_slug: a.page_id,

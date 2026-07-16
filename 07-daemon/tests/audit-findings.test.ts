@@ -189,3 +189,38 @@ describe('runSelfAudit', () => {
     delete process.env.DEVNEURAL_LLM_PROVIDER;
   });
 });
+
+/* 2026-07-16 operator audit: 6,993 open findings, of which 6,972 were
+ * ONE lint finding ("archive pending stale") duplicated daily since
+ * June 3. Root cause: the content-derived finding id hashed the raw
+ * detail text, and the detail carries a day counter ("pending 73d,
+ * no hits") that increments every run - a fresh id per day per page.
+ * The id must be stable across volatile numbers in the detail. */
+describe('stableLintFindingId', () => {
+  it('same page+kind with a different day-count maps to the SAME id', async () => {
+    const { stableLintFindingId } = await import('../src/wiki/lint.js');
+    const a = stableLintFindingId(
+      'page-1',
+      'archive-pending-stale',
+      'pending 72d, no hits',
+    );
+    const b = stableLintFindingId(
+      'page-1',
+      'archive-pending-stale',
+      'pending 73d, no hits',
+    );
+    expect(a).toBe(b);
+  });
+
+  it('different pages or failure shapes still get distinct ids', async () => {
+    const { stableLintFindingId } = await import('../src/wiki/lint.js');
+    expect(
+      stableLintFindingId('page-1', 'archive-pending-stale', 'pending 72d'),
+    ).not.toBe(
+      stableLintFindingId('page-2', 'archive-pending-stale', 'pending 72d'),
+    );
+    expect(
+      stableLintFindingId('page-1', 'shape-fix', 'missing trigger'),
+    ).not.toBe(stableLintFindingId('page-1', 'shape-fix', 'missing insight'));
+  });
+});

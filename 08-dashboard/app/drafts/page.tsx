@@ -30,7 +30,15 @@ export default function DraftsPage() {
           <p className="text-sm text-txt3">loading…</p>
         ) : rows.length === 0 ? (
           <div className="rounded border border-dashed border-border1 bg-surface1 p-6 text-center text-sm text-txt3">
-            no pending drafts.
+            <p>No drafts waiting on you.</p>
+            <p className="mt-2 text-xs">
+              Drafts appear here when a brainstorm session ends with enough
+              substance (200+ characters of transcript); the local model
+              distills it into a candidate wiki page for your review.
+              Everything reviewed so far has already been promoted into the
+              wiki, so an empty list means you&apos;re caught up, not that the
+              pipeline is idle.
+            </p>
           </div>
         ) : (
           <ul className="flex flex-col gap-2">
