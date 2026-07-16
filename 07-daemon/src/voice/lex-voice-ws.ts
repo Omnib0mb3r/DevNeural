@@ -58,7 +58,10 @@ import {
   ptyKill,
 } from '../dashboard/pty-host.js';
 import { getLexSession, setLexSessionStatus } from '../lex/lex-session-store.js';
-import { prewarmVoiceBrainSession } from '../lex/voice-brain-session.js';
+import {
+  prewarmVoiceBrainSession,
+  isVoiceBrainSessionWarm,
+} from '../lex/voice-brain-session.js';
 import {
   getBrainstormByClaudeSessionId,
   getBrainstormByPty,
@@ -2145,21 +2148,75 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * fallbackRaw=true speaks the raw text (Lex's own words - a
    * protection against the brain silencing Lex, never a canned line);
    * fallbackRaw=false stays silent (filler like recaps and acks is
-   * dropped rather than replaced by a template). */
+   * dropped rather than replaced by a template).
+   *
+   * 'cut' outcome (2026-07-16 failure 1): partials were spoken, then
+   * the stream died (idle stall or the session was killed). The tail
+   * was never heard, and raw fallback would double-speak the heard
+   * prefix - so the delivery is RE-SPOKEN in full once the brain is
+   * back (poll for warm, one retry), raw fallback only if the retry
+   * also fails. deliverySeq guards staleness: a newer body supersedes
+   * a pending redelivery, and the operator is never re-read an old
+   * reply after the conversation moved on. */
+  let deliverySeq = 0;
+  const REDELIVERY_WAIT_MS = 90_000;
+  const REDELIVERY_POLL_MS = 3_000;
+
   function speakViaBrain(text: string, fallbackRaw: boolean): void {
+    deliverySeq += 1;
+    const seq = deliverySeq;
     const raw = (): void => {
       for (const s of splitForSpeech(text)) speak(s, { continuation: true });
     };
-    void voiceLexReply(text, {
-      onSpeech: (line) => {
-        for (const s of splitForSpeech(line)) {
-          speak(s, { continuation: true });
+    const deliver = (): Promise<'delivered' | 'cut' | 'miss'> =>
+      voiceLexReply(text, {
+        onSpeech: (line) => {
+          for (const s of splitForSpeech(line)) {
+            speak(s, { continuation: true });
+          }
+        },
+        log: logFn,
+      });
+    const redeliverAfterRespawn = async (): Promise<void> => {
+      const deadline = Date.now() + REDELIVERY_WAIT_MS;
+      while (Date.now() < deadline) {
+        if (state.closed || deliverySeq !== seq) {
+          logFn(
+            '[voice-ws] redelivery abandoned: superseded by a newer delivery or socket closed',
+          );
+          return;
         }
-      },
-      log: logFn,
-    })
-      .then((delivered) => {
-        if (!delivered && fallbackRaw) raw();
+        if (isVoiceBrainSessionWarm()) {
+          logFn(
+            `[voice-ws] re-delivering cut reply via respawned brain (body=${text.length} chars)`,
+          );
+          const second = await deliver();
+          if (second !== 'delivered' && fallbackRaw && deliverySeq === seq) {
+            logFn(
+              `[voice-ws] redelivery ${second}; speaking raw body as final fallback`,
+            );
+            raw();
+          }
+          return;
+        }
+        await new Promise<void>((r) => {
+          const t = setTimeout(r, REDELIVERY_POLL_MS);
+          if (typeof (t as { unref?: () => void }).unref === 'function') {
+            (t as { unref: () => void }).unref();
+          }
+        });
+      }
+      if (fallbackRaw && deliverySeq === seq && !state.closed) {
+        logFn(
+          '[voice-ws] redelivery gave up waiting for warm brain; speaking raw body',
+        );
+        raw();
+      }
+    };
+    void deliver()
+      .then((outcome) => {
+        if (outcome === 'miss' && fallbackRaw) raw();
+        else if (outcome === 'cut') void redeliverAfterRespawn();
       })
       .catch(() => {
         if (fallbackRaw) raw();

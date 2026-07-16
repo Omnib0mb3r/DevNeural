@@ -347,7 +347,12 @@ function ensureSpawned(): boolean {
  * CR was eaten by a late overlay still submits. */
 const WARMUP_BOOT_DELAY_MS = 3_000;
 const WARMUP_RENUDGE_MS = 5_000;
-const DEFAULT_WARMUP_TIMEOUT_MS = 45_000;
+/* 90s, not 45s (2026-07-16 failure 1): a healthy boot on this box
+ * measured 27s (04:29:38Z spawn -> 04:30:05Z first reply) and the
+ * respawn under load blew straight through 45s and got killed. The
+ * probe reply is the ONLY thing this timer bounds, so generous is
+ * cheap; a genuinely dead spawn still dies, just 45s later. */
+const DEFAULT_WARMUP_TIMEOUT_MS = 90_000;
 
 /* In-flight warmup, exposed to tests so the background boot can be
  * driven to completion deterministically on the virtual clock. */
@@ -467,6 +472,17 @@ export function prewarmVoiceBrainSession(): void {
   ensureSpawned();
 }
 
+/* True when a live, boot-probed session is accepting asks. The
+ * redelivery path (a spoken delivery cut by a session death waits for
+ * the respawn, then re-delivers) polls this instead of poking the ask
+ * queue with probe asks. */
+export function isVoiceBrainSessionWarm(): boolean {
+  if (!isVoiceBrainSessionEnabled()) return false;
+  if (!state.ptyId || !state.warm) return false;
+  const handle = deps.getPty(state.ptyId);
+  return Boolean(handle && !handle.exited);
+}
+
 function handleTimeout(): void {
   state.consecutiveTimeouts += 1;
   deps.log(
@@ -502,6 +518,31 @@ function assistantStopReason(rec: Record<string, unknown>): string | null {
   return typeof message?.stop_reason === 'string' ? message.stop_reason : null;
 }
 
+/* Streaming progress extension (2026-07-16 failure 1, second wave).
+ * The 04:30Z incident: a spoken delivery was actively streaming
+ * records when its ABSOLUTE deadline lapsed; the ask "timed out",
+ * scored a liveness strike, and the two-strike watchdog killed the
+ * session mid-speech - the operator heard the reply clipped
+ * mid-sentence. An absolute deadline is the wrong shape for a
+ * streaming ask: once records are flowing the session is provably
+ * alive, and what we need to bound is SILENCE, not total duration.
+ * So: the caller's timeout governs time-to-FIRST-record only; after
+ * that, each new record extends the effective deadline by the idle
+ * grace, capped by an absolute wall so a runaway generation still
+ * ends. */
+const DEFAULT_STREAM_IDLE_MS = 15_000;
+const DEFAULT_STREAM_MAX_MS = 120_000;
+
+function streamIdleMs(): number {
+  const raw = Number(process.env.DEVNEURAL_VOICE_BRAIN_STREAM_IDLE_MS ?? '');
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_STREAM_IDLE_MS;
+}
+
+function streamMaxMs(): number {
+  const raw = Number(process.env.DEVNEURAL_VOICE_BRAIN_STREAM_MAX_MS ?? '');
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_STREAM_MAX_MS;
+}
+
 /* Tail the session jsonl from startOffset until an answer or the
  * deadline. Two modes:
  *
@@ -509,16 +550,31 @@ function assistantStopReason(rec: Record<string, unknown>): string | null {
  *     record, exactly like judge-session's waitForAssistantReply.
  *   - onPartial present: deliver each record's text to onPartial as it
  *     lands, accumulate, and resolve with the concatenation when a
- *     record carries stop_reason 'end_turn'.
- */
+ *     record carries stop_reason 'end_turn'. The caller deadline
+ *     bounds the wait for the FIRST record; after that the idle grace
+ *     governs (see streamIdleMs above), bounded by the absolute wall.
+ *
+ * On timeout, recordsSeen + sawBytes tell the caller whether the
+ * session was mid-generation (records flowed, then stalled), alive
+ * but slow (the jsonl grew - claude accepted the inject and is
+ * working, it just has not produced an assistant record yet; this is
+ * what a slow HEARTBEAT ask looks like), or silent - the liveness
+ * watchdog treats those very differently. */
 async function waitForVoiceReply(
   jsonlPath: string,
   startOffset: number,
   deadline: number,
   onPartial: ((text: string) => void) | undefined,
-): Promise<{ timedOut: true } | { timedOut: false; text: string }> {
+): Promise<
+  | { timedOut: true; recordsSeen: number; sawBytes: boolean }
+  | { timedOut: false; text: string }
+> {
   let offset = startOffset;
   const parts: string[] = [];
+  let recordsSeen = 0;
+  let sawBytes = false;
+  const wall = deps.now() + streamMaxMs();
+  let effectiveDeadline = deadline;
   for (;;) {
     let stat: { size: number } | null;
     try {
@@ -527,6 +583,7 @@ async function waitForVoiceReply(
       stat = null;
     }
     if (stat && stat.size > offset) {
+      sawBytes = true;
       const chunk = deps.readRange(jsonlPath, offset, stat.size - offset);
       offset = stat.size;
       for (const line of chunk.split(/\r?\n/)) {
@@ -544,6 +601,7 @@ async function waitForVoiceReply(
           continue;
         }
         if (text) {
+          recordsSeen += 1;
           parts.push(text);
           try {
             onPartial(text);
@@ -552,16 +610,41 @@ async function waitForVoiceReply(
               `[voice-brain] onPartial threw (ignored): ${(err as Error).message}`,
             );
           }
+          /* Progress extends the deadline: bound silence, not total
+           * duration. Never shrinks the caller deadline; never
+           * exceeds the wall. */
+          effectiveDeadline = Math.min(
+            wall,
+            Math.max(effectiveDeadline, deps.now() + streamIdleMs()),
+          );
         }
         if (assistantStopReason(rec) === 'end_turn') {
           return { timedOut: false, text: parts.join('\n') };
         }
       }
     }
-    const remaining = deadline - deps.now();
-    if (remaining <= 0) return { timedOut: true };
+    const remaining = effectiveDeadline - deps.now();
+    if (remaining <= 0) return { timedOut: true, recordsSeen, sawBytes };
     await deps.sleep(Math.min(deps.pollIntervalMs, remaining));
   }
+}
+
+/* Liveness strike policy, isolated on purpose (2026-07-16 addendum).
+ * A candidate redesign is under operator review: drop fixed deadlines
+ * entirely and treat transcript-jsonl growth OR pty byte output within
+ * the last N seconds as the liveness signal at EVERY phase, killing
+ * only when all signals are quiet. Until that lands, this function is
+ * the single place the interim policy lives: a timed-out ask counts
+ * as a strike ONLY when the session showed zero life for the whole
+ * wait - no assistant records (streaming) and no jsonl growth at all
+ * (covers non-streaming HEARTBEAT asks on a slow-but-alive session;
+ * the 04:46Z incident killed the brain mid-heartbeat exactly because
+ * record-less progress was invisible to the old policy). */
+export function _shouldCountLivenessStrikeImpl(result: {
+  recordsSeen: number;
+  sawBytes: boolean;
+}): boolean {
+  return result.recordsSeen === 0 && !result.sawBytes;
 }
 
 /* The ask primitive: enable-flag check, lazy spawn, inject,
@@ -606,6 +689,18 @@ async function askVoiceInner(input: AskVoiceInput): Promise<string | null> {
   const askStartedAt = deps.now();
   const result = await waitForVoiceReply(jsonlPath, sinceOffset, deadline, input.onPartial);
   if (result.timedOut) {
+    if (!_shouldCountLivenessStrikeImpl(result)) {
+      /* The session showed life during the wait (assistant records
+       * streamed, or the jsonl grew at all - claude accepted the
+       * inject and is working): this is a slow/stalled TURN, not a
+       * dead session. No liveness strike. The 04:30Z (delivery) and
+       * 04:46Z (heartbeat) incidents were exactly this shape scoring
+       * strike 2 and getting killed mid-speech / mid-pulse. */
+      deps.log(
+        `[voice-brain] ask timed out but session showed life (records=${result.recordsSeen} bytes_grew=${result.sawBytes}); no liveness strike (streak stays ${state.consecutiveTimeouts})`,
+      );
+      return null;
+    }
     handleTimeout();
     return null;
   }

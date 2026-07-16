@@ -361,17 +361,17 @@ describe('topLayerTurn', () => {
     expect(timeoutMs).toBe(1234);
   });
 
-  it('defaults to 4000ms with the env unset', async () => {
+  it('defaults to 8000ms with the env unset (2026-07-16: time-to-first-record bound)', async () => {
     let timeoutMs = 0;
     const ask: AskFn = async (args) => {
       timeoutMs = args.timeoutMs;
       return 'ok';
     };
     await topLayerTurn('hi', makeCtx(ask));
-    expect(timeoutMs).toBe(4000);
+    expect(timeoutMs).toBe(8000);
   });
 
-  it('falls back to 4000ms on a garbage env value', async () => {
+  it('falls back to 8000ms on a garbage env value', async () => {
     process.env.DEVNEURAL_VOICE_VERDICT_TIMEOUT_MS = 'soon';
     let timeoutMs = 0;
     const ask: AskFn = async (args) => {
@@ -379,7 +379,7 @@ describe('topLayerTurn', () => {
       return 'ok';
     };
     await topLayerTurn('hi', makeCtx(ask));
-    expect(timeoutMs).toBe(4000);
+    expect(timeoutMs).toBe(8000);
   });
 });
 
@@ -585,7 +585,7 @@ describe('voiceLexReply (TTS hooked only to the top layer)', () => {
       onSpeech: (l) => spoken.push(l),
       deps: { ask },
     });
-    expect(delivered).toBe(true);
+    expect(delivered).toBe('delivered');
     expect(spoken).toEqual([
       'The build passed.',
       'Three of three tests are green.',
@@ -600,7 +600,7 @@ describe('voiceLexReply (TTS hooked only to the top layer)', () => {
       onSpeech: (l) => spoken.push(l),
       deps: { ask },
     });
-    expect(delivered).toBe(true);
+    expect(delivered).toBe('delivered');
     expect(spoken).toEqual(['Delivered as one block.']);
   });
 
@@ -611,7 +611,7 @@ describe('voiceLexReply (TTS hooked only to the top layer)', () => {
       onSpeech: () => undefined,
       deps: { ask },
     });
-    expect(delivered).toBe(false);
+    expect(delivered).toBe('miss');
   });
 
   it('reports a miss on a throwing ask, never throws itself', async () => {
@@ -623,7 +623,7 @@ describe('voiceLexReply (TTS hooked only to the top layer)', () => {
       onSpeech: () => undefined,
       deps: { ask },
     });
-    expect(delivered).toBe(false);
+    expect(delivered).toBe('miss');
   });
 
   it('an empty body is trivially delivered (nothing to speak)', async () => {
@@ -633,7 +633,7 @@ describe('voiceLexReply (TTS hooked only to the top layer)', () => {
       onSpeech: (l) => spoken.push(l),
       deps: { ask: async () => 'never called' },
     });
-    expect(delivered).toBe(true);
+    expect(delivered).toBe('delivered');
     expect(spoken).toEqual([]);
   });
 
@@ -645,7 +645,7 @@ describe('voiceLexReply (TTS hooked only to the top layer)', () => {
       onSpeech: (l) => spoken.push(l),
       deps: { ask },
     });
-    expect(delivered).toBe(false);
+    expect(delivered).toBe('miss');
     expect(spoken).toEqual([]);
   });
 });

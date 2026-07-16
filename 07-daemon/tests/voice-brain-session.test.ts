@@ -20,6 +20,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   askVoice,
   isVoiceBrainSessionEnabled,
+  isVoiceBrainSessionWarm,
   prewarmVoiceBrainSession,
   _resetVoiceBrainSessionStateForTests,
   _setVoiceBrainSessionDepsForTests,
@@ -519,14 +520,16 @@ describe('onPartial: per-record streaming, end_turn resolution', () => {
     );
   });
 
-  it('does NOT resolve on a text record without end_turn; the deadline still governs', async () => {
+  it('does NOT resolve on a text record without end_turn; the idle grace eventually times it out with NO liveness strike', async () => {
     const io = makeVirtualIo();
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
     await warmSession(io, pty, 1);
     const path1 = pathForSession(1);
     // A partial lands but no end_turn ever arrives: the ask must time
-    // out (null) rather than resolve early with the fragment.
+    // out (null) rather than resolve early with the fragment. Since
+    // 2026-07-16, progress extends the deadline (idle grace) and a
+    // stalled-after-partial timeout is NOT a liveness strike.
     io.scheduleAssistantRecord(path1, 10, 'Well, the thing is');
 
     const partials: string[] = [];
@@ -538,7 +541,7 @@ describe('onPartial: per-record streaming, end_turn resolution', () => {
 
     expect(partials).toEqual(['Well, the thing is']);
     expect(result).toBeNull();
-    expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(1);
+    expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(0);
   });
 
   it('an end_turn record with no text blocks still closes the ask with the accumulated text', async () => {
@@ -591,6 +594,148 @@ describe('onPartial: per-record streaming, end_turn resolution', () => {
     const result = await askVoice({ prompt: 'q', timeoutMs: 5000 });
 
     expect(result).toBe('Quick answer.');
+  });
+});
+
+describe('streaming asks: idle extension + no liveness strike on progress (2026-07-16 failure 1)', () => {
+  it('records arriving past the base deadline keep the ask alive; it resolves on end_turn', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
+    const path1 = pathForSession(1);
+    /* Base deadline 300ms; the turn keeps producing well past it. */
+    io.scheduleAssistantRecord(path1, 100, 'Sentence one.');
+    io.scheduleAssistantRecord(path1, 5_000, 'Sentence two.');
+    io.scheduleAssistantRecord(path1, 9_000, 'Sentence three.', 'end_turn');
+
+    const partials: string[] = [];
+    const result = await askVoice({
+      prompt: 'deliver',
+      timeoutMs: 300,
+      onPartial: (t) => partials.push(t),
+    });
+
+    expect(result).toBe('Sentence one.\nSentence two.\nSentence three.');
+    expect(partials.length).toBe(3);
+    expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(0);
+    expect(pty.killCalls.length).toBe(0);
+  });
+
+  it('a stream that stalls after partials times out via the idle grace but scores NO liveness strike - twice in a row never kills', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
+    const path1 = pathForSession(1);
+
+    /* The 04:30Z incident shape, twice: partials flow, then silence.
+     * Pre-fix each counted a strike and the second kill clipped the
+     * spoken reply mid-sentence. */
+    io.scheduleAssistantRecord(path1, 100, 'First half of the reply,');
+    const r1 = await askVoice({
+      prompt: 'deliver A',
+      timeoutMs: 300,
+      onPartial: () => undefined,
+    });
+    io.scheduleAssistantRecord(path1, 100, 'Another half of a reply,');
+    const r2 = await askVoice({
+      prompt: 'deliver B',
+      timeoutMs: 300,
+      onPartial: () => undefined,
+    });
+
+    expect(r1).toBeNull();
+    expect(r2).toBeNull();
+    expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(0);
+    expect(pty.killCalls.length).toBe(0);
+    expect(_voiceBrainSessionSnapshotForTests().ptyId).not.toBeNull();
+  });
+
+  it('the absolute wall still bounds a turn that streams forever without end_turn', async () => {
+    const priorIdle = process.env.DEVNEURAL_VOICE_BRAIN_STREAM_IDLE_MS;
+    const priorMax = process.env.DEVNEURAL_VOICE_BRAIN_STREAM_MAX_MS;
+    process.env.DEVNEURAL_VOICE_BRAIN_STREAM_IDLE_MS = '1000';
+    process.env.DEVNEURAL_VOICE_BRAIN_STREAM_MAX_MS = '3000';
+    try {
+      const io = makeVirtualIo();
+      const pty = makeFakePtyLayer();
+      _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+      await warmSession(io, pty, 1);
+      const path1 = pathForSession(1);
+      /* Steady records every 800ms, never an end_turn: idle grace
+       * alone would extend forever; the wall cuts at +3000ms. */
+      for (let d = 100; d <= 6_000; d += 800) {
+        io.scheduleAssistantRecord(path1, d, `chunk at ${d}`);
+      }
+      const t0 = io.now();
+      const result = await askVoice({
+        prompt: 'runaway',
+        timeoutMs: 300,
+        onPartial: () => undefined,
+      });
+      expect(result).toBeNull();
+      expect(io.now() - t0).toBeLessThanOrEqual(3_100);
+      /* Progress was made, so still no liveness strike. */
+      expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(0);
+    } finally {
+      if (priorIdle === undefined) delete process.env.DEVNEURAL_VOICE_BRAIN_STREAM_IDLE_MS;
+      else process.env.DEVNEURAL_VOICE_BRAIN_STREAM_IDLE_MS = priorIdle;
+      if (priorMax === undefined) delete process.env.DEVNEURAL_VOICE_BRAIN_STREAM_MAX_MS;
+      else process.env.DEVNEURAL_VOICE_BRAIN_STREAM_MAX_MS = priorMax;
+    }
+  });
+
+  it('a NON-streaming ask (heartbeat shape) whose jsonl grew without a text record times out with NO strike - the 04:46Z heartbeat kill', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
+    const path1 = pathForSession(1);
+
+    /* Two heartbeat asks in a row: the session writes jsonl bytes
+     * (claude picked the prompt up; textless record models the user
+     * record / a content-free assistant record) but no reply lands
+     * inside the deadline. Pre-fix: strike 1, strike 2, session
+     * killed mid-heartbeat (04:46:25Z). */
+    io.scheduleAssistantRecord(path1, 100, null);
+    const r1 = await askVoice({ prompt: 'pulse A', timeoutMs: 300 });
+    io.scheduleAssistantRecord(path1, 100, null);
+    const r2 = await askVoice({ prompt: 'pulse B', timeoutMs: 300 });
+
+    expect(r1).toBeNull();
+    expect(r2).toBeNull();
+    expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(0);
+    expect(pty.killCalls.length).toBe(0);
+  });
+
+  it('zero-record timeouts still strike and kill on the second (dead-session detection intact)', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
+
+    await askVoice({ prompt: 'q1', timeoutMs: 100, onPartial: () => undefined });
+    expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(1);
+    await askVoice({ prompt: 'q2', timeoutMs: 100, onPartial: () => undefined });
+    expect(pty.killCalls.length).toBe(1);
+  });
+});
+
+describe('isVoiceBrainSessionWarm', () => {
+  it('true after warmup, false after the session is killed', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+
+    expect(isVoiceBrainSessionWarm()).toBe(false);
+    await warmSession(io, pty, 1);
+    expect(isVoiceBrainSessionWarm()).toBe(true);
+
+    /* Two zero-record timeouts kill the session. */
+    await askVoice({ prompt: 'q1', timeoutMs: 100 });
+    await askVoice({ prompt: 'q2', timeoutMs: 100 });
+    expect(isVoiceBrainSessionWarm()).toBe(false);
   });
 });
 

@@ -112,7 +112,14 @@ const CONTROLS: ReadonlySet<string> = new Set([
  * off-contract, and speaking all of it would be worse than trimming. */
 const MAX_SPEECH_CHARS = 500;
 
-const DEFAULT_TURN_TIMEOUT_MS = 4000;
+/* 8s, not 4s (2026-07-16 failure 1): this bound is time-to-FIRST-
+ * record now (the session layer's idle grace governs once records
+ * flow), and measured claude turn latency on this box regularly
+ * exceeds 4s - the 04:30:30Z "timeout" was a reply landing right at
+ * the 4s bell, scoring liveness strike 1 for nothing. The fail-safe
+ * (forward the utterance to Lex) means the only cost of the higher
+ * bound is a longer wait when the brain is genuinely hung. */
+const DEFAULT_TURN_TIMEOUT_MS = 8000;
 
 function turnTimeoutMs(override?: number): number {
   if (override !== undefined) return override;
@@ -413,7 +420,11 @@ export async function topLayerTurn(
 /* being piped into piper.                                             */
 /* ------------------------------------------------------------------ */
 
-const DEFAULT_RENDER_TIMEOUT_MS = 3000;
+/* 8s, not 3s (2026-07-16 failure 1): same time-to-first-record
+ * reasoning as DEFAULT_TURN_TIMEOUT_MS above. 3s to first record was
+ * a coin flip on this box, and a delivery miss costs a raw-fallback
+ * restart of the whole spoken reply. */
+const DEFAULT_RENDER_TIMEOUT_MS = 8000;
 
 function renderTimeoutMs(override?: number): number {
   if (override !== undefined) return override;
@@ -517,17 +528,26 @@ export async function voiceHeartbeat(
   return line;
 }
 
-/** Deliver Lex's reply body through the voice brain. Returns true when
- * the brain delivered anything (every line went out via onSpeech);
- * false on miss (session down, timeout, empty delivery) - the caller
- * MUST then speak the raw body itself. Never throws; a miss can never
- * silence Lex. */
+/** Outcome of a brain delivery (2026-07-16 failure 1):
+ *  - 'delivered': the reply went out in full (streamed to end_turn,
+ *    or the resolved text was spoken).
+ *  - 'cut': partials were spoken but the ask never closed (idle stall
+ *    or the session died mid-stream). The TAIL of Lex's reply was NOT
+ *    spoken; the caller must arrange a re-delivery - it must not fall
+ *    back raw immediately (that would double-speak the heard prefix).
+ *  - 'miss': nothing was spoken (session down, timeout before the
+ *    first record, empty delivery). The caller MUST speak the raw
+ *    body itself. */
+export type LexReplyOutcome = 'delivered' | 'cut' | 'miss';
+
+/** Deliver Lex's reply body through the voice brain. Never throws; a
+ * miss can never silence Lex (see LexReplyOutcome). */
 export async function voiceLexReply(
   body: string,
   ctx: VoiceLexReplyCtx,
-): Promise<boolean> {
+): Promise<LexReplyOutcome> {
   const text = body.trim();
-  if (!text) return true;
+  if (!text) return 'delivered';
   const ask = ctx.deps?.ask ?? defaultAsk;
   let delivered = false;
   const onPartial = (recordText: string): void => {
@@ -556,17 +576,17 @@ export async function voiceLexReply(
   }
   if (delivered) {
     if (raw === null) {
-      /* Partials flowed but the ask never closed (timeout / session
-       * death mid-stream): the tail of Lex's reply was NOT spoken.
-       * Falling back raw here would re-speak the whole body over what
-       * the operator already heard, so we stay with what went out -
-       * but LOUDLY, because a silent version of this is exactly the
-       * Fix 24 "never finishes" symptom. */
+      /* Partials flowed but the ask never closed (idle stall or
+       * session death mid-stream): the tail of Lex's reply was NOT
+       * spoken. Loud log + 'cut' so the caller re-delivers once the
+       * brain is back; speaking raw here would double-talk the heard
+       * prefix. */
       ctx.log?.(
         `[voice-top-layer] LEX REPLY DELIVERY CUT MID-STREAM: partials spoken but ask never closed (body=${text.length} chars); tail unspoken`,
       );
+      return 'cut';
     }
-    return true;
+    return 'delivered';
   }
   /* Non-streaming session path (or a single empty partial): fall back
    * to the resolved text. */
@@ -577,7 +597,7 @@ export async function voiceLexReply(
     } catch {
       /* caller's bug */
     }
-    return true;
+    return 'delivered';
   }
-  return false;
+  return 'miss';
 }

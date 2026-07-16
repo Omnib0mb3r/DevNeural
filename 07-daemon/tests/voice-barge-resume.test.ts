@@ -139,8 +139,8 @@ describe('_resumeBargedSpeechImpl (phantom barge resume)', () => {
 });
 
 describe('lexReplyTimeoutMs (brain-path delivery deadline scales with body)', () => {
-  it('keeps the render floor for short bodies', () => {
-    expect(lexReplyTimeoutMs(20)).toBe(3_000);
+  it('keeps the render floor for short bodies (8s time-to-first-record, 2026-07-16)', () => {
+    expect(lexReplyTimeoutMs(20)).toBe(8_000);
   });
 
   it('scales up for a long body so a streaming delivery is not cut at 3s', () => {
@@ -160,10 +160,10 @@ describe('lexReplyTimeoutMs (brain-path delivery deadline scales with body)', ()
 });
 
 describe('voiceLexReply partial-then-timeout latch', () => {
-  it('logs the mid-stream cut loudly when partials flowed but the ask never closed, and still reports delivered', async () => {
+  it("logs the mid-stream cut loudly when partials flowed but the ask never closed, and reports 'cut' so the caller re-delivers", async () => {
     const logs: string[] = [];
     const spoken: string[] = [];
-    const delivered = await voiceLexReply('A long body. With several sentences.', {
+    const outcome = await voiceLexReply('A long body. With several sentences.', {
       onSpeech: (l) => spoken.push(l),
       log: (m) => logs.push(m),
       deps: {
@@ -174,14 +174,14 @@ describe('voiceLexReply partial-then-timeout latch', () => {
         timeoutMs: 100,
       },
     });
-    expect(delivered).toBe(true);
+    expect(outcome).toBe('cut');
     expect(spoken).toEqual(['A long body.']);
     expect(logs.some((l) => l.includes('DELIVERY CUT MID-STREAM'))).toBe(true);
   });
 
   it('does not log a cut when the ask closes normally', async () => {
     const logs: string[] = [];
-    const delivered = await voiceLexReply('Short body.', {
+    const outcome = await voiceLexReply('Short body.', {
       onSpeech: () => undefined,
       log: (m) => logs.push(m),
       deps: {
@@ -192,7 +192,7 @@ describe('voiceLexReply partial-then-timeout latch', () => {
         timeoutMs: 100,
       },
     });
-    expect(delivered).toBe(true);
+    expect(outcome).toBe('delivered');
     expect(logs.length).toBe(0);
   });
 });
