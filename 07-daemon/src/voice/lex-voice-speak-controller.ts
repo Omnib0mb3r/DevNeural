@@ -180,6 +180,12 @@ export function createSpeakController(
       handle = deps.synthesize(clean);
     } catch (err) {
       grant.release();
+      /* 2026-07-17 item 3: an evening of silence traced to failures
+       * that only pushed an error frame at a possibly-dead socket.
+       * Scream in the daemon log too. */
+      deps.log?.(
+        `[voice-tts] TTS SYNTH FAILED: ${(err as Error).message}; reply will be SILENT (text=${JSON.stringify(clean.slice(0, 80))})`,
+      );
       deps.send({ t: 'error', code: 'tts', message: (err as Error).message });
       return;
     }
@@ -230,6 +236,9 @@ export function createSpeakController(
         finish();
       });
       handle.pcm.on('error', (err: Error) => {
+        deps.log?.(
+          `[voice-tts] TTS STREAM ERROR mid-synthesis: ${err.message}; remainder of the reply will be SILENT`,
+        );
         deps.send({ t: 'error', code: 'tts-stream', message: err.message });
         state.ttsActive = null;
         finish();

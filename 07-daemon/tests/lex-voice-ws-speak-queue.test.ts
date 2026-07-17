@@ -267,3 +267,25 @@ describe('speak-queue controller (Fix 40)', () => {
     expect(state.ttsQueue).toEqual([]);
   });
 });
+
+/* 2026-07-17 item 3: nothing was spoken all evening and no log said
+ * why. A synth failure must scream, not just push a client error
+ * frame at a possibly-dead socket. */
+describe('loud TTS failure logging (2026-07-17)', () => {
+  it('a throwing synthesize logs TTS SYNTH FAILED loudly', async () => {
+    const logs: string[] = [];
+    const state = freshState();
+    const ctrl = createSpeakController(state, {
+      synthesize: () => {
+        throw new Error('piper missing');
+      },
+      send: () => undefined,
+      sendBinary: () => undefined,
+      log: (m: string) => logs.push(m),
+    });
+    ctrl.speak('a reply that should have been heard');
+    await flush();
+    expect(logs.join(' ')).toContain('TTS SYNTH FAILED');
+    expect(logs.join(' ')).toContain('piper missing');
+  });
+});

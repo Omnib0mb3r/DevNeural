@@ -1404,6 +1404,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     synthesize,
     send: (frame) => send(frame as Record<string, unknown>),
     sendBinary,
+    /* 2026-07-17 item 3: synth/stream failures scream in daemon.log,
+     * not just at a possibly-dead client socket. */
+    log: logFn,
     onTtsEnd: () => {
       lastTtsEndMs = Date.now();
       lastSpeechMs = Date.now();
@@ -1412,8 +1415,24 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * full LLM round trip before the reply body reached piper. */
   });
 
+  /* One-shot per connection: the first TTS frame dropped on a closed
+   * socket screams (2026-07-17 item 3: an evening of silence with
+   * zero log evidence - frames were silently discarded here). */
+  let loggedTtsDropAfterClose = false;
   function send(msg: Record<string, unknown>): void {
-    if (state.closed) return;
+    if (state.closed) {
+      if (
+        !loggedTtsDropAfterClose &&
+        typeof msg.t === 'string' &&
+        msg.t.startsWith('tts')
+      ) {
+        loggedTtsDropAfterClose = true;
+        logFn(
+          `[voice-ws] SPEAKABLE REPLY DROPPED: ${msg.t} frame discarded - no live voice sink (ws closed); the reply will never be heard`,
+        );
+      }
+      return;
+    }
     try {
       socket.send(JSON.stringify(msg));
     } catch {
@@ -2403,6 +2422,16 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * queue and play back-to-back; barge / hold-up clears the queue
    * and cancels the in-flight ctx as one atomic boundary. */
   function speak(text: string, opts?: { continuation?: boolean }): void {
+    /* No-live-sink guard (2026-07-17 item 3): a speakable reply
+     * heading into a closed connection is dead air the operator can
+     * only diagnose from this line. The socket cycled every 30-60s
+     * tonight, so replies routinely landed in these gaps. */
+    if (state.closed) {
+      logFn(
+        `[voice-ws] SPEAKABLE REPLY DROPPED: no live voice sink (ws closed); text=${JSON.stringify(text.slice(0, 80))}`,
+      );
+      return;
+    }
     /* Reset the heartbeat silence clock on any real speech (ack, body,
      * or a heartbeat pulse itself) so a pulse only fires after a genuine
      * gap of silence. */
