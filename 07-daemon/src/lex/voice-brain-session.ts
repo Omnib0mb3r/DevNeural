@@ -86,6 +86,11 @@ export interface AskVoiceInput {
   onPartial?: (text: string) => void;
 }
 
+/* Bounds time-to-first-SIGNAL, not total reply time (2026-07-17
+ * signal-based liveness): once the session shows any life (jsonl
+ * growth / pty output) the effective deadline extends by the quiet
+ * window up to the wall, so a 6-7s slow-but-generating ask no longer
+ * returns chars=0 and produces a silent turn. */
 const DEFAULT_ASK_TIMEOUT_MS = 6_000;
 
 /* Read per ask, not cached at module load, so a daemon that mutates
@@ -403,7 +408,12 @@ async function runWarmup(ptyId: string): Promise<void> {
       killCurrent('warmup-inject-failed');
       return;
     }
-    const deadline = deps.now() + warmupTimeoutMs();
+    /* Signal-based warmup (2026-07-17): the base timeout bounds
+     * time-to-first-signal; jsonl growth / pty output during boot
+     * extend the effective deadline, bounded by a 3x wall so a truly
+     * wedged boot still dies. */
+    const warmupWall = deps.now() + warmupTimeoutMs() * 3;
+    let effectiveDeadline = deps.now() + warmupTimeoutMs();
     let lastNudgeAt = deps.now();
     for (;;) {
       if (state.ptyId !== ptyId) return; /* killed/replaced mid-warmup */
@@ -413,11 +423,22 @@ async function runWarmup(ptyId: string): Promise<void> {
         killCurrent('warmup-pty-died');
         return;
       }
+      const ptyAt = ptyOutputAtMs(ptyId);
+      if (ptyAt !== null && deps.now() - ptyAt < signalQuietMs()) {
+        effectiveDeadline = extendOnSignal(effectiveDeadline, warmupWall, ptyAt);
+      }
       let stat: { size: number } | null;
       try {
         stat = deps.statSync(jsonlPath);
       } catch {
         stat = null;
+      }
+      if (stat && stat.size > sinceOffset) {
+        effectiveDeadline = extendOnSignal(
+          effectiveDeadline,
+          warmupWall,
+          deps.now(),
+        );
       }
       if (stat && stat.size > sinceOffset) {
         const chunk = deps.readRange(jsonlPath, sinceOffset, stat.size - sinceOffset);
@@ -442,9 +463,9 @@ async function runWarmup(ptyId: string): Promise<void> {
         }
       }
       const now = deps.now();
-      if (now >= deadline) {
+      if (now >= effectiveDeadline) {
         deps.log(
-          `[voice-brain] WARMUP FAILED: no assistant reply within ${warmupTimeoutMs()}ms; killing session (respawn gated by cooldown)`,
+          `[voice-brain] WARMUP FAILED: no assistant reply and all liveness signals quiet for ${signalQuietMs()}ms (base ${warmupTimeoutMs()}ms); killing session (respawn gated by cooldown)`,
         );
         killCurrent('warmup-timeout');
         return;
@@ -533,6 +554,47 @@ function assistantStopReason(rec: Record<string, unknown>): string | null {
 const DEFAULT_STREAM_IDLE_MS = 15_000;
 const DEFAULT_STREAM_MAX_MS = 120_000;
 
+/* Signal-based liveness (2026-07-17 operator directive: "time based
+ * is likely bad, it is too short"). A session is ALIVE while ANY
+ * signal fired within the last quiet window: transcript-jsonl growth
+ * (bytes appended, assistant record or not) or pty byte output
+ * (pty-host handle lastActivity). Every phase (ask, warmup,
+ * streaming) treats its configured timeout as the bound on
+ * time-to-first-SIGNAL and on silence between signals - never on
+ * total reply time. Kill only fires when all signals are quiet; the
+ * absolute wall still bounds runaways. */
+const DEFAULT_SIGNAL_QUIET_MS = 15_000;
+
+function signalQuietMs(): number {
+  const raw = Number(process.env.DEVNEURAL_VOICE_BRAIN_SIGNAL_QUIET_MS ?? '');
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_SIGNAL_QUIET_MS;
+}
+
+/* Extend an effective deadline off a fresh liveness signal, never
+ * shrinking it and never past the wall. */
+function extendOnSignal(
+  effectiveDeadline: number,
+  wall: number,
+  signalAtMs: number,
+): number {
+  return Math.min(
+    wall,
+    Math.max(effectiveDeadline, signalAtMs + signalQuietMs()),
+  );
+}
+
+/* Latest pty output timestamp for the session's pty, or null when the
+ * handle is gone / the dep does not expose it. */
+function ptyOutputAtMs(ptyId: string | null): number | null {
+  if (!ptyId) return null;
+  const h = deps.getPty(ptyId) as
+    | { exited: boolean; lastActivity?: number }
+    | undefined;
+  return h && !h.exited && typeof h.lastActivity === 'number'
+    ? h.lastActivity
+    : null;
+}
+
 function streamIdleMs(): number {
   const raw = Number(process.env.DEVNEURAL_VOICE_BRAIN_STREAM_IDLE_MS ?? '');
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_STREAM_IDLE_MS;
@@ -565,6 +627,7 @@ async function waitForVoiceReply(
   startOffset: number,
   deadline: number,
   onPartial: ((text: string) => void) | undefined,
+  ptyId: string | null = null,
 ): Promise<
   | { timedOut: true; recordsSeen: number; sawBytes: boolean }
   | { timedOut: false; text: string }
@@ -582,8 +645,18 @@ async function waitForVoiceReply(
     } catch {
       stat = null;
     }
+    /* Pty output is a liveness signal too (claude echoes/renders while
+     * generating, before the jsonl record lands). */
+    const ptyAt = ptyOutputAtMs(ptyId);
+    if (ptyAt !== null && deps.now() - ptyAt < signalQuietMs()) {
+      effectiveDeadline = extendOnSignal(effectiveDeadline, wall, ptyAt);
+    }
     if (stat && stat.size > offset) {
       sawBytes = true;
+      /* ANY jsonl growth is a liveness signal - assistant record or
+       * not, streaming or not. The caller timeout bounds
+       * time-to-first-signal; from here silence is what kills. */
+      effectiveDeadline = extendOnSignal(effectiveDeadline, wall, deps.now());
       const chunk = deps.readRange(jsonlPath, offset, stat.size - offset);
       offset = stat.size;
       for (const line of chunk.split(/\r?\n/)) {
@@ -687,7 +760,13 @@ async function askVoiceInner(input: AskVoiceInput): Promise<string | null> {
   }
 
   const askStartedAt = deps.now();
-  const result = await waitForVoiceReply(jsonlPath, sinceOffset, deadline, input.onPartial);
+  const result = await waitForVoiceReply(
+    jsonlPath,
+    sinceOffset,
+    deadline,
+    input.onPartial,
+    ptyId,
+  );
   if (result.timedOut) {
     if (!_shouldCountLivenessStrikeImpl(result)) {
       /* The session showed life during the wait (assistant records

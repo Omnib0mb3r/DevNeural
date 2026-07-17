@@ -841,3 +841,57 @@ describe('DEVNEURAL_VOICE_BRAIN_SESSION flag', () => {
     expect(pty.spawnCalls.length).toBe(0);
   });
 });
+
+/* Signal-based liveness (2026-07-17 operator directive: "time based is
+ * likely bad, it is too short"). Alive = transcript-jsonl growth OR
+ * pty output within the quiet window, at EVERY phase; timeouts bound
+ * time-to-first-SIGNAL and silence, never total reply time. Tonight's
+ * evidence: asks returned chars=0 at 6-7s while the session was
+ * provably generating (bytes_grew=true), producing silent turns. */
+describe('signal-based liveness (2026-07-17)', () => {
+  it('an ask with jsonl growth but a late answer resolves past the base timeout', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
+    /* Growth signal (record with no text) at 2s, real answer at 9s -
+     * past the 6s base ask deadline. Old behavior: null at ~6s. */
+    io.scheduleAssistantRecord(pathForSession(1), 2_000, null);
+    io.scheduleAssistantRecord(pathForSession(1), 9_000, 'late but alive');
+    const r = await askVoice({ prompt: 'slow ask', timeoutMs: 6_000 });
+    expect(r).toBe('late but alive');
+  });
+
+  it('a fully quiet session still times out at the base deadline', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
+    const before = io.now();
+    const r = await askVoice({ prompt: 'dead ask', timeoutMs: 6_000 });
+    expect(r).toBeNull();
+    /* No signals: the wait must not balloon to the wall. */
+    expect(io.now() - before).toBeLessThan(10_000);
+  });
+
+  it('warmup survives past its base timeout while the jsonl keeps growing', async () => {
+    process.env.DEVNEURAL_VOICE_BRAIN_WARMUP_TIMEOUT_MS = '1000';
+    try {
+      const io = makeVirtualIo();
+      const pty = makeFakePtyLayer();
+      _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+      /* The fake pty boots in ~3s (probe baseline lands then), so the
+       * 1000ms base warmup bound expires ~4s. A growth-only record at
+       * 3.5s keeps the boot alive; the real reply at 5.5s is past the
+       * base bound - old behavior: WARMUP FAILED kill. */
+      io.scheduleAssistantRecord(pathForSession(1), 3_500, null);
+      io.scheduleAssistantRecord(pathForSession(1), 5_500, 'boot OK');
+      const trigger = await askVoice({ prompt: 'warm trigger', timeoutMs: 100 });
+      expect(trigger).toBeNull();
+      await _voiceBrainWarmupForTests();
+      expect(_voiceBrainSessionSnapshotForTests().warm).toBe(true);
+    } finally {
+      delete process.env.DEVNEURAL_VOICE_BRAIN_WARMUP_TIMEOUT_MS;
+    }
+  });
+});
