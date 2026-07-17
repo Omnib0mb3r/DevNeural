@@ -352,6 +352,20 @@ function ensureSpawned(): boolean {
  * CR was eaten by a late overlay still submits. */
 const WARMUP_BOOT_DELAY_MS = 3_000;
 const WARMUP_RENUDGE_MS = 5_000;
+/* 2026-07-17 incident (13:25Z, first spawn after a daemon restart
+ * storm): a probe injected 3s after spawn landed in the pre-paint
+ * cooked->raw ConPTY window and was swallowed WHOLESALE - it never
+ * reached the composer at all (terminal ring showed the composer
+ * rendering empty), so the bare-CR re-nudges no-opped for 4.5 minutes
+ * and the warmup died with no jsonl ever written. Bare CRs cannot
+ * resurrect text that never buffered, so while the jsonl has never
+ * grown (a committed probe writes its user record immediately) the
+ * FULL probe is re-sent on this cadence. If the first probe DID
+ * survive in the composer, the re-sent text appends to it and the
+ * commit CR submits one garbled turn - harmless, since any assistant
+ * reply warms the session. */
+const WARMUP_REPROBE_MS = 15_000;
+const WARMUP_PROBE_TEXT = 'Warmup check. Reply with exactly: OK';
 /* 90s, not 45s (2026-07-16 failure 1): a healthy boot on this box
  * measured 27s (04:29:38Z spawn -> 04:30:05Z first reply) and the
  * respawn under load blew straight through 45s and got killed. The
@@ -398,11 +412,7 @@ async function runWarmup(ptyId: string): Promise<void> {
     } catch {
       sinceOffset = 0;
     }
-    const probe = deps.ptyInject(
-      ptyId,
-      'Warmup check. Reply with exactly: OK',
-      true,
-    );
+    const probe = deps.ptyInject(ptyId, WARMUP_PROBE_TEXT, true);
     if (!probe.ok) {
       deps.log(`[voice-brain] WARMUP FAILED: probe inject error: ${probe.error}`);
       killCurrent('warmup-inject-failed');
@@ -415,6 +425,8 @@ async function runWarmup(ptyId: string): Promise<void> {
     const warmupWall = deps.now() + warmupTimeoutMs() * 3;
     let effectiveDeadline = deps.now() + warmupTimeoutMs();
     let lastNudgeAt = deps.now();
+    let lastProbeAt = deps.now();
+    let jsonlEverGrew = false;
     for (;;) {
       if (state.ptyId !== ptyId) return; /* killed/replaced mid-warmup */
       const handle = deps.getPty(ptyId);
@@ -434,6 +446,7 @@ async function runWarmup(ptyId: string): Promise<void> {
         stat = null;
       }
       if (stat && stat.size > sinceOffset) {
+        jsonlEverGrew = true;
         effectiveDeadline = extendOnSignal(
           effectiveDeadline,
           warmupWall,
@@ -470,7 +483,14 @@ async function runWarmup(ptyId: string): Promise<void> {
         killCurrent('warmup-timeout');
         return;
       }
-      if (now - lastNudgeAt >= WARMUP_RENUDGE_MS) {
+      if (!jsonlEverGrew && now - lastProbeAt >= WARMUP_REPROBE_MS) {
+        lastProbeAt = now;
+        lastNudgeAt = now;
+        /* Swallowed-probe recovery (see WARMUP_REPROBE_MS): no jsonl
+         * growth means the probe never committed as a turn; re-send
+         * the full text, not just a CR. */
+        try { deps.ptyInject(ptyId, WARMUP_PROBE_TEXT, true); } catch { /* best-effort */ }
+      } else if (now - lastNudgeAt >= WARMUP_RENUDGE_MS) {
         lastNudgeAt = now;
         /* Idempotent bare CR: commits a probe whose original CR a boot
          * overlay swallowed; a no-op on an empty ready composer. */

@@ -16,6 +16,41 @@ function daemonEntryPath(): string {
   return path.resolve(__dirname, '..', 'daemon.js');
 }
 
+/* dist/lifecycle/spawn.js -> the 07-daemon package root. The daemon's
+ * process.cwd() feeds voice-brain spawn cwd (and with it the transcript
+ * slug the warmup watches), so a lazy spawn must match what
+ * start-daemon.ps1 sets via -WorkingDirectory. 2026-07-17: a hook-fired
+ * lazy spawn won the restart race with no cwd option and the daemon ran
+ * a whole day rooted at the REPO root instead. */
+export function daemonPackageRoot(): string {
+  return path.resolve(__dirname, '..', '..');
+}
+
+/* The lazy spawn runs inside a hook, i.e. inside a live Claude Code
+ * session, so process.env carries that session's identity and IDE-host
+ * markers (CLAUDECODE, CLAUDE_CODE_*, CLAUDE_TRANSCRIPT_PATH, VSCODE_*,
+ * ELECTRON_RUN_AS_NODE). A daemon launched by Task Scheduler has none
+ * of them; strip them here so both launch paths hand the daemon the
+ * same environment. Config-scope vars stay (CLAUDE_CONFIG_DIR,
+ * ANTHROPIC_*, DEVNEURAL_*) - same contract as pty-host's
+ * sanitizeClaudeSpawnEnv, which guards the NEXT hop (daemon -> Lex PTY)
+ * and stays in place as defense in depth. */
+export function sanitizeDaemonEnv(
+  base: NodeJS.ProcessEnv,
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(base)) {
+    if (v === undefined) continue;
+    if (k === 'CLAUDE_CONFIG_DIR') {
+      env[k] = v;
+      continue;
+    }
+    if (/^(CLAUDE|VSCODE_)/.test(k) || k === 'ELECTRON_RUN_AS_NODE') continue;
+    env[k] = v;
+  }
+  return env;
+}
+
 export function ensureDaemonRunning(): { started: boolean; pid: number | null } {
   const existing = readPid();
   if (existing !== null && isAlive(existing)) {
@@ -61,8 +96,9 @@ export function ensureDaemonRunning(): { started: boolean; pid: number | null } 
       // windowsHide: true tells CreateProcess to set SW_HIDE so the console
       // is created invisibly and stdio still gets redirected to the log.
       windowsHide: true,
+      cwd: daemonPackageRoot(),
       env: {
-        ...process.env,
+        ...sanitizeDaemonEnv(process.env),
         DEVNEURAL_SPAWNED_BY_HOOK: '1',
       },
     });

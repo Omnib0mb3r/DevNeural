@@ -279,10 +279,12 @@ describe('warmup gate (2026-07-16 smoke-test fix 2/3)', () => {
     const result = await askVoice({ prompt: 'real ask', timeoutMs: 5000 });
 
     expect(result).toBe('real answer');
-    /* Warmup traffic: two banner CRs + the probe, all on the same pty. */
-    const probe = pty.injectCalls.find((c) => c.text.startsWith('Warmup check'));
-    expect(probe).toBeDefined();
-    expect(probe!.commit).toBe(true);
+    /* Warmup traffic: two banner CRs + the probe, all on the same pty.
+     * A fast boot must see the probe exactly once - the re-probe path
+     * (below) only fires when the jsonl never grew. */
+    const probes = pty.injectCalls.filter((c) => c.text.startsWith('Warmup check'));
+    expect(probes.length).toBe(1);
+    expect(probes[0]!.commit).toBe(true);
   });
 
   it('a warmup that never sees a reply kills the session; the cooldown gates the respawn', async () => {
@@ -302,6 +304,42 @@ describe('warmup gate (2026-07-16 smoke-test fix 2/3)', () => {
     const r2 = await askVoice({ prompt: 'again', timeoutMs: 100 });
     expect(r2).toBeNull();
     expect(pty.spawnCalls.length).toBe(1); // cooldown suppressed the respawn
+  });
+
+  it('re-injects the FULL probe while the jsonl never grows (2026-07-17 swallowed-probe boot race)', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+
+    /* No reply ever: the probe text was swallowed by the pre-paint
+     * cooked->raw ConPTY window, so not even the user record lands in
+     * the jsonl. Pre-fix, warmup only re-sent bare CRs into an empty
+     * composer for the whole window and the session died silent. */
+    await askVoice({ prompt: 'trigger', timeoutMs: 100 });
+    await _voiceBrainWarmupForTests();
+
+    const probes = pty.injectCalls.filter((c) => c.text.startsWith('Warmup check'));
+    expect(probes.length).toBeGreaterThanOrEqual(2);
+    for (const p of probes) expect(p.commit).toBe(true);
+    /* A genuinely dead spawn still dies at the deadline. */
+    expect(pty.killCalls.length).toBe(1);
+  });
+
+  it('a re-sent probe rescues a warmup whose first probe was swallowed', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+
+    /* Reply lands 20s in: after the first re-probe (probe at 3s,
+     * re-probe due at 18s) but well inside the warmup window. */
+    io.scheduleAssistantRecord(pathForSession(1), 20_000, 'OK');
+    await askVoice({ prompt: 'trigger', timeoutMs: 100 });
+    await _voiceBrainWarmupForTests();
+
+    expect(_voiceBrainSessionSnapshotForTests().warm).toBe(true);
+    const probes = pty.injectCalls.filter((c) => c.text.startsWith('Warmup check'));
+    expect(probes.length).toBe(2);
+    expect(pty.killCalls.length).toBe(0);
   });
 
   it('re-nudges an idempotent bare CR while waiting out a slow boot', async () => {
