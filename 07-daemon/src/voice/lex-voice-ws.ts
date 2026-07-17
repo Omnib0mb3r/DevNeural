@@ -121,6 +121,11 @@ import {
   extendedDuringTts,
 } from './engine/ws-glue.js';
 import {
+  createEndpointState,
+  decideEndpoint,
+  ENDPOINT_CHECK_INTERVAL_MS,
+} from './engine/endpoint-governor.js';
+import {
   classifyStopUtterance,
   truncateToHeard,
 } from './engine/interrupt-arbiter.js';
@@ -3884,6 +3889,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         Date.now(),
       );
       smartTurnCoalescer = dec.nextState;
+      /* A real event just re-evaluated the coalescer; whatever flush
+       * timer was pending belongs to the previous hold. */
+      clearHeldTurnFlush();
       if (dec.action === 'hold') {
         logFn(
           `[voice-ws] smart-turn hold (mid-thought): ${JSON.stringify(dec.text.slice(0, 80))}`,
@@ -3893,6 +3901,13 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
          * stash must not resume over the operator's continuation. */
         confirmRealBarge(true);
         state.utteranceStartedDuringTts = false;
+        /* Governor fallback (2026-07-17, VOICE-TOP-LAYER-SPEC): the
+         * coalescer is timer-free by design, so without this a held
+         * mid-thought fragment whose speaker never resumed would
+         * starve FOREVER (the anti-starvation merge only runs at the
+         * NEXT event). The bounded loop re-checks on the governor
+         * cadence and force-ships at the hard ceiling. */
+        armHeldTurnFlush(dec.nextState.heldSinceMs || Date.now());
         return;
       }
       if (dec.text !== trimmed) {
@@ -3903,6 +3918,70 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         result = { text: dec.text, ms: result.ms };
       }
     }
+    await processTurnText(trimmed, result.ms);
+  }
+
+  /* Held-turn governor flush (2026-07-17). While the Smart Turn
+   * coalescer holds a mid-thought fragment, re-evaluate on the
+   * endpoint governor's cadence; at the hard ceiling pop the held
+   * words and ship them through the identical post-endpointing
+   * pipeline. Cleared whenever a real event re-runs the coalescer. */
+  let heldTurnFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  function clearHeldTurnFlush(): void {
+    if (heldTurnFlushTimer) {
+      clearTimeout(heldTurnFlushTimer);
+      heldTurnFlushTimer = null;
+    }
+  }
+  function armHeldTurnFlush(heldSinceMs: number): void {
+    clearHeldTurnFlush();
+    const tick = (): void => {
+      heldTurnFlushTimer = null;
+      if (state.closed) return;
+      if (!smartTurnCoalescer.heldText) return;
+      const d = decideEndpoint(
+        createEndpointState(heldSinceMs),
+        'incomplete',
+        Date.now(),
+      );
+      if (d.action === 'hold') {
+        heldTurnFlushTimer = setTimeout(
+          tick,
+          d.nextCheckInMs ?? ENDPOINT_CHECK_INTERVAL_MS,
+        );
+        if (
+          typeof (heldTurnFlushTimer as { unref?: () => void }).unref ===
+          'function'
+        ) {
+          (heldTurnFlushTimer as { unref: () => void }).unref();
+        }
+        return;
+      }
+      const popped = decideCoalesce(smartTurnCoalescer, 'complete', '', Date.now());
+      smartTurnCoalescer = popped.nextState;
+      if (popped.action === 'process' && popped.text.trim()) {
+        logFn(
+          `[voice-ws] held-turn governor flush: hard ceiling reached, shipping ${JSON.stringify(popped.text.slice(0, 80))}`,
+        );
+        void processTurnText(popped.text, 0);
+      }
+    };
+    heldTurnFlushTimer = setTimeout(tick, ENDPOINT_CHECK_INTERVAL_MS);
+    if (
+      typeof (heldTurnFlushTimer as { unref?: () => void }).unref === 'function'
+    ) {
+      (heldTurnFlushTimer as { unref: () => void }).unref();
+    }
+  }
+
+  /* Post-endpointing turn processing: notes gate -> voice top layer ->
+   * inject/queue/direct-llm. Extracted from handleUtteranceEnd
+   * (2026-07-17) so the held-turn governor flush can dispatch a
+   * starved mid-thought fragment through the IDENTICAL pipeline a
+   * merged turn takes. */
+  async function processTurnText(text: string, ms: number): Promise<void> {
+    let trimmed = text;
+    let result: { text: string; ms: number } = { text, ms };
     /* Notes/meeting name-gate (2026-07), task 2. Voice commands above
      * always run first regardless of mode (unchanged). In notes mode,
      * either kind (brainstorm or meeting), every OTHER utterance is
@@ -4751,6 +4830,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   function teardown(): void {
     state.closed = true;
     stopJsonlWatch();
+    clearHeldTurnFlush();
     if (state.ttsActive) {
       state.ttsActive.cancel();
       state.ttsActive = null;
