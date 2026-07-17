@@ -8,13 +8,20 @@ reflects what was true at the last update.
 
 ## Cursor (2026-07-17, voice engine replacement wave)
 
-- **HEAD:** 4dfe56b on master (VE-5 held-turn governor flush), tree
-  clean after the docs commit.
-- **PROD:** daemon still runs the FIFTH-wave build (pid 111816, booted
-  02:23Z). The voice-engine wave (VE-0..VE-5, commits 14eaded 7510a7b
-  a921ca1 0f04375 d9ec1a7 d246c15 4dfe56b) is committed + dist rebuilt
-  (02:39 local, post-last-source-edit) but NOT live: restart is the
-  operator's call per the wave order.
+- **HEAD:** 0485e13 on master (VE-6 warmup re-probe + VE-7 lazy-spawn
+  hygiene), tree clean after the docs commit.
+- **PROD:** daemon pid 135480 booted 13:22:38Z - NOT via
+  start-daemon.ps1 but via a hook lazy-spawn that won the restart race
+  (VE-7): it runs with cwd=REPO ROOT and a leaked live-session env,
+  and it predates VE-6/VE-7, so the swallowed-probe warmup bug is
+  still live in it. It DOES run the voice-engine wave code (dist was
+  rebuilt 02:39). Next operator restart via the task/script picks up
+  0485e13 dist (rebuilt 13:49) AND clears the wrong cwd/env.
+- **13:25Z incident (the operator's "spoke to Lex, nothing happened"):**
+  first voice spawn after the restart storm; claude booted slower than
+  the 3s probe delay, the probe text was swallowed pre-paint, bare-CR
+  nudges no-opped 4.5min, warmup killed the session. Full chain +
+  ConPTY repro evidence in FIXES.md VE-6/VE-7.
 - **Audit notes:** Smart Turn v3 has been integrated since 07-15
   (model on disk, live holds in tonight's log); deck worker nesting
   live since 4779d7b. VE-5 closed the one real endpointing gap: held
