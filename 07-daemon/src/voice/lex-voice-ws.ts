@@ -4369,8 +4369,25 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     void fireSessionEndPipeline('ws-close');
   }
 
-  socket.on('close', teardown);
-  socket.on('error', teardown);
+  /* Loud close diagnostics (2026-07-17: the socket dropped every
+   * 30-60s all evening and nothing logged WHY). Code + reason + which
+   * side benefits triage: 1000/1001 = clean client close, 1006 =
+   * abnormal (no close frame - process death, idle reaper, network),
+   * anything else names itself. */
+  socket.on('close', (code: number, reason: Buffer | string) => {
+    const reasonText =
+      typeof reason === 'string' ? reason : (reason?.toString('utf-8') ?? '');
+    logFn(
+      `[voice-ws] ws-close code=${code} reason=${JSON.stringify(reasonText || '(none)')} bindKey=${state.bindKey ?? 'null'} ttsActive=${Boolean(state.ttsActive)} (1000/1001=clean client close, 1006=abnormal/no close frame)`,
+    );
+    teardown();
+  });
+  socket.on('error', (err: Error) => {
+    logFn(
+      `[voice-ws] ws-error before close: ${err.message} bindKey=${state.bindKey ?? 'null'}`,
+    );
+    teardown();
+  });
 }
 
 /* Heuristic for "is this binary PCM or a JSON text frame?" — fastify-

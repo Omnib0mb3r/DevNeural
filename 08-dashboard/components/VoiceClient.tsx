@@ -1918,6 +1918,28 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         const ws = new WebSocket(wsUrl);
         ws.binaryType = "arraybuffer";
         wsRef.current = ws;
+        /* App-level keepalive (2026-07-17: the socket dropped every
+         * 30-60s all evening). An idle voice session sends ZERO frames
+         * - no audio, no TTS, nothing - so any idle-timeout between
+         * client and daemon reaps the connection. The protocol already
+         * defines {t:"ping"}->{t:"pong"}; nothing ever drove it. Ping
+         * every 15s while open so the socket is never idle. */
+        let keepaliveTimer: ReturnType<typeof setInterval> | null =
+          setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+              try {
+                ws.send(JSON.stringify({ t: "ping" }));
+              } catch {
+                /* onclose handles the dead socket */
+              }
+            }
+          }, 15_000);
+        const stopKeepalive = (): void => {
+          if (keepaliveTimer) {
+            clearInterval(keepaliveTimer);
+            keepaliveTimer = null;
+          }
+        };
 
         ws.onopen = () => {
           const wasReconnect = reconnectAttempts > 0;
@@ -2035,6 +2057,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           }
         };
         ws.onclose = (ev) => {
+          stopKeepalive();
           if (cancelled) return;
           /* If the close happened because Lex itself was just ended,
            * the auto-stop effect is already on its way to flipping
