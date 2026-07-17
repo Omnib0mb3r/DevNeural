@@ -31,7 +31,33 @@ reflects what was true at the last update.
 
 ## Tonight's work (newest first)
 
-- **Fifth wave (SM-19..SM-22, this commit):** replay-on-switch stamps
+- **Voice engine replacement wave (VE-0..VE-5, 14eaded..4dfe56b, per
+  VOICE-TOP-LAYER-SPEC.md):** full replacement, not patches, 100+ new
+  test pins across 5 phases. Phase 0 audit findings appended to
+  voice-review.md (AudioContext playback was AEC-blind = THE echo
+  source; barge death = per-segment cooldown restamps x 1500ms pref;
+  during-TTS window died at synth end; stop-class rode an LLM round
+  trip or queued to boundary; duplicate delivery = repaste + CR storm
+  + requeue; 12 bell emitters inventoried). Then the build: five pure
+  engine modules (echo filter, word-gated barge, endpoint governor,
+  interrupt arbiter, delivery dedupe); media-element playback queue
+  (WAV segments through one HTMLAudioElement so AEC references the
+  TTS, instant cancel with real played-ms, true-drain signal); daemon
+  + client wired end to end (vad-onset/asr-interim/asr-final/
+  playback-drained/playback-stopped frames; words interrupt, noise
+  never; stop-class finals hard-interrupt mid-turn deterministically;
+  echo transcripts drop loudly; context truncates to words actually
+  heard; one utterance = one delivery across every re-send path;
+  VoiceClient net -36 lines, cooldown gate deleted); DRIVE-QUEUE
+  riders (reinforcement telemetry off the bell, idle_prompt debounced
+  10min/session, cross-session injects verify delivery on both
+  transports with a followup bell on stuck paste); VE-5 held-turn
+  governor flush (starved mid-thought fragments ship at the 3s hard
+  ceiling through the identical pipeline). Smart Turn v3 was already
+  integrated + model on disk since 07-15; deck worker nesting already
+  live since 4779d7b - both audit-corrected in FIXES.md, not
+  re-shipped.
+- **Fifth wave (SM-19..SM-22, ecc22e4):** replay-on-switch stamps
   its own delivery so ws flap can never loop the same reply (repeat
   bug the operator heard at 01:33Z; replay-once on disconnect/switch
   preserved); headless distill timeout 60s -> 180s (env
