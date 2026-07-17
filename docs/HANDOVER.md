@@ -6,19 +6,22 @@ Update this file IN PLACE every time the cursor moves; never add a new
 dated file. Ground every claim against git before asserting; this doc
 reflects what was true at the last update.
 
-## Cursor (2026-07-17, fifth wave)
+## Cursor (2026-07-17, voice engine replacement wave)
 
-- **HEAD:** fifth-wave commit on master (SM-19..SM-22; FIXES.md rows).
-- **PROD:** daemon restarted onto the fifth-wave build via
-  /admin/daemon/restart (operator-authorized in the /goal directive);
-  dashboard next dev child respawned by the daemon supervisor.
-- **Operator smoke test PENDING:** walk
-  `C:/dev/data/skill-connections/brainstorm/RESTART-TEST-CHECKLIST.md`
-  items 1-26, plus: (a) one spoken turn to verify the quick layer end
-  to end, (b) flip voice off/on twice fast - the last reply must speak
-  at most once (SM-19), (c) after ending a session, grep daemon.log
-  for a ref_summary/rolling-aggregate line instead of
-  "[distill-headless] empty reply" (SM-20), (d) open /help.
+- **HEAD:** d246c15 on master, tree clean after the docs commit.
+- **PROD:** daemon still runs the FIFTH-wave build (pid 111816, booted
+  02:23Z). The voice-engine wave (VE-0..VE-4, commits 14eaded 7510a7b
+  a921ca1 0f04375 d9ec1a7 d246c15) is committed + dist rebuilt but NOT
+  live: restart is the operator's call per the wave order.
+- **On restart the engine goes live:** word-gated barge (words
+  interrupt, noise never), media-element playback (AEC finally sees
+  the TTS), fuzzy echo discard, drain-window fix, deterministic
+  stop-class mid-turn interrupts, played-ms context truncation,
+  delivery dedupe, quiet bell (telemetry reclassed, idle_prompt
+  debounced), cross-session delivery confirmation.
+- **Operator verification after restart:** FIXES.md VE-table lists the
+  six live metrics; the barge cooldown + pause sliders are now inert
+  by design (engine self-manages; panels untouched per spec).
 
 ## Tonight's work (newest first)
 
