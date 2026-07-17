@@ -299,3 +299,246 @@ DevNeural's core wiki layer sits on validated ground (Karpathy's pattern). The r
 The most important correction in this review is **brainstorm-first**: voice brainstorm conversations are the substrate, not derivatives. Retrieval, decay, privacy, dashboard, and lineage are all reordered around that fact.
 
 Lex stays on the critical path independent of wiki proof and brainstorm-first build-out. Stopping criteria are decidable. With Waves 1 through 3 done, this is solid agentic personal infrastructure for one user, organised around how that user actually thinks: out loud, in conversation, before code.
+
+---
+
+# 2026-07-17 voice pipeline findings (investigation only, feeds the barge-in spec)
+
+Audit of the live pipeline against four target behaviors plus the bell
+inventory. Every claim below carries file:line evidence from the
+working tree at ecc22e4 or from live state (daemon.log,
+voice-preferences.json, notifications.jsonl). No code was changed.
+
+## F1. Self-echo: how Lex's own TTS becomes a user utterance
+
+**Capture path.** The mic opens ONCE with browser echo cancellation ON:
+getUserMedia({audio: {echoCancellation: true, noiseSuppression: true,
+autoGainControl: true}}) (08-dashboard/components/VoiceClient.tsx:2442-2448).
+That raw stream feeds a GainNode (live mic_gain currently 1.1) whose
+output is injected into silero VAD via the getStream/pauseStream/
+resumeStream override triad (VoiceClient.tsx:2586-2626). So AEC is on,
+but its residual is multiplied by mic gain before VAD triggering, and
+laptop-speaker/Bluetooth leakage routinely survives browser AEC.
+
+**Playback path defeats the echo canceller.** TTS PCM plays through a
+bare AudioContext: every binary chunk is wrapped in an
+AudioBufferSourceNode and scheduled onto a playhead
+(schedulePcmChunk, VoiceClient.tsx:1226-1242, fed from the ws binary
+handler at 2115). Chromium's AEC historically does not reference Web
+Audio API output (Chromium bug 40504498; the fix landed 2023-10-31 and
+coverage of AudioWorklet/setSinkId paths remains unverified), so the
+echoCancellation:true constraint on capture has nothing to subtract:
+the canceller never sees what the speakers are playing. This is the
+spec's named suspect path, confirmed present.
+
+**The during-TTS guard is advisory now, not a drop.**
+state.utteranceStartedDuringTts is set only when an utterance-start
+frame arrives (07-daemon/src/voice/lex-voice-ws.ts:4182-4193) and is
+consumed as a context HINT to the voice-brain top layer
+(lex-voice-ws.ts:3766-3784, voice-top-layer.ts:88-98). The only hard
+suppression left is the fail-safe branch: forward suppressed when the
+top layer returned nothing AND the turn started during TTS
+(lex-voice-ws.ts:3837-3851). Top layer v2 (aa330c4, 2026-07-15) removed
+the old deterministic non-wake during-TTS drop; a model judgment call
+now decides echo vs real, and it demonstrably misjudges (the live
+"Cancelled call" echo delivered as a queued user utterance).
+
+**Two holes make the flag itself wrong:**
+
+1. **Drain tail.** The daemon clears state.ttsActive and sends
+   tts-end when the piper PCM stream ends
+   (lex-voice-speak-controller.ts:219-235), which is seconds before the
+   client's AudioContext drains its scheduled buffers (the client
+   documents exactly this at VoiceClient.tsx:2322-2328). The client
+   knows true drain in finalizePlaybackEnd (VoiceClient.tsx:1030-1049)
+   but sends NO frame to the daemon there. Any utterance starting in
+   the tail gets utteranceStartedDuringTts=false.
+2. **Swallowed-start staleness.** The client barge cooldown early-return
+   exits onSpeechStart BEFORE utterance-start is sent
+   (VoiceClient.tsx:2657-2667 returns; the send is at 2676). VAD's
+   onSpeechEnd still ships the audio plus utterance-end
+   (VoiceClient.tsx:2735-2743 into finalizeUtterance 2562-2581). The
+   daemon then transcribes a turn whose during-TTS flag is whatever the
+   PREVIOUS turn left (cleared to false at lex-voice-ws.ts:3784), and
+   whose mic buffer was never reset: binary frames append
+   unconditionally (lex-voice-ws.ts:4119-4120) and only an
+   utterance-start clears the buffer (4191-4192).
+
+**Live confirmation:** every "transcript received" line tonight
+03:02-03:14Z logs duringTts=false (daemon.log), during a session with
+active TTS.
+
+## F2. Barge-in regression: why speech during TTS stops nothing
+
+**The only entry point** is silero onSpeechStart
+(VoiceClient.tsx:2633). Flow: muted return (2634); if
+speakingRef || ttsActiveRef (2657) then IF
+Date.now() - lastTtsStartAtRef < bargeCooldownRef return with NO
+frames sent (2664-2667); otherwise send barge-in, locally
+resetTtsPlayback() (2672-2673), then utterance-start (2676), which
+is the daemon floor that kills piper unconditionally
+(lex-voice-ws.ts:4190, killActiveTts 2937-2975).
+
+**The cooldown clock restarts on every segment.**
+lastTtsStartAtRef.current = Date.now() runs on EVERY tts-start
+frame, continuation segments included (VoiceClient.tsx:2285-2305), and
+the daemon emits tts-start PER SEGMENT
+(lex-voice-speak-controller.ts:200-204). Since top layer v2 phase 2
+(7319847, 2026-07-15), a reply streams as MANY short segments: each
+directive-free voice-brain record speaks immediately as its own
+segment (lex-voice-ws.ts:3777-3781), and the raw fallback splits per
+sentence via splitForSpeech (lex-voice-ws.ts:2496). Result: the
+cooldown window re-arms every few seconds for the whole reply.
+
+**The live cooldown is 1500ms** (voice-preferences.json,
+barge_cooldown_ms: 1500; file last written 2026-07-16 22:49 local).
+Default is 250ms (piper.ts:60-64); the slider max is 2000
+(VoiceClient.tsx:218). With 1500ms re-armed at every segment start,
+most user speech during playback falls inside a swallow window: the
+handler returns before ANY frame is sent, so the daemon floor never
+fires either. Playback continues; the operator cannot interrupt.
+
+**Commit hunt result:** none of 73508bd / 7d4222a / 1cc3701 / d238332 /
+ecc22e4 touched the kill path (their diffs cover inject-verify,
+keepalive, failure logging, session-end triggers, replay). 1e1d48e
+migrates only mic_gain and vad_redemption (lib/mic-gain-migration.ts)
+and does not touch barge_cooldown_ms. The regression is an
+interaction, not one commit: (a) 2026-07-15 top layer v2
+(aa330c4 + 7319847) turned one-or-two tts-starts per reply into a
+per-sentence/per-record stream of them, multiplying cooldown restamps;
+(b) the persisted cooldown sits at 1500ms, 6x default (the tunable knob
+itself dates to 6c50b7e). Either alone is survivable; together the
+swallow windows tile the reply.
+
+**Drain-tail corollary:** in the tail the daemon has no ctx to cancel
+(speakCtrl.killActive() returns false, killActiveTts 2947-2948 exits
+before tts-cancel), so ONLY the client-local resetTtsPlayback() can
+stop tail audio, and only when the cooldown gate lets the handler run
+(client flags stay true until finalizePlaybackEnd, so the block is
+reachable there).
+
+## F3. Endpointing: vad_redemption_ms application
+
+- **Init:** MicVAD.new spreads
+  buildVadOptionSet(vadSensitivityRef.current, vadRedemptionRef.current)
+  (VoiceClient.tsx:2826-2829); vad-web 0.0.30 honors only the ms-based
+  keys (lib/voice-vad-options.ts header comment).
+- **Live update machinery EXISTS and works:** applyLiveVadOptions calls
+  vad.setOptions(buildVadOptionSet(...)) (VoiceClient.tsx:1577-1588);
+  vad-web recomputes redemption frames on the next audio frame
+  (node_modules/@ricky0123/vad-web/dist/real-time-vad.js:316-317,
+  frame-processor.js:67-73).
+- **But nothing server-side can trigger it.** The only triggers are:
+  (a) the settings bus, a same-window CustomEvent
+  (lib/voice-settings-bus.ts:36-53), and (b) the reconnect re-sync that
+  re-fetches /voice/piper-status and re-emits all keys including
+  vad_redemption_ms (VoiceClient.tsx:1974-2047).
+- **FINDING:** no UI control emits vad_redemption_ms at all.
+  VoiceSettingsPanel emits mic_gain (41, 254), audio_output_device
+  (217), vad_sensitivity (226), and barge_cooldown_ms (285); it
+  contains zero matches for "redemption". Therefore tonight's
+  server-side push 450 -> 2500 at ~22:53 (via POST
+  /voice/set-vad-redemption, 07-daemon/src/dashboard/routes.ts:2279)
+  did NOT reach the running VAD instance and cannot until a ws
+  reconnect fires the re-sync block or voice is toggled off/on. A
+  running VAD keeps endpointing at its init-time value indefinitely
+  under a server-side change.
+- Current persisted value: vad_redemption_ms 2500
+  (voice-preferences.json).
+
+## F4. Mid-turn interrupts: stop-class routing today
+
+- A stop-class utterance must round-trip the voice-brain LLM. Only a
+  parsed CONTROL: line fires effects (lex-voice-ws.ts:3797-3804 ->
+  applyTopLayerControl 3123-3154). interrupt_work maps to
+  dispatchVoiceCommand('hold_up') which DOES hard-abort: TTS kill +
+  a real \x03 down the Lex PTY + recap (runHoldUp wiring,
+  lex-voice-ws.ts:3261-3315). stop_speaking kills TTS only
+  (3128-3134), Lex keeps working by contract.
+- When classification misses, times out, or the brain is down, the
+  utterance becomes a FORWARD and, mid-turn with no TTS, lands in
+  pendingUserUtterances (lex-voice-ws.ts:4004-4033), which flushes
+  only at the next end_turn boundary (2050-2054;
+  _flushPendingUtterancesImpl 873-930). That is tonight's observed
+  "stop queued until the tool boundary". The ONLY deterministic phrase
+  today is the panic kill (matchPanicCommand, 3675-3681).
+- **Hard-interrupt attach point:** the PTY interrupt write pattern
+  already exists at three sites sharing one shape
+  (handle.pty.write of \x03): confirmRealBarge
+  (lex-voice-ws.ts:2920-2935), killActiveTts explicit-barge branch
+  (2965-2974), and runHoldUp's ctrlCLexPty (3281-3293). An
+  ESC-equivalent stop-class hook rides the same
+  getPty(bindKey)/handle.pty.write path; Fix 29's post-abort state
+  resets (awaitingResponseSince=0, pendingUserUtterances=[],
+  3311-3313) document exactly which state must clear after an abort or
+  the next utterance wedges in the mid-turn queue.
+
+## F5. Duplicate mid-turn delivery (observed 3x tonight)
+
+Live trace 03:09:25-03:09:41Z (daemon.log): forward committed ->
+"INJECT PARTIAL DELIVERY: landed user record is missing payload
+head/tail; repasting the full payload" -> CR retry 2/3 -> 3/3 ->
+"INJECT DELIVERY FAILED" for the SAME fingerprint. Mechanisms, all in
+code:
+
+1. **Repaste on partial landing** re-sends the FULL payload after a
+   truncated copy already submitted (verifyInjectDelivery,
+   lex-voice-ws.ts:1102-1112): copy 1 (truncated, live_state fragments
+   from the snapshot the direct path prepends at 3934+) plus copy 2
+   (full).
+2. **CR retries commit whatever sits in the composer**
+   (lex-voice-ws.ts:1114-1119). A stuck paste from utterance A can be
+   committed by utterance B's CR retry, B's 850ms flush follow-up CR
+   (881-919), or the always-fire bare CR after inject: three
+   independent CR sources share one composer.
+3. **Flush requeue on failure** (lex-voice-ws.ts:894-901) re-queues the
+   text for the NEXT end_turn while the original paste may still be
+   sitting uncommitted: a third copy when it finally commits.
+4. The queued path itself has no fingerprint dedupe against copies
+   already delivered by (1)/(2).
+
+**Heard-you today:** a queued mid-turn utterance only gets a
+queued-mid-turn UI frame (lex-voice-ws.ts:4030-4033). No audio ack
+exists, so queued-until-boundary reads as ignored. (Output-side dedupe
+wasLastSpoken/rememberSpokenLine exists in voice-top-layer.ts:460-521
+but covers spoken lines, not inject delivery.)
+
+## F6. Bell notification emitter inventory
+
+Bell filter: BELL_NOTIFY_CLASSES = report/followup/signal;
+'conversation' is excluded from the bell but still lands in the feed
+(07-daemon/src/dashboard/notifications.ts:46-51).
+
+| Emitter | file:line | class | fires on | routine? |
+|---|---|---|---|---|
+| Curator inject | reinforcement/index.ts:164 | signal | EVERY curator context inject | yes: 3 bell rows in 2 min tonight (03:12:43, 03:13:46, 03:14:21) |
+| Wiki promote | reinforcement/index.ts:175 | signal | every pending-page promotion | yes |
+| Wiki hit | reinforcement/index.ts:185 | signal | every retrieval hit | yes |
+| Raw-chunk hit | reinforcement/index.ts:195 | signal | every raw transcript hit | yes |
+| Correction demote | reinforcement/index.ts:205 | signal (warn) | user-correction demotion | borderline |
+| Claude waiting (idle_prompt) | dashboard/routes.ts:1379 | followup (warn, pushes) | every CC Notification hook idle prompt | yes while voice-chatting: 03:12:32, 03:13:51, 03:15:58, 03:16:09 |
+| Lex finished a turn | dashboard/routes.ts:1450 | conversation | every Lex turn | bell-filtered, floods activity feed (5 rows 03:12-03:15) |
+| Generic POST /notifications | dashboard/routes.ts:3535 | caller-set, default signal | any internal poster | open door |
+| Session ended report | lex/session-end-pipeline.ts:203 | report | every terminal session end | semi |
+| Stale distillation | lex/stale-watcher.ts:183 | signal | stale anchors per tick | yes when distill pipeline is broken |
+| Grooming gaps | daemon.ts:646 wrapper | signal | grooming classes, 30-min/anchor debounce | semi |
+| Missing ffmpeg/binary | reference/process.ts:286 | signal (warn) | reference ingest needs binary | legit |
+
+The bell fillers during tonight's session were the curator inject
+signals and the idle_prompt followups (which also web-push at warn).
+
+## Verdict against the four target behaviors
+
+1. Speech cuts Lex audio under 300ms: FAILS during cooldown windows
+   (1500ms x per-segment restamp tiles the reply) and has no server
+   kill in the drain tail.
+2. Long TTS reply, zero phantom utterances: FAILS via three compounding
+   holes: advisory-only echo judgment, drain-tail flag=false, and
+   swallowed-start stale flag plus un-cleared mic buffer.
+3. Stop lands under 1s mid-turn: FAILS unless the LLM classifies
+   CONTROL in time; the deterministic path exists only for the panic
+   phrase. The PTY interrupt primitive already exists (three call
+   sites).
+4. One utterance = one delivery: FAILS under partial-landing repaste
+   plus multi-source CR commits plus failure requeue, with no
+   delivery-side fingerprint dedupe.
