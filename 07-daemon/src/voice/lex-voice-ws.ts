@@ -974,15 +974,6 @@ export async function _verifyInjectDeliveryImpl(
   const intervalMs = deps.intervalMs ?? 4_000;
   const maxAttempts = deps.maxAttempts ?? 3;
   const log = deps.log ?? logFn;
-  /* Every provided probe must land in ONE user record for an intact
-   * confirm; a record carrying some but not all is a PARTIAL landing
-   * (front/tail truncation between the paste writer and the
-   * terminal - the daemon-side text was intact all three times live). */
-  const probes = [
-    fingerprint,
-    ...(deps.headFingerprint ? [deps.headFingerprint] : []),
-    ...(deps.tailFingerprint ? [deps.tailFingerprint] : []),
-  ].filter((p) => p.length > 0);
   let offset = deps.startOffset;
   let repasteUsed = false;
   for (let attempt = 0; attempt <= maxAttempts; attempt++) {
@@ -1004,9 +995,28 @@ export async function _verifyInjectDeliveryImpl(
           }
           const text = userRecordText(rec);
           if (text === null || text === '') continue;
-          const hits = probes.filter((p) => text.includes(p)).length;
-          if (hits === probes.length) {
-            if (repasteUsed) {
+          /* Delivery contract (2026-07-17 00:50Z duplicate-turn fix):
+           * the UTTERANCE fingerprint is the delivery signal. A record
+           * carrying the operator's words is DELIVERED even when the
+           * payload head/tail got eaten by the paste path - repasting
+           * a word-carrying landing makes Lex answer the same turn
+           * twice, and FAILED must never log on delivered words. Head
+           * loss is context damage: log it loudly, do not repair it.
+           * Repaste stays reserved for word-LESS fragments (the words
+           * themselves were eaten). */
+          const utteranceHit = text.includes(fingerprint);
+          const headHit = deps.headFingerprint
+            ? text.includes(deps.headFingerprint)
+            : true;
+          const tailHit = deps.tailFingerprint
+            ? text.includes(deps.tailFingerprint)
+            : true;
+          if (utteranceHit) {
+            if (!headHit || !tailHit) {
+              log(
+                `[voice-ws] TRUNCATED DELIVERY: user record landed carrying the utterance but missing payload ${!headHit ? 'head' : 'tail'} (context lost in the paste path); NOT repasting - words were delivered`,
+              );
+            } else if (repasteUsed) {
               log(
                 '[voice-ws] inject delivery confirmed INTACT after repaste (partial landing repaired)',
               );
@@ -1017,7 +1027,7 @@ export async function _verifyInjectDeliveryImpl(
             }
             return 'confirmed';
           }
-          if (hits > 0) sawPartial = true;
+          if (headHit || tailHit) sawPartial = true;
         }
       }
     }

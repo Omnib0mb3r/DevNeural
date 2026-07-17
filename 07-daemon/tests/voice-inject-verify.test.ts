@@ -269,24 +269,30 @@ describe('_verifyInjectDeliveryImpl content integrity', () => {
     expect(rig.retries).toEqual([]);
   });
 
-  it('a front-truncated landing (head eaten, tail intact) triggers ONE repaste and then confirms', async () => {
+  it('a front-truncated landing that CARRIES the utterance confirms without repasting (2026-07-17 00:50Z duplicate-turn fix)', async () => {
+    /* Live failure: both pastes landed front-truncated but with the
+     * operator's words intact in the tail; the old verifier read
+     * utterance+tail-without-head as "partial", repasted (Lex answered
+     * the same utterance twice), then logged FAILED on a delivered
+     * prompt. The utterance fingerprint IS the delivery signal: head
+     * loss is context damage worth a loud log, never a repaste. */
     const rig = integrityRig({
       onTick: (t, r) => {
         if (t === 1) {
-          /* The ~05:20Z shape: lead of the payload gone, tail survived. */
           r.file.content += userRecordLine(
             'context never ran.\n[voice mode] I was trying to figure out how your context got cleared when that pipeline to clear the brainstorming context never ran.',
           );
         }
-        if (t === 2 && r.state.repastes === 1) {
-          r.file.content += userRecordLine(PAYLOAD);
-        }
       },
     });
+    const logs: string[] = [];
+    rig.deps.log = (m) => logs.push(m);
     const result = await _verifyInjectDeliveryImpl(rig.deps);
     expect(result).toBe('confirmed');
-    expect(rig.state.repastes).toBe(1);
+    expect(rig.state.repastes).toBe(0);
     expect(rig.retries).toEqual([]);
+    expect(rig.state.failures).toBe(0);
+    expect(logs.join(' ')).toContain('TRUNCATED DELIVERY');
   });
 
   it('total front loss leaving only a tail fragment still classifies partial and repastes (the 04:54Z shape)', async () => {
@@ -306,18 +312,38 @@ describe('_verifyInjectDeliveryImpl content integrity', () => {
     expect(rig.state.repastes).toBe(1);
   });
 
-  it('repaste fires at most once; persistent partial landings exhaust into the loud failure', async () => {
+  it('repaste fires at most once; persistent WORD-LESS partial landings exhaust into the loud failure', async () => {
+    /* Only fragments that never carry the utterance may keep the
+     * failure path: here every landing is a head-only fragment. */
     const rig = integrityRig({
       onTick: (_t, r) => {
-        r.file.content += userRecordLine(
-          '[voice mode] I was trying to figure out how your context got cleared but the head is gone',
-        );
+        const fps = payloadIntegrityFingerprints(PAYLOAD);
+        r.file.content += userRecordLine(`${fps.head} ...rest eaten`);
       },
     });
     const result = await _verifyInjectDeliveryImpl(rig.deps);
     expect(result).toBe('failed');
     expect(rig.state.repastes).toBe(1);
     expect(rig.state.failures).toBe(1);
+  });
+
+  it('a delivered prompt NEVER logs FAILED even when the repasted copy is also truncated', async () => {
+    /* The exact 00:50Z sequence: paste 1 lands word-carrying but
+     * headless; under the fixed contract it confirms immediately -
+     * FAILED must be unreachable for delivered words. */
+    const rig = integrityRig({
+      onTick: (t, r) => {
+        if (t === 1) {
+          r.file.content += userRecordLine(
+            '[voice mode] I was trying to figure out how your context got cleared when that pipeline to clear the brainstorming context never ran.',
+          );
+        }
+      },
+    });
+    const result = await _verifyInjectDeliveryImpl(rig.deps);
+    expect(result).toBe('confirmed');
+    expect(rig.state.failures).toBe(0);
+    expect(rig.state.repastes).toBe(0);
   });
 
   it('no record at all still walks the CR-retry path (integrity deps do not change the stuck-paste behavior)', async () => {
