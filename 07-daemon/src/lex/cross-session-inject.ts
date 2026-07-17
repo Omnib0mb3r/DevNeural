@@ -187,6 +187,18 @@ export interface CrossSessionInjectDeps {
    * resolveDeliverableBridgeForSession. Tests stub this so the
    * inject path can be exercised without a real presence dir. */
   resolveDeliverableBridge?: (ccSessionId: string) => DeliverabilityResult;
+  /** Delivery confirmation (DRIVE-QUEUE rider, 2026-07-17): every
+   * ACCEPTED inject hands off here so "accepted" stops meaning "we
+   * hope it landed". The default resolves the worker's jsonl and runs
+   * the same fingerprint verification loop the voice path uses (CR
+   * retries through the SAME transport, loud failure log + a followup
+   * bell on a stuck paste). Tests stub it to pin the hook. */
+  verifyDelivery?: (args: {
+    sessionId: string | null;
+    text: string;
+    transport: 'pty' | 'bridge';
+    retryCr: () => void;
+  }) => void;
 }
 
 const DEFAULT_COMMIT_DELAY_MS = 850;
@@ -196,6 +208,104 @@ function defaultScheduleCommit(fn: () => void, delayMs: number): void {
   if (typeof (t as { unref?: () => void }).unref === 'function') {
     (t as { unref: () => void }).unref();
   }
+}
+
+/* Default delivery confirmation (DRIVE-QUEUE rider, 2026-07-17).
+ * Accepted-is-not-delivered: the bridge path queues a marker and hopes;
+ * tonight's idle worker sat with an unsubmitted paste behind an
+ * 'accepted' audit row - again. Reuse the voice path's jsonl
+ * fingerprint verifier: watch the target session's jsonl for a user
+ * record carrying the injected words, fire CR retries through the SAME
+ * transport that delivered the primary text, and on exhaustion log
+ * LOUDLY plus land a followup bell (a stuck worker paste is genuinely
+ * action-required). Fire-and-forget; lazy imports keep this module's
+ * load graph unchanged. */
+function defaultVerifyDelivery(args: {
+  sessionId: string | null;
+  text: string;
+  transport: 'pty' | 'bridge';
+  retryCr: () => void;
+}): void {
+  void (async () => {
+    try {
+      if (!args.sessionId || !args.text.trim()) return;
+      const voiceWs = await import('../voice/lex-voice-ws.js');
+      const jsonlPath = voiceWs.findJsonlBySessionId(args.sessionId);
+      if (!jsonlPath) return;
+      const fsMod = await import('node:fs');
+      let startOffset = 0;
+      try {
+        startOffset = fsMod.statSync(jsonlPath).size;
+      } catch {
+        startOffset = 0;
+      }
+      const verdict = await voiceWs._verifyInjectDeliveryImpl({
+        jsonlPath,
+        startOffset,
+        fingerprint: args.text.slice(0, 60),
+        statSize: (p) => {
+          try {
+            return fsMod.statSync(p).size;
+          } catch {
+            return null;
+          }
+        },
+        readRange: (p, start, length) => {
+          try {
+            const fd = fsMod.openSync(p, 'r');
+            try {
+              const buf = Buffer.alloc(length);
+              fsMod.readSync(fd, buf, 0, length, start);
+              return buf.toString('utf-8');
+            } finally {
+              fsMod.closeSync(fd);
+            }
+          } catch {
+            return null;
+          }
+        },
+        retryCr: () => {
+          try {
+            args.retryCr();
+          } catch {
+            /* best-effort */
+          }
+        },
+        onFailure: () => {
+          process.stdout.write(
+            `[cross-inject] DELIVERY FAILED: accepted ${args.transport} inject never produced a user record in ${args.sessionId} (stuck paste?) text=${JSON.stringify(args.text.slice(0, 60))}\n`,
+          );
+          void import('../dashboard/notifications.js')
+            .then(({ emitNotification }) => {
+              emitNotification({
+                severity: 'warn',
+                source: 'cross-inject',
+                notify_class: 'followup',
+                title: 'Worker never received an inject',
+                body: `An accepted ${args.transport} inject never landed in the worker session; its composer likely holds a stuck paste. Press Enter in that terminal or re-send.`,
+                link: `/sessions/detail?id=${encodeURIComponent(args.sessionId ?? '')}`,
+              });
+            })
+            .catch(() => undefined);
+        },
+        sleep: (ms) =>
+          new Promise((r) => {
+            const t = setTimeout(r, ms);
+            if (typeof (t as { unref?: () => void }).unref === 'function') {
+              (t as { unref: () => void }).unref();
+            }
+          }),
+        log: (msg) => process.stdout.write(`[cross-inject] ${msg}\n`),
+      });
+      if (verdict === 'confirmed') {
+        process.stdout.write(
+          `[cross-inject] delivery confirmed: ${args.transport} inject landed in ${args.sessionId}\n`,
+        );
+      }
+    } catch {
+      /* verification is observational; the inject already happened */
+    }
+  })();
 }
 
 export interface LexScopeCheck {
@@ -365,6 +475,7 @@ export function crossSessionInject(
     deps?.queueSessionSuggestion ?? queueSessionSuggestion;
   const scheduleCommit = deps?.scheduleCommit ?? defaultScheduleCommit;
   const commitDelayMs = deps?.commitDelayMs ?? DEFAULT_COMMIT_DELAY_MS;
+  const verifyDeliveryFn = deps?.verifyDelivery ?? defaultVerifyDelivery;
   const resolveDeliverableBridge =
     deps?.resolveDeliverableBridge ??
     ((ccSessionId: string) => resolveDeliverableBridgeForSession(ccSessionId));
@@ -526,6 +637,12 @@ export function crossSessionInject(
         }
       }, commitDelayMs);
     }
+    verifyDeliveryFn({
+      sessionId: live.sessionId ?? null,
+      text,
+      transport: 'pty',
+      retryCr: () => ptyInjectFn(live.ptyId, '\r', false),
+    });
     return { ok: true, decision: 'accepted', transport: 'pty' };
   }
 
@@ -592,6 +709,14 @@ export function crossSessionInject(
       }
     }, commitDelayMs);
   }
+  verifyDeliveryFn({
+    sessionId: target_session,
+    text,
+    transport: 'bridge',
+    retryCr: () => {
+      queueSessionPromptFn(target_session, '\r');
+    },
+  });
   return { ok: true, decision: 'accepted', transport: 'bridge' };
 }
 

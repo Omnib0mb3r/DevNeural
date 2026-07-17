@@ -368,7 +368,7 @@ const SESSION_UUID_RE =
  * slug under ~/.claude/projects. Decouples the TTS watcher from pty-host
  * tracking: if a Claude Code instance is running outside the daemon's
  * PTY pool but its session jsonl exists on disk, we can still tail it. */
-function findJsonlBySessionId(sessionId: string): string | null {
+export function findJsonlBySessionId(sessionId: string): string | null {
   if (!SESSION_UUID_RE.test(sessionId)) return null;
   const claudeRoot = path.posix.join(
     os.homedir().replace(/\\/g, '/'),

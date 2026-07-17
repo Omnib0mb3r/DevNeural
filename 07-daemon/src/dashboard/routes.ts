@@ -11,6 +11,11 @@
 import type { FastifyInstance } from 'fastify';
 import type { MultipartFile } from '@fastify/multipart';
 import type { Store } from '../store/index.js';
+import {
+  shouldNotifyPendingPrompt,
+  markIdlePromptNotified,
+  lastIdlePromptNotifiedMs,
+} from './pending-prompt-notify.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -1372,18 +1377,28 @@ export async function registerDashboardRoutes(
       reply.code(400);
       return { ok: false, error: 'message required' };
     }
-    setPending(id, body.message, body.kind ?? 'notification');
+    const promptKind = body.kind ?? 'notification';
+    setPending(id, body.message, promptKind);
     // Also surface in the live activity feed so the user sees CC waiting
     // even when not on /sessions. warn-level because it blocks Claude
     // until the user answers; this severity also triggers web push.
-    emitNotification({
-      severity: 'warn',
-      source: 'permission',
-      notify_class: 'followup',
-      title: `Claude waiting on you (${body.kind ?? 'notification'})`,
-      body: body.message.slice(0, 200),
-      link: `/sessions/detail?id=${encodeURIComponent(id)}`,
-    });
+    // DRIVE-QUEUE rider (2026-07-17): idle_prompt is conversational
+    // rhythm, not an ask - it debounces per session (a PERSISTING idle
+    // prompt still bells); permission/elicitation stay instant.
+    const now = Date.now();
+    if (
+      shouldNotifyPendingPrompt(promptKind, lastIdlePromptNotifiedMs(id), now)
+    ) {
+      if (promptKind === 'idle_prompt') markIdlePromptNotified(id, now);
+      emitNotification({
+        severity: 'warn',
+        source: 'permission',
+        notify_class: 'followup',
+        title: `Claude waiting on you (${promptKind})`,
+        body: body.message.slice(0, 200),
+        link: `/sessions/detail?id=${encodeURIComponent(id)}`,
+      });
+    }
     return { ok: true };
   });
 

@@ -129,93 +129,108 @@ function appendReinforcementLog(entry: Record<string, unknown>): void {
       `[reinforcement] append failed: ${(err as Error).message}\n`,
     );
   }
-  // Mirror the high-signal kinds into the dashboard notification feed so
-  // the user sees the brain learning in real time. Lazy import so the
-  // reinforcement loop stays loadable even when the dashboard module
-  // fails to initialize (e.g. during smoke tests). All notifications
-  // are info-level except corrections (warn), which the user typically
-  // wants to look at sooner.
+  // Mirror the loop's events into the dashboard ACTIVITY feed so the
+  // user can watch the brain learn in real time. DRIVE-QUEUE rider
+  // (2026-07-17): turn telemetry is not a notification - the routine
+  // kinds (injection, hit, raw-hit, promote) are 'conversation' class,
+  // which the bell filter excludes; only the correction demote (the
+  // loop acted on user feedback, rare) keeps the bell. Lazy import so
+  // the reinforcement loop stays loadable even when the dashboard
+  // module fails to initialize (e.g. during smoke tests).
   void (async () => {
     try {
       const kind = entry.kind as string | undefined;
       if (!kind) return;
+      const built = buildReinforcementNotification(kind, entry);
+      if (!built) return;
       const { emitNotification } = await import('../dashboard/notifications.js');
-      const page = (entry.page as string | undefined) ?? '';
-      const session = (entry.session as string | undefined) ?? '';
-      const link = page
-        ? `/wiki?page=${encodeURIComponent(page)}`
-        : session
-          ? `/sessions/detail?id=${encodeURIComponent(session)}`
-          : undefined;
-      switch (kind) {
-        case 'injection': {
-          // Fired the moment the curator decides to inject. Visibility
-          // matters: injection is invisible to the user inside the CC
-          // terminal (it goes in as additional context, not chat
-          // output), so the dashboard rail is the only place to spot
-          // bad recommendations before they steer Claude. Click takes
-          // the user to the wiki page so they can vet it.
-          const source = (entry.source as string | undefined) ?? 'wiki';
-          const target = (entry.chunk as string | undefined) ?? page;
-          const targetLink =
-            source === 'wiki' && page
-              ? `/wiki?page=${encodeURIComponent(page)}`
-              : link;
-          emitNotification({
-            severity: 'info',
-            source: 'curator',
-            notify_class: 'signal',
-            title: `Lex injected ${source}: ${target || '(unknown)'}`,
-            body: `Lex pulled this into the next prompt as additional context. Click to inspect; if it looks wrong, ignore it in your reply and the reinforcement loop will demote it on its own.`,
-            ...(targetLink ? { link: targetLink } : {}),
-          });
-          break;
-        }
-        case 'promote':
-          emitNotification({
-            severity: 'info',
-            source: 'reinforcement',
-            notify_class: 'signal',
-            title: `Wiki promoted: ${page || '(unknown)'}`,
-            body: `Pending page reinforced into canonical (cosine ${(entry.cosine as number | undefined)?.toFixed(2) ?? '?'}).`,
-            ...(link ? { link } : {}),
-          });
-          break;
-        case 'hit':
-          emitNotification({
-            severity: 'info',
-            source: 'reinforcement',
-            notify_class: 'signal',
-            title: `Wiki reinforced: ${page || '(unknown)'}`,
-            body: `Page weight raised on retrieval hit (cosine ${(entry.cosine as number | undefined)?.toFixed(2) ?? '?'}).`,
-            ...(link ? { link } : {}),
-          });
-          break;
-        case 'raw-hit':
-          emitNotification({
-            severity: 'info',
-            source: 'reinforcement',
-            notify_class: 'signal',
-            title: `Transcript chunk reinforced`,
-            body: `Raw transcript hit queued for wiki distillation (cosine ${(entry.cosine as number | undefined)?.toFixed(2) ?? '?'}).`,
-            ...(link ? { link } : {}),
-          });
-          break;
-        case 'correction':
-          emitNotification({
-            severity: 'warn',
-            source: 'reinforcement',
-            notify_class: 'signal',
-            title: `Page demoted: ${page || '(unknown)'}`,
-            body: `User correction signal lowered the page weight.`,
-            ...(link ? { link } : {}),
-          });
-          break;
-      }
+      emitNotification(built);
     } catch {
       /* notification emission is best-effort */
     }
   })();
+}
+
+/* Pure builder, exported so the class/severity mapping is pinned by
+ * tests (tests/reinforcement-notify-class.test.ts). Returns null for
+ * kinds that should not notify at all. */
+export function buildReinforcementNotification(
+  kind: string,
+  entry: Record<string, unknown>,
+): {
+  severity: 'info' | 'warn';
+  source: string;
+  notify_class: 'conversation' | 'signal';
+  title: string;
+  body: string;
+  link?: string;
+} | null {
+  const page = (entry.page as string | undefined) ?? '';
+  const session = (entry.session as string | undefined) ?? '';
+  const link = page
+    ? `/wiki?page=${encodeURIComponent(page)}`
+    : session
+      ? `/sessions/detail?id=${encodeURIComponent(session)}`
+      : undefined;
+  switch (kind) {
+    case 'injection': {
+      /* Fired the moment the curator decides to inject. Still worth a
+       * feed row (injection is invisible inside the CC terminal), but
+       * it is rhythm, not an ask: conversation class, off the bell. */
+      const source = (entry.source as string | undefined) ?? 'wiki';
+      const target = (entry.chunk as string | undefined) ?? page;
+      const targetLink =
+        source === 'wiki' && page
+          ? `/wiki?page=${encodeURIComponent(page)}`
+          : link;
+      return {
+        severity: 'info',
+        source: 'curator',
+        notify_class: 'conversation',
+        title: `Lex injected ${source}: ${target || '(unknown)'}`,
+        body: `Lex pulled this into the next prompt as additional context. Click to inspect; if it looks wrong, ignore it in your reply and the reinforcement loop will demote it on its own.`,
+        ...(targetLink ? { link: targetLink } : {}),
+      };
+    }
+    case 'promote':
+      return {
+        severity: 'info',
+        source: 'reinforcement',
+        notify_class: 'conversation',
+        title: `Wiki promoted: ${page || '(unknown)'}`,
+        body: `Pending page reinforced into canonical (cosine ${(entry.cosine as number | undefined)?.toFixed(2) ?? '?'}).`,
+        ...(link ? { link } : {}),
+      };
+    case 'hit':
+      return {
+        severity: 'info',
+        source: 'reinforcement',
+        notify_class: 'conversation',
+        title: `Wiki reinforced: ${page || '(unknown)'}`,
+        body: `Page weight raised on retrieval hit (cosine ${(entry.cosine as number | undefined)?.toFixed(2) ?? '?'}).`,
+        ...(link ? { link } : {}),
+      };
+    case 'raw-hit':
+      return {
+        severity: 'info',
+        source: 'reinforcement',
+        notify_class: 'conversation',
+        title: `Transcript chunk reinforced`,
+        body: `Raw transcript hit queued for wiki distillation (cosine ${(entry.cosine as number | undefined)?.toFixed(2) ?? '?'}).`,
+        ...(link ? { link } : {}),
+      };
+    case 'correction':
+      return {
+        severity: 'warn',
+        source: 'reinforcement',
+        notify_class: 'signal',
+        title: `Page demoted: ${page || '(unknown)'}`,
+        body: `User correction signal lowered the page weight.`,
+        ...(link ? { link } : {}),
+      };
+    default:
+      return null;
+  }
 }
 
 export function recordInjection(
