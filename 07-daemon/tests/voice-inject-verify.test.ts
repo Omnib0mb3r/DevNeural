@@ -354,3 +354,19 @@ describe('_verifyInjectDeliveryImpl content integrity', () => {
     expect(rig.state.repastes).toBe(0);
   });
 });
+
+/* 2026-07-17 hotfix: a routine ws-close on the flaky pre-keepalive
+ * build ran the TERMINAL session-end pipeline and flipped the live
+ * brainstorm to status='ended'; every reconnect then bounced off the
+ * bind gate. Disconnects flush only; terminal is explicit intent. */
+describe('_sessionEndActionForReason', () => {
+  it('ws-close is never terminal; explicit ends are', async () => {
+    const { _sessionEndActionForReason } = await import(
+      '../src/voice/lex-voice-ws.js'
+    );
+    expect(_sessionEndActionForReason('ws-close')).toBe('flush');
+    expect(_sessionEndActionForReason('voice-command')).toBe('terminal');
+    expect(_sessionEndActionForReason('compaction-restart')).toBe('terminal');
+    expect(_sessionEndActionForReason('ui-end')).toBe('terminal');
+  });
+});

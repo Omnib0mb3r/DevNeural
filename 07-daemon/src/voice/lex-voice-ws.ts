@@ -898,6 +898,22 @@ export function _flushPendingUtterancesImpl(
  * queue flush): a mid-turn steering inject does not produce its user
  * record until claude picks it up, so confirmation there would false-
  * alarm. Both call sites in this file satisfy that by construction. */
+/* Session-end trigger table (2026-07-17 hotfix). A ws-close is NEVER
+ * terminal on its own: tonight's flaky socket (pre-keepalive build)
+ * fired the terminal pipeline on a routine drop and flipped the LIVE
+ * brainstorm to status='ended'; every reconnect then bounced off the
+ * bind gate with 'brainstorm-ended' and the operator was locked out
+ * of his own session. Disconnects flush distillation state only (the
+ * brainstorm stays alive for the reconnect that follows seconds
+ * later, in EVERY runtime mode); the terminal pipeline is reserved
+ * for explicit intent: the spoken end-session command, the UI end,
+ * and compaction-restart. Exported for tests. */
+export function _sessionEndActionForReason(
+  reason: string,
+): 'flush' | 'terminal' {
+  return reason === 'ws-close' ? 'flush' : 'terminal';
+}
+
 export interface _VerifyInjectDeliveryDeps {
   jsonlPath: string | null;
   /** Byte offset of the jsonl at inject time; only content appended
@@ -4340,16 +4356,16 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       }
       /* Plan section F amendment (2026-05-22): triggers table.
        *
-       *   ws-close + direct-llm -> runDistillationFlush (brainstorm
+       *   ws-close (ANY mode)   -> runDistillationFlush (brainstorm
        *     stays alive across voice disconnects; next attached
-       *     worker / next voice resume gets fresh last_summary)
+       *     worker / next voice resume gets fresh last_summary).
+       *     2026-07-17 hotfix: cc-pty used to run the TERMINAL
+       *     pipeline here, so one flaky-socket drop flipped a live
+       *     brainstorm to status='ended' and locked the operator out
+       *     at the bind gate ('brainstorm-ended').
        *   voice end-session     -> runSessionEndPipeline (terminal)
-       *   compaction-restart    -> runSessionEndPipeline (legacy)
-       *   ws-close + cc-pty     -> runSessionEndPipeline (legacy
-       *     teardown; cc-pty brainstorms still tear down on ws
-       *     close to preserve existing behavior). */
-      const isDirectLlm = (bs.runtime_mode ?? 'cc-pty') === 'direct-llm';
-      const flushOnly = reason === 'ws-close' && isDirectLlm;
+       *   compaction-restart    -> runSessionEndPipeline (legacy) */
+      const flushOnly = _sessionEndActionForReason(reason) === 'flush';
       const runner = flushOnly ? runDistillationFlush : runSessionEndPipeline;
       await runner(
         getBrainstormStore(),
