@@ -108,6 +108,26 @@ import {
   type TurnVerdict,
 } from './smart-turn.js';
 import { runHoldUp } from './lex-voice-hold-up.js';
+/* Voice engine (2026-07-17, VOICE-TOP-LAYER-SPEC): the carved-out
+ * modules this monolith now delegates its safety decisions to. */
+import { createEchoRegistry, classifyEcho } from './engine/echo-filter.js';
+import {
+  advanceBargeGate,
+  createBargeGateState,
+  type BargeGateState,
+} from './engine/barge-word-gate.js';
+import {
+  classifyIncomingTranscript,
+  extendedDuringTts,
+} from './engine/ws-glue.js';
+import {
+  classifyStopUtterance,
+  truncateToHeard,
+} from './engine/interrupt-arbiter.js';
+import {
+  createDeliveryRegistry,
+  fingerprintUtterance,
+} from './engine/delivery-dedupe.js';
 import {
   detectContradiction,
   formatQueueDrain,
@@ -856,6 +876,16 @@ export interface _FlushPendingUtterancesDeps {
   followupDelayMs?: number;
   /* Test seam: capture the log line instead of writing to stdout. */
   log?: (msg: string) => void;
+  /* One-utterance-one-delivery gate (2026-07-17): queued items whose
+   * fingerprint already reached Lex inside the window are dropped
+   * before the flush payload is assembled; delivered items are marked
+   * after a successful inject. Optional so legacy callers/tests are
+   * byte-identical. */
+  dedupe?: {
+    shouldDeliver(fingerprint: string, nowMs: number): boolean;
+    markDelivered(fingerprint: string, nowMs: number): void;
+    fingerprint(text: string): string;
+  };
 }
 
 function _defaultScheduleFollowupCr(fn: () => void, delayMs: number): void {
@@ -878,8 +908,21 @@ export function _flushPendingUtterancesImpl(
   const { state, ptyInject, send } = deps;
   if (state.pendingUserUtterances.length === 0) return null;
   if (!state.bindKey) return null;
-  const queued = state.pendingUserUtterances.slice();
+  let queued = state.pendingUserUtterances.slice();
   state.pendingUserUtterances = [];
+  if (deps.dedupe) {
+    const now = Date.now();
+    const kept = queued.filter((t) =>
+      deps.dedupe!.shouldDeliver(deps.dedupe!.fingerprint(t), now),
+    );
+    if (kept.length < queued.length) {
+      (deps.log ?? logFn)(
+        `[voice-ws] DUPLICATE DELIVERY SUPPRESSED (flush): dropped ${queued.length - kept.length} already-delivered queued utterance(s)`,
+      );
+    }
+    queued = kept;
+    if (queued.length === 0) return null;
+  }
   const header =
     queued.length === 1
       ? '[voice-context: queued-mid-turn-utterance] The user spoke this while you were mid-turn; it was held until your turn boundary.\n\n'
@@ -899,6 +942,12 @@ export function _flushPendingUtterancesImpl(
     });
     state.pendingUserUtterances = queued.concat(state.pendingUserUtterances);
     return null;
+  }
+  if (deps.dedupe) {
+    const now = Date.now();
+    for (const t of queued) {
+      deps.dedupe.markDelivered(deps.dedupe.fingerprint(t), now);
+    }
   }
   /* Bare-CR follow-up. Mirrors cross-session-inject.ts:297-306: bridge-
    * attached workers sometimes receive the primary atomic write into
@@ -1500,6 +1549,30 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         );
       }
       return;
+    }
+    /* Engine bookkeeping rides the outbound TTS frames: tts-start
+     * marks client playback live, remembers the segment text for the
+     * echo filter, and extends the run-text record used for played-ms
+     * truncation. tts-end/tts-cancel arm the bounded tail fallback
+     * (a real client drain signal preempts it). Never blocks the
+     * frame. */
+    try {
+      if (msg.t === 'tts-start') {
+        clientPlaybackActive = true;
+        if (playbackTailTimer) {
+          clearTimeout(playbackTailTimer);
+          playbackTailTimer = null;
+        }
+        const segText = state.currentTtsText;
+        if (segText && segText.trim()) {
+          echoRegistry.remember(segText, Date.now());
+          spokenRunTexts.push(segText);
+        }
+      } else if (msg.t === 'tts-end' || msg.t === 'tts-cancel') {
+        armPlaybackTailFallback();
+      }
+    } catch {
+      /* engine bookkeeping is observational */
     }
     try {
       socket.send(JSON.stringify(msg));
@@ -2887,6 +2960,49 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * in-flight turn either. */
   let bargeStash: BargeStashEntry | null = null;
 
+  /* Voice engine wiring (2026-07-17, VOICE-TOP-LAYER-SPEC). Per-
+   * connection engine state: what Lex spoke (echo registry + run
+   * texts for played-ms truncation), what was delivered (dedupe
+   * registry), the word-gated barge state machine, and the extended
+   * during-TTS window that closes at CLIENT drain instead of synth
+   * end. */
+  const echoRegistry = createEchoRegistry();
+  const deliveryRegistry = createDeliveryRegistry();
+  let bargeGate: BargeGateState = createBargeGateState();
+  let clientPlaybackActive = false;
+  let playbackTailTimer: ReturnType<typeof setTimeout> | null = null;
+  let spokenRunTexts: string[] = [];
+  /* Last deterministic hard interrupt (asr fast path), so the whisper
+   * transcript of the same words does not double-fire hold_up. */
+  let lastHardInterruptMs = 0;
+
+  const engineDuringTts = (): boolean =>
+    extendedDuringTts({
+      ttsActive: state.ttsActive !== null,
+      clientPlaybackActive,
+    });
+
+  const isEchoTextNow = (text: string): boolean =>
+    classifyEcho(text, echoRegistry, Date.now()).echo;
+
+  /* Legacy-client fallback: without playback-drained frames the
+   * clientPlaybackActive flag would stick forever after tts-end. A
+   * bounded tail (6s, generous for buffered audio) clears it; a new
+   * tts-start or a real drain signal preempts. */
+  function armPlaybackTailFallback(): void {
+    if (playbackTailTimer) clearTimeout(playbackTailTimer);
+    playbackTailTimer = setTimeout(() => {
+      playbackTailTimer = null;
+      clientPlaybackActive = false;
+      spokenRunTexts = [];
+    }, 6_000);
+    if (
+      typeof (playbackTailTimer as { unref?: () => void }).unref === 'function'
+    ) {
+      (playbackTailTimer as { unref: () => void }).unref();
+    }
+  }
+
   /* The barging utterance resolved as phantom (blank audio, noise
    * floor, or the top layer judged it Lex's own echo): put the barged
    * speech back. The interrupted segment restarts from its beginning -
@@ -2993,6 +3109,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       state,
       ptyInject,
       send,
+      dedupe: {
+        shouldDeliver: (fp, now) => deliveryRegistry.shouldDeliver(fp, now),
+        markDelivered: (fp, now) => deliveryRegistry.markDelivered(fp, now),
+        fingerprint: fingerprintUtterance,
+      },
     });
     /* Queue emptied = the flush inject was accepted; verify it
      * actually SUBMITTED (2026-07-16 stuck-paste failure) and landed
@@ -3041,6 +3162,19 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         ? {
             repaste: () => {
               if (!state.bindKey || state.closed) return;
+              /* One repaste per utterance EVER (live 3x duplication,
+               * 2026-07-17 03:09Z): the verifier already limits to one
+               * per verification loop; this registry key caps it
+               * across loops so no combination of partial landings
+               * can re-send the same words twice. */
+              const repasteKey = `repaste:${fingerprintUtterance(fingerprint)}`;
+              if (!deliveryRegistry.shouldDeliver(repasteKey, Date.now())) {
+                logFn(
+                  '[voice-ws] repaste suppressed: this utterance was already repasted once',
+                );
+                return;
+              }
+              deliveryRegistry.markDelivered(repasteKey, Date.now());
               try {
                 ptyInject(state.bindKey, payload, true);
               } catch {
@@ -3679,6 +3813,55 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       state.utteranceStartedDuringTts = false;
       return;
     }
+    /* Engine classification (2026-07-17, VOICE-TOP-LAYER-SPEC).
+     * Order is the safety property: deterministic stop-class BEFORE
+     * the echo filter (a spoken "hold on" interrupts even when Lex's
+     * reply contained those words), echo discard BEFORE anything that
+     * could turn Lex's own audio into a user turn (top layer, inject,
+     * mid-turn queue). Panic already ran above. */
+    const engineVerdict = classifyIncomingTranscript({
+      text: trimmed,
+      echoRegistry,
+      nowMs: Date.now(),
+      duringTts: state.utteranceStartedDuringTts,
+    });
+    if (
+      engineVerdict.action === 'stop_speaking' ||
+      engineVerdict.action === 'interrupt_work'
+    ) {
+      /* The asr fast path may have already fired for these same words;
+       * do not double-interrupt, but still honor the remainder. */
+      const recentAsrInterrupt = Date.now() - lastHardInterruptMs < 5_000;
+      logFn(
+        `[voice-ws] stop-class ${engineVerdict.action} (whisper path) remainder=${JSON.stringify(engineVerdict.remainder.slice(0, 60))} recent_asr_interrupt=${recentAsrInterrupt}`,
+      );
+      confirmRealBarge(false);
+      if (!recentAsrInterrupt) {
+        if (engineVerdict.action === 'interrupt_work') {
+          lastHardInterruptMs = Date.now();
+          dispatchVoiceCommand('hold_up', 'transcript');
+        } else {
+          const cancelled = speakCtrl.killActive();
+          if (cancelled) send({ t: 'tts-cancel', reason: 'quiet' });
+        }
+      }
+      if (!engineVerdict.remainder.trim()) {
+        state.utteranceStartedDuringTts = false;
+        return;
+      }
+      /* Substantive content behind the stop phrase forwards through
+       * the normal pipeline below. */
+      trimmed = engineVerdict.remainder;
+      result = { text: engineVerdict.remainder, ms: result.ms };
+    } else if (engineVerdict.action === 'echo-drop') {
+      logFn(
+        `[voice-ws] ECHO DROPPED: transcript matches Lex's own recent TTS (score=${(engineVerdict.echoScore ?? 0).toFixed(2)} matched=${JSON.stringify((engineVerdict.echoMatched ?? '').slice(0, 60))}) text=${JSON.stringify(trimmed.slice(0, 80))}`,
+      );
+      send({ t: 'echo-dropped', text: trimmed });
+      resumeBargedSpeech('echo-filter');
+      state.utteranceStartedDuringTts = false;
+      return;
+    }
     /* Smart Turn semantic endpointing (spec v2 phase 2). The client's
      * VAD ends utterances on 450ms of silence now; this decides whether
      * the operator was actually DONE. 'incomplete' holds the text and
@@ -4023,6 +4206,17 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         dispatchVoiceCommand('panic', 'transcript');
         return;
       }
+      /* One utterance = one delivery: if this exact utterance already
+       * reached Lex inside the window (asr fast path + whisper double
+       * classification, or a re-transcribed echo), do not queue a
+       * second copy. */
+      const queueFp = fingerprintUtterance(result.text);
+      if (!deliveryRegistry.shouldDeliver(queueFp, Date.now())) {
+        logFn(
+          `[voice-ws] DUPLICATE DELIVERY SUPPRESSED (mid-turn queue): ${JSON.stringify(result.text.slice(0, 60))}`,
+        );
+        return;
+      }
       state.pendingUserUtterances.push(result.text);
       logFn(
         `[voice-ws] mid-turn-no-tts queue push depth=${state.pendingUserUtterances.length} text=${JSON.stringify(result.text.slice(0, 80))}`,
@@ -4053,6 +4247,16 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     if (state.absorbedAsides.length > 0) {
       asideBlock = _formatAbsorbedAsideBlockImpl(state.absorbedAsides) + '\n\n';
     }
+    /* One utterance = one delivery (live 3x duplication, 2026-07-17
+     * 03:09Z): the direct path marks the fingerprint; the queue,
+     * flush, and repaste paths all consult the same registry. */
+    const directFp = fingerprintUtterance(result.text);
+    if (!deliveryRegistry.shouldDeliver(directFp, Date.now())) {
+      logFn(
+        `[voice-ws] DUPLICATE DELIVERY SUPPRESSED (direct inject): ${JSON.stringify(result.text.slice(0, 60))}`,
+      );
+      return;
+    }
     const preInjectJsonlSize = currentJsonlSize();
     const injectPayload =
       asideBlock + snapshotBlock + gateNote + partialChainBlock + voiceTag + result.text;
@@ -4061,6 +4265,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       send({ t: 'error', code: 'inject', message: ir.error });
       return;
     }
+    deliveryRegistry.markDelivered(directFp, Date.now());
     /* Idle-time commit inject: verify it actually SUBMITTED (2026-07-16
      * stuck-paste failure - trailing CR silently swallowed, prompt sat
      * at the terminal until the operator pressed Enter by hand) AND
@@ -4180,10 +4385,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         }
         break;
       case 'utterance-start':
-        /* Daemon-enforced barge-in floor (2026-05-22). Capture
-         * whether TTS was active BEFORE the kill so the AEC-bleed
-         * gate downstream still sees the truth. */
-        state.utteranceStartedDuringTts = state.ttsActive !== null;
+        /* LEGACY client path (raw-VAD kill). Capture whether TTS was
+         * active BEFORE the kill so the AEC-bleed gate downstream
+         * still sees the truth. 2026-07-17: the window now extends to
+         * client drain, not synth end (the drain-tail hole). New
+         * clients send vad-onset instead and the word gate decides. */
+        state.utteranceStartedDuringTts = engineDuringTts();
         /* User holds the floor until utterance-end; suppress any
          * working-heartbeat pulse for the duration. */
         state.userSpeaking = true;
@@ -4191,6 +4398,112 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         state.micBuf = [];
         state.micBufBytes = 0;
         break;
+      case 'vad-onset': {
+        /* Word-gated barge (VOICE-TOP-LAYER-SPEC): a VAD onset only
+         * ARMS the gate; nothing dies until real non-echo words
+         * arrive via asr-interim/asr-final. Noise can never kill
+         * playback again, and the mic never gates. */
+        state.utteranceStartedDuringTts = engineDuringTts();
+        state.userSpeaking = true;
+        state.micBuf = [];
+        state.micBufBytes = 0;
+        bargeGate = advanceBargeGate(
+          bargeGate,
+          {
+            type: 'vad-onset',
+            atMs: Date.now(),
+            playbackActive: state.utteranceStartedDuringTts,
+          },
+          { isEchoText: isEchoTextNow },
+        ).state;
+        break;
+      }
+      case 'asr-interim':
+      case 'asr-final': {
+        /* Streaming ASR words from the client (Web Speech interims).
+         * Two jobs: (1) advance the word gate - 2+ interim words or 1
+         * final word that are not Lex's own text stop playback
+         * instantly; (2) the deterministic stop-class fast path -
+         * "stop" / "hold on" interrupts the Lex turn NOW, no LLM
+         * round trip, no queue-to-boundary. */
+        const words = typeof msg.text === 'string' ? msg.text.trim() : '';
+        if (!words) break;
+        const kind = msg.t === 'asr-final' ? 'final' : 'interim';
+        const gated = advanceBargeGate(
+          bargeGate,
+          { type: 'words', kind, text: words, atMs: Date.now() },
+          { isEchoText: isEchoTextNow },
+        );
+        bargeGate = gated.state;
+        if (gated.fire) {
+          logFn(
+            `[voice-ws] barge word-gate FIRED (${kind}) words=${JSON.stringify(words.slice(0, 60))}`,
+          );
+          killActiveTts('utterance-start');
+        }
+        if (kind === 'final') {
+          const sv = classifyStopUtterance(words);
+          if (sv.stop === 'interrupt_work') {
+            lastHardInterruptMs = Date.now();
+            logFn(
+              `[voice-ws] stop-class hard interrupt (asr fast path) text=${JSON.stringify(words.slice(0, 60))}`,
+            );
+            confirmRealBarge(false);
+            dispatchVoiceCommand('hold_up', 'transcript');
+          } else if (sv.stop === 'stop_speaking') {
+            lastHardInterruptMs = Date.now();
+            confirmRealBarge(false);
+            const cancelled = speakCtrl.killActive();
+            if (cancelled) send({ t: 'tts-cancel', reason: 'quiet' });
+          }
+        }
+        break;
+      }
+      case 'playback-drained': {
+        /* Client's TRUE end of audio (the daemon's tts-end fires at
+         * synth-stream end, seconds early). Closes the during-TTS
+         * window and the current spoken run. */
+        clientPlaybackActive = false;
+        if (playbackTailTimer) {
+          clearTimeout(playbackTailTimer);
+          playbackTailTimer = null;
+        }
+        spokenRunTexts = [];
+        bargeGate = advanceBargeGate(
+          bargeGate,
+          { type: 'playback-idle', atMs: Date.now() },
+          { isEchoText: isEchoTextNow },
+        ).state;
+        break;
+      }
+      case 'playback-stopped': {
+        /* Interrupt accounting (OpenAI Realtime pattern): the client
+         * stopped the element and reports elapsed ms; conversational
+         * context truncates to the words the operator actually heard
+         * so the assistant never believes it said words that never
+         * played. */
+        clientPlaybackActive = false;
+        if (playbackTailTimer) {
+          clearTimeout(playbackTailTimer);
+          playbackTailTimer = null;
+        }
+        const playedMs =
+          typeof msg.played_ms === 'number' && Number.isFinite(msg.played_ms)
+            ? Math.max(0, msg.played_ms)
+            : 0;
+        const fullRun = spokenRunTexts.join(' ').trim();
+        spokenRunTexts = [];
+        if (fullRun) {
+          const heard = truncateToHeard(fullRun, playedMs);
+          if (heard.length < fullRun.length) {
+            logFn(
+              `[voice-ws] playback stopped at ${Math.round(playedMs)}ms; context truncated to ${heard.length}/${fullRun.length} chars actually heard`,
+            );
+            lastSpokenText = heard || null;
+          }
+        }
+        break;
+      }
       case 'utterance-end':
         /* User released the floor. Clear the heartbeat suppression and
          * stamp the moment so the cooldown keeps a pulse off the heels
