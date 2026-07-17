@@ -8,11 +8,17 @@ reflects what was true at the last update.
 
 ## Cursor (2026-07-17, voice engine replacement wave)
 
-- **HEAD:** d246c15 on master, tree clean after the docs commit.
+- **HEAD:** 4dfe56b on master (VE-5 held-turn governor flush), tree
+  clean after the docs commit.
 - **PROD:** daemon still runs the FIFTH-wave build (pid 111816, booted
-  02:23Z). The voice-engine wave (VE-0..VE-4, commits 14eaded 7510a7b
-  a921ca1 0f04375 d9ec1a7 d246c15) is committed + dist rebuilt but NOT
-  live: restart is the operator's call per the wave order.
+  02:23Z). The voice-engine wave (VE-0..VE-5, commits 14eaded 7510a7b
+  a921ca1 0f04375 d9ec1a7 d246c15 4dfe56b) is committed + dist rebuilt
+  (02:39 local, post-last-source-edit) but NOT live: restart is the
+  operator's call per the wave order.
+- **Audit notes:** Smart Turn v3 has been integrated since 07-15
+  (model on disk, live holds in tonight's log); deck worker nesting
+  live since 4779d7b. VE-5 closed the one real endpointing gap: held
+  fragments now ship at the 3s governor ceiling instead of starving.
 - **On restart the engine goes live:** word-gated barge (words
   interrupt, noise never), media-element playback (AEC finally sees
   the TTS), fuzzy echo discard, drain-window fix, deterministic
