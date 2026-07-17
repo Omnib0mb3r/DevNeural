@@ -233,6 +233,17 @@ export function createLlmDistillationGenerator(
   };
 }
 
+/* Headless pass timeout (2026-07-17). The old 60s default killed
+ * essentially every real pass on this box: a trivial `claude -p` takes
+ * ~26s, a realistic 8KB distillation prompt ~57s, and real transcripts
+ * with full structured replies run past 60s. Result: 12+ hours of
+ * "[distill-headless] empty reply" lines (dozens of attempts, zero
+ * successes) that were all silent timeouts. 180s gives generation 3x
+ * the observed floor; env-overridable without a rebuild. */
+export const HEADLESS_DISTILL_TIMEOUT_MS_DEFAULT = Number(
+  process.env.DEVNEURAL_DISTILL_TIMEOUT_MS ?? 180_000,
+);
+
 export interface CreateHeadlessGeneratorOptions {
   db: IndexDb;
   log?: (msg: string) => void;
@@ -245,7 +256,7 @@ export interface CreateHeadlessGeneratorOptions {
    * neutral by default so a project CLAUDE.md does not bias the
    * summary; pass a project dir only when that context is wanted. */
   cwd?: string;
-  /** Headless pass timeout. Default 60000. */
+  /** Headless pass timeout. Default HEADLESS_DISTILL_TIMEOUT_MS_DEFAULT. */
   timeoutMs?: number;
   /** Test seam; prod uses spawnHeadlessOpus. */
   spawnHeadless?: SpawnHeadlessOpus;
@@ -276,7 +287,7 @@ export function createHeadlessDistillationGenerator(
   const maxTranscriptBytes = opts.maxTranscriptBytes ?? 8000;
   const chunkLimit = opts.chunkLimit ?? 50;
   const cwd = opts.cwd ?? process.cwd();
-  const timeoutMs = opts.timeoutMs ?? 60000;
+  const timeoutMs = opts.timeoutMs ?? HEADLESS_DISTILL_TIMEOUT_MS_DEFAULT;
   const spawnHeadless = opts.spawnHeadless ?? spawnHeadlessOpus;
   return async (row: BrainstormSessionRow): Promise<string | null> => {
     let transcript = buildTranscript(
@@ -304,7 +315,9 @@ export function createHeadlessDistillationGenerator(
     const prompt = `${SYSTEM_BLOCK.text}\n\n--- TRANSCRIPT ---\n${transcript}`;
     let raw: string | null;
     try {
-      raw = await spawnHeadless(prompt, cwd, timeoutMs);
+      raw = await spawnHeadless(prompt, cwd, timeoutMs, (line) =>
+        log(`[distill-headless] ${row.id.slice(0, 8)}: ${line}`),
+      );
     } catch (err) {
       log(
         `[distill-headless] spawn failed for ${row.id.slice(0, 8)}: ${(err as Error).message}`,
@@ -537,7 +550,7 @@ export interface CreateHeadlessPerSessionGeneratorOptions {
   chunkLimit?: number;
   /** cwd the `claude -p` pass runs in. Default process.cwd(). */
   cwd?: string;
-  /** Headless pass timeout. Default 60000. */
+  /** Headless pass timeout. Default HEADLESS_DISTILL_TIMEOUT_MS_DEFAULT. */
   timeoutMs?: number;
   /** Test seam; prod uses spawnHeadlessOpus. */
   spawnHeadless?: SpawnHeadlessOpus;
@@ -561,7 +574,7 @@ export function createHeadlessPerSessionDistillationGenerator(
   const maxTranscriptBytes = opts.maxTranscriptBytes ?? 8000;
   const chunkLimit = opts.chunkLimit ?? 50;
   const cwd = opts.cwd ?? process.cwd();
-  const timeoutMs = opts.timeoutMs ?? 60000;
+  const timeoutMs = opts.timeoutMs ?? HEADLESS_DISTILL_TIMEOUT_MS_DEFAULT;
   const spawnHeadless = opts.spawnHeadless ?? spawnHeadlessOpus;
   return async (input) => {
     const tag = `${input.brainstorm_id.slice(0, 8)}/${input.cc_session_id.slice(0, 8)}`;
@@ -603,7 +616,9 @@ export function createHeadlessPerSessionDistillationGenerator(
     const prompt = `${PER_SESSION_SYSTEM_BLOCK.text}\n\n--- TRANSCRIPT ---\n${transcript}`;
     let raw: string | null;
     try {
-      raw = await spawnHeadless(prompt, cwd, timeoutMs);
+      raw = await spawnHeadless(prompt, cwd, timeoutMs, (line) =>
+        log(`[per-session-headless] ${tag}: ${line}`),
+      );
     } catch (err) {
       log(
         `[per-session-headless] spawn failed ${tag}: ${(err as Error).message}`,

@@ -473,6 +473,58 @@ export interface LastAssistantTurn {
   uuid: string | null;
 }
 
+/* Replay-repeat guard (2026-07-17, daemon.log 01:33Z). A ws flap during
+ * a daemon boot (client reconnecting every ~1s) re-spoke the same last
+ * reply on EVERY fresh socket - ages 5s..9s in the log - until the 10s
+ * staleness cap silenced it; the operator heard Lex repeat in a loop.
+ * The per-connection replayedOnBind flag dies with each socket and the
+ * replay never recorded a delivery, so "no delivery record (client was
+ * away)" stayed true across reconnects. The replay IS a delivery: stamp
+ * 'delivered' BEFORE speak so even two sockets racing through bind in
+ * the same tick cannot both pass the gate. Exported + dependency-
+ * injected (same seam pattern as _seedDigestFromLastTurnImpl) so the
+ * once-only contract is unit-testable without a real WS. Returns true
+ * when it spoke. */
+export interface ReplayOnBindDeps {
+  getDelivery: (key: string | null) => ReplyDeliveryRecord | null;
+  recordDelivery: (
+    key: string | null,
+    outcome: LexReplyOutcome,
+    ms: number,
+  ) => void;
+  speak: (text: string) => void;
+  log: (line: string) => void;
+  /** Test seam: pin the clock. Default: Date.now. */
+  now?: () => number;
+}
+
+export function _replayLastTurnOnBindImpl(
+  jsonlPath: string,
+  last: LastAssistantTurn,
+  bindKey: string | null,
+  deps: ReplayOnBindDeps,
+): boolean {
+  const now = (deps.now ?? Date.now)();
+  const decision = _shouldReplayOnBindImpl({
+    lastTurn: last,
+    lastDelivery: deps.getDelivery(jsonlPath),
+    now,
+  });
+  const ageS = Math.round((now - last.mtimeMs) / 1000);
+  if (!decision.replay) {
+    deps.log(
+      `[voice-ws] replay-on-switch: SKIPPED (${decision.reason}) age=${ageS}s bindKey=${bindKey ?? 'null'}`,
+    );
+    return false;
+  }
+  deps.log(
+    `[voice-ws] replay-on-switch: speaking last reply (${decision.reason}) age=${ageS}s bindKey=${bindKey ?? 'null'}`,
+  );
+  deps.recordDelivery(jsonlPath, 'delivered', now);
+  deps.speak(last.text);
+  return true;
+}
+
 /* Extract the most recent assistant reply (concatenated text blocks) from
  * a Claude Code session jsonl, with the file's mtime for the recency
  * guard. Reads only the tail (last 64 KB) so a multi-MB transcript is
@@ -1794,24 +1846,16 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       return;
     }
     if (!last || !last.text) return;
-    /* Stale-replay gate (2026-07-16): fresh (<= ~10s) AND not already
-     * fully delivered. See _shouldReplayOnBindImpl for the contract. */
-    const decision = _shouldReplayOnBindImpl({
-      lastTurn: last,
-      lastDelivery: _getReplyDelivery(state.jsonlPath),
-      now: Date.now(),
+    /* Stale-replay gate (2026-07-16) + replay-repeat guard (2026-07-17):
+     * fresh (<= ~10s), not already fully delivered, and the replay
+     * stamps its own delivery so a ws flap cannot re-speak it on every
+     * reconnect. See _replayLastTurnOnBindImpl for the contract. */
+    _replayLastTurnOnBindImpl(state.jsonlPath, last, state.bindKey, {
+      getDelivery: _getReplyDelivery,
+      recordDelivery: _recordReplyDelivery,
+      speak,
+      log: logFn,
     });
-    const ageS = Math.round((Date.now() - last.mtimeMs) / 1000);
-    if (!decision.replay) {
-      logFn(
-        `[voice-ws] replay-on-switch: SKIPPED (${decision.reason}) age=${ageS}s bindKey=${state.bindKey ?? 'null'}`,
-      );
-      return;
-    }
-    logFn(
-      `[voice-ws] replay-on-switch: speaking last reply (${decision.reason}) age=${ageS}s bindKey=${state.bindKey ?? 'null'}`,
-    );
-    speak(last.text);
   }
 
   /* Periodic "still working" pulse while a turn is in flight. The gate

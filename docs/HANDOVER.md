@@ -6,21 +6,33 @@ Update this file IN PLACE every time the cursor moves; never add a new
 dated file. Ground every claim against git before asserting; this doc
 reflects what was true at the last update.
 
-## Cursor (2026-07-17 ~01:50Z)
+## Cursor (2026-07-17, fifth wave)
 
-- **HEAD:** d238332 on master, tree clean.
-- **PROD:** daemon pid 122044 (restarted 01:49Z) runs the FULL stack:
-  the 2026-07-16 dashboard audit wave (GS-1..GS-12, migrations 051 +
-  052 applied at the 01:33Z boot), the four 2026-07-17 voice fixes
-  (SM-14..SM-17), and the SM-18 ws-close hotfix. Dashboard serves via
-  next dev from source; production build validated clean.
+- **HEAD:** fifth-wave commit on master (SM-19..SM-22; FIXES.md rows).
+- **PROD:** daemon restarted onto the fifth-wave build via
+  /admin/daemon/restart (operator-authorized in the /goal directive);
+  dashboard next dev child respawned by the daemon supervisor.
 - **Operator smoke test PENDING:** walk
   `C:/dev/data/skill-connections/brainstorm/RESTART-TEST-CHECKLIST.md`
-  items 1-26. Items 22-26 are the voice fixes; item 23 needs a spoken
-  turn, item 22 needs 5 idle minutes.
+  items 1-26, plus: (a) one spoken turn to verify the quick layer end
+  to end, (b) flip voice off/on twice fast - the last reply must speak
+  at most once (SM-19), (c) after ending a session, grep daemon.log
+  for a ref_summary/rolling-aggregate line instead of
+  "[distill-headless] empty reply" (SM-20), (d) open /help.
 
 ## Tonight's work (newest first)
 
+- **Fifth wave (SM-19..SM-22, this commit):** replay-on-switch stamps
+  its own delivery so ws flap can never loop the same reply (repeat
+  bug the operator heard at 01:33Z; replay-once on disconnect/switch
+  preserved); headless distill timeout 60s -> 180s (env
+  DEVNEURAL_DISTILL_TIMEOUT_MS) after 12+ hours of every pass dying at
+  the cap logged as "empty reply" - spawnHeadlessOpus now names the
+  real failure (timeout / exit code + stderr tail / empty stdout);
+  cold-start preload now appends the last 10 dashboard-log turns
+  (brainstorm_chunks) so voice-only conversation reaches a fresh Lex
+  even when distillation lags; /help rebuilt as a full help section
+  (sticky topic nav, 9 topics, 4 new plain-English guides).
 - **SM-18 (d238332):** ws-close is never terminal - a socket drop runs
   the distillation flush only; the brainstorm stays alive for the
   reconnect. Terminal pipeline reserved for spoken end-session, UI

@@ -477,6 +477,162 @@ describe('buildSiblingIndex - anchor transcript_refs path (TODO bug 2026-05-13)'
   });
 });
 
+/* Cold-start dashboard-log turns (2026-07-17, operator request). The
+ * anchor block only rendered turns extracted from prior CC jsonl refs;
+ * voice-only (direct-llm) conversation lives in brainstorm_chunks (the
+ * log the dashboard shows) and never reached the cold-start preload.
+ * buildSiblingIndex now appends the last 10 user/lex chunks for the
+ * anchor as a "Recent conversation (dashboard log)" block, and renders
+ * it even when the anchor has no prior refs at all. */
+describe('buildSiblingIndex - recent dashboard-log turns on the anchor', () => {
+  function insertChunk(opts: {
+    id: string;
+    brainstormId: string;
+    turnIndex: number;
+    role: 'user' | 'lex' | 'tool';
+    text: string;
+  }): void {
+    db.insertBrainstormChunk({
+      id: opts.id,
+      brainstorm_id: opts.brainstormId,
+      turn_index: opts.turnIndex,
+      role: opts.role,
+      mode: 'conversation',
+      text: opts.text,
+      model_id: 'test-model',
+    });
+  }
+
+  function insertLexSession(id: string): void {
+    db.insertLexSession({
+      id,
+      created_ms: Date.now(),
+      title: null,
+      derived_title: null,
+      status: 'dormant',
+      current_pty_id: null,
+      cwd: 'C:/p/lex',
+    });
+  }
+
+  it('renders the last chunks for a refless (voice-only) anchor instead of returning nothing', () => {
+    insertLexSession('anchor-voice');
+    insertBs({ id: 'anchor-voice', user_label: null, started_ms: 1_000 });
+    insertChunk({
+      id: 'ch-1',
+      brainstormId: 'anchor-voice',
+      turnIndex: 0,
+      role: 'user',
+      text: 'how do we stop the double tts',
+    });
+    insertChunk({
+      id: 'ch-2',
+      brainstormId: 'anchor-voice',
+      turnIndex: 1,
+      role: 'lex',
+      text: 'top layer owns the voice, watchers stay silent',
+    });
+    const out = buildSiblingIndex({
+      db,
+      label: null,
+      anchorId: 'anchor-voice',
+      strictScope: true,
+    });
+    expect(out).toMatch(/# Recent conversation \(dashboard log\)/);
+    expect(out).toMatch(/- USER: how do we stop the double tts/);
+    expect(out).toMatch(/- LEX: top layer owns the voice, watchers stay silent/);
+  });
+
+  it('caps at the 10 newest user/lex turns, chronological, tool chunks skipped', () => {
+    insertLexSession('anchor-cap');
+    insertBs({ id: 'anchor-cap', user_label: null, started_ms: 1_000 });
+    for (let i = 0; i < 14; i++) {
+      insertChunk({
+        id: `cap-${i}`,
+        brainstormId: 'anchor-cap',
+        turnIndex: i,
+        role: i % 2 === 0 ? 'user' : 'lex',
+        text: `turn number ${i}`,
+      });
+    }
+    insertChunk({
+      id: 'cap-tool',
+      brainstormId: 'anchor-cap',
+      turnIndex: 14,
+      role: 'tool',
+      text: 'tool noise must not render',
+    });
+    const out = buildSiblingIndex({
+      db,
+      label: null,
+      anchorId: 'anchor-cap',
+      strictScope: true,
+    });
+    expect(out).not.toMatch(/turn number 3\b/);
+    expect(out).toMatch(/turn number 4\b/);
+    expect(out).toMatch(/turn number 13\b/);
+    expect(out).not.toMatch(/tool noise/);
+    /* Chronological: turn 4 renders before turn 13. */
+    expect(out.indexOf('turn number 4')).toBeLessThan(
+      out.indexOf('turn number 13'),
+    );
+  });
+
+  it('appends the dashboard-log block AFTER the prior-refs block when both exist', () => {
+    insertLexSession('anchor-both');
+    insertBs({
+      id: 'anchor-both',
+      user_label: null,
+      started_ms: 1_000,
+      last_summary: 'a decision from the prior session',
+    });
+    db.insertLexTranscriptRef({
+      lex_session_id: 'anchor-both',
+      cc_session_id: 'cc-prior',
+      transcript_path: '/fake/prior.jsonl',
+      started_ms: Date.now() - 3_600_000,
+      ended_ms: Date.now() - 3_600_000,
+      ordering: 0,
+    });
+    insertChunk({
+      id: 'both-1',
+      brainstormId: 'anchor-both',
+      turnIndex: 0,
+      role: 'user',
+      text: 'freshest spoken turn',
+    });
+    const out = buildSiblingIndex({
+      db,
+      label: null,
+      anchorId: 'anchor-both',
+      currentCcSessionId: 'cc-live',
+      readTranscript: () =>
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: 'jsonl turn body' },
+        }),
+    });
+    expect(out).toMatch(/^# Prior Lex sessions on this anchor/);
+    expect(out).toMatch(/# Recent conversation \(dashboard log\)/);
+    expect(out.indexOf('# Prior Lex sessions')).toBeLessThan(
+      out.indexOf('# Recent conversation'),
+    );
+    expect(out).toMatch(/- USER: freshest spoken turn/);
+  });
+
+  it('anchor with no refs AND no chunks still returns empty (existing contract)', () => {
+    insertLexSession('anchor-empty');
+    insertBs({ id: 'anchor-empty', user_label: null, started_ms: 1_000 });
+    const out = buildSiblingIndex({
+      db,
+      label: null,
+      anchorId: 'anchor-empty',
+      strictScope: true,
+    });
+    expect(out).toBe('');
+  });
+});
+
 /* Codex item 12a (Fix 49) parallel scope swap for buildLabelMatchBlock.
  * preloadSiblingDistillations already prefers project_scope_id over
  * user_label when both the active anchor and the candidate row carry

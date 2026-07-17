@@ -16,11 +16,16 @@
 import { spawn } from 'node:child_process';
 
 /** Run-a-headless-Opus-pass contract. Resolves the reply text, or null
- * on ANY failure so every caller can fall back deterministically. */
+ * on ANY failure so every caller can fall back deterministically.
+ * The optional diag callback receives one line naming WHICH failure
+ * happened (timeout / exit code + stderr tail / empty stdout) - added
+ * 2026-07-17 after 12+ hours of timeouts logged as "empty reply".
+ * Existing 3-param stubs remain assignable. */
 export type SpawnHeadlessOpus = (
   prompt: string,
   cwd: string,
   timeoutMs: number,
+  diag?: (line: string) => void,
 ) => Promise<string | null>;
 
 /* Prod headless Opus pass: `claude -p` reading the prompt from stdin
@@ -37,7 +42,9 @@ export function spawnHeadlessOpus(
   prompt: string,
   cwd: string,
   timeoutMs: number,
+  diag?: (line: string) => void,
 ): Promise<string | null> {
+  const say = diag ?? (() => undefined);
   return new Promise((resolve) => {
     let done = false;
     const finish = (v: string | null): void => {
@@ -61,12 +68,20 @@ export function spawnHeadlessOpus(
           windowsHide: true,
         },
       );
-    } catch {
+    } catch (err) {
+      say(`spawn threw: ${(err as Error).message}`);
       resolve(null);
       return;
     }
     let out = '';
-    const timer = setTimeout(() => finish(null), timeoutMs);
+    let errTail = '';
+    const startMs = Date.now();
+    const timer = setTimeout(() => {
+      say(
+        `TIMEOUT after ${timeoutMs}ms; pass killed mid-generation (stdout ${out.length}b so far${errTail ? `, stderr tail: ${errTail.slice(-300)}` : ''})`,
+      );
+      finish(null);
+    }, timeoutMs);
     if (typeof (timer as { unref?: () => void }).unref === 'function') {
       (timer as { unref: () => void }).unref();
     }
@@ -78,19 +93,38 @@ export function spawnHeadlessOpus(
         finish(out);
       }
     });
-    child.on('error', () => {
+    child.stderr?.on('data', (d: Buffer) => {
+      errTail = (errTail + d.toString()).slice(-2_000);
+    });
+    child.on('error', (err: Error) => {
       clearTimeout(timer);
+      say(`spawn error: ${err.message}`);
       finish(null);
     });
     child.on('close', (code: number | null) => {
       clearTimeout(timer);
-      finish(code === 0 && out.trim() ? out : null);
+      if (code !== 0) {
+        say(
+          `exit code=${code} after ${Date.now() - startMs}ms${errTail ? ` stderr tail: ${errTail.slice(-300)}` : ''}`,
+        );
+        finish(null);
+        return;
+      }
+      if (!out.trim()) {
+        say(
+          `exit 0 but EMPTY stdout after ${Date.now() - startMs}ms${errTail ? ` stderr tail: ${errTail.slice(-300)}` : ''}`,
+        );
+        finish(null);
+        return;
+      }
+      finish(out);
     });
     try {
       child.stdin?.write(prompt);
       child.stdin?.end();
-    } catch {
+    } catch (err) {
       clearTimeout(timer);
+      say(`stdin write failed: ${(err as Error).message}`);
       finish(null);
     }
   });

@@ -3,6 +3,7 @@ import {
   readLastAssistantTurn,
   _seedDigestFromLastTurnImpl,
   _shouldReplayOnBindImpl,
+  _replayLastTurnOnBindImpl,
   _recordReplyDelivery,
   _getReplyDelivery,
   _resetReplyDeliveryTracking,
@@ -280,6 +281,84 @@ describe('_shouldReplayOnBindImpl (stale-replay gate)', () => {
     });
     expect(inWindow.replay).toBe(true);
     expect(outOfWindow.replay).toBe(false);
+  });
+});
+
+/**
+ * Replay-repeat guard (2026-07-17, daemon.log 01:33Z). During a daemon
+ * boot the dashboard ws flapped (connect -> close roughly every second)
+ * and EVERY fresh socket re-spoke the same last reply: ages 5s, 6s, 7s,
+ * 8s, 9s in the log, until the 10s staleness cap finally silenced it.
+ * The operator heard Lex repeat himself in a loop. Root cause: the
+ * replay itself never recorded a delivery, so the "no delivery record
+ * (client was away)" branch stayed true across reconnects; the only
+ * per-connection guard (replayedOnBind) dies with each socket. The
+ * replay IS a delivery: it must stamp 'delivered' (before speak, so
+ * overlapping reconnect races cannot double-speak) and the next bind
+ * must skip with "already fully delivered".
+ */
+describe('_replayLastTurnOnBindImpl (replay-repeat guard)', () => {
+  const TURN = { text: 'the reply body', mtimeMs: 100_000, uuid: 'a1' };
+
+  const harness = () => {
+    const deliveries = new Map<string, { outcome: string; ms: number }>();
+    const calls: string[] = [];
+    const spoken: string[] = [];
+    const deps = {
+      getDelivery: (key: string | null) =>
+        key ? ((deliveries.get(key) as never) ?? null) : null,
+      recordDelivery: (key: string | null, outcome: string, ms: number) => {
+        calls.push(`record:${outcome}`);
+        if (key) deliveries.set(key, { outcome, ms });
+      },
+      speak: (text: string) => {
+        calls.push('speak');
+        spoken.push(text);
+      },
+      log: () => {},
+      now: () => TURN.mtimeMs + 3_000,
+    };
+    return { deliveries, calls, spoken, deps };
+  };
+
+  it('speaks the replay once and stamps it delivered', () => {
+    const h = harness();
+    const spoke = _replayLastTurnOnBindImpl('x.jsonl', TURN, 'bk', h.deps as never);
+    expect(spoke).toBe(true);
+    expect(h.spoken).toEqual(['the reply body']);
+    expect(h.deliveries.get('x.jsonl')?.outcome).toBe('delivered');
+  });
+
+  it('a second bind moments later does NOT re-speak (the 01:33Z ws-flap loop)', () => {
+    const h = harness();
+    _replayLastTurnOnBindImpl('x.jsonl', TURN, 'bk', h.deps as never);
+    const spokeAgain = _replayLastTurnOnBindImpl('x.jsonl', TURN, 'bk', h.deps as never);
+    expect(spokeAgain).toBe(false);
+    expect(h.spoken).toHaveLength(1);
+  });
+
+  it('stamps BEFORE speaking so an overlapping reconnect race cannot double-speak', () => {
+    const h = harness();
+    _replayLastTurnOnBindImpl('x.jsonl', TURN, 'bk', h.deps as never);
+    expect(h.calls).toEqual(['record:delivered', 'speak']);
+  });
+
+  it('a cut delivery still replays once, then locks (existing cut-replay contract preserved)', () => {
+    const h = harness();
+    h.deliveries.set('x.jsonl', { outcome: 'cut', ms: TURN.mtimeMs + 500 });
+    const spoke = _replayLastTurnOnBindImpl('x.jsonl', TURN, 'bk', h.deps as never);
+    expect(spoke).toBe(true);
+    const spokeAgain = _replayLastTurnOnBindImpl('x.jsonl', TURN, 'bk', h.deps as never);
+    expect(spokeAgain).toBe(false);
+    expect(h.spoken).toHaveLength(1);
+  });
+
+  it('a stale turn never speaks and never stamps', () => {
+    const h = harness();
+    const old = { ...TURN, mtimeMs: h.deps.now() - REPLAY_MAX_AGE_MS - 1_000 };
+    const spoke = _replayLastTurnOnBindImpl('x.jsonl', old, 'bk', h.deps as never);
+    expect(spoke).toBe(false);
+    expect(h.calls).toEqual([]);
   });
 });
 

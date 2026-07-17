@@ -76,6 +76,10 @@ export interface BuildSiblingIndexOptions {
    * investigator/cold-start path sets strictScope so an LPCC session
    * can never inherit DevNeural context. Empty is safe; wrong is not. */
   strictScope?: boolean;
+  /** Max user/lex chunks rendered in the "Recent conversation
+   * (dashboard log)" block (default 10, operator request 2026-07-17).
+   * 0 disables the block. */
+  recentChunkTurns?: number;
 }
 
 const DEFAULT_REF_LIMIT = 5;
@@ -83,6 +87,7 @@ const DEFAULT_LIMIT = 8;
 const DEFAULT_DISTILLATION_WORDS = 10;
 const DEFAULT_TURN_SNIPPET_CHARS = 400;
 const DEFAULT_PAIRS_PER_REF = 5;
+const DEFAULT_RECENT_CHUNK_TURNS = 10;
 
 function normLabel(s: string | null | undefined): string {
   return (s ?? '').trim().toLowerCase();
@@ -390,10 +395,54 @@ function buildLabelMatchBlock(opts: BuildSiblingIndexOptions): string {
   return [headerLine, '', intro, '', ...lines].join('\n');
 }
 
+/* Recent conversation block from brainstorm_chunks - the log the
+ * dashboard shows (operator request 2026-07-17). Prior-ref sections
+ * only carry turns extracted from CC jsonl transcripts; voice-only
+ * (direct-llm) turns live exclusively in brainstorm_chunks, so a cold
+ * start after a spoken conversation preloaded zero of it. Renders the
+ * last N user/lex chunks chronologically; tool chunks are noise and
+ * skipped. Anchor-scoped by construction, so it is safe under
+ * strictScope. Best-effort: any read failure returns ''. */
+function buildRecentChunkTurnsBlock(opts: BuildSiblingIndexOptions): string {
+  if (!opts.anchorId) return '';
+  const limit = opts.recentChunkTurns ?? DEFAULT_RECENT_CHUNK_TURNS;
+  if (limit <= 0) return '';
+  const snippetChars = opts.turnSnippetChars ?? DEFAULT_TURN_SNIPPET_CHARS;
+  let rows: Array<{ role: string; text: string }>;
+  try {
+    /* Over-fetch so tool chunks between spoken turns do not shrink
+     * the rendered count below the cap. */
+    rows = opts.db.listBrainstormChunks(opts.anchorId, limit * 3, {
+      order: 'desc',
+    });
+  } catch {
+    return '';
+  }
+  const spoken = rows
+    .filter((r) => r.role === 'user' || r.role === 'lex')
+    .slice(0, limit)
+    .reverse();
+  if (spoken.length === 0) return '';
+  const lines = spoken.map((c) => {
+    const role = c.role === 'lex' ? 'LEX' : 'USER';
+    return `- ${role}: ${trimSnippet(c.text, snippetChars)}`;
+  });
+  return [
+    '# Recent conversation (dashboard log)',
+    '',
+    `Last ${spoken.length} user/Lex turns on this brainstorm, oldest first. This is the live conversation log the dashboard shows; resume the thread from here.`,
+    '',
+    ...lines,
+  ].join('\n');
+}
+
 export function buildSiblingIndex(opts: BuildSiblingIndexOptions): string {
   if (opts.anchorId) {
     const fromRefs = buildAnchorTranscriptBlock(opts);
-    if (fromRefs) return fromRefs;
+    const recentTurns = buildRecentChunkTurnsBlock(opts);
+    if (fromRefs || recentTurns) {
+      return [fromRefs, recentTurns].filter(Boolean).join('\n\n');
+    }
     /* Fail-closed: an anchored, strict-scope caller never crosses into
      * the label-match fallback. No anchor refs -> no context, rather
      * than risk pulling a same-named brainstorm from another project. */
