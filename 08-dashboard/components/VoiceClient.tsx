@@ -31,6 +31,10 @@ import {
 } from "@/lib/audio-output";
 import { buildVadOptionSet, type VadOptionSet } from "@/lib/voice-vad-options";
 import {
+  createBrowserPlaybackSink,
+  type BrowserPlaybackSink,
+} from "@/lib/voice-engine/audio-element-sink";
+import {
   migrateLegacyMicGain,
   migrateLegacyVadRedemption,
 } from "@/lib/mic-gain-migration";
@@ -714,6 +718,35 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         r.onresult = (event) => {
           if (cancelled) return;
           stamp();
+          /* Voice engine (2026-07-17): forward streaming ASR words to
+           * the daemon's word gate. 2+ interim words (or 1 final) that
+           * are not Lex's own TTS text fire the barge; the stop-class
+           * fast path reads finals for instant mid-turn interrupts.
+           * Best-effort: a failed send never breaks wake matching. */
+          try {
+            const evLike = event as {
+              resultIndex?: number;
+              results?: ArrayLike<{
+                0?: { transcript?: string };
+                isFinal?: boolean;
+              }>;
+            };
+            const results = evLike.results;
+            const startIdx = evLike.resultIndex ?? 0;
+            if (results) {
+              for (let i = startIdx; i < results.length; i++) {
+                const res = results[i];
+                const transcript = res?.[0]?.transcript?.trim() ?? "";
+                if (!transcript) continue;
+                sendJson({
+                  t: res?.isFinal ? "asr-final" : "asr-interim",
+                  text: transcript,
+                });
+              }
+            }
+          } catch {
+            /* forwarding is observational */
+          }
           /* Iterate NEW results only. processWakeResults reads from
            * event.resultIndex per the Web Speech spec so old
            * finalised fragments are NOT re-matched on every event.
@@ -973,34 +1006,56 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   const awaitingFinalizeRef = useRef<boolean>(false);
   const finalizeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  /* Reset playhead, hard-stop every scheduled source, and bump the
-   * generation counter so any in-flight binary chunks from the now-
-   * cancelled reply get discarded instead of scheduled into the next
-   * one. Used on barge-in, tts-cancel, and soft mute; tts-start
-   * deliberately does NOT call this (segments of one reply chain onto
-   * the live playhead instead, see the tts-start handler). The bump
-   * is what fixes "two voices at once": the server cancels piper, but
-   * TCP frames already in flight still arrive client-side; without
-   * this gen guard those frames would schedule fresh sources just as
-   * the new reply's chunks start landing. */
+  /* Media-element playback sink (2026-07-17 voice engine cut). One
+   * persistent HTMLAudioElement replaces the AudioContext buffer-
+   * source scheduler so the browser echo canceller actually
+   * references what the speakers play (VOICE-TOP-LAYER-SPEC "Echo,
+   * first line"; Chromium bug 40504498). Segment assembly, ordered
+   * chaining, played-ms accounting, and stale-chunk discard live in
+   * lib/voice-engine/playback-queue (unit-pinned); this ref just
+   * holds the browser binding. */
+  const sinkRef = useRef<BrowserPlaybackSink | null>(null);
+  function ensureSink(): BrowserPlaybackSink {
+    if (sinkRef.current) return sinkRef.current;
+    const sink = createBrowserPlaybackSink({
+      onPlaybackStart: () => {
+        speakingRef.current = true;
+        setStatus("speaking");
+      },
+      onDrained: () => {
+        /* TRUE audio end: tell the daemon so the during-TTS echo
+         * window closes at the speakers, not at synth-stream end. */
+        sendJson({ t: "playback-drained" });
+        streamFinishedRef.current = true;
+        finalizePlaybackEnd();
+      },
+      onError: (err) => {
+        logVoice(
+          "audio-context-state",
+          "media-element playback failed",
+          { error: String((err as Error | undefined)?.message ?? err) },
+          "error",
+        );
+      },
+    });
+    const deviceId = getPersistedAudioOutputDevice();
+    if (deviceId) void sink.applySinkId(deviceId);
+    sinkRef.current = sink;
+    return sink;
+  }
+
+  /* Instant stop + played-ms report. Used on barge (daemon word-gate
+   * tts-cancel), soft mute, and teardown. The daemon truncates the
+   * conversational context to the words that actually played
+   * (playback-stopped frame), so the assistant never believes it said
+   * words the operator never heard. */
   function resetTtsPlayback(): void {
     ttsGenRef.current += 1;
-    for (const src of activeSourcesRef.current) {
-      try {
-        src.stop();
-      } catch {
-        /* already stopped */
-      }
-      try {
-        src.disconnect();
-      } catch {
-        /* already disconnected */
-      }
+    let playedMs = 0;
+    if (sinkRef.current) {
+      playedMs = sinkRef.current.cancelAll().playedMs;
     }
-    activeSourcesRef.current = [];
-    if (audioCtxRef.current) {
-      playheadRef.current = audioCtxRef.current.currentTime;
-    }
+    sendJson({ t: "playback-stopped", played_ms: Math.round(playedMs) });
     speakingRef.current = false;
     /* Barge-in: drop the TTS gate immediately so the new utterance's
      * onSpeechStart doesn't early-return against a stale micGatedRef.
@@ -1010,12 +1065,8 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     setMicGated(false);
     streamFinishedRef.current = false;
     /* Watchdog teardown: the c2335c5 watchdog reads ttsActiveRef +
-     * lastBufferProgressTsMsRef on its poll. Without clearing them
-     * here, barge-in leaves ttsActive=true with zero active sources
-     * and a stale progress timestamp, which the watchdog misreads as
-     * a stuck buffer and self-heals (resetVoiceAudio) mid-utterance.
-     * Bump the progress clock too so a heal poll mid-fade does not
-     * see a fossil timestamp. */
+     * lastBufferProgressTsMsRef on its poll; clear + restamp so a
+     * heal poll mid-fade does not see a fossil timestamp. */
     ttsActiveRef.current = false;
     lastBufferProgressTsMsRef.current = Date.now();
   }
@@ -1223,49 +1274,19 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * in bursts. `gen` is the ttsGen value captured when the chunk
    * arrived; if a barge-in / new tts-start has bumped it since, drop
    * the chunk so we don't schedule cancelled audio into a fresh reply. */
+  /* Feed one raw PCM chunk into the media-element sink's open segment
+   * (2026-07-17 voice engine cut: the AudioContext buffer-source
+   * scheduler is gone; assembly + ordering + stale-chunk discard live
+   * in lib/voice-engine/playback-queue). Name kept: every caller and
+   * watchdog contract predates the cut. */
   function schedulePcmChunk(pcm: ArrayBuffer, gen: number): void {
     if (gen !== ttsGenRef.current) return;
     /* Stamp the frame arrival even before we decide whether to
      * schedule it. A late chunk from a barged-in stream still
      * proves the WS audio path is alive end-to-end. */
     lastFrameTsMsRef.current = Date.now();
-    const ctx = audioCtxRef.current;
-    if (!ctx) return;
-    const int16 = new Int16Array(pcm);
-    const float = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) {
-      float[i] = (int16[i] ?? 0) / 0x8000;
-    }
-    const rate = ttsRateRef.current;
-    const buffer = ctx.createBuffer(1, float.length, rate);
-    buffer.copyToChannel(float, 0);
-    const src = ctx.createBufferSource();
-    src.buffer = buffer;
-    src.connect(ctx.destination);
-    /* Start a tiny epsilon ahead of currentTime so the first chunk
-     * doesn't underrun. Subsequent chunks chain off playhead. */
-    if (playheadRef.current < ctx.currentTime + 0.05) {
-      playheadRef.current = ctx.currentTime + 0.05;
-    }
-    src.start(playheadRef.current);
-    playheadRef.current += float.length / rate;
+    sinkRef.current?.appendPcm(new Uint8Array(pcm));
     lastBufferProgressTsMsRef.current = Date.now();
-    /* Track so resetTtsPlayback can stop everything on barge-in. Drop
-     * the entry on natural end so the array doesn't grow unbounded. */
-    activeSourcesRef.current.push(src);
-    src.onended = () => {
-      const idx = activeSourcesRef.current.indexOf(src);
-      if (idx >= 0) activeSourcesRef.current.splice(idx, 1);
-      lastBufferProgressTsMsRef.current = Date.now();
-      /* Last scheduled buffer just left the speaker AND the server is
-       * done streaming: only now is the mic gate safe to drop. */
-      if (
-        streamFinishedRef.current &&
-        activeSourcesRef.current.length === 0
-      ) {
-        finalizePlaybackEnd();
-      }
-    };
   }
 
   /* Phone Bluetooth output routing. setSinkId only exists on desktop
@@ -1648,6 +1669,9 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         case "audio_output_device":
           if (typeof u.value === "string") {
             applyOutputDeviceToCtx(audioCtxRef.current, u.value);
+            /* Media-element sink routes independently of the capture
+             * AudioContext. */
+            void sinkRef.current?.applySinkId(u.value);
           }
           break;
       }
@@ -2111,7 +2135,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
               /* malformed json, ignore */
             }
           } else if (ev.data instanceof ArrayBuffer) {
-            if (speakingRef.current) {
+            /* Gate on ttsActiveRef (set at tts-start), not speakingRef:
+             * with the media-element sink, audible playback begins only
+             * after the first segment fully assembles, so speakingRef
+             * flips later than chunk arrival by design. */
+            if (ttsActiveRef.current) {
               schedulePcmChunk(ev.data, ttsGenRef.current);
             }
           }
@@ -2238,58 +2266,13 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             }
             const rate = Number(msg.rate) || 22050;
             ttsRateRef.current = rate;
-            /* Segment chaining (2026-07-15 gapless fix). The server
-             * tags tts-start frames that belong to the same logical
-             * reply turn (pre-tool ack then body; sentence-serialized
-             * body segments) with continuation:true. Daemons that
-             * predate the flag omit it; a missing flag means false. */
-            const continuation = msg.continuation === true;
-            /* AudioContext is warmed inside the toggleEnabled() click
-             * handler (a user gesture), not here. Lazy-creating in
-             * this network callback used to ship a context iOS
-             * Safari refused to start, silencing the first reply.
-             * The ref should be live by the time we land here; if
-             * for any reason it is not (teardown raced ahead of a
-             * late tts-start) we skip the audio path rather than
-             * fabricate a broken context. */
-            /* Chrome / Safari suspend the AudioContext when the tab
-             * loses focus. Resume defensively on every tts-start so
-             * the scheduled buffers actually play. */
-            const ctx = audioCtxRef.current;
-            if (ctx && ctx.state === "suspended") {
-              void ctx.resume().catch(() => undefined);
-            }
-            /* Playhead policy. The old code reset playheadRef to
-             * ctx.currentTime on EVERY tts-start, which laid the new
-             * segment's first chunk on top of the previous segment's
-             * still-scheduled tail (overlap) or, after a full drain,
-             * restarted with an audible seam (gap). Now:
-             *  - continuation:true never touches the playhead: the
-             *    incoming chunks chain onto the existing schedule so
-             *    consecutive segments of one reply play gaplessly.
-             *    (schedulePcmChunk clamps a stale playhead forward
-             *    itself, so a fully-drained chain restarts cleanly.)
-             *  - continuation absent/false only rewinds a playhead
-             *    that has fallen into the past (previous audio fully
-             *    drained). A playhead still ahead of currentTime
-             *    means earlier audio is still scheduled; chain behind
-             *    it instead of resetting so two segments can never
-             *    overlap.
-             * The generation counter is deliberately NOT bumped here:
-             * chunks still in flight from the previous segment were
-             * never cancelled and must keep scheduling onto the
-             * shared chain. Cancellation (barge-in, tts-cancel, soft
-             * mute) still goes through resetTtsPlayback, which stops
-             * every scheduled source (chained segments included),
-             * resets the playhead, and bumps the generation. */
-            if (
-              ctx &&
-              !continuation &&
-              playheadRef.current < ctx.currentTime
-            ) {
-              playheadRef.current = ctx.currentTime;
-            }
-            speakingRef.current = true;
+            /* Media-element sink (2026-07-17 voice engine cut): open a
+             * new segment; chunks append until this segment's tts-end
+             * closes it into a WAV blob. Ordering/gapless chaining is
+             * the queue's job; continuation needs no special playhead
+             * handling anymore. speakingRef flips when audio actually
+             * starts (sink onPlaybackStart), not here. */
+            ensureSink().beginSegment(rate);
             /* Fresh segment: reset the server-finished flag so an
              * onended for THIS segment only finalises after this
              * segment's own tts-end has landed. */
@@ -2320,16 +2303,12 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             break;
           }
           case "tts-end": {
-            /* Server has flushed the last PCM chunk for this reply.
-             * That can land seconds before the AudioContext has played
-             * the buffered tail (the client schedules audio ahead of
-             * the playhead). Mark the stream finished; the actual gate
-             * drop happens in finalizePlaybackEnd, called either now
-             * (if no buffers remain) or by the last src.onended. */
-            streamFinishedRef.current = true;
-            if (activeSourcesRef.current.length === 0) {
-              finalizePlaybackEnd();
-            }
+            /* Server flushed the last PCM chunk for this SEGMENT.
+             * Close it into a WAV blob; it plays now (if idle) or
+             * chains after the current one. True end-of-audio is the
+             * sink's onDrained (which reports playback-drained to the
+             * daemon and finalizes). */
+            sinkRef.current?.endSegment();
             break;
           }
           case "tts-cancel": {
@@ -2643,37 +2622,22 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                * lex-voice-ws.ts). The barge-in path below still
                * cancels the in-flight TTS playback so the user is
                * heard immediately. */
-              /* Hardened barge trigger (2026-05-22): trip on EITHER
-               * speakingRef (set when first PCM chunk arrives) OR
-               * ttsActiveRef (set on tts-start, earlier in the
-               * pipeline). The gap between the two flags is where
-               * the old code could miss a barge: tts-start has
-               * fired daemon-side, the mic is gated, the user
-               * begins speaking, but speakingRef has not flipped
-               * yet because no PCM chunk has landed locally. The
-               * daemon-side floor (utterance-start unconditionally
-               * kills TTS) covers the worst case; this client-side
-               * harden keeps the visual + audio teardown tight. */
-              if (speakingRef.current || ttsActiveRef.current) {
-                /* Self-echo guard: Lex's own audio bleeds into the mic
-                 * (laptop speakers, AirPods leak, etc.) and trips VAD
-                 * milliseconds after tts-start. Swallow VAD events
-                 * within bargeCooldownMs of audio onset so the loop
-                 * does not feedback on itself. The cooldown is user-
-                 * tunable in the voice panel and persisted server-side. */
-                const sinceStart = Date.now() - lastTtsStartAtRef.current;
-                if (sinceStart < bargeCooldownRef.current) {
-                  return;
-                }
-                /* Barge-in: stop Lex, start a fresh utterance. The
-                 * explicit barge-in frame is kept for daemon-side
-                 * audit clarity, but the daemon will also kill on
-                 * the trailing utterance-start regardless. */
-                sendJson({ t: "barge-in" });
-                resetTtsPlayback();
-              }
+              /* Word-gated barge (2026-07-17 voice engine cut,
+               * VOICE-TOP-LAYER-SPEC): a VAD onset never kills
+               * playback anymore - it ARMS the daemon's word gate.
+               * Playback dies only when streaming ASR words (the
+               * wake recognizer's interims, forwarded as asr-interim/
+               * asr-final) prove a real interruption: the daemon then
+               * sends tts-cancel and resetTtsPlayback reports the
+               * played ms. The barge cooldown knob is gone with the
+               * raw-VAD trigger it papered over; noise cannot stop
+               * Lex, words always can. */
+              sendJson({
+                t: "vad-onset",
+                playback_active:
+                  speakingRef.current || ttsActiveRef.current,
+              });
               setStatus("listening");
-              sendJson({ t: "utterance-start" });
               /* Reset + arm the parallel capture so a mute mid-
                * utterance has audio to flush. */
               captureBufRef.current = [];
