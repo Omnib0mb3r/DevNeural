@@ -106,6 +106,26 @@ export function createPlaybackQueue(
     runActive = true;
     void Promise.resolve(audio.play()).catch((err) => {
       cb.onError?.(err);
+      /* Autoplay-block resilience (2026-07-18 silent-TTS fix): a
+       * NotAllowedError here previously killed the whole run
+       * silently - the queue never drained, the UI sat on
+       * "speaking", and the reply was readable but never heard.
+       * Retry the SAME item on the next user gesture; the element
+       * keeps its gesture blessing from then on. */
+      const name = (err as Error | undefined)?.name;
+      if (name === "NotAllowedError" && typeof document !== "undefined") {
+        const retry = (): void => {
+          document.removeEventListener("pointerdown", retry);
+          document.removeEventListener("keydown", retry);
+          if (current === next) {
+            void Promise.resolve(audio.play()).catch((e2) => {
+              cb.onError?.(e2);
+            });
+          }
+        };
+        document.addEventListener("pointerdown", retry, { once: true });
+        document.addEventListener("keydown", retry, { once: true });
+      }
     });
     if (startedRun) cb.onPlaybackStart?.();
   }

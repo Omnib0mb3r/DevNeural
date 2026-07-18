@@ -297,6 +297,16 @@ interface ConnState {
    * the user "stack" follow-on context that gets delivered cleanly
    * at the next natural turn boundary. */
   pendingUserUtterances: string[];
+  /* SM-25 smart stacking (2026-07-18, operator): one top-layer voice
+   * turn at a time. While a topLayerTurn ask is in flight, newer
+   * utterances queue here instead of firing concurrent asks (which
+   * produced stacked discrete replies spoken back to back). If the
+   * in-flight ask resolves with its reply still UNSPOKEN, the queue
+   * supersedes it: one combined re-ask answers everything
+   * cohesively. Distinct from pendingUserUtterances above, which is
+   * the MID-layer (Lex inject) boundary queue. */
+  topTurnInFlight: boolean;
+  pendingTopUtterances: string[];
   /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
    * Set when a hello frame carries a brainstorm_id and the resolved
    * brainstorm has runtime_mode='direct-llm'. Drives the dispatch
@@ -1553,6 +1563,18 @@ export function _resumeBargedSpeechImpl(deps: _ResumeBargedSpeechDeps): boolean 
   return true;
 }
 
+/* SM-25: combine utterances that piled up while a top-layer ask was
+ * in flight into ONE message so the voice brain answers them
+ * cohesively instead of stacking discrete replies. Module-level +
+ * exported so the regression pin can exercise it directly. */
+export function mergeOperatorUtterances(parts: string[]): string {
+  const clean = parts.map((p) => p.trim()).filter((p) => p.length > 0);
+  if (clean.length <= 1) return clean[0] ?? '';
+  return clean
+    .map((p, i) => (i === 0 ? p : `(operator added before you replied): ${p}`))
+    .join('\n');
+}
+
 export function attachLexVoiceWs(socket: FastifyWS): void {
   logFn(`[voice-ws] client connected (attach)`);
   /* 2026-07-16 smoke-test fix 3: boot the voice brain the moment a
@@ -1590,6 +1612,8 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     currentTtsStartedAtMs: 0,
     partialChain: [],
     pendingUserUtterances: [],
+    topTurnInFlight: false,
+    pendingTopUtterances: [],
     directLlmAbort: null,
     brainstormId: null,
     runtimeMode: null,
@@ -4128,16 +4152,84 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
        * direct-llm below. Nothing extra is written here; see the
        * guard note above. */
     }
-    /* Voice top layer (spec v2, 2026-07-15): the one conversational
-     * brain the operator talks to. Every utterance that survived the
-     * panic check and the notes gate gets ONE speech-first turn from
-     * the dedicated persistent session: whatever it says is spoken;
-     * a trailing FORWARD: line hands substance to Lex through the
-     * normal inject path below; a trailing CONTROL: line fires the
-     * existing dispatch effects. No lanes, no whitelist, no canned
-     * lines. Fail-safe: session down/timeout/unparseable means the
-     * turn forwards untouched - the top layer can never eat the
-     * operator's words. */
+    await runCoalescedTopLayerTurn(trimmed, result.ms);
+  }
+
+  /* SM-25 smart stacking (2026-07-18, operator): serialize top-layer
+   * voice turns. Concurrent utterance-ends used to fire concurrent
+   * topLayerTurn asks whose replies then played back to back as
+   * discrete stacked answers. Now: one turn at a time; utterances
+   * arriving mid-turn queue onto state.pendingTopUtterances; when
+   * the in-flight turn resolves UNSPOKEN (no streamed lines, nothing
+   * at the speakers yet) the queue supersedes it - a single combined
+   * re-ask answers everything in one cohesive reply. If speech
+   * already streamed, the reply finishes and the queued utterances
+   * get one combined follow-up turn. Depth-capped so a pathological
+   * loop can never spin the brain forever. */
+  async function runCoalescedTopLayerTurn(
+    firstUtterance: string,
+    sttMs: number,
+  ): Promise<void> {
+    if (state.topTurnInFlight) {
+      state.pendingTopUtterances.push(firstUtterance);
+      logFn(
+        `[voice-ws] top-layer coalesce: queued while turn in flight depth=${state.pendingTopUtterances.length} text=${JSON.stringify(firstUtterance.slice(0, 60))}`,
+      );
+      send({
+        t: 'queued-mid-turn',
+        text: firstUtterance,
+        queue_depth: state.pendingTopUtterances.length,
+      });
+      return;
+    }
+    state.topTurnInFlight = true;
+    try {
+      let utterance = firstUtterance;
+      for (let depth = 0; depth < 6; depth++) {
+        const superseding = await runTopLayerVoiceTurnOnce(utterance, sttMs);
+        if (typeof superseding === 'string' && superseding.length > 0) {
+          utterance = superseding;
+          continue;
+        }
+        const queued = state.pendingTopUtterances.splice(0);
+        if (queued.length === 0) return;
+        logFn(
+          `[voice-ws] top-layer coalesce: draining ${queued.length} queued utterance(s) as one combined turn`,
+        );
+        utterance = mergeOperatorUtterances(queued);
+      }
+      if (state.pendingTopUtterances.length > 0) {
+        logFn(
+          `[voice-ws] top-layer coalesce: depth cap hit; dropping ${state.pendingTopUtterances.length} queued utterance(s)`,
+        );
+        state.pendingTopUtterances = [];
+      }
+    } finally {
+      state.topTurnInFlight = false;
+    }
+  }
+
+  /* Voice top layer (spec v2, 2026-07-15): the one conversational
+   * brain the operator talks to. Every utterance that survived the
+   * panic check and the notes gate gets ONE speech-first turn from
+   * the dedicated persistent session: whatever it says is spoken;
+   * a trailing FORWARD: line hands substance to Lex through the
+   * normal inject path below; a trailing CONTROL: line fires the
+   * existing dispatch effects. No lanes, no whitelist, no canned
+   * lines. Fail-safe: session down/timeout/unparseable means the
+   * turn forwards untouched - the top layer can never eat the
+   * operator's words.
+   *
+   * SM-25: extracted from handleUtteranceEnd's tail so the coalesce
+   * loop above can re-enter it with a combined utterance. Returns a
+   * string when the resolved reply was superseded (the caller
+   * re-asks with that combined text); returns void when the turn
+   * completed (spoken, forwarded, controlled, or absorbed). */
+  async function runTopLayerVoiceTurnOnce(
+    trimmed: string,
+    sttMs: number,
+  ): Promise<string | void> {
+    let result: { text: string; ms: number } = { text: trimmed, ms: sttMs };
     const wasDuringTts = state.utteranceStartedDuringTts;
     /* Streaming partials (spec v2 phase 2): each directive-free record
      * from the voice brain speaks the moment it lands; the resolved
@@ -4168,6 +4260,23 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       logFn(
         `[voice-ws] top-layer early-speech mismatch; remainder dropped (${earlySpoken.length} line(s) already spoken)`,
       );
+    }
+    /* SM-25: newer utterances arrived while this ask ran and NOTHING
+     * of this reply has reached the speakers (no streamed lines).
+     * Discard the unspoken result and re-ask once with everything
+     * combined so the operator hears one cohesive answer instead of
+     * stacked discrete replies. Control verdicts are never
+     * superseded - they are immediate effects, not speech. */
+    if (
+      !tl.control &&
+      earlySpoken.length === 0 &&
+      state.pendingTopUtterances.length > 0
+    ) {
+      const extras = state.pendingTopUtterances.splice(0);
+      logFn(
+        `[voice-ws] top-layer coalesce: unspoken reply superseded by ${extras.length} newer utterance(s); re-asking combined`,
+      );
+      return mergeOperatorUtterances([trimmed, ...extras]);
     }
     if (tl.control) {
       /* Real interpreted control: drop any barge stash (never resume

@@ -1040,14 +1040,59 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * lib/voice-engine/playback-queue (unit-pinned); this ref just
    * holds the browser binding. */
   const sinkRef = useRef<BrowserPlaybackSink | null>(null);
+  /* Silent-audio probe (2026-07-18): counts every stage of the TTS
+   * playback chain so voice_health "snk:" rows show WHERE audio dies
+   * without DevTools. sb/se = segments begun/closed (tts-start /
+   * tts-end), ch = PCM chunks appended, ps = sink playback starts,
+   * er = media-element errors (each also posts an immediate
+   * snk-err row with the exact error), dr = drains. Reported for
+   * ~12s after each tts-start. Diagnostic; remove once the silent
+   * TTS bug is fixed. */
+  const sinkProbeRef = useRef({
+    segBegins: 0,
+    segEnds: 0,
+    chunks: 0,
+    playStarts: 0,
+    errors: 0,
+    drains: 0,
+    reportTicks: 0,
+    reportTimer: null as ReturnType<typeof setInterval> | null,
+  });
+  function armSinkProbeReporter(): void {
+    const p = sinkProbeRef.current;
+    if (p.reportTimer) return;
+    p.reportTicks = 0;
+    p.reportTimer = setInterval(() => {
+      p.reportTicks += 1;
+      if (p.reportTicks > 3) {
+        if (p.reportTimer) clearInterval(p.reportTimer);
+        p.reportTimer = null;
+        return;
+      }
+      void postVoiceHealth([
+        {
+          ts_ms: Date.now(),
+          check_kind:
+            `snk:sb=${p.segBegins},se=${p.segEnds},ch=${p.chunks}` +
+            `,ps=${p.playStarts},er=${p.errors},dr=${p.drains}`,
+          status: "probe",
+          heal_attempt: Math.min(9, p.reportTicks),
+          recovered: 0,
+        },
+      ]);
+    }, 4_000);
+  }
+
   function ensureSink(): BrowserPlaybackSink {
     if (sinkRef.current) return sinkRef.current;
     const sink = createBrowserPlaybackSink({
       onPlaybackStart: () => {
+        sinkProbeRef.current.playStarts += 1;
         speakingRef.current = true;
         setStatus("speaking");
       },
       onDrained: () => {
+        sinkProbeRef.current.drains += 1;
         /* TRUE audio end: tell the daemon so the during-TTS echo
          * window closes at the speakers, not at synth-stream end. */
         sendJson({ t: "playback-drained" });
@@ -1055,12 +1100,28 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         finalizePlaybackEnd();
       },
       onError: (err) => {
+        sinkProbeRef.current.errors += 1;
         logVoice(
           "audio-context-state",
           "media-element playback failed",
           { error: String((err as Error | undefined)?.message ?? err) },
           "error",
         );
+        /* Silent-audio investigation (2026-07-18): a media-element
+         * play() rejection (e.g. NotAllowedError from the autoplay
+         * policy) previously died in the in-browser ring only -
+         * "speaking" status with zero audio and no server-side
+         * evidence. Mirror the exact error to voice_health. */
+        const e = err as Error | undefined;
+        void postVoiceHealth([
+          {
+            ts_ms: Date.now(),
+            check_kind: `snk-err:${e?.name ?? "?"}:${e?.message ?? String(err)}`.slice(0, 64),
+            status: "probe",
+            heal_attempt: 0,
+            recovered: 0,
+          },
+        ]);
       },
     });
     const deviceId = getPersistedAudioOutputDevice();
@@ -1310,6 +1371,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
      * schedule it. A late chunk from a barged-in stream still
      * proves the WS audio path is alive end-to-end. */
     lastFrameTsMsRef.current = Date.now();
+    sinkProbeRef.current.chunks += 1;
     sinkRef.current?.appendPcm(new Uint8Array(pcm));
     lastBufferProgressTsMsRef.current = Date.now();
   }
@@ -2403,6 +2465,8 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
              * handling anymore. speakingRef flips when audio actually
              * starts (sink onPlaybackStart), not here. */
             ensureSink().beginSegment(rate);
+            sinkProbeRef.current.segBegins += 1;
+            armSinkProbeReporter();
             /* Fresh segment: reset the server-finished flag so an
              * onended for THIS segment only finalises after this
              * segment's own tts-end has landed. */
@@ -2439,6 +2503,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
              * sink's onDrained (which reports playback-drained to the
              * daemon and finalizes). */
             sinkRef.current?.endSegment();
+            sinkProbeRef.current.segEnds += 1;
             break;
           }
           case "tts-cancel": {
@@ -3350,6 +3415,16 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
        * platforms/contexts where they don't apply. */
       applyIosAudioSessionHint();
       applyPersistedOutputDevice(audioCtxRef.current);
+      /* Silent-TTS fix (2026-07-18): earn the media element's
+       * autoplay blessing INSIDE this user gesture. The engine cut
+       * moved playback from the gesture-warmed AudioContext to an
+       * HTMLAudioElement, whose play() from a network callback the
+       * autoplay policy may reject (fresh profiles, low media
+       * engagement) - "speaking" with zero audio. A beat of silence
+       * played here makes every later play() gesture-blessed; the
+       * queue's retry-on-gesture is the fallback when even the
+       * prime is refused. */
+      void ensureSink().primeFromGesture();
       setEnabled(true);
       return;
     }

@@ -19,6 +19,39 @@ import {
 export interface BrowserPlaybackSink extends PlaybackQueue {
   /** Route the element to an output device (setSinkId), best-effort. */
   applySinkId(deviceId: string): Promise<boolean>;
+  /** Play a beat of silence NOW, inside a user-gesture call stack, so
+   * the element earns gesture-blessed playback and later play() calls
+   * from network callbacks cannot be rejected by the autoplay policy.
+   * Best-effort: resolves true when the prime played, false when the
+   * browser refused (in which case the retry-on-gesture path in the
+   * queue is the fallback). */
+  primeFromGesture(): Promise<boolean>;
+}
+
+/* 100ms of 16kHz mono int16 silence wrapped as a WAV, tiny enough to
+ * inline. Built lazily once; used only by primeFromGesture. */
+function silentWavBytes(): Uint8Array {
+  const samples = 1600;
+  const dataLen = samples * 2;
+  const buf = new ArrayBuffer(44 + dataLen);
+  const v = new DataView(buf);
+  const w = (off: number, s: string): void => {
+    for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i));
+  };
+  w(0, "RIFF");
+  v.setUint32(4, 36 + dataLen, true);
+  w(8, "WAVE");
+  w(12, "fmt ");
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true);
+  v.setUint32(24, 16000, true);
+  v.setUint32(28, 32000, true);
+  v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true);
+  w(36, "data");
+  v.setUint32(40, dataLen, true);
+  return new Uint8Array(buf);
 }
 
 export function createBrowserPlaybackSink(
@@ -70,6 +103,27 @@ export function createBrowserPlaybackSink(
         return true;
       } catch {
         return false;
+      }
+    },
+    async primeFromGesture(): Promise<boolean> {
+      /* Never prime over live playback; the element already has the
+       * blessing if it is playing. */
+      if (!el.paused) return true;
+      const url = URL.createObjectURL(
+        new Blob([silentWavBytes().buffer as ArrayBuffer], {
+          type: "audio/wav",
+        }),
+      );
+      try {
+        el.src = url;
+        await el.play();
+        el.pause();
+        el.removeAttribute("src");
+        return true;
+      } catch {
+        return false;
+      } finally {
+        URL.revokeObjectURL(url);
       }
     },
   };
