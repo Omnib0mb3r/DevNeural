@@ -249,14 +249,29 @@ async function finalizeDayCap(
   out: GroomingResult,
 ): Promise<void> {
   try {
+    /* SM-27 (2026-07-18, operator): distill BEFORE flipping ended, no
+     * exceptions. The old order flipped status='ended' first, so a
+     * daemon death in the window before runFinalDistillation wrote
+     * its pending-distill marker left an ended brainstorm with no
+     * distillation and no recovery record - the next cold start read
+     * stale context. runFinalDistillation (wired to
+     * queueSessionEndPipeline in daemon.ts) writes the marker
+     * synchronously and the terminal pipeline flips ended itself, so
+     * running it first both guarantees the marker and does the
+     * status flip; the explicit flip below is now just the belt for
+     * the (prod-unreachable) unwired case. */
+    if (deps.runFinalDistillation) {
+      await deps.runFinalDistillation(row.id);
+    } else {
+      (deps.log ?? (() => undefined))(
+        `[grooming] DAY-CAP WITHOUT DISTILLATION: runFinalDistillation not wired for brainstorm=${row.id.slice(0, 8)}; ending with stale context (should never happen in prod)`,
+      );
+    }
     deps.db.updateBrainstorm(row.id, {
       lifecycle_state: 'ended',
       status: 'ended',
       ended_ms: row.ended_ms ?? (deps.now ?? Date.now)(),
     });
-    if (deps.runFinalDistillation) {
-      await deps.runFinalDistillation(row.id);
-    }
     out.ended_at_day_cap = true;
   } catch (err) {
     out.errors.push(`day_cap_finalize: ${(err as Error).message}`);

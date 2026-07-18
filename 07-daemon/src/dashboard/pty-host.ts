@@ -1247,7 +1247,46 @@ export function ptyKill(ptyIdOrSession: string): boolean {
     try {
       const bs = getBrainstormByPty(ptyId);
       if (bs && bs.status === 'active') {
-        endBrainstorm(bs.id);
+        /* SM-27 (2026-07-18, operator): guarantee a distillation on
+         * EVERY brainstorm end, no exceptions. This kill/reaper path
+         * (taskkill, switch-session, daemon-restart PTY teardown,
+         * onExit-never-fired) previously ended the brainstorm with
+         * ZERO distillation, and because it flips status='ended'
+         * synchronously it ALSO defeated the async onExit handler's
+         * distillation guard (status==='active'). Route it through
+         * the same pending-distill queue: the marker is persisted so
+         * a daemon death mid-run is recovered by the next cold start,
+         * and the session-end lock + in-flight join dedupe against
+         * any concurrent funnel (End button, onExit) so no double
+         * run. cc-pty only: direct-llm has no PTY to kill, and a PTY
+         * exit never means "Lex stopped" for it. */
+        const runtimeMode = bs.runtime_mode ?? 'cc-pty';
+        if (runtimeMode === 'cc-pty') {
+          void queueSessionEndPipeline(
+            getBrainstormStore(),
+            {
+              brainstormId: bs.id,
+              claudeSessionId: bs.claude_session_id,
+              mode: bs.mode,
+              reason: 'pty-kill',
+            },
+            (msg) => logFn(msg),
+          )
+            .catch((err) =>
+              logFn(
+                `[pty-host] ptyKill session-end pipeline failed: ${(err as Error).message}`,
+              ),
+            )
+            .finally(() => {
+              try {
+                endBrainstorm(bs.id);
+              } catch {
+                /* observability: never block kill cleanup */
+              }
+            });
+        } else {
+          endBrainstorm(bs.id);
+        }
       }
     } catch {
       /* observability: never block kill */

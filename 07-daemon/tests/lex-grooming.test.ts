@@ -283,6 +283,46 @@ describe('runGroomingPass', () => {
     expect(refreshed.last_grooming_kind).toBe('day-cap');
   });
 
+  it('SM-27: distillation runs BEFORE the ended flip, never after', async () => {
+    insertWithChunks('bs-order', 12);
+    let statusAtDistillTime: string | undefined;
+    const runFinalDistillation = vi.fn(async (id: string) => {
+      /* At the moment distillation is invoked the brainstorm must
+       * still be un-ended, so a crash mid-distill leaves it
+       * retryable rather than ended-with-stale-context. */
+      statusAtDistillTime = db.getBrainstorm(id)!.status;
+    });
+    const result = await runGroomingPass('day-cap', 'bs-order', {
+      db,
+      generator: vi.fn(async () => 'summary'),
+      writeHandover: vi.fn(() => ({ filePath: '/x/H.md', bytes: 10 })),
+      runFinalDistillation,
+      now: () => NOW,
+    });
+    expect(result.ended_at_day_cap).toBe(true);
+    expect(statusAtDistillTime).not.toBe('ended');
+    expect(db.getBrainstorm('bs-order')!.status).toBe('ended');
+  });
+
+  it('SM-27: day-cap without a wired distillation hook logs loudly and still ends', async () => {
+    insertWithChunks('bs-nohook', 12);
+    const log = vi.fn();
+    const result = await runGroomingPass('day-cap', 'bs-nohook', {
+      db,
+      generator: vi.fn(async () => 'summary'),
+      writeHandover: vi.fn(() => ({ filePath: '/x/H.md', bytes: 10 })),
+      now: () => NOW,
+      log,
+    });
+    expect(result.ended_at_day_cap).toBe(true);
+    expect(db.getBrainstorm('bs-nohook')!.status).toBe('ended');
+    expect(
+      log.mock.calls.some((c) =>
+        String(c[0]).includes('DAY-CAP WITHOUT DISTILLATION'),
+      ),
+    ).toBe(true);
+  });
+
   it('skips a row whose lifecycle flipped to speaking between watcher tick and runGroomingPass', async () => {
     insertWithChunks('bs-mid-flip', 12);
     db.updateBrainstorm('bs-mid-flip', { lifecycle_state: 'speaking' });
