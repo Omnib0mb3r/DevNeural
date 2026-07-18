@@ -11,6 +11,7 @@ import { LexThumbs } from "./LexThumbs";
 import { listPtys, lexAnchors, type PtyEntry } from "@/lib/daemon-client";
 import { emitVoiceSettingUpdate, onVoiceSettingUpdate } from "@/lib/voice-settings-bus";
 import { emitTranscriptTurn } from "@/lib/transcript-bus";
+import { shouldFinalizeUtteranceOnMute } from "@/lib/mute-finalize";
 import {
   createDedupe,
   getSpeechRecognitionCtor,
@@ -1218,16 +1219,20 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     return true;
   }
 
-  /* Hard mute. The WS stays open so unmuting is instant, but every
-   * audio path is shut down: MediaStream tracks disabled (so the
-   * mic hardware stops capturing), parallel capture buffer dropped
-   * (NOT flushed to Lex — user explicitly said don't listen), any
-   * in-flight utterance timers cleared. Unmute re-enables the
-   * track. Without this the previous "soft mute" still let Lex
-   * hear: it only gated future VAD events, while flushing the
-   * captured audio buffer to the server on mute-mid-utterance and
-   * leaving track.enabled=true on the hardware.
-   * Bug: 2026-05-11-mute-still-hears. */
+  /* Hard mute. The WS stays open so unmuting is instant. The mic
+   * hardware stops capturing (MediaStream tracks disabled), so no
+   * FURTHER audio is heard once muted (the 2026-05-11-mute-still-hears
+   * fix: never leave track.enabled=true on mute).
+   *
+   * P5 (2026-07-18 spec): mute is a SOFT ENDPOINT, not a discard. If an
+   * utterance is in flight when mute fires, FINALIZE it - ship what was
+   * already captured (before the tracks go dead) and send utterance-end
+   * so Lex still replies - THEN go muted. We ship only the pre-mute
+   * buffer, so muting does not keep hearing; it just does not throw
+   * away what the operator already said (real case: a loud room, mute
+   * pressed the instant he finishes). A true cancel / "scrap that" is a
+   * separate gesture, out of scope. With no utterance in flight, this
+   * is the plain hard-mute teardown. */
   function setMicMuted(next: boolean): void {
     mutedRef.current = next;
     setMuted(next);
@@ -1238,22 +1243,32 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       }
     }
     if (next) {
-      /* Drop the parallel capture buffer rather than shipping it.
-       * Any partial utterance still in memory is intentionally
-       * discarded so Lex never sees audio captured while muted. */
-      captureCapturingRef.current = false;
-      captureBufRef.current = [];
-      if (utteranceTimerRef.current) {
-        clearInterval(utteranceTimerRef.current);
-        utteranceTimerRef.current = null;
-      }
-      if (utteranceCapRef.current) {
-        clearTimeout(utteranceCapRef.current);
-        utteranceCapRef.current = null;
-      }
-      setUtteranceMs(0);
-      if (statusRef.current === "listening") {
-        setStatus("ready");
+      /* Finalize + submit the in-progress utterance instead of
+       * discarding it. flushParallelCapture ships the buffer, sends
+       * utterance-end, clears the timers, and sets status
+       * 'transcribing'. It returns false when there was nothing
+       * capturing or the buffer was empty - then fall through to the
+       * plain teardown. */
+      const shipped =
+        shouldFinalizeUtteranceOnMute({
+          muting: true,
+          capturing: captureCapturingRef.current,
+        }) && flushParallelCapture();
+      if (!shipped) {
+        captureCapturingRef.current = false;
+        captureBufRef.current = [];
+        if (utteranceTimerRef.current) {
+          clearInterval(utteranceTimerRef.current);
+          utteranceTimerRef.current = null;
+        }
+        if (utteranceCapRef.current) {
+          clearTimeout(utteranceCapRef.current);
+          utteranceCapRef.current = null;
+        }
+        setUtteranceMs(0);
+        if (statusRef.current === "listening") {
+          setStatus("ready");
+        }
       }
     }
   }
