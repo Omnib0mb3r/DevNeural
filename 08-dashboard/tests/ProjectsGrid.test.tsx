@@ -25,6 +25,7 @@ vi.mock("@/lib/daemon-client", () => ({
     ],
   }),
   sessions: vi.fn().mockResolvedValue({ ok: true, sessions: [] }),
+  startClaude: vi.fn().mockResolvedValue({ ok: true }),
   listProjectAnchorTiles: vi.fn().mockResolvedValue({
     ok: true,
     tiles: [

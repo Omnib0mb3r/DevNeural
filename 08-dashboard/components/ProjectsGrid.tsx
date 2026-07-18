@@ -1,9 +1,11 @@
 "use client";
 
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   projects as projectsClient,
   sessions as sessionsClient,
+  startClaude,
   listProjectAnchorTiles,
   type ProjectAnchorTile,
 } from "@/lib/daemon-client";
@@ -62,6 +64,34 @@ export function ProjectsGrid({ compact = false, limit }: Props = {}) {
   for (const t of anchorsQ.data?.tiles ?? []) {
     anchorByCwd.set(normalizeCwd(t.cwd), t);
   }
+
+  /* Operator control restore (2026-07-18): a "Start Claude" button on
+   * a not-running home tile launches a pty-controlled Claude session
+   * via the EXISTING start path (startClaude -> POST
+   * /projects/:id/start-claude). Same button shape + pending semantics
+   * as the Sessions page. In-flight ids disable the button and show
+   * "starting…" until the sessions/anchor feeds refresh. This touches
+   * rendering only - no bridge/pty/status logic. */
+  const [startPending, setStartPending] = useState<Set<string>>(new Set());
+  const startMutation = useMutation({
+    mutationFn: (id: string) => startClaude(id),
+    onMutate: (id) => {
+      setStartPending((prev) => {
+        const next = new Set(prev);
+        next.add(id);
+        return next;
+      });
+    },
+    onSettled: (_data, _err, id) => {
+      setStartPending((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      qc.invalidateQueries({ queryKey: ["sessions"] });
+      qc.invalidateQueries({ queryKey: ["project-anchor-tiles"] });
+    },
+  });
 
   const all = projQ.data?.projects ?? [];
   const sessByProject = sessionsByProject(sessQ.data?.sessions ?? []);
@@ -131,6 +161,11 @@ export function ProjectsGrid({ compact = false, limit }: Props = {}) {
         const liveSessions = sessByProject.get(p.name) ?? sessByProject.get(p.id) ?? 0;
         const anchor = anchorByCwd.get(normalizeCwd(p.root));
         const dim = anchor?.supervision_mode === "off";
+        /* "Not running" = no live captured session AND the anchor (if
+         * any) is not live. Same intent as the Sessions page's
+         * idle-project rows: the Start button only offers to launch a
+         * project that has nothing running. */
+        const running = liveSessions > 0 || anchor?.status === "live";
         return (
           <div
             key={p.id}
@@ -187,6 +222,26 @@ export function ProjectsGrid({ compact = false, limit }: Props = {}) {
                 <span title="Supervision mode (change it on the Projects page)">
                   supervision: {anchor.supervision_mode}
                 </span>
+              </div>
+            )}
+            {compact && !running && (
+              /* Operator control (restored 2026-07-18): launch a
+               * pty-controlled Claude session from the home view.
+               * stopPropagation so the click starts the session and
+               * never triggers the tile's tap-to-navigate. */
+              <div className="mt-3 pt-2 border-t border-border2 flex items-center">
+                <button
+                  type="button"
+                  data-testid="projects-grid-start-claude"
+                  disabled={startPending.has(p.id)}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    startMutation.mutate(p.id);
+                  }}
+                  className="px-3 py-1.5 text-xs font-emphasized rounded-pill bg-surface2 hairline hover:bg-surface3 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {startPending.has(p.id) ? "starting…" : "Start Claude"}
+                </button>
               </div>
             )}
             {anchor && !compact && (
