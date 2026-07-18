@@ -1616,6 +1616,22 @@ export function _shouldSpeakDeepAckImpl(args: { topOwnsAck: boolean }): {
   return { speak: true, reason: 'no-top-ack-fallback' };
 }
 
+/* ── P3: coalesce is the INTERRUPT case only (2026-07-18 spec) ────────
+ *
+ * Utterances combine into ONE handling ONLY when they stack while a
+ * reply is already in flight (the operator interrupted / added
+ * mid-reply). A normal sequential turn - nothing in flight - runs as
+ * its own fresh turn and is never coalesced. Both queue sites gate on
+ * this: the top-layer path (topTurnInFlight) and the direct-llm path
+ * (inFlightDirectLlmReply). This is the INPUT-queue scope only; it is
+ * NOT the output ack-vs-answer race (that is P1's top-owned ack). Pure
+ * + exported so the interrupt-only scope is locked against regression. */
+export function _shouldCoalesceMidReplyImpl(args: {
+  replyInFlight: boolean;
+}): boolean {
+  return args.replyInFlight;
+}
+
 export function attachLexVoiceWs(socket: FastifyWS): void {
   logFn(`[voice-ws] client connected (attach)`);
   /* 2026-07-16 smoke-test fix 3: boot the voice brain the moment a
@@ -4243,7 +4259,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     firstUtterance: string,
     sttMs: number,
   ): Promise<void> {
-    if (state.topTurnInFlight) {
+    if (_shouldCoalesceMidReplyImpl({ replyInFlight: state.topTurnInFlight })) {
       state.pendingTopUtterances.push(firstUtterance);
       logFn(
         `[voice-ws] top-layer coalesce: queued while turn in flight depth=${state.pendingTopUtterances.length} text=${JSON.stringify(firstUtterance.slice(0, 60))}`,
@@ -4457,7 +4473,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
        *    is not aborted (it still lands as one assistant chunk),
        *    but the queue is empty so no follow-on inject replays
        *    the original instruction. */
-      if (state.inFlightDirectLlmReply) {
+      if (
+        _shouldCoalesceMidReplyImpl({
+          replyInFlight: state.inFlightDirectLlmReply,
+        })
+      ) {
         if (detectContradiction(result.text)) {
           const dropped = state.pendingUserUtterances.length;
           state.pendingUserUtterances = [];

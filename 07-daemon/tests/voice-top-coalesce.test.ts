@@ -7,7 +7,10 @@
  * closure state (topTurnInFlight / pendingTopUtterances) exercised
  * live; these pin the message shape the voice brain receives. */
 import { describe, it, expect } from 'vitest';
-import { mergeOperatorUtterances } from '../src/voice/lex-voice-ws.js';
+import {
+  mergeOperatorUtterances,
+  _shouldCoalesceMidReplyImpl,
+} from '../src/voice/lex-voice-ws.js';
 
 describe('mergeOperatorUtterances', () => {
   it('single utterance passes through untouched', () => {
@@ -41,5 +44,23 @@ describe('mergeOperatorUtterances', () => {
 
   it('empty input yields empty string (caller treats as no-op)', () => {
     expect(mergeOperatorUtterances([])).toBe('');
+  });
+});
+
+/* P3 (2026-07-18 VOICE-TOP-LAYER-SMARTS-SPEC): coalesce is the
+ * INTERRUPT case only. Utterances combine into ONE handling ONLY when
+ * they stack while a reply is already in flight (the operator
+ * interrupted / added mid-reply). A normal sequential turn - nothing in
+ * flight - runs as its own fresh turn, never coalesced. This scope
+ * predicate is what both the top-layer (topTurnInFlight) and the
+ * direct-llm (inFlightDirectLlmReply) queue sites gate on; it is NOT an
+ * output ack-vs-answer race (that is P1's top-owned ack). */
+describe('_shouldCoalesceMidReplyImpl (P3 interrupt-only scope)', () => {
+  it('coalesces only when a reply is already in flight (mid-reply interrupt)', () => {
+    expect(_shouldCoalesceMidReplyImpl({ replyInFlight: true })).toBe(true);
+  });
+
+  it('a normal sequential turn (nothing in flight) is never coalesced', () => {
+    expect(_shouldCoalesceMidReplyImpl({ replyInFlight: false })).toBe(false);
   });
 });
