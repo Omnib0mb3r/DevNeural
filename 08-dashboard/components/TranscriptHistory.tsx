@@ -18,6 +18,7 @@ import {
   readCollapsedState,
   writeCollapsedState,
 } from "@/lib/transcript-collapse";
+import { groupTranscriptTurns } from "@/lib/transcript-grouping";
 
 /** Three-layer voice topology (2026-07-18): the operator talks to the
  * TOP (fast voice) layer, which routes to the MID (deep reasoning /
@@ -78,6 +79,21 @@ export function TranscriptHistory({
   const [collapsed, setCollapsed] = useState<boolean>(
     initialCollapsed ?? false,
   );
+  /* P4: which deep (MID) step-down nodes are expanded, keyed by group
+   * id. Collapsed by default - the deep reply is troubleshooting detail
+   * under the voice line, revealed on demand. */
+  const [expandedDeep, setExpandedDeep] = useState<Set<string>>(
+    () => new Set<string>(),
+  );
+
+  function toggleDeep(id: string): void {
+    setExpandedDeep((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
 
   /* Read persisted state on mount when the caller did not pre-seed
    * via initialCollapsed. SSR-safe: readCollapsedState bails when
@@ -97,6 +113,9 @@ export function TranscriptHistory({
   }
 
   const rendered = turns.slice(-maxTurns);
+  /* P4: fold deep (MID) turns under their voice line so the transcript
+   * reads as a two-party operator <-> VOICE conversation. */
+  const groups = groupTranscriptTurns(rendered);
   const showPlaceholder = status === "thinking";
 
   return (
@@ -127,24 +146,68 @@ export function TranscriptHistory({
           {rendered.length === 0 && !showPlaceholder && (
             <div className="text-txt3">No transcript yet.</div>
           )}
-          {rendered.map((t, i) => (
-            <div
-              key={t.id ?? `${t.role}-${i}`}
-              data-testid="lex-turn"
-              data-role={t.role}
-              data-layer={t.layer}
-              className="flex items-start gap-2"
-            >
-              <span
-                className={`text-nano font-mono mr-2 shrink-0 ${turnLabelClass(t)}`}
-              >
-                {turnLabel(t)}
-              </span>
-              <span className="text-txt1 flex-1 min-w-0 whitespace-pre-wrap">
-                {t.text}
-              </span>
-            </div>
-          ))}
+          {groups.map((g, gi) => {
+            const deepOpen = expandedDeep.has(g.id);
+            return (
+              <div key={g.id} className="space-y-1">
+                {g.row && (
+                  <div
+                    data-testid="lex-turn"
+                    data-role={g.row.role}
+                    data-layer={g.row.layer}
+                    className="flex items-start gap-2"
+                  >
+                    <span
+                      className={`text-nano font-mono mr-2 shrink-0 ${turnLabelClass(g.row)}`}
+                    >
+                      {turnLabel(g.row)}
+                    </span>
+                    <span className="text-txt1 flex-1 min-w-0 whitespace-pre-wrap">
+                      {g.row.text}
+                    </span>
+                  </div>
+                )}
+                {g.deep.length > 0 && (
+                  /* Thin COLLAPSED deep step-down node under the voice
+                   * line. Never a bubble that addresses the operator;
+                   * the deep text is hidden until expanded. */
+                  <div className="pl-[3.25rem]">
+                    <button
+                      type="button"
+                      data-testid="lex-deep-toggle"
+                      onClick={() => toggleDeep(g.id)}
+                      aria-expanded={deepOpen}
+                      aria-controls={`lex-deep-body-${gi}`}
+                      className="flex items-center gap-1 text-nano text-txt3 hover:text-txt2 font-mono"
+                    >
+                      <span aria-hidden="true">{deepOpen ? "▾" : "▸"}</span>
+                      <span>
+                        deep replied
+                        {g.deep.length > 1 ? ` (${g.deep.length})` : ""}
+                      </span>
+                    </button>
+                    {deepOpen && (
+                      <div
+                        id={`lex-deep-body-${gi}`}
+                        data-testid="lex-deep-body"
+                        className="mt-1 pl-3 border-l border-border1 space-y-1 text-txt2"
+                      >
+                        {g.deep.map((d, di) => (
+                          <div
+                            key={d.id ?? `deep-${di}`}
+                            data-testid="lex-deep-line"
+                            className="whitespace-pre-wrap"
+                          >
+                            {d.text}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
           {showPlaceholder && (
             <div
               data-testid="lex-thinking-placeholder"

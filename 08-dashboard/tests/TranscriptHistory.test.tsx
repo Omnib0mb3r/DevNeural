@@ -74,7 +74,7 @@ describe("TranscriptHistory - N turns rendering", () => {
 });
 
 describe("TranscriptHistory - three-way layer labels", () => {
-  it("labels operator, top (voice), and mid (deep) layers distinctly", () => {
+  it("labels operator and voice (top) as the two-party conversation", () => {
     render(
       <TranscriptHistory
         turns={[
@@ -85,12 +85,13 @@ describe("TranscriptHistory - three-way layer labels", () => {
       />,
     );
     const turns = screen.getAllByTestId("lex-turn");
+    /* P4: only operator + voice are conversation rows; the deep (mid)
+     * turn is NOT a top-level bubble. */
+    expect(turns).toHaveLength(2);
     expect(turns[0]).toHaveAttribute("data-layer", "operator");
     expect(turns[0]).toHaveTextContent(/you:/);
     expect(turns[1]).toHaveAttribute("data-layer", "top");
     expect(turns[1]).toHaveTextContent(/voice/i);
-    expect(turns[2]).toHaveAttribute("data-layer", "mid");
-    expect(turns[2]).toHaveTextContent(/deep/i);
   });
 
   it("falls back to role labels when no layer is set (back-compat)", () => {
@@ -106,6 +107,59 @@ describe("TranscriptHistory - three-way layer labels", () => {
     expect(u).toHaveTextContent(/you:/);
     expect(u).not.toHaveAttribute("data-layer");
     expect(a).toHaveTextContent(/lex:/);
+  });
+});
+
+describe("TranscriptHistory - P4 deep collapse", () => {
+  const exchange = [
+    { id: "o", role: "user" as const, layer: "operator" as const, text: "start the build" },
+    { id: "t", role: "assistant" as const, layer: "top" as const, text: "on it, handing to Lex" },
+    { id: "m", role: "assistant" as const, layer: "mid" as const, text: "build kicked off, running now" },
+  ];
+
+  it("collapses the deep reply under the voice line by default (no content shown)", () => {
+    render(<TranscriptHistory turns={exchange} />);
+    /* Deep is a thin collapsed step-down node, not a bubble. */
+    const toggle = screen.getByTestId("lex-deep-toggle");
+    expect(toggle).toHaveTextContent(/deep replied/i);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    /* The deep TEXT is not rendered anywhere until expanded. */
+    expect(screen.queryByText(/build kicked off/)).not.toBeInTheDocument();
+  });
+
+  it("never renders the deep reply as an operator-addressed bubble", () => {
+    render(<TranscriptHistory turns={exchange} />);
+    const turns = screen.getAllByTestId("lex-turn");
+    expect(turns).toHaveLength(2);
+    for (const t of turns) {
+      expect(t).not.toHaveAttribute("data-layer", "mid");
+      expect(t).not.toHaveTextContent(/build kicked off/);
+    }
+  });
+
+  it("reveals the deep text on expand and hides it again on collapse", () => {
+    render(<TranscriptHistory turns={exchange} />);
+    const toggle = screen.getByTestId("lex-deep-toggle");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("lex-deep-body")).toHaveTextContent(
+      /build kicked off, running now/,
+    );
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("lex-deep-body")).not.toBeInTheDocument();
+  });
+
+  it("shows no deep node for a conversational (top-only) turn", () => {
+    render(
+      <TranscriptHistory
+        turns={[
+          { id: "o", role: "user", layer: "operator", text: "good morning" },
+          { id: "t", role: "assistant", layer: "top", text: "morning boss" },
+        ]}
+      />,
+    );
+    expect(screen.queryByTestId("lex-deep-toggle")).not.toBeInTheDocument();
   });
 });
 
