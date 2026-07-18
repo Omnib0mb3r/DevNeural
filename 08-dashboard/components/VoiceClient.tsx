@@ -103,6 +103,7 @@ interface VoiceCtxValue {
     role: "user" | "assistant";
     text: string;
     silent?: boolean;
+    layer?: "operator" | "top" | "mid";
   }>;
   hasLex: boolean;
   /* Soft mute set by the "Lex mute / shut up / be quiet / stop talking"
@@ -442,6 +443,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       role: "user" | "assistant";
       text: string;
       silent?: boolean;
+      layer?: "operator" | "top" | "mid";
     }>
   >([]);
   const TURNS_BUFFER_CAP = 50;
@@ -654,6 +656,18 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * daemon fails open (and sends ready:true immediately when the top
    * session is disabled) so the operator is never stuck connecting. */
   const brainReadyRef = useRef<boolean>(false);
+  /* Deploy-order safety: a NEW client holds "connecting" until it hears
+   * the daemon's voice-brain frame, but an OLD daemon never sends one,
+   * which would strand voice on "connecting" forever (the half-deploy
+   * skew that has bitten this project before). brainFrameSeenRef records
+   * whether ANY voice-brain frame arrived; if none has by a short
+   * fallback deadline after hello-ack, assume an old daemon and go live.
+   * The new daemon sends the frame immediately, so this never fires in a
+   * matched deploy. */
+  const brainFrameSeenRef = useRef<boolean>(false);
+  const brainGateFallbackRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
 
   /* Reset soft-mute + silent-message badge whenever the user fully
    * disables voice. A fresh "start voice" cycle always begins
@@ -1912,6 +1926,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     /* Phase 2 R2: a fresh connect re-gates on the top brain being warm
      * (the daemon re-sends its voice-brain frame per socket). */
     brainReadyRef.current = false;
+    brainFrameSeenRef.current = false;
+    if (brainGateFallbackRef.current) {
+      clearTimeout(brainGateFallbackRef.current);
+      brainGateFallbackRef.current = null;
+    }
     setStatus("connecting");
     setErrMsg("");
     logVoice("engine-enable", "voice engine effect entering connect path");
@@ -1941,6 +1960,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         });
         /* Phase 2 R2: a reconnect re-gates on top-brain warm. */
         brainReadyRef.current = false;
+        brainFrameSeenRef.current = false;
+        if (brainGateFallbackRef.current) {
+          clearTimeout(brainGateFallbackRef.current);
+          brainGateFallbackRef.current = null;
+        }
         setStatus("connecting");
         setErrMsg(
           `voice connection lost (${reason}); reconnecting in ${Math.round(delay / 1000)}s…`,
@@ -2176,9 +2200,26 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
              * immediately) this goes straight to "ready". */
             setStatus(voiceStatusForBrainReady(brainReadyRef.current));
             void initVad();
+            /* Deploy-order safety net: if no voice-brain frame arrives
+             * shortly (old daemon), stop gating and go live. */
+            if (brainGateFallbackRef.current) {
+              clearTimeout(brainGateFallbackRef.current);
+            }
+            if (!brainFrameSeenRef.current) {
+              brainGateFallbackRef.current = setTimeout(() => {
+                if (brainFrameSeenRef.current) return;
+                brainReadyRef.current = true;
+                setStatus((cur) => (cur === "connecting" ? "ready" : cur));
+              }, 2500);
+            }
             break;
           }
           case "voice-brain": {
+            brainFrameSeenRef.current = true;
+            if (brainGateFallbackRef.current) {
+              clearTimeout(brainGateFallbackRef.current);
+              brainGateFallbackRef.current = null;
+            }
             /* Top-brain readiness (Phase 2 R2). ready:true = the top
              * layer can answer now -> go live. ready:false = still
              * warming -> hold "connecting". Only moves the top-of-turn
@@ -2208,6 +2249,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                     id: turnId,
                     role: "user" as const,
                     text,
+                    layer: "operator" as const,
                   },
                 ];
                 return next.length > TURNS_BUFFER_CAP
@@ -2217,9 +2259,48 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
               /* Push to the transcript bus so the dedicated panel
                * surfaces the line without waiting on the VoiceCtx
                * re-render chain. The panel maintains its own list
-               * fed by these events. */
-              emitTranscriptTurn({ id: turnId, role: "user", text });
+               * fed by these events. The operator utterance is layer 0
+               * of the three-way transcript. */
+              emitTranscriptTurn({
+                id: turnId,
+                role: "user",
+                text,
+                layer: "operator",
+              });
             } else setStatus("ready");
+            break;
+          }
+          case "layer-hop": {
+            /* Three-way transcript (2026-07-18): a TOP-layer entry - the
+             * fast voice layer either handing the operator's intent down
+             * to the deep (MID) layer ("-> Lex: ...") or answering the
+             * operator directly. Visual only; no audio side effect (TTS
+             * is driven by tts-* frames). */
+            const hopText = String(msg.text ?? "").trim();
+            if (hopText) {
+              const layer =
+                msg.layer === "mid" || msg.layer === "operator"
+                  ? (msg.layer as "mid" | "operator")
+                  : ("top" as const);
+              const turnId = `l-${Date.now()}-${Math.random()
+                .toString(36)
+                .slice(2, 8)}`;
+              setTurns((prev) => {
+                const next = [
+                  ...prev,
+                  { id: turnId, role: "assistant" as const, text: hopText, layer },
+                ];
+                return next.length > TURNS_BUFFER_CAP
+                  ? next.slice(next.length - TURNS_BUFFER_CAP)
+                  : next;
+              });
+              emitTranscriptTurn({
+                id: turnId,
+                role: "assistant",
+                text: hopText,
+                layer,
+              });
+            }
             break;
           }
           case "injected":
@@ -2241,6 +2322,14 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                * turn lands so a later unmute doesn't retroactively
                * un-flag a turn the user never heard. */
               const silentNow = softMutedRef.current;
+              /* The deep (MID) reasoning layer's reply, delivered back
+               * up through the voice layer: layer 2 of the three-way
+               * transcript. The daemon may override via msg.layer (a
+               * top-only conversational reply arrives tagged 'top'). */
+              const replyLayer =
+                msg.layer === "top" || msg.layer === "operator"
+                  ? (msg.layer as "top" | "operator")
+                  : ("mid" as const);
               setTurns((prev) => {
                 const next = [
                   ...prev,
@@ -2249,6 +2338,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                     role: "assistant" as const,
                     text: replyText,
                     silent: silentNow ? true : undefined,
+                    layer: replyLayer,
                   },
                 ];
                 return next.length > TURNS_BUFFER_CAP
@@ -2262,6 +2352,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                 id: turnId,
                 role: "assistant",
                 text: replyText,
+                layer: replyLayer,
               });
             }
             /* If the user pressed stop in notes mode and we are

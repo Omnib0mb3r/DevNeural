@@ -19,11 +19,39 @@ import {
   writeCollapsedState,
 } from "@/lib/transcript-collapse";
 
+/** Three-layer voice topology (2026-07-18): the operator talks to the
+ * TOP (fast voice) layer, which routes to the MID (deep reasoning /
+ * brainstorm Lex) layer and back. The transcript labels each turn by
+ * the layer it came from so the round trip (you -> voice -> deep -> and
+ * back) is legible, not flattened to a two-party you/lex log. Absent =
+ * legacy turn, labelled by role. */
+export type TranscriptLayer = "operator" | "top" | "mid";
+
 export interface TranscriptTurn {
   /** Stable id used as React key. Falls back to index when omitted. */
   id?: string;
   role: "user" | "assistant";
   text: string;
+  layer?: TranscriptLayer;
+}
+
+/* Speaker label per turn. Layer wins when present (three-way); role is
+ * the back-compat fallback for turns emitted before the layer wiring. */
+function turnLabel(t: TranscriptTurn): string {
+  if (t.layer === "operator") return "you:";
+  if (t.layer === "top") return "lex (voice):";
+  if (t.layer === "mid") return "lex (deep):";
+  return t.role === "assistant" ? "lex:" : "you:";
+}
+
+function turnLabelClass(t: TranscriptTurn): string {
+  if (t.layer === "operator" || (!t.layer && t.role === "user")) {
+    return "text-txt3";
+  }
+  /* top = fast voice throat, mid = deep reasoning. Both are Lex; tint
+   * the fast layer lighter so the two are distinguishable at a glance. */
+  if (t.layer === "top") return "text-txt2";
+  return "text-brandSoft";
 }
 
 export interface TranscriptHistoryProps {
@@ -104,14 +132,13 @@ export function TranscriptHistory({
               key={t.id ?? `${t.role}-${i}`}
               data-testid="lex-turn"
               data-role={t.role}
+              data-layer={t.layer}
               className="flex items-start gap-2"
             >
               <span
-                className={`text-nano font-mono mr-2 ${
-                  t.role === "assistant" ? "text-brandSoft" : "text-txt3"
-                }`}
+                className={`text-nano font-mono mr-2 shrink-0 ${turnLabelClass(t)}`}
               >
-                {t.role === "assistant" ? "lex:" : "you:"}
+                {turnLabel(t)}
               </span>
               <span className="text-txt1 flex-1 min-w-0 whitespace-pre-wrap">
                 {t.text}

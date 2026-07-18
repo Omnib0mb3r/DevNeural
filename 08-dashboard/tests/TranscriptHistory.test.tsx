@@ -73,6 +73,42 @@ describe("TranscriptHistory - N turns rendering", () => {
   });
 });
 
+describe("TranscriptHistory - three-way layer labels", () => {
+  it("labels operator, top (voice), and mid (deep) layers distinctly", () => {
+    render(
+      <TranscriptHistory
+        turns={[
+          { id: "o", role: "user", layer: "operator", text: "start the build" },
+          { id: "t", role: "assistant", layer: "top", text: "on it, handing to Lex" },
+          { id: "m", role: "assistant", layer: "mid", text: "build kicked off" },
+        ]}
+      />,
+    );
+    const turns = screen.getAllByTestId("lex-turn");
+    expect(turns[0]).toHaveAttribute("data-layer", "operator");
+    expect(turns[0]).toHaveTextContent(/you:/);
+    expect(turns[1]).toHaveAttribute("data-layer", "top");
+    expect(turns[1]).toHaveTextContent(/voice/i);
+    expect(turns[2]).toHaveAttribute("data-layer", "mid");
+    expect(turns[2]).toHaveTextContent(/deep/i);
+  });
+
+  it("falls back to role labels when no layer is set (back-compat)", () => {
+    render(
+      <TranscriptHistory
+        turns={[
+          { id: "u", role: "user", text: "hi" },
+          { id: "a", role: "assistant", text: "hello" },
+        ]}
+      />,
+    );
+    const [u, a] = screen.getAllByTestId("lex-turn");
+    expect(u).toHaveTextContent(/you:/);
+    expect(u).not.toHaveAttribute("data-layer");
+    expect(a).toHaveTextContent(/lex:/);
+  });
+});
+
 describe("TranscriptHistory - thinking placeholder", () => {
   it("renders the placeholder when status='thinking'", () => {
     render(<TranscriptHistory turns={[]} status="thinking" />);

@@ -2327,6 +2327,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       send({
         t: 'assistant-text',
         text,
+        /* layer 'mid': this is the deep (MID / brainstorm Lex) layer's
+         * reply, delivered back up through the voice layer to the
+         * operator - layer 2 of the three-way transcript. */
+        layer: 'mid',
         ...(uuid ? { turn_id: uuid } : {}),
         ...(brainstormForFeedback?.id ? { brainstorm_id: brainstormForFeedback.id } : {}),
         ...(brainstormForFeedback?.prompt_version
@@ -3867,7 +3871,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       resumeBargedSpeech(reason);
       return;
     }
-    send({ t: 'transcript', text: result.text, ms: result.ms });
+    /* layer 'operator': the operator's own utterance, layer 0 of the
+     * three-way transcript (you -> voice -> deep -> and back). */
+    send({ t: 'transcript', text: result.text, ms: result.ms, layer: 'operator' });
     /* Real voice turn confirmed (passed the noise floor): Lex talks
      * back. Clears any suppression a prior typed turn left set. */
     state.suppressSpeakForTurn = false;
@@ -4184,6 +4190,13 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
        * so the exchange is persisted and queued onto the asides ring
        * exactly as the fast lane used to do - streamed lines included. */
       if (remainderSpeech) speak(remainderSpeech);
+      /* Three-way transcript (2026-07-18): the TOP (fast voice) layer
+       * answered the operator directly - surface it as a layer-1 turn
+       * (no MID hop this turn). Skip pure echo/noise where nothing was
+       * said. Visual only; the audio already went out via speak(). */
+      if (fullReply) {
+        send({ t: 'layer-hop', layer: 'top', text: fullReply });
+      }
       if (fullReply && shouldCaptureAbsorbedAside(state.mode)) {
         captureAbsorbedAside(trimmed, fullReply);
         state.absorbedAsides = _pushAbsorbedAsideImpl(
@@ -4225,6 +4238,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * fires now so Lex drops the interrupted reply. */
     confirmRealBarge(true);
     result = { text: tl.forward, ms: result.ms };
+    /* Three-way transcript (2026-07-18): the TOP layer is routing the
+     * operator's intent DOWN to the MID (deep) layer. Surface the
+     * handoff so the you -> voice -> deep hop is visible in the panel;
+     * the MID reply comes back later as an assistant-text (layer 'mid'). */
+    send({ t: 'layer-hop', layer: 'top', text: `to Lex: ${tl.forward}` });
     /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
      * Direct-llm branch: no PTY, no jsonl watch. Build the system
      * prompt + brainstorm chunks history, call ollama, stream the

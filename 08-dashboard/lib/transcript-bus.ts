@@ -15,10 +15,17 @@
  * thinking placeholder via status updates.
  */
 
+/** Three-layer voice topology (2026-07-18): operator -> TOP (fast
+ * voice) -> MID (deep reasoning / brainstorm Lex) -> and back. The
+ * panel labels each turn by its layer so the round trip is legible.
+ * Absent = legacy turn, labelled by role. */
+export type TranscriptLayer = "operator" | "top" | "mid";
+
 export interface TranscriptTurn {
   id: string;
   role: "user" | "assistant";
   text: string;
+  layer?: TranscriptLayer;
 }
 
 export type TranscriptStatus =
