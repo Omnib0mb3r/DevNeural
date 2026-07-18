@@ -295,6 +295,10 @@ function PtyDiagnosticBlock({ pty }: { pty: PtyEntry }): React.ReactElement {
  */
 interface Props {
   sessionId: string;
+  /** Header title. Defaults to "Terminal mirror"; set e.g. "Lex
+   * terminal" / "Worker terminal" when more than one mirror shares a
+   * page so they are tellable apart. */
+  title?: string;
 }
 
 /* Header label naming what this mirror is actually watching
@@ -310,7 +314,7 @@ export function mirrorWatchLabel(
   return `watching ${proj} · session ${sess} · read-only`;
 }
 
-export function TerminalMirror({ sessionId }: Props) {
+export function TerminalMirror({ sessionId, title }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<unknown>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -750,7 +754,7 @@ export function TerminalMirror({ sessionId }: Props) {
   return (
     <section className="rounded-panel bg-surface1 hairline overflow-hidden">
       <div className="px-5 py-3 border-b border-border1 flex items-center gap-2 flex-wrap">
-        <span className="font-display text-sm font-emphasized">Terminal mirror</span>
+        <span className="font-display text-sm font-emphasized">{title ?? "Terminal mirror"}</span>
         <span
           data-testid="mirror-watch-label"
           className="text-nano font-mono text-txt3"

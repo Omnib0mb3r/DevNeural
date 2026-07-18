@@ -27,7 +27,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="hidden md:flex min-h-0">
           <StreamDeck />
         </div>
-        <main className="flex-1 min-w-0 overflow-y-auto pb-14 md:pb-0">{children}</main>
+        <main className="flex-1 min-w-0 overflow-y-auto touch-scroll pb-14 md:pb-0">{children}</main>
         {/* RightRail: hidden below xl, visible xl+ */}
         <div className="hidden xl:flex min-h-0">
           <RightRail />

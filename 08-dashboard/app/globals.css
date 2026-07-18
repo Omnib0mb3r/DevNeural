@@ -266,3 +266,33 @@ html, body {
   touch-action: pan-y;
   overflow-y: auto !important;
 }
+
+/* Semi-large, touch-grabbable vertical scrollbar (operator ask: hard to
+ * navigate the Lex tab and the terminal mirrors by touch with the thin
+ * 8px default). Applied to the terminal viewports and to a .touch-scroll
+ * region for the page itself. 14px thumb with a padding-box border reads
+ * as a comfortable grab target on a phone/tablet without dominating the
+ * layout on desktop. */
+.xterm-viewport::-webkit-scrollbar,
+.touch-scroll::-webkit-scrollbar {
+  width: 14px;
+  height: 14px;
+}
+.xterm-viewport::-webkit-scrollbar-thumb,
+.touch-scroll::-webkit-scrollbar-thumb {
+  background: var(--c-fg-disabled);
+  border-radius: var(--r-pill);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+.xterm-viewport::-webkit-scrollbar-thumb:hover,
+.touch-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--c-fg-muted, var(--c-fg-disabled));
+}
+.touch-scroll {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+  /* Firefox */
+  scrollbar-width: auto;
+}

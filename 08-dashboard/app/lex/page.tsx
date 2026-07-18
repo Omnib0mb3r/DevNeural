@@ -10,6 +10,7 @@ import {
   ptyInject,
   uploadScreenshot,
   lexAnchors,
+  listProjectAnchorTiles,
   createLexAnchor,
   endLexAnchor,
   DaemonError,
@@ -261,6 +262,30 @@ export default function LexPage() {
   const activeAnchorId =
     liveAnchors.find((a) => a.current_pty_id === lexPty?.ptyId)?.id ?? null;
 
+  /* Worker terminal mirror (2026-07-18 operator ask): show the mirror
+   * of the worker this Lex is supervising, right next to Lex's own
+   * terminal. We already TRACK that binding - the active anchor's
+   * supervises_project_anchor_id points at the supervised project
+   * anchor, whose live tile carries current_session_id. This only READS
+   * that binding to pick a session id for a second read-only mirror; it
+   * changes no anchor/supervision logic. Null (no supervised worker, or
+   * it is not live) simply renders no worker mirror. */
+  const activeAnchor = liveAnchors.find((a) => a.id === activeAnchorId) ?? null;
+  const supervisedProjectAnchorId =
+    activeAnchor?.supervises_project_anchor_id ?? null;
+  const tilesQ = useQuery({
+    queryKey: ["project-anchor-tiles", "all"],
+    queryFn: () => listProjectAnchorTiles({ status: "all" }),
+    refetchInterval: 10_000,
+    enabled: Boolean(supervisedProjectAnchorId),
+  });
+  const workerSessionId =
+    (supervisedProjectAnchorId
+      ? tilesQ.data?.tiles?.find(
+          (t) => t.anchor_id === supervisedProjectAnchorId,
+        )?.current_session_id
+      : null) ?? null;
+
   /* No auto-spawn. Landing on /lex with no live brainstorm PTY
    * renders the empty state ("Lex isn't running. Click start lex")
    * below. The user explicitly starts a session by clicking
@@ -451,7 +476,19 @@ export default function LexPage() {
              * mirror still pulls from the same terminal-stream ring;
              * before the daemon binds a session id, the panel is
              * empty and starts streaming once binding completes. */}
-            <TerminalMirror sessionId={lexPty?.sessionId ?? ""} />
+            <TerminalMirror
+              sessionId={lexPty?.sessionId ?? ""}
+              title="Lex terminal"
+            />
+            {/* Worker terminal mirror: the session this Lex supervises
+             * (read-only, resolved from the tracked supervises binding).
+             * Renders only when a live supervised worker session exists. */}
+            {workerSessionId && (
+              <TerminalMirror
+                sessionId={workerSessionId}
+                title="Worker terminal"
+              />
+            )}
             <LexArtifactsPanel
               brainstormId={activeAnchorId}
               active={Boolean(lexPty)}
