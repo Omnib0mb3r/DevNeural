@@ -66,7 +66,7 @@ export function ProjectsGrid({ compact = false, limit }: Props = {}) {
   }
 
   /* Operator control restore (2026-07-18): a "Start Claude" button on
-   * a not-running home tile launches a pty-controlled Claude session
+   * every compact home tile launches a pty-controlled Claude session
    * via the EXISTING start path (startClaude -> POST
    * /projects/:id/start-claude). Same button shape + pending semantics
    * as the Sessions page. In-flight ids disable the button and show
@@ -161,11 +161,6 @@ export function ProjectsGrid({ compact = false, limit }: Props = {}) {
         const liveSessions = sessByProject.get(p.name) ?? sessByProject.get(p.id) ?? 0;
         const anchor = anchorByCwd.get(normalizeCwd(p.root));
         const dim = anchor?.supervision_mode === "off";
-        /* "Not running" = no live captured session AND the anchor (if
-         * any) is not live. Same intent as the Sessions page's
-         * idle-project rows: the Start button only offers to launch a
-         * project that has nothing running. */
-        const running = liveSessions > 0 || anchor?.status === "live";
         return (
           <div
             key={p.id}
@@ -224,11 +219,13 @@ export function ProjectsGrid({ compact = false, limit }: Props = {}) {
                 </span>
               </div>
             )}
-            {compact && !running && (
-              /* Operator control (restored 2026-07-18): launch a
-               * pty-controlled Claude session from the home view.
-               * stopPropagation so the click starts the session and
-               * never triggers the tile's tap-to-navigate. */
+            {compact && (
+              /* Operator control (restored 2026-07-18, idle gate removed
+               * 2026-07-18): launch a pty-controlled Claude session from
+               * the home view. Always offered on compact tiles regardless
+               * of running state - the operator wants to launch a fresh
+               * session on demand. stopPropagation so the click starts the
+               * session and never triggers the tile's tap-to-navigate. */
               <div className="mt-3 pt-2 border-t border-border2 flex items-center">
                 <button
                   type="button"
