@@ -16,6 +16,7 @@ import { runMigrations } from '../src/db/migrate.js';
 import {
   resolveAnchorDispatch,
   resolveMirrorSessionId,
+  workerActionItemLink,
 } from '../src/lex/cross-session-resolve.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -158,6 +159,39 @@ describe('resolveAnchorDispatch (Fix 15 C1)', () => {
       previous_session_id: STALE_UUID,
     });
     expect(resolveMirrorSessionId(db, STALE_UUID)).toBe(STALE_UUID);
+  });
+
+  it('workerActionItemLink points a bell/action item at the STABLE anchor, and it survives a swap', () => {
+    /* BELL-ACTIONABLE-ONLY task 3 (swap-pairing): an action item
+     * targeting a worker must reference the stable anchor id, not the
+     * ephemeral session uuid (which dies on /clear). Link to the anchor
+     * page - it always resolves to the anchor's LIVE session. */
+    insertAnchor({
+      id: 'anchor-w',
+      status: 'live',
+      current_session_id: STALE_UUID,
+    });
+    const at = workerActionItemLink(db, STALE_UUID);
+    expect(at.anchor_id).toBe('anchor-w');
+    expect(at.link).toBe('/projects/anchor-w');
+
+    /* The worker /clears: current_session_id flips to LIVE_UUID, the old
+     * uuid is stashed as previous_session_id. The action item still
+     * references anchor-w, which now resolves to the LIVE session. */
+    db.updateProjectSession('anchor-w', {
+      current_session_id: LIVE_UUID,
+      previous_session_id: STALE_UUID,
+    });
+    expect(db.getProjectSession('anchor-w')?.current_session_id).toBe(LIVE_UUID);
+    /* And the mirror/click resolver maps the item's original uuid to the
+     * new live session via the anchor. */
+    expect(resolveMirrorSessionId(db, STALE_UUID)).toBe(LIVE_UUID);
+  });
+
+  it('workerActionItemLink falls back to the session link when no anchor knows the session', () => {
+    const at = workerActionItemLink(db, 'orphan-uuid-xxxx');
+    expect(at.anchor_id).toBeNull();
+    expect(at.link).toBe('/sessions/detail?id=orphan-uuid-xxxx');
   });
 
   it('audit log decision enum accepts new Fix 15 values', () => {

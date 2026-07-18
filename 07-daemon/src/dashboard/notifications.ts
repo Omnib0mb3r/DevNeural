@@ -32,20 +32,27 @@ export const ALL_SCOPES: NotificationScope[] = ['bell', 'activity'];
  *                  notify_class, the emit is filtered out of the bell
  *                  rather than leaking conversational noise into it.
  *   report       - morning report, post-session brief, anything Lex
- *                  publishes for the user. Hits the bell.
+ *                  publishes for the user. NOT actionable, so it does
+ *                  NOT hit the bell (BELL-ACTIONABLE-ONLY, 2026-07-18);
+ *                  it stays on the activity rail / transcript.
  *   followup     - scheduled or condition-triggered item needing the
- *                  user's eye (lex-attention, reminders). Hits the
- *                  bell.
+ *                  user's eye: a FIRED reminder or a Lex needs-you /
+ *                  requires-user-input item. Hits the bell.
  *   signal       - automated supervision (worker stalled, daemon down,
- *                  push notifications, lint errors). Hits the bell.
+ *                  push notifications, lint errors). Hits the bell ONLY
+ *                  at 'alert' severity (an emergency); info/warn signals
+ *                  live on the activity rail.
  *
- * Per Fix 9, the bell filter keeps only report / followup / signal.
- * Existing call sites that emit legitimate system signals are
- * classified explicitly at the write site; new Lex-conversation
- * surfaces emit `conversation` and are dropped at the bell. */
+ * BELL-ACTIONABLE-ONLY (2026-07-18 operator directive): the bell shows
+ * ONLY things the user must act on - a fired reminder they set, a
+ * needs-you/requires-user-input item, or an alert-severity emergency.
+ * Reports, completions, autonomous decisions, telemetry, and routine
+ * signals are NOT actionable: they go to the activity rail / transcript
+ * and must not even APPEAR in the bell. So the bell allowlist keeps only
+ * followup + signal (and signal only at alert, gated below). Un-tagged
+ * legacy emits default to `conversation` and are dropped at the bell. */
 export type NotifyClass = 'conversation' | 'report' | 'followup' | 'signal';
 export const BELL_NOTIFY_CLASSES: ReadonlySet<NotifyClass> = new Set([
-  'report',
   'followup',
   'signal',
 ]);
@@ -208,9 +215,11 @@ function passesSurfaceFilter(
   if (!BELL_NOTIFY_CLASSES.has(cls)) return false;
   /* 2026-07-16 operator directive: the bell pinned at 9+ because
    * automated 'signal' chatter (reinforcement hits, supervision
-   * noise) counted as unread. The bell is reserved for reports,
-   * followups (reminders / Lex needs-you items), and alert-severity
-   * emergencies; info/warn signals live on the activity rail. */
+   * noise) counted as unread. 2026-07-18 BELL-ACTIONABLE-ONLY: reports
+   * left the bell too. The bell is now reserved for ACTIONABLE items -
+   * fired reminders + Lex needs-you (followup) and alert-severity
+   * emergencies (signal@alert); info/warn signals and reports live on
+   * the activity rail. */
   if (cls === 'signal' && n.severity !== 'alert') return false;
   return true;
 }

@@ -275,18 +275,40 @@ function defaultVerifyDelivery(args: {
           process.stdout.write(
             `[cross-inject] DELIVERY FAILED: accepted ${args.transport} inject never produced a user record in ${args.sessionId} (stuck paste?) text=${JSON.stringify(args.text.slice(0, 60))}\n`,
           );
-          void import('../dashboard/notifications.js')
-            .then(({ emitNotification }) => {
-              emitNotification({
-                severity: 'warn',
-                source: 'cross-inject',
-                notify_class: 'followup',
-                title: 'Worker never received an inject',
-                body: `An accepted ${args.transport} inject never landed in the worker session; its composer likely holds a stuck paste. Press Enter in that terminal or re-send.`,
-                link: `/sessions/detail?id=${encodeURIComponent(args.sessionId ?? '')}`,
-              });
-            })
-            .catch(() => undefined);
+          void (async () => {
+            const { emitNotification } = await import(
+              '../dashboard/notifications.js'
+            );
+            /* BELL-ACTIONABLE-ONLY task 3 (swap-pairing): reference the
+             * STABLE anchor so this needs-you survives the worker's
+             * /clear/restart instead of pointing at a dead session uuid.
+             * Falls back to the session link when no anchor knows it. */
+            let link = `/sessions/detail?id=${encodeURIComponent(args.sessionId ?? '')}`;
+            let anchorId: string | null = null;
+            try {
+              if (args.sessionId) {
+                const [{ getStore }, { workerActionItemLink }] =
+                  await Promise.all([
+                    import('./brainstorm-store.js'),
+                    import('./cross-session-resolve.js'),
+                  ]);
+                const t = workerActionItemLink(getStore().db, args.sessionId);
+                link = t.link;
+                anchorId = t.anchor_id;
+              }
+            } catch {
+              /* fall back to the direct session link */
+            }
+            emitNotification({
+              severity: 'warn',
+              source: 'cross-inject',
+              notify_class: 'followup',
+              title: 'Worker never received an inject',
+              body: `An accepted ${args.transport} inject never landed in the worker session; its composer likely holds a stuck paste. Press Enter in that terminal or re-send.`,
+              link,
+              ...(anchorId ? { push_data: { anchor_id: anchorId } } : {}),
+            });
+          })().catch(() => undefined);
         },
         sleep: (ms) =>
           new Promise((r) => {

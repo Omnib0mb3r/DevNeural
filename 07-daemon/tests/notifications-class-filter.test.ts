@@ -6,7 +6,10 @@
  *     filter than to leak)
  *   - listNotifications({surface:'bell'}) drops conversation rows
  *   - listNotifications({surface:'activity'}) keeps every row
- *   - report / followup / signal all pass the bell filter
+ *   - BELL-ACTIONABLE-ONLY (2026-07-18): the bell shows ONLY fired
+ *     reminders + needs-you (followup) + alert-severity emergencies
+ *     (signal@alert). The 'report' class is OFF the bell - reports live
+ *     on the activity rail only.
  *   - dismissed_scopes interact correctly with the surface filter
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -71,12 +74,22 @@ describe('notify_class surface filter', () => {
     const titles = bell.map((n) => n.title);
     expect(titles).not.toContain('Lex spoke');
     /* 2026-07-16 operator directive: automated signal chatter (info /
-     * warn) stays on the activity rail; the bell is reserved for
-     * reports, followups, and alert-severity emergencies. */
+     * warn) stays on the activity rail. 2026-07-18 BELL-ACTIONABLE-ONLY:
+     * reports leave the bell too - it is reserved for fired reminders,
+     * needs-you followups, and alert-severity emergencies. */
     expect(titles).not.toContain('Wiki match');
     expect(titles).toContain('Lex needs you');
-    expect(titles).toContain('Morning report');
-    expect(bell.length).toBe(2);
+    /* The morning report is NOT actionable: off the bell now. */
+    expect(titles).not.toContain('Morning report');
+    expect(bell.length).toBe(1);
+
+    /* ...but the report is still on the activity rail (nothing removed
+     * from the full stream). */
+    const activityTitles = mod
+      .listNotifications({ surface: 'activity' })
+      .map((n) => n.title);
+    expect(activityTitles).toContain('Morning report');
+    expect(activityTitles).toContain('Wiki match');
   });
 
   it('signal rows reach the bell only at alert severity (2026-07-16: the bell pinned at 9+ on signal chatter)', async () => {
@@ -184,11 +197,12 @@ describe('notify_class surface filter', () => {
 
   it('dismissAllNotifications clears one scope without touching the other', async () => {
     const mod = await import('../src/dashboard/notifications.js');
+    /* Two followups (both actionable): a fired reminder + a needs-you. */
     mod.emitNotification({
-      severity: 'info',
-      source: 'lex',
-      notify_class: 'report',
-      title: 'report one',
+      severity: 'warn',
+      source: 'reminder',
+      notify_class: 'followup',
+      title: 'followup one',
     });
     mod.emitNotification({
       severity: 'warn',
@@ -205,5 +219,83 @@ describe('notify_class surface filter', () => {
       .listNotifications({ surface: 'activity' })
       .filter((n) => !(n.dismissed_scopes ?? []).includes('activity'));
     expect(activity.length).toBe(2);
+  });
+
+  it('BELL-ACTIONABLE-ONLY: a plain report never increments the bell count but stays on activity', async () => {
+    const mod = await import('../src/dashboard/notifications.js');
+    /* Routine worker activity (signal@info) + a report flowing while a
+     * single real needs-you followup is set. */
+    mod.emitNotification({
+      severity: 'info',
+      source: 'worker',
+      notify_class: 'signal',
+      title: 'worker iterated',
+    });
+    mod.emitNotification({
+      severity: 'info',
+      source: 'lex',
+      notify_class: 'report',
+      title: 'post-session brief',
+    });
+    mod.emitNotification({
+      severity: 'warn',
+      source: 'lex-attention',
+      notify_class: 'followup',
+      title: 'Lex needs a decision',
+    });
+    /* Bell counts ONLY the followup. */
+    expect(mod.unreadCount('bell')).toBe(1);
+    const bellTitles = mod
+      .listNotifications({ surface: 'bell' })
+      .map((n) => n.title);
+    expect(bellTitles).toEqual(['Lex needs a decision']);
+    /* The full stream is still browsable on the activity rail. */
+    expect(mod.listNotifications({ surface: 'activity' }).length).toBe(3);
+  });
+
+  it('BELL-ACTIONABLE-ONLY: fired reminder + needs-you + alert emergency are the only bell passes', async () => {
+    const mod = await import('../src/dashboard/notifications.js');
+    mod.emitNotification({
+      severity: 'warn',
+      source: 'reminder',
+      notify_class: 'followup',
+      title: 'reminder fired',
+    });
+    mod.emitNotification({
+      severity: 'info',
+      source: 'lex-attention',
+      notify_class: 'followup',
+      title: 'needs you',
+    });
+    mod.emitNotification({
+      severity: 'alert',
+      source: 'daemon',
+      notify_class: 'signal',
+      title: 'daemon down',
+    });
+    /* Non-passes: a report, an info signal, a conversation. */
+    mod.emitNotification({
+      severity: 'info',
+      source: 'lex',
+      notify_class: 'report',
+      title: 'report',
+    });
+    mod.emitNotification({
+      severity: 'warn',
+      source: 'supervision',
+      notify_class: 'signal',
+      title: 'worker slow',
+    });
+    mod.emitNotification({
+      severity: 'info',
+      source: 'lex',
+      notify_class: 'conversation',
+      title: 'lex chatter',
+    });
+    const bellTitles = mod
+      .listNotifications({ surface: 'bell' })
+      .map((n) => n.title)
+      .sort();
+    expect(bellTitles).toEqual(['daemon down', 'needs you', 'reminder fired']);
   });
 });

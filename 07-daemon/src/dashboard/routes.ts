@@ -53,7 +53,10 @@ import {
   getTerminalReplay,
   subscribeTerminal,
 } from './terminal-stream.js';
-import { resolveMirrorSessionId } from '../lex/cross-session-resolve.js';
+import {
+  resolveMirrorSessionId,
+  workerActionItemLink,
+} from '../lex/cross-session-resolve.js';
 import {
   spawnLex,
   ptyInject,
@@ -1396,13 +1399,22 @@ export async function registerDashboardRoutes(
       shouldNotifyPendingPrompt(promptKind, lastIdlePromptNotifiedMs(id), now)
     ) {
       if (promptKind === 'idle_prompt') markIdlePromptNotified(id, now);
+      /* BELL-ACTIONABLE-ONLY task 3: point this needs-you at the STABLE
+       * anchor (survives the worker's /clear) instead of the ephemeral
+       * session uuid; carry the anchor id in push_data as the durable
+       * reference. Falls back to the session link for a non-anchor
+       * session. */
+      const waitTarget = workerActionItemLink(store.db, id);
       emitNotification({
         severity: 'warn',
         source: 'permission',
         notify_class: 'followup',
         title: `Claude waiting on you (${promptKind})`,
         body: body.message.slice(0, 200),
-        link: `/sessions/detail?id=${encodeURIComponent(id)}`,
+        link: waitTarget.link,
+        ...(waitTarget.anchor_id
+          ? { push_data: { anchor_id: waitTarget.anchor_id } }
+          : {}),
       });
     }
     return { ok: true };

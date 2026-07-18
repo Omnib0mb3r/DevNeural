@@ -95,3 +95,29 @@ export function resolveMirrorSessionId(
   const outcome = resolveAnchorDispatch(db, rawSessionId);
   return outcome.kind === 'redirect' ? outcome.dispatch_session : rawSessionId;
 }
+
+/* BELL-ACTIONABLE-ONLY (2026-07-18), task 3 swap-pairing: a bell/action
+ * item targeting a WORKER must reference the STABLE anchor id, not the
+ * ephemeral session uuid - the uuid dies on the worker's /clear/restart
+ * and the item would then point at a dead session. Link to the anchor's
+ * project page, which always resolves to the anchor's LIVE session
+ * (current_session_id), so the item survives a swap. A session with no
+ * known project anchor (e.g. a bare bridge terminal) keeps the direct
+ * session link. Returns the anchor id too, for the push_data so the
+ * durable reference rides the row. */
+export function workerActionItemLink(
+  db: Pick<IndexDb, 'findProjectSessionBySessionId'>,
+  sessionId: string,
+): { link: string; anchor_id: string | null } {
+  const anchor = db.findProjectSessionBySessionId(sessionId);
+  if (anchor) {
+    return {
+      link: `/projects/${encodeURIComponent(anchor.id)}`,
+      anchor_id: anchor.id,
+    };
+  }
+  return {
+    link: `/sessions/detail?id=${encodeURIComponent(sessionId)}`,
+    anchor_id: null,
+  };
+}
