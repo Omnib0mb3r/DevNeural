@@ -53,6 +53,7 @@ import {
   getTerminalReplay,
   subscribeTerminal,
 } from './terminal-stream.js';
+import { resolveMirrorSessionId } from '../lex/cross-session-resolve.js';
 import {
   spawnLex,
   ptyInject,
@@ -1506,7 +1507,12 @@ export async function registerDashboardRoutes(
    * writing the replay. JSON envelope: { data, cols?, rows? }. */
   app.get('/sessions/:id/terminal-replay', async (req, reply) => {
     const id = (req.params as { id: string }).id;
-    return getTerminalReplay(id);
+    /* SESSIONS-VIEW defect 1/3: anchor-resolve a stale (URL-frozen)
+     * session uuid to the anchor's live session so the mirror replays
+     * the ring producers actually fill. Read-only pass-through when
+     * there is no live redirect. */
+    const liveId = resolveMirrorSessionId(store.db, id);
+    return getTerminalReplay(liveId);
   });
 
   /* Live mirror via WebSocket. Each connected client gets every
@@ -1517,7 +1523,11 @@ export async function registerDashboardRoutes(
     { websocket: true },
     (socket, req) => {
       const id = (req.params as { id: string }).id;
-      const unsubscribe = subscribeTerminal(id, (data) => {
+      /* SESSIONS-VIEW defect 1/3: bind the live mirror to the anchor's
+       * live session (resolve a stale URL-frozen uuid), matching the
+       * replay route so the ring keys agree. Read-only. */
+      const liveId = resolveMirrorSessionId(store.db, id);
+      const unsubscribe = subscribeTerminal(liveId, (data) => {
         try {
           socket.send(data);
         } catch {

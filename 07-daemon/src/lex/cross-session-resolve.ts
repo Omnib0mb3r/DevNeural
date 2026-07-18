@@ -76,3 +76,22 @@ export function resolveAnchorDispatch(
     anchor_id: anchor.id,
   };
 }
+
+/* SESSIONS-VIEW read-only (2026-07-18), defects 1 + 3: the terminal
+ * MIRROR binds by a session uuid, but the Sessions page freezes that
+ * uuid in the URL. After a /clear or restart the owning anchor's live
+ * session moved on, so the frozen uuid's output ring is empty (producers
+ * only ever fill the ring under the CURRENT live session id) and the
+ * mirror is blank while the durable transcript still renders. Resolve
+ * the requested uuid through the SAME anchor mapping Fix 15 uses so the
+ * mirror binds to the anchor's live session ring - the fix the mirror
+ * routes never got. Read-only (a pure DB lookup); returns the raw uuid
+ * unchanged when there is no live redirect (no anchor, still-current, or
+ * dormant with no live ring to bind). */
+export function resolveMirrorSessionId(
+  db: Pick<IndexDb, 'findProjectSessionBySessionId'>,
+  rawSessionId: string,
+): string {
+  const outcome = resolveAnchorDispatch(db, rawSessionId);
+  return outcome.kind === 'redirect' ? outcome.dispatch_session : rawSessionId;
+}

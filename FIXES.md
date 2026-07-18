@@ -7,6 +7,14 @@ file is for live status only.
 
 Status legend: ⏳ queued, 🔄 in progress, ✅ shipped, ❌ blocked.
 
+## 2026-07-18 sessions-view = read-only observatory (SESSIONS-VIEW-READONLY, tests-first)
+
+Root-caused via three parallel code investigations before any fix (spec: do not speculate). Confirmed: the daemon terminal-mirror routes are already fully read-only; every defect is a client-side coupling plus one missing daemon anchor-resolution. Rebuild required (daemon + dashboard); no daemon restart (operator-only).
+
+| # | Title | Status | Commit | Evidence + fix |
+|---|-------|--------|--------|-----------------|
+| SV-1 | Blank terminal mirror on the Sessions view: bound to a session uuid frozen in the URL, empty after /clear/restart | ✅ shipped, awaiting rebuild + live verify | (this commit) | **Root cause (confirmed by code):** the Sessions-detail mirror binds by the `?id=` uuid frozen in the URL (`08-dashboard/app/sessions/detail/SessionDetailRoute.tsx:11,24` ← `SessionsTable.tsx:175`). The daemon output ring is keyed by the session's CURRENT live uuid (`pty-host.ts:601` pushes under `handle.sessionId`); after a /clear/restart/end the frozen uuid's ring is empty, so the mirror is blank while the transcript still renders (it reads durable persisted chunks via a separate REST detail query). Fix 15's `resolveAnchorDispatch` solves this staleness for inject/steer routes (`routes.ts:1205,1293,2688,3245`) but the terminal-mirror routes never got it. The Lex-page mirror avoids the bug by deriving its session from the live anchor→PTY chain (`app/lex/page.tsx:87-102`). **Fix (daemon, additive, read-only):** new pure `resolveMirrorSessionId(db, rawId)` in `cross-session-resolve.ts` (reuses `resolveAnchorDispatch`; returns the anchor's live session on a redirect, else the raw uuid unchanged). Both mirror routes - `GET /sessions/:id/terminal-replay` and the `terminal-ws` subscribe (`routes.ts:1507-1533`) - now resolve `:id` through it so the mirror binds to the ring producers actually fill. **Tests:** 4 new pins in `tests/cross-session-resolve.test.ts` (redirect stale→live, live-direct unchanged, no-anchor pass-through, dormant→raw). Suite green, tsc clean. **Rebuild:** yes (daemon). |
+
 ## 2026-07-18 voice top-layer smarts (VOICE-TOP-LAYER-SMARTS-SPEC, tests-first, additive-only)
 
 Spec `C:\dev\data\skill-connections\brainstorm\VOICE-TOP-LAYER-SMARTS-SPEC.md`. Daemon NOT restarted (operator-only); rebuild required before live verify.

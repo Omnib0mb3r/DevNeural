@@ -13,7 +13,10 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { IndexDb } from '../src/store/index-db.js';
 import { runMigrations } from '../src/db/migrate.js';
-import { resolveAnchorDispatch } from '../src/lex/cross-session-resolve.js';
+import {
+  resolveAnchorDispatch,
+  resolveMirrorSessionId,
+} from '../src/lex/cross-session-resolve.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = path.resolve(HERE, '..', 'scripts', 'migrations');
@@ -115,6 +118,46 @@ describe('resolveAnchorDispatch (Fix 15 C1)', () => {
     if (outcome.kind !== 'live-direct') throw new Error('narrowing');
     expect(outcome.dispatch_session).toBe(LIVE_UUID);
     expect(outcome.anchor_id).toBe('anchor-c');
+  });
+
+  it('resolveMirrorSessionId redirects a stale mirror uuid to the live session', () => {
+    /* SESSIONS-VIEW defect 1/3: the terminal mirror binds by a session
+     * uuid frozen in the URL; after /clear or restart the anchor's live
+     * session moved on, so the frozen uuid's output ring is empty and
+     * the mirror is blank. Resolve it to the anchor's live session so
+     * the mirror binds to the ring producers actually fill. */
+    insertAnchor({
+      id: 'anchor-m',
+      status: 'live',
+      current_session_id: LIVE_UUID,
+      previous_session_id: STALE_UUID,
+    });
+    expect(resolveMirrorSessionId(db, STALE_UUID)).toBe(LIVE_UUID);
+  });
+
+  it('resolveMirrorSessionId leaves a live-current uuid unchanged', () => {
+    insertAnchor({
+      id: 'anchor-n',
+      status: 'live',
+      current_session_id: LIVE_UUID,
+    });
+    expect(resolveMirrorSessionId(db, LIVE_UUID)).toBe(LIVE_UUID);
+  });
+
+  it('resolveMirrorSessionId passes through a uuid with no known anchor (bridge session)', () => {
+    expect(resolveMirrorSessionId(db, 'orphan-uuid-xxxx')).toBe(
+      'orphan-uuid-xxxx',
+    );
+  });
+
+  it('resolveMirrorSessionId returns the raw uuid when the anchor is dormant (no live ring to bind)', () => {
+    insertAnchor({
+      id: 'anchor-o',
+      status: 'dormant',
+      current_session_id: null,
+      previous_session_id: STALE_UUID,
+    });
+    expect(resolveMirrorSessionId(db, STALE_UUID)).toBe(STALE_UUID);
   });
 
   it('audit log decision enum accepts new Fix 15 values', () => {
