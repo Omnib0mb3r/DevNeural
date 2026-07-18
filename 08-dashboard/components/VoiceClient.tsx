@@ -79,6 +79,7 @@ interface VoiceCtxValue {
   status:
     | "idle"
     | "connecting"
+    | "warming"
     | "ready"
     | "listening"
     | "transcribing"
@@ -2209,7 +2210,9 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
               brainGateFallbackRef.current = setTimeout(() => {
                 if (brainFrameSeenRef.current) return;
                 brainReadyRef.current = true;
-                setStatus((cur) => (cur === "connecting" ? "ready" : cur));
+                setStatus((cur) =>
+                  cur === "connecting" || cur === "warming" ? "ready" : cur,
+                );
               }, 2500);
             }
             break;
@@ -2229,7 +2232,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             const ready = msg.ready === true;
             brainReadyRef.current = ready;
             setStatus((cur) =>
-              cur === "connecting" || cur === "ready"
+              cur === "connecting" || cur === "warming" || cur === "ready"
                 ? voiceStatusForBrainReady(ready)
                 : cur,
             );
@@ -3238,6 +3241,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   const statusTone: Record<Status, string> = {
     idle: "text-txt3",
     connecting: "text-txt3",
+    warming: "text-attn",
     ready: "text-promoted",
     listening: "text-promoted",
     transcribing: "text-attn",

@@ -26,6 +26,7 @@
 export type VoiceStatus =
   | "idle"
   | "connecting"
+  | "warming"
   | "ready"
   | "listening"
   | "transcribing"
@@ -39,6 +40,7 @@ export type VoiceStatus =
 export const VOICE_STATUS_LABEL: Record<VoiceStatus, string> = {
   idle: "off",
   connecting: "connecting",
+  warming: "warming",
   ready: "ready",
   listening: "listening",
   transcribing: "transcribing",
@@ -57,8 +59,13 @@ export const VOICE_STATUS_LABEL: Record<VoiceStatus, string> = {
  * that readiness; this maps it to the pipeline status. */
 export function voiceStatusForBrainReady(
   brainReady: boolean,
-): "connecting" | "ready" {
-  return brainReady ? "ready" : "connecting";
+): "warming" | "ready" {
+  /* Not ready yet reads as "warming", not "ready": the WS is bound but
+   * the backend (top voice terminal, and behind it the deep/worker
+   * terminals) is still booting, so it is NOT ready to work. "ready"
+   * means ready to WORK - the operator can speak and it will act.
+   * "connecting" stays reserved for the pre-bind WS-dialing phase. */
+  return brainReady ? "ready" : "warming";
 }
 
 /* Which overlay, if any, replaced the base label. Surfaces key

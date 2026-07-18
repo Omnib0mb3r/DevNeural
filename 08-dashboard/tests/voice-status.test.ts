@@ -31,6 +31,7 @@ import {
 const ALL_STATUSES: VoiceStatus[] = [
   "idle",
   "connecting",
+  "warming",
   "ready",
   "listening",
   "transcribing",
@@ -39,15 +40,16 @@ const ALL_STATUSES: VoiceStatus[] = [
   "error",
 ];
 
-describe("voiceStatusForBrainReady (Phase 2 R2 connecting->live gate)", () => {
-  it("holds 'connecting' until the top voice-brain reports warm", () => {
-    /* hello-ack (WS bind) is necessary but NOT sufficient: the socket
-     * is up but the operator must not be told the line is live until
-     * the top layer can actually answer. */
-    expect(voiceStatusForBrainReady(false)).toBe("connecting");
+describe("voiceStatusForBrainReady (Phase 2 R2 warming->ready gate)", () => {
+  it("shows 'warming' while the backend is not ready to work", () => {
+    /* hello-ack (WS bind) is necessary but NOT sufficient: the socket is
+     * up but the top voice terminal (and the deep/worker terminals
+     * behind it) are still booting, so it is NOT ready to work. The pill
+     * must say "warming", never "ready", until it can actually act. */
+    expect(voiceStatusForBrainReady(false)).toBe("warming");
   });
 
-  it("goes 'ready' (live) once the top voice-brain is warm", () => {
+  it("goes 'ready' (ready to work) once the backend is warm", () => {
     expect(voiceStatusForBrainReady(true)).toBe("ready");
   });
 });
@@ -57,6 +59,7 @@ describe("VOICE_STATUS_LABEL", () => {
     expect(VOICE_STATUS_LABEL).toEqual({
       idle: "off",
       connecting: "connecting",
+      warming: "warming",
       ready: "ready",
       listening: "listening",
       transcribing: "transcribing",

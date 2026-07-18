@@ -31,6 +31,7 @@ export interface TranscriptTurn {
 export type TranscriptStatus =
   | "idle"
   | "connecting"
+  | "warming"
   | "ready"
   | "listening"
   | "transcribing"
