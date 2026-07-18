@@ -24,6 +24,7 @@ export type VoiceLogKind =
   | "ws-open"
   | "ws-close"
   | "ws-error"
+  | "ws-rebind"
   | "ws-reconnect-scheduled"
   | "ws-reconnect-giveup"
   | "mic-permission-prompt"

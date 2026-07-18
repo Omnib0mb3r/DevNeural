@@ -10,7 +10,7 @@ import { Icon } from "./Icon";
 import { LexThumbs } from "./LexThumbs";
 import { listPtys, lexAnchors, type PtyEntry } from "@/lib/daemon-client";
 import { emitVoiceSettingUpdate, onVoiceSettingUpdate } from "@/lib/voice-settings-bus";
-import { emitTranscriptTurn } from "@/lib/transcript-bus";
+import { emitTranscriptTurn, emitTranscriptClear } from "@/lib/transcript-bus";
 import { shouldFinalizeUtteranceOnMute } from "@/lib/mute-finalize";
 import {
   resolveActiveBrainstormId,
@@ -18,6 +18,7 @@ import {
   writePersistedActiveBrainstorm,
   writePersistedVoiceEnabled,
 } from "@/lib/voice-active-anchor";
+import { onVoiceAnchorSwitch } from "@/lib/voice-anchor-bus";
 import {
   createDedupe,
   getSpeechRecognitionCtor,
@@ -1926,6 +1927,46 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     }
   }
 
+  /* SESSIONS-VIEW defect 2 (switch path, 2026-07-18): switching the
+   * bound brainstorm RE-HELLOs on the LIVE socket instead of tearing the
+   * WS + VAD down and reconnecting (which blips voice). sendHelloRef
+   * reads the current bind target each render so the onopen handler and
+   * the rebind effect share one hello shape (no drift). lastHelloedPty
+   * guards the redundant rebind on the sessionId-resolve-under-same-pty
+   * case (Fix 31): only a real ptyId change (brainstorm switch / respawn)
+   * re-hellos. */
+  const lastHelloedPtyRef = useRef<string | null>(null);
+  /* Render-fresh current bind target: the big WS effect no longer
+   * re-runs on ptyId change (it rebinds on the live socket instead), so
+   * its closure's lexPty goes stale after a switch. onopen reads this to
+   * record what it actually bound. */
+  const currentPtyRef = useRef<string | null>(null);
+  currentPtyRef.current = lexPty?.ptyId ?? null;
+  const sendHelloRef = useRef<() => void>(() => undefined);
+  sendHelloRef.current = () => {
+    sendJson({
+      t: "hello",
+      ...(activeBrainstormId
+        ? { brainstorm_id: activeBrainstormId }
+        : { session_id: sessionId ?? undefined }),
+      mode: modeRef.current,
+      kind:
+        modeRef.current === "notes" && meetingKindOnRef.current
+          ? "meeting"
+          : "brainstorm",
+    });
+  };
+
+  /* An explicit brainstorm switch (Lex session list / anchor nav) is a
+   * soft in-app signal now, not a full-page reload: re-pin the bind and
+   * persist it. The rebind effect below carries it to the live socket. */
+  useEffect(() => {
+    return onVoiceAnchorSwitch((id) => {
+      setPinnedBrainstorm(id);
+      writePersistedActiveBrainstorm(id);
+    });
+  }, []);
+
   useEffect(() => {
     /* Tear down every resource the effect owns. Idempotent: safe to
      * call from the !enabled branch, from React's cleanup phase on
@@ -2130,26 +2171,14 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
            * resolves runtime_mode and either runs the direct-llm
            * path or falls through to legacy bind() via the brainstorm's
            * claude_session_id. */
-          const brainstormIdFromUrl =
-            typeof window !== "undefined"
-              ? new URL(window.location.href).searchParams.get("brainstorm")
-              : null;
-          sendJson({
-            t: "hello",
-            ...(brainstormIdFromUrl
-              ? { brainstorm_id: brainstormIdFromUrl }
-              : { session_id: sessionId ?? undefined }),
-            mode: modeRef.current,
-            /* Meeting-notes fixes (2026-07), task 1: explicit-confirm
-             * kind. Only notes mode with the toggle on classifies as
-             * a meeting; every other mode (and notes with the toggle
-             * off) explicitly sends 'brainstorm' so a reconnect never
-             * leaves kind ambiguous. */
-            kind:
-              modeRef.current === "notes" && meetingKindOnRef.current
-                ? "meeting"
-                : "brainstorm",
-          });
+          /* SESSIONS-VIEW defect 2: hello via the shared sender (binds
+           * the PINNED active brainstorm, decoupled from a transient URL
+           * read) and record which PTY we bound so the rebind effect
+           * knows the current target and does not re-hello redundantly.
+           * The kind rule (meeting only for notes+toggle, else brainstorm)
+           * lives in sendHelloRef so reconnect + rebind never drift. */
+          sendHelloRef.current();
+          lastHelloedPtyRef.current = currentPtyRef.current;
           if (wasReconnect) {
             /* Daemon restart breaks voice: on reconnect the WS re-binds
              * but every cached voice setting (mic gain, VAD threshold,
@@ -3381,25 +3410,38 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       logVoice("engine-disable", "voice engine effect cleanup");
       teardown();
     };
-    /* Fix 31 (2026-05-25): depend on lexPty.ptyId, NOT sessionId.
-     * sessionId is Claude Code's cc-session-id, which is null at PTY
-     * spawn time and populates a few seconds later when Claude Code
-     * emits SessionStart. When that resolution races with the user's
-     * first voice utterance, the dep tuple change tore down WS #1
-     * (with its awaitingResponseSince stamped from the inject) and
-     * opened WS #2 (fresh state, awaiting=0). The assistant turn then
-     * landed in the jsonl past WS #2's bind-time EOF stamp, but
-     * handleJsonlLine's awaiting-gate dropped it because WS #2 never
-     * saw an inject. Result: silent first turn, spoken turn 2 onward.
-     *
-     * ptyId is the true PTY identity. It does NOT change when
-     * Claude Code resolves its cc-session-id; it only changes when
-     * the user switches brainstorms or Lex respawns from outside
-     * the daemon (smart-compact restart is handled in-daemon at
-     * lex-voice-ws.ts:1053 with no client visibility). So this dep
-     * captures every WS-replacement-worthy event and ignores the
-     * spurious sessionId-resolve case. */
-  }, [enabled, lexPty?.ptyId ?? null, mode]);
+    /* SESSIONS-VIEW defect 2 (2026-07-18): the WS + VAD lifecycle no
+     * longer depends on lexPty.ptyId. A brainstorm switch used to change
+     * this dep and tear the whole engine down (WS close + ORT VAD
+     * destroy) then reconnect - an audible blip. Now the engine is built
+     * once per enable/mode and a bind-target change RE-HELLOs on the live
+     * socket (see the rebind effect below), so switching never blips.
+     * Fix 31's original concern (the sessionId-resolve race tearing down
+     * WS #1 mid-first-turn) is subsumed: sessionId never drove teardown,
+     * and now neither does ptyId - the rebind is a hello, not a
+     * reconnect, and is guarded to skip the sessionId-resolve case. */
+  }, [enabled, mode]);
+
+  /* SESSIONS-VIEW defect 2: rebind on the LIVE socket when the bound
+   * PTY changes (a brainstorm switch or an out-of-daemon respawn) without
+   * tearing the engine down. Guarded by lastHelloedPty so the
+   * sessionId-resolve-under-same-ptyId case (Fix 31) never re-hellos, and
+   * only fires while the socket is open. Clears the transcript so the new
+   * session starts clean. */
+  useEffect(() => {
+    if (!enabled) return;
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const targetPty = lexPty?.ptyId ?? null;
+    if (targetPty === lastHelloedPtyRef.current) return;
+    lastHelloedPtyRef.current = targetPty;
+    logVoice("ws-rebind", "re-hello on live socket for brainstorm switch", {
+      ptyId: targetPty,
+    });
+    setTurns([]);
+    emitTranscriptClear();
+    sendHelloRef.current();
+  }, [enabled, lexPty?.ptyId ?? null, activeBrainstormId, sessionId]);
 
   function pttDown(): void {
     setPttHolding(true);

@@ -1,6 +1,7 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AppShell } from "@/components/AppShell";
 import { TerminalMirror } from "@/components/TerminalMirror";
@@ -20,6 +21,10 @@ import { LexSessionList } from "@/components/LexSessionList";
 import { LexArtifactsPanel } from "@/components/LexArtifactsPanel";
 import { LexTranscriptHistoryPanel } from "@/components/LexTranscriptHistoryPanel";
 import { emitTranscriptTurn } from "@/lib/transcript-bus";
+import {
+  emitVoiceAnchorSwitch,
+  onVoiceAnchorSwitch,
+} from "@/lib/voice-anchor-bus";
 
 /**
  * Brainstorming with Lex.
@@ -45,22 +50,37 @@ function selectedAnchorIdFromUrl(): string | null {
   return new URL(window.location.href).searchParams.get("brainstorm");
 }
 
-function navigateToAnchor(id: string | null): void {
-  if (typeof window === "undefined") return;
-  const url = new URL(window.location.href);
-  if (id) url.searchParams.set("brainstorm", id);
-  else url.searchParams.delete("brainstorm");
-  window.location.href = url.toString();
-}
-
 export default function LexPage() {
   const qc = useQueryClient();
+  const router = useRouter();
   const ptysQ = useQuery({
     queryKey: ["pty-list"],
     queryFn: listPtys,
     refetchInterval: 3_000,
   });
-  const [selectedAnchorId] = useState<string | null>(selectedAnchorIdFromUrl);
+  /* SESSIONS-VIEW defect 2: selection is reactive now (not just
+   * mount-captured), because switching is a soft router.push, not a full
+   * reload. The switch bus updates it so the text surface + terminal
+   * mirror follow the switch without a page reload, in lockstep with the
+   * global VoiceClient re-pinning its bind on the live socket. */
+  const [selectedAnchorId, setSelectedAnchorId] = useState<string | null>(
+    selectedAnchorIdFromUrl,
+  );
+  useEffect(() => onVoiceAnchorSwitch(setSelectedAnchorId), []);
+
+  /* Soft-nav to a brainstorm (or deselect with null): update the URL for
+   * deep-linking + the local selection + signal voice - no full reload,
+   * so the live voice never blips. */
+  function navigateToAnchor(id: string | null): void {
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      if (id) url.searchParams.set("brainstorm", id);
+      else url.searchParams.delete("brainstorm");
+      router.push(url.pathname + url.search);
+    }
+    setSelectedAnchorId(id);
+    emitVoiceAnchorSwitch(id);
+  }
 
   /* Resolve the active anchor list up front: lexPty resolution needs
    * it to honor the user's selection. /lex/anchors carries each

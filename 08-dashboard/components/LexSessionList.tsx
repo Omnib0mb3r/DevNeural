@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   lexAnchors,
@@ -13,6 +14,7 @@ import {
 } from "@/lib/daemon-client";
 import { relTime } from "@/lib/session-helpers";
 import { createCollapseStore } from "@/lib/transcript-collapse";
+import { emitVoiceAnchorSwitch } from "@/lib/voice-anchor-bus";
 import { Icon } from "./Icon";
 import { StatusDot } from "./StatusDot";
 import { SupervisesPicker } from "./SupervisesPicker";
@@ -68,6 +70,20 @@ export function LexSessionList({
   initialCollapsed,
 }: Props) {
   const qc = useQueryClient();
+  const router = useRouter();
+  /* SESSIONS-VIEW defect 2 (switch path): switch the live voice to a
+   * brainstorm via a SOFT nav + an in-app signal, never a full-page
+   * reload. router.push updates ?brainstorm= (deep-link / back-button)
+   * and keeps the page mounted; emitVoiceAnchorSwitch tells the global
+   * VoiceClient + the Lex page to re-pin the bind on the LIVE socket, so
+   * the switch never blips voice. */
+  function switchToAnchor(id: string): void {
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    url.searchParams.set("brainstorm", id);
+    router.push(url.pathname + url.search);
+    emitVoiceAnchorSwitch(id);
+  }
   /* Collapsed = count-only strip; expanded = capped-height list with
    * internal scroll. Default expanded on first load; persists every
    * toggle through the shared transcript-collapse store under the
@@ -129,10 +145,10 @@ export function LexSessionList({
      * voice hello at THIS anchor (bug 2026-07-08: switch was a
      * silent no-op while another PTY was live). */
     onSuccess: (data, id) => {
-      if (!data?.ok || typeof window === "undefined") return;
-      const url = new URL(window.location.href);
-      url.searchParams.set("brainstorm", id);
-      window.location.href = url.toString();
+      if (!data?.ok) return;
+      /* SESSIONS-VIEW defect 2: soft nav + bus signal instead of a full
+       * reload, so switching sessions never blips the live voice. */
+      switchToAnchor(id);
     },
     onSettled: async () => {
       setPendingRowId(null);
@@ -416,9 +432,10 @@ export function LexSessionList({
                              * the global VoiceClient's hello picks
                              * up ?brainstorm=<id> on its next open. */
                             if (row.runtime_mode === "direct-llm") {
-                              const url = new URL(window.location.href);
-                              url.searchParams.set("brainstorm", row.id);
-                              window.location.href = url.toString();
+                              /* Soft nav + bus signal, no reload: voice
+                               * connect by brainstorm_id without blipping
+                               * the live session. */
+                              switchToAnchor(row.id);
                               return;
                             }
                             /* cc-pty rows: spawn-or-bind first (a
