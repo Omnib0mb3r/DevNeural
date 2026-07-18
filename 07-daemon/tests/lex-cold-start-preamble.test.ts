@@ -214,12 +214,29 @@ describe('formatColdStartPreamble', () => {
         recent_turns_appended: 12,
         failure_reason: null,
       },
-      { timeZoneTag: 'EDT' },
+      /* SM-26: inject now 30min after the stamp so the FRESH branch
+       * renders (past 6h the line carries an explicit age). */
+      { timeZoneTag: 'EDT', now: () => new Date(2026, 4, 14, 15, 2, 0) },
     );
     expect(out).toContain(
       'Loaded 4 sibling sessions, last distilled 14:32 EDT, 12 recent turns appended.',
     );
     expect(out).toContain('context_verdict=');
+  });
+
+  it('SM-26: past 6h the distilled line carries explicit age + trust hint', () => {
+    const out = formatColdStartPreamble(
+      {
+        preload: { preloaded: [], skipped: [], already_present: [] },
+        sibling_count: 2,
+        last_distilled_ms: new Date(2026, 4, 13, 21, 4, 0).valueOf(),
+        recent_turns_appended: 5,
+        failure_reason: null,
+      },
+      { timeZoneTag: 'EDT', now: () => new Date(2026, 4, 14, 17, 4, 0) },
+    );
+    expect(out).toContain('last distilled 20h ago (21:04 EDT');
+    expect(out).toContain('trust the appended recent turns');
   });
 
   it('singularises the sibling + turn words for count=1', () => {
@@ -228,10 +245,11 @@ describe('formatColdStartPreamble', () => {
         preload: { preloaded: [], skipped: [], already_present: [] },
         sibling_count: 1,
         last_distilled_ms: new Date(2026, 4, 14, 9, 5, 0).valueOf(),
+
         recent_turns_appended: 1,
         failure_reason: null,
       },
-      { timeZoneTag: 'EDT' },
+      { timeZoneTag: 'EDT', now: () => new Date(2026, 4, 14, 9, 35, 0) },
     );
     expect(out).toContain(
       'Loaded 1 sibling session, last distilled 09:05 EDT, 1 recent turn appended.',

@@ -807,7 +807,21 @@ export function formatColdStartPreamble(
     const tz = opts.timeZoneTag ?? defaultTimeZoneTag();
     const hh = String(d.getHours()).padStart(2, '0');
     const mm = String(d.getMinutes()).padStart(2, '0');
-    distilled = `last distilled ${hh}:${mm}${tz ? ' ' + tz : ''}`;
+    const stamp = `${hh}:${mm}${tz ? ' ' + tz : ''}`;
+    /* SM-26 (2026-07-18, operator): a bare HH:MM hides the DATE, so a
+     * day-old distillation read as if it were from earlier today and
+     * Lex greeted with confident stale state ("voice-engine build was
+     * GO" from the previous day). Past 6h the line carries the age
+     * explicitly plus a trust hint so the greeting stays honest. */
+    const nowMs = (opts.now?.() ?? new Date()).getTime();
+    const ageMs = Math.max(0, nowMs - summary.last_distilled_ms);
+    const SIX_H = 6 * 60 * 60 * 1000;
+    if (ageMs >= SIX_H) {
+      const ageH = Math.round(ageMs / (60 * 60 * 1000));
+      distilled = `last distilled ${ageH}h ago (${stamp}; stale - trust the appended recent turns over the distilled state)`;
+    } else {
+      distilled = `last distilled ${stamp}`;
+    }
   }
   const turnWord = summary.recent_turns_appended === 1 ? 'turn' : 'turns';
   const turns = `${summary.recent_turns_appended} recent ${turnWord} appended`;
