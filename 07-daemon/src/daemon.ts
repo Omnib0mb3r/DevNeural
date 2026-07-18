@@ -694,8 +694,12 @@ async function main(): Promise<void> {
         './lex/distillation-generator.js'
       );
       const { writeHandover } = await import('./lex/handover-writer.js');
-      const { runSessionEndPipeline } = await import(
-        './lex/session-end-pipeline.js'
+      /* SM-23: day-cap distillation rides the pending-distill queue
+       * so it carries the persisted marker + joins any in-flight run
+       * instead of stacking on the session-end lock. Await semantics
+       * unchanged (the idle watcher wants completion). */
+      const { queueSessionEndPipeline } = await import(
+        './lex/distill-pending.js'
       );
       const generator = createLlmDistillationGenerator({
         db: store.db,
@@ -708,7 +712,7 @@ async function main(): Promise<void> {
         runFinalDistillation: async (brainstormId: string) => {
           const row = store.db.getBrainstorm(brainstormId);
           if (!row) return;
-          await runSessionEndPipeline(
+          await queueSessionEndPipeline(
             store,
             {
               brainstormId,

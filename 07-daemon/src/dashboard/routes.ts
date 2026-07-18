@@ -1968,25 +1968,33 @@ export async function registerDashboardRoutes(
     /* Dashboard "End" button must behave identically to the spoken
      * "Lex end session" voice command: both fire the full session-end
      * pipeline (distillation, ref_summary write, last_summary refresh,
-     * RAG embed, thread-doc) on the active transcript before the PTY
-     * is killed. Prior behaviour skipped the pipeline entirely, which
-     * left ended sessions with NULL ref_summary and broke smoke step
-     * 3.1/3.2/3.3. */
+     * RAG embed, thread-doc) on the active transcript.
+     *
+     * SM-23 (2026-07-18): the pipeline is QUEUED, not awaited. The
+     * old inline await hung this HTTP request (and the UI End
+     * button) for the full headless-distill duration - 90s+
+     * observed, 180s cap. queueSessionEndPipeline persists a
+     * distill-pending marker so the owed work survives a daemon
+     * restart, and the cold-start-preload route forces/awaits it
+     * before a new session on this anchor reads last_summary. */
+    let pipeline: 'queued' | 'skipped' = 'skipped';
     try {
       const refs = listTranscriptRefs(id);
       const active = refs.find((r) => !r.ended_ms);
       if (active) {
         const bs = getBrainstorm(id);
-        const { runSessionEndPipeline } = await import('../lex/session-end-pipeline.js');
+        const { queueSessionEndPipeline } = await import(
+          '../lex/distill-pending.js'
+        );
         const mode = (bs?.mode ?? 'conversation') as
           | 'conversation'
           | 'notes'
           | 'push-to-talk'
           | string;
         log(
-          `[lex-anchor] /end: firing session-end pipeline anchor=${id} cc=${active.cc_session_id} reason=dashboard-end-button`,
+          `[lex-anchor] /end: queueing session-end pipeline anchor=${id} cc=${active.cc_session_id} reason=dashboard-end-button`,
         );
-        await runSessionEndPipeline(
+        queueSessionEndPipeline(
           store,
           {
             brainstormId: id,
@@ -1995,7 +2003,10 @@ export async function registerDashboardRoutes(
             reason: 'dashboard-end-button',
           },
           (msg) => log(msg),
-        );
+        ).catch(() => {
+          /* failure already logged + marker kept by the queue */
+        });
+        pipeline = 'queued';
       } else {
         log(
           `[lex-anchor] /end: no active transcript for anchor=${id}; skipping pipeline`,
@@ -2003,7 +2014,7 @@ export async function registerDashboardRoutes(
       }
     } catch (err) {
       log(
-        `[lex-anchor] /end: pipeline failed for ${id}: ${(err as Error).message}`,
+        `[lex-anchor] /end: pipeline queue failed for ${id}: ${(err as Error).message}`,
       );
     }
     if (row.current_pty_id) {
@@ -2014,7 +2025,7 @@ export async function registerDashboardRoutes(
       }
     }
     setLexSessionStatus(id, { status: 'dormant', currentPtyId: null });
-    return { ok: true };
+    return { ok: true, pipeline };
   });
 
   /* Stream Deck tile feed for live anchors. Read-only; no tap
@@ -6037,6 +6048,37 @@ export async function registerDashboardRoutes(
         mode,
       };
     }
+    /* SM-23 restart-before-distill gate (2026-07-18): the sibling
+     * preload below EXCLUDES this anchor's own brainstorm
+     * (excludeId), so a session restarted before its predecessor's
+     * end-of-session distillation completed would cold-start on a
+     * STALE last_summary. If distillation is owed for THIS
+     * brainstorm (queued marker survived a restart, or a pipeline
+     * is in flight right now), force/join it and wait BOUNDED
+     * (DEVNEURAL_DISTILL_AWAIT_CAP_MS, default 150s) before
+     * reading summaries. Timeout proceeds loudly with stale
+     * context rather than hanging session start. The wait is
+     * surfaced in the preamble so the operator sees WHY the cold
+     * start took longer - acceptable latency on a true cold start
+     * only, per the operator's spec. */
+    let distillWaitNote = '';
+    try {
+      const { awaitPendingDistill } = await import(
+        '../lex/distill-pending.js'
+      );
+      const wait = await awaitPendingDistill(store, bs.id, (m) => log(m));
+      if (wait.outcome !== 'none') {
+        const secs = Math.round(wait.waited_ms / 1000);
+        distillWaitNote =
+          wait.outcome === 'completed'
+            ? `(waited ${secs}s for the previous session's distillation to finish before loading context)`
+            : `(previous session's distillation ${wait.outcome} after ${secs}s; context below may lag the last session)`;
+      }
+    } catch (err) {
+      log(
+        `[cold-start-preload] pending-distill gate failed: ${(err as Error).message}; proceeding`,
+      );
+    }
     /* Force-distill the top-N siblings synchronously before
      * buildSiblingIndex reads them. Closes the race where the
      * steady-state cron has not yet caught up to a just-ended
@@ -6088,6 +6130,12 @@ export async function registerDashboardRoutes(
         perSessionGenerator,
       });
       preamble = formatColdStartPreamble(preloadSummary);
+      /* SM-23: surface the pending-distill wait (or its timeout) in
+       * the context block itself so the new session - and the
+       * operator reading the transcript - can see what happened. */
+      if (distillWaitNote) {
+        preamble = `${distillWaitNote}\n${preamble}`;
+      }
       /* DRIVE-QUEUE 3: stage-aware greeting. When this brainstorm anchor
        * supervises a project, append the project's current lifecycle
        * stage + what the gate needs next so Lex states it on its first

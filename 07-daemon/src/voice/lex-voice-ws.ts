@@ -141,10 +141,8 @@ import {
 import { firePanic } from '../dashboard/panic-routes.js';
 import { getStore } from '../lex/brainstorm-store.js';
 import { checkToolGate, notifyLargeFsRead, LARGE_FS_READ_LINE_THRESHOLD } from '../lex/tool-gate.js';
-import {
-  runSessionEndPipeline,
-  runDistillationFlush,
-} from '../lex/session-end-pipeline.js';
+import { runDistillationFlush } from '../lex/session-end-pipeline.js';
+import { queueSessionEndPipeline } from '../lex/distill-pending.js';
 import { appendUtterance as appendSessionAudio } from './audio-bundle.js';
 import { selectTtsContent, clampAck } from './select-tts-content.js';
 import {
@@ -4937,17 +4935,26 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
        *   voice end-session     -> runSessionEndPipeline (terminal)
        *   compaction-restart    -> runSessionEndPipeline (legacy) */
       const flushOnly = _sessionEndActionForReason(reason) === 'flush';
-      const runner = flushOnly ? runDistillationFlush : runSessionEndPipeline;
-      await runner(
-        getBrainstormStore(),
-        {
-          brainstormId: bs.id,
-          claudeSessionId: bs.claude_session_id ?? claudeSessionId,
-          mode: bs.mode || state.mode,
-          reason,
-        },
-        (msg) => logFn(msg),
-      );
+      const endInput = {
+        brainstormId: bs.id,
+        claudeSessionId: bs.claude_session_id ?? claudeSessionId,
+        mode: bs.mode || state.mode,
+        reason,
+      };
+      /* SM-23: terminal runs ride the pending-distill queue so a
+       * daemon death mid-pipeline leaves a persisted marker and the
+       * next cold start forces the owed distillation. Await
+       * semantics unchanged. Flush stays direct: it is the light
+       * non-terminal variant and owes no marker. */
+      if (flushOnly) {
+        await runDistillationFlush(getBrainstormStore(), endInput, (msg) =>
+          logFn(msg),
+        );
+      } else {
+        await queueSessionEndPipeline(getBrainstormStore(), endInput, (msg) =>
+          logFn(msg),
+        );
+      }
       if (flushOnly) {
         /* Re-arm so a subsequent voice end-session / explicit UI end
          * can still fire the terminal pipeline on the same in-memory

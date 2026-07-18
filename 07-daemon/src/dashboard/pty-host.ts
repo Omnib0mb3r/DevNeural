@@ -40,10 +40,8 @@ import {
   setLexSessionStatus,
   closeTranscriptRef,
 } from '../lex/lex-session-store.js';
-import {
-  runSessionEndPipeline,
-  runDistillationFlush,
-} from '../lex/session-end-pipeline.js';
+import { runDistillationFlush } from '../lex/session-end-pipeline.js';
+import { queueSessionEndPipeline } from '../lex/distill-pending.js';
 
 /* Injected daemon logger (mirrors embedder/index.ts's setEmbedderLogger
  * pattern). Every console.log/warn in this file used to write to stdout,
@@ -676,7 +674,12 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
        * unset (pre-migration rows default to cc-pty via SQLite). */
       const runtimeMode = bs?.runtime_mode ?? 'cc-pty';
       if (bs && bs.status === 'active' && runtimeMode === 'cc-pty') {
-        void runSessionEndPipeline(
+        /* SM-23: route through the pending-distill queue so a daemon
+         * death mid-pipeline leaves a persisted marker and the next
+         * cold start on this anchor forces the owed distillation.
+         * Same fire-and-forget semantics as before; the session-end
+         * lock still dedupes against any concurrent funnel path. */
+        void queueSessionEndPipeline(
           getBrainstormStore(),
           {
             brainstormId: bs.id,
