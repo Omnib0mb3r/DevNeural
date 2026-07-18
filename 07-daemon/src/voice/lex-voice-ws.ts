@@ -61,6 +61,7 @@ import { getLexSession, setLexSessionStatus } from '../lex/lex-session-store.js'
 import {
   prewarmVoiceBrainSession,
   isVoiceBrainSessionWarm,
+  isVoiceBrainSessionEnabled,
 } from '../lex/voice-brain-session.js';
 import {
   getBrainstormByClaudeSessionId,
@@ -900,6 +901,111 @@ function _defaultScheduleFollowupCr(fn: () => void, delayMs: number): void {
   }
 }
 
+/* Phase 2 R3/R5: the operator forward is NEVER held to a mid turn
+ * boundary. The top layer is the always-reachable arbiter; it routes the
+ * operator's substance to mid LIVE (top -> mid). The mid session is a
+ * real Claude Code PTY whose composer buffers a live inject that arrives
+ * mid-turn and picks it up at the next boundary (exactly how Claude Code
+ * voice already behaves), so a mid-turn inject is safe and is precisely
+ * what "top never blocks on mid being busy" requires.
+ *
+ * Before Phase 2 the "mid-turn-no-tts queue" pushed the forward onto
+ * state.pendingUserUtterances whenever Lex was mid-turn with no TTS,
+ * draining only at Lex's end_turn - the queue R3 kills. This predicate
+ * is the one wired seam that governs that branch; it always returns
+ * false now, so the forward falls through to the live inject path. Kept
+ * as a named export so the "never queue the operator" contract has a
+ * single test target and any regression that re-introduces turn-boundary
+ * holding has to flip this and fight its test. The double-inject guard
+ * that the old branch provided (deliveryRegistry fingerprint) is applied
+ * unchanged on the live inject path, so routing live cannot double-speak
+ * or double-deliver. */
+/* Phase 2 R2 / acceptance-3: the top (Lex voice) headless session
+ * starts on Start voice; the control shows "connecting" until it is
+ * WARM, then goes live. This watch drives that transition with a
+ * `voice-brain` frame:
+ *   - ready:false emitted immediately while the top brain is still
+ *     warming (client holds "connecting");
+ *   - ready:true the moment isWarm() flips (client goes "ready"/live);
+ *   - a fail-open cap emits ready:true even if the brain never warms,
+ *     so a broken boot can never lock the operator in "connecting"
+ *     (matches "never drop / never lock out the operator");
+ *   - when the top session is DISABLED, the gate is a no-op: ready:true
+ *     immediately, so today's hello-ack->ready behavior is unchanged
+ *     ("nothing that works today breaks").
+ * Returns a cancel fn the WS calls on teardown so a closed socket
+ * leaves no live poll timer. Deps are injected so the poll loop is
+ * driven deterministically in tests (no real timers/clock). */
+export interface VoiceBrainReadyWatchDeps<T = unknown> {
+  enabled: boolean;
+  isWarm: () => boolean;
+  send: (msg: Record<string, unknown>) => void;
+  schedule: (fn: () => void, ms: number) => T;
+  clearTimer: (timer: T) => void;
+  now: () => number;
+  pollMs?: number;
+  capMs?: number;
+}
+
+export function _startVoiceBrainReadyWatch<T = unknown>(
+  deps: VoiceBrainReadyWatchDeps<T>,
+): () => void {
+  const READY = (): Record<string, unknown> => ({ t: 'voice-brain', ready: true });
+  /* Disabled top session: gate does not apply. Go live immediately so
+   * the client behaves exactly as it did before Phase 2. */
+  if (!deps.enabled) {
+    deps.send(READY());
+    return () => undefined;
+  }
+  /* Already warm at attach (the always-live steady state): live now. */
+  if (deps.isWarm()) {
+    deps.send(READY());
+    return () => undefined;
+  }
+  /* Warming: connecting now, then poll to warm. */
+  deps.send({ t: 'voice-brain', ready: false });
+  const pollMs = deps.pollMs ?? 300;
+  const capMs = deps.capMs ?? 20_000;
+  const startedAt = deps.now();
+  let timer: T | null = null;
+  let stopped = false;
+  const finishLive = (): void => {
+    stopped = true;
+    deps.send(READY());
+  };
+  const tick = (): void => {
+    if (stopped) return;
+    if (deps.isWarm()) {
+      finishLive();
+      return;
+    }
+    if (deps.now() - startedAt >= capMs) {
+      finishLive();
+      return;
+    }
+    timer = deps.schedule(tick, pollMs);
+  };
+  timer = deps.schedule(tick, pollMs);
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    if (timer !== null) deps.clearTimer(timer);
+  };
+}
+
+export interface MidTurnForwardInput {
+  /** Lex (mid) is mid-turn: state.awaitingResponseSince > 0. */
+  lexMidTurn: boolean;
+  /** TTS is currently playing (a barge, handled elsewhere). */
+  ttsActive: boolean;
+}
+
+export function _shouldDeferForwardToMidTurnBoundary(
+  _input: MidTurnForwardInput,
+): boolean {
+  return false;
+}
+
 /* Mid-turn queue flush. Exported as `_flushPendingUtterancesImpl` so
  * the regression test (lex-voice-ws.flush-cr.test.ts) can drive it
  * without standing up a full WS attach. The closure inside
@@ -1514,6 +1620,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   /* Replay-on-switch guard: speak the bound session's last reply at most
    * once per socket, even if the read misses or the turn is too old. */
   let replayedOnBind = false;
+  /* Phase 2 R2: cancel handle for the top-brain connecting->live watch
+   * (started near the close handler, cancelled in teardown). */
+  let cancelBrainReadyWatch: (() => void) | null = null;
 
   /* Fix 40 (2026-05-26): centralise piper synth lifecycle behind a
    * controller that serialises same-turn speak() calls and cancels
@@ -4263,15 +4372,23 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       });
       return;
     }
-    /* Fix 20 (2026-05-23): mid-turn-no-tts utterance queueing.
-     * If Lex is mid-turn (awaitingResponseSince > 0) and no TTS is
-     * playing, the user is stacking follow-on context onto an
-     * in-flight reasoning / tool sequence. Don't inject mid-stream;
-     * push into the pending queue and let handleJsonlLine flush it
-     * the moment Lex's end_turn lands. The TTS-active case is a
-     * "barge over Lex's reply" and is already handled by
-     * killActiveTts (PTY Ctrl+C + tts-cancel + partialChain). */
-    if (state.awaitingResponseSince > 0 && !state.ttsActive) {
+    /* Fix 20 (2026-05-23) mid-turn-no-tts queue - RETIRED by Phase 2
+     * R3/R5. The old rule held the forward onto pendingUserUtterances
+     * whenever Lex was mid-turn with no TTS, draining only at end_turn.
+     * Phase 2 makes the top layer the always-reachable arbiter that
+     * routes to mid LIVE, so this hold is gone: the predicate returns
+     * false and the forward falls through to the live inject below,
+     * where the mid CC composer buffers a mid-turn paste and picks it
+     * up at its next boundary. The block is retained behind the seam
+     * (unreachable while the predicate is false) so the contract has a
+     * single, tested toggle point. The TTS-active case remains a
+     * "barge over Lex's reply" handled earlier by killActiveTts. */
+    if (
+      _shouldDeferForwardToMidTurnBoundary({
+        lexMidTurn: state.awaitingResponseSince > 0,
+        ttsActive: Boolean(state.ttsActive),
+      })
+    ) {
       /* Addendum 2026-05-24, narrowed by spec v2: belt-and-suspenders
        * panic punch-through. The panic phrase already ran at the top
        * of handleUtteranceEnd, but re-check at the queue's edge so any
@@ -4829,6 +4946,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
 
   function teardown(): void {
     state.closed = true;
+    if (cancelBrainReadyWatch) {
+      cancelBrainReadyWatch();
+      cancelBrainReadyWatch = null;
+    }
     stopJsonlWatch();
     clearHeldTurnFlush();
     if (state.ttsActive) {
@@ -4850,6 +4971,28 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * does its own best-effort error handling. */
     void fireSessionEndPipeline('ws-close');
   }
+
+  /* Phase 2 R2 / acceptance-3: gate the client's connecting->live
+   * transition on the TOP (Lex voice) brain being warm. prewarm above
+   * kicked the boot on Start voice; this drives the `voice-brain` frame
+   * the client reads (connecting while warming, live on warm, fail-open
+   * at the cap, no-op live when the top session is disabled). Started
+   * here so every `let`/closure `send` touches is initialized; cancelled
+   * in teardown so a closed socket leaves no live poll timer. */
+  cancelBrainReadyWatch = _startVoiceBrainReadyWatch<ReturnType<typeof setTimeout>>({
+    enabled: isVoiceBrainSessionEnabled(),
+    isWarm: isVoiceBrainSessionWarm,
+    send,
+    schedule: (fn, ms) => {
+      const t = setTimeout(fn, ms);
+      if (typeof (t as { unref?: () => void }).unref === 'function') {
+        (t as { unref: () => void }).unref();
+      }
+      return t;
+    },
+    clearTimer: (t) => clearTimeout(t),
+    now: () => Date.now(),
+  });
 
   /* Loud close diagnostics (2026-07-17: the socket dropped every
    * 30-60s all evening and nothing logged WHY). Code + reason + which

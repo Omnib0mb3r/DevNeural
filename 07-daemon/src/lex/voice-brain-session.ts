@@ -100,6 +100,21 @@ function defaultAskTimeoutMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_ASK_TIMEOUT_MS;
 }
 
+/* Top-session model (Phase 2 R1). The top voice layer is haiku-class:
+ * a fast model is the ENTIRE point of the layer. The pre-fix 33s cold
+ * boot (`voice-brain warm: first reply after 33653ms`) was caused by
+ * spawning with NO --model, so the "fast voice layer" booted the
+ * account default (Opus-class), neither always-live nor haiku-class as
+ * drawn-conclusion 1 requires. Read per spawn so a runtime_config
+ * reload takes effect without a restart. Default alias 'haiku' (the
+ * exact alias Claude Code's own voice call uses). */
+const DEFAULT_VOICE_BRAIN_MODEL = 'haiku';
+
+function voiceBrainModel(): string {
+  const raw = (process.env.DEVNEURAL_VOICE_BRAIN_MODEL ?? '').trim();
+  return raw || DEFAULT_VOICE_BRAIN_MODEL;
+}
+
 /* Session-level contract, injected once at spawn via
  * --append-system-prompt. Deliberately thin: the top layer restates
  * its full speech-first contract (persona, digest grounding,
@@ -317,7 +332,26 @@ function ensureSpawned(): boolean {
     const spawned = deps.spawnLex({
       cwd: deps.cwd,
       systemPrompt: VOICE_BRAIN_SESSION_SYSTEM_PROMPT,
-      args: ['--session-id', ccSessionId, '--dangerously-skip-permissions'],
+      args: [
+        '--session-id',
+        ccSessionId,
+        '--dangerously-skip-permissions',
+        /* Phase 2 R1 - haiku-class, context-thin, fast warm:
+         *   --model <alias>   fast model (default 'haiku'); the fix for
+         *                     the heavy-default 33s cold boot.
+         *   --tools ""        disable every built-in tool. The session
+         *                     prompt already forbids tool use; this
+         *                     enforces it mechanically and trims warm.
+         *   --strict-mcp-config  with no --mcp-config, load ZERO MCP
+         *                     servers at boot (a large warm-time save).
+         * quoteWindowsArg('') -> "" so the empty --tools value survives
+         * cmd.exe quoting on Windows. */
+        '--model',
+        voiceBrainModel(),
+        '--tools',
+        '',
+        '--strict-mcp-config',
+      ],
       sessionId: ccSessionId,
     });
     state.ptyId = spawned.ptyId;

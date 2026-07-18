@@ -47,6 +47,7 @@ import {
 import { VoiceErrorPill } from "./VoiceErrorPill";
 import {
   resolveVoiceStatusLabel,
+  voiceStatusForBrainReady,
   type VoiceStatus,
 } from "@/lib/voice-status";
 
@@ -644,6 +645,15 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   useEffect(() => {
     statusRef.current = status;
   }, [status]);
+
+  /* Phase 2 R2 / acceptance-3: the TOP (Lex voice) headless session
+   * starts on Start voice; the control stays "connecting" until it is
+   * warm, then goes live. hello-ack (WS bind) alone is NOT "live": the
+   * daemon sends a `voice-brain` frame with the top brain's readiness,
+   * tracked here. Defaults false so a fresh connect gates on warm; the
+   * daemon fails open (and sends ready:true immediately when the top
+   * session is disabled) so the operator is never stuck connecting. */
+  const brainReadyRef = useRef<boolean>(false);
 
   /* Reset soft-mute + silent-message badge whenever the user fully
    * disables voice. A fresh "start voice" cycle always begins
@@ -1899,6 +1909,9 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     let cancelled = false;
     let reconnectAttempts = 0;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    /* Phase 2 R2: a fresh connect re-gates on the top brain being warm
+     * (the daemon re-sends its voice-brain frame per socket). */
+    brainReadyRef.current = false;
     setStatus("connecting");
     setErrMsg("");
     logVoice("engine-enable", "voice engine effect entering connect path");
@@ -1926,6 +1939,8 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           attempt: reconnectAttempts,
           delay_ms: delay,
         });
+        /* Phase 2 R2: a reconnect re-gates on top-brain warm. */
+        brainReadyRef.current = false;
         setStatus("connecting");
         setErrMsg(
           `voice connection lost (${reason}); reconnecting in ${Math.round(delay / 1000)}s…`,
@@ -2154,8 +2169,29 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           case "hello-ack": {
             const rate = Number(msg.voice_rate) || 22050;
             ttsRateRef.current = rate;
-            setStatus("ready");
+            /* Phase 2 R2: bind is up, but stay "connecting" until the
+             * top voice-brain reports warm (the daemon's voice-brain
+             * frame flips brainReadyRef). If that frame already arrived
+             * (or the top session is disabled -> daemon sent ready:true
+             * immediately) this goes straight to "ready". */
+            setStatus(voiceStatusForBrainReady(brainReadyRef.current));
             void initVad();
+            break;
+          }
+          case "voice-brain": {
+            /* Top-brain readiness (Phase 2 R2). ready:true = the top
+             * layer can answer now -> go live. ready:false = still
+             * warming -> hold "connecting". Only moves the top-of-turn
+             * states (connecting/ready); mid-turn states
+             * (listening/transcribing/thinking/speaking) are never
+             * clobbered by a late readiness frame. */
+            const ready = msg.ready === true;
+            brainReadyRef.current = ready;
+            setStatus((cur) =>
+              cur === "connecting" || cur === "ready"
+                ? voiceStatusForBrainReady(ready)
+                : cur,
+            );
             break;
           }
           case "transcript": {

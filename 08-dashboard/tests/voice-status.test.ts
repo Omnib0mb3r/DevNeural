@@ -24,6 +24,7 @@ import { describe, expect, it } from "vitest";
 import {
   VOICE_STATUS_LABEL,
   resolveVoiceStatusLabel,
+  voiceStatusForBrainReady,
   type VoiceStatus,
 } from "../lib/voice-status";
 
@@ -37,6 +38,19 @@ const ALL_STATUSES: VoiceStatus[] = [
   "speaking",
   "error",
 ];
+
+describe("voiceStatusForBrainReady (Phase 2 R2 connecting->live gate)", () => {
+  it("holds 'connecting' until the top voice-brain reports warm", () => {
+    /* hello-ack (WS bind) is necessary but NOT sufficient: the socket
+     * is up but the operator must not be told the line is live until
+     * the top layer can actually answer. */
+    expect(voiceStatusForBrainReady(false)).toBe("connecting");
+  });
+
+  it("goes 'ready' (live) once the top voice-brain is warm", () => {
+    expect(voiceStatusForBrainReady(true)).toBe("ready");
+  });
+});
 
 describe("VOICE_STATUS_LABEL", () => {
   it("maps every reachable pipeline status to its display label", () => {

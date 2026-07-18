@@ -47,6 +47,20 @@ export const VOICE_STATUS_LABEL: Record<VoiceStatus, string> = {
   error: "error",
 };
 
+/* Phase 2 R2 / acceptance-3: pressing Start voice starts the TOP
+ * (Lex voice) headless session; the control shows "connecting" until
+ * that session reports warm, then goes live ("ready"). hello-ack (the
+ * WS bind) is necessary but NOT sufficient - the socket being up does
+ * not mean the top layer can answer yet, and telling the operator the
+ * line is live before then is the no-audio incident (they speak into a
+ * not-yet-warm brain). The daemon sends a `voice-brain` frame carrying
+ * that readiness; this maps it to the pipeline status. */
+export function voiceStatusForBrainReady(
+  brainReady: boolean,
+): "connecting" | "ready" {
+  return brainReady ? "ready" : "connecting";
+}
+
 /* Which overlay, if any, replaced the base label. Surfaces key
  * their tone (text color) off this instead of re-deriving the
  * precedence themselves. */

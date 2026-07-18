@@ -22,6 +22,7 @@ import {
   isVoiceBrainSessionEnabled,
   isVoiceBrainSessionWarm,
   prewarmVoiceBrainSession,
+  VOICE_BRAIN_SESSION_SYSTEM_PROMPT,
   _resetVoiceBrainSessionStateForTests,
   _setVoiceBrainSessionDepsForTests,
   _voiceBrainSessionSnapshotForTests,
@@ -374,6 +375,98 @@ describe('warmup gate (2026-07-16 smoke-test fix 2/3)', () => {
     io.scheduleAssistantRecord(pathForSession(1), 10, 'first real reply');
     const result = await askVoice({ prompt: 'first real ask', timeoutMs: 5000 });
     expect(result).toBe('first real reply');
+  });
+});
+
+describe('haiku-class top session (Phase 2 R1)', () => {
+  it('spawns the top session on the fast model, with tools off and no MCP load', () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+
+    prewarmVoiceBrainSession();
+
+    expect(pty.spawnCalls.length).toBe(1);
+    const args = pty.spawnCalls[0]!.args ?? [];
+    /* Fast model is the whole point of the top layer (the 33s cold-boot
+     * root cause was NO --model, so it booted the account default). The
+     * default alias is 'haiku'. */
+    const mi = args.indexOf('--model');
+    expect(mi).toBeGreaterThanOrEqual(0);
+    expect(args[mi + 1]).toBe('haiku');
+    /* Minimal tools: mechanically disable the built-in tool set (the
+     * session prompt already forbids tool use) so the warm is lean. */
+    const ti = args.indexOf('--tools');
+    expect(ti).toBeGreaterThanOrEqual(0);
+    expect(args[ti + 1]).toBe('');
+    /* No MCP servers loaded at boot: a large warm-time save. With no
+     * --mcp-config, --strict-mcp-config means zero MCP servers. */
+    expect(args).toContain('--strict-mcp-config');
+    /* Unchanged: deterministic session binding + headless permissions. */
+    expect(args).toContain('--session-id');
+    expect(args).toContain('--dangerously-skip-permissions');
+  });
+
+  it('honors DEVNEURAL_VOICE_BRAIN_MODEL override for the top-session model', () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    const prior = process.env.DEVNEURAL_VOICE_BRAIN_MODEL;
+    process.env.DEVNEURAL_VOICE_BRAIN_MODEL = 'claude-haiku-4-5-20251001';
+    try {
+      prewarmVoiceBrainSession();
+      const args = pty.spawnCalls[0]!.args ?? [];
+      const mi = args.indexOf('--model');
+      expect(args[mi + 1]).toBe('claude-haiku-4-5-20251001');
+    } finally {
+      if (prior === undefined) delete process.env.DEVNEURAL_VOICE_BRAIN_MODEL;
+      else process.env.DEVNEURAL_VOICE_BRAIN_MODEL = prior;
+    }
+  });
+});
+
+describe('top layer is context-thin (Phase 2 R6)', () => {
+  it('the top-session system prompt carries no cold-start / digest / investigator context', () => {
+    /* R6: cold-start context, distillation, the sibling index, and the
+     * investigator feed the MID (brainstorm Lex) session, never the top.
+     * The top boots thin and fast; less context = faster warm AND a
+     * smarter-feeling system. A regression that preloads context onto
+     * the top session's prompt must fight this test. */
+    const p = VOICE_BRAIN_SESSION_SYSTEM_PROMPT.toLowerCase();
+    for (const banned of [
+      'digest',
+      'distill',
+      'sibling',
+      'investigat',
+      'cold-start',
+      'cold start',
+      'snapshot',
+    ]) {
+      expect(p.includes(banned)).toBe(false);
+    }
+  });
+
+  it('spawns the top session with only the thin arg set (no cold-start wiring)', () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+
+    prewarmVoiceBrainSession();
+
+    const args = pty.spawnCalls[0]!.args ?? [];
+    /* The exact thin set: deterministic binding, headless perms, fast
+     * model, tools off, no MCP load. Nothing else - no context preload
+     * flags, no cold-start report path, no investigator seed. */
+    expect(args).toEqual([
+      '--session-id',
+      'cc-session-1',
+      '--dangerously-skip-permissions',
+      '--model',
+      'haiku',
+      '--tools',
+      '',
+      '--strict-mcp-config',
+    ]);
   });
 });
 
