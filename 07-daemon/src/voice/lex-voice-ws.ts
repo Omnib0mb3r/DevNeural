@@ -307,6 +307,13 @@ interface ConnState {
    * the MID-layer (Lex inject) boundary queue. */
   topTurnInFlight: boolean;
   pendingTopUtterances: string[];
+  /* P1 top-owned ack (2026-07-18): true from the moment the TOP layer
+   * speaks its own handoff on an escalated forward until the deep
+   * turn's end_turn. While true, deep pre-tool acks are suppressed (the
+   * top already acked out loud - no double-ack, no stale-ack race).
+   * Left false on a fail-safe forward where the top produced no handoff,
+   * so the deep pre-tool ack is the safety net there. */
+  topOwnsAck: boolean;
   /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
    * Set when a hello frame carries a brainstorm_id and the resolved
    * brainstorm has runtime_mode='direct-llm'. Drives the dispatch
@@ -1575,6 +1582,40 @@ export function mergeOperatorUtterances(parts: string[]): string {
     .join('\n');
 }
 
+/* ── P1: the TOP layer owns its ack (2026-07-18 spec) ────────────────
+ *
+ * Today the ack the operator hears on an escalated turn is DEEP-sourced
+ * (clampAck of Lex's first sentence, echoed up late). That is a
+ * stale-ack race and, paired with the top layer's own handoff line, a
+ * double-ack. Move ack ownership to the TOP: the top's spoken handoff
+ * IS the ack (it streams instantly, at the top layer's latency), and
+ * the deep layer stops emitting pre-tool acks for that turn.
+ *
+ * `_topOwnsAckAfterForwardImpl` decides whether the top actually acked
+ * for a forward: it did iff it spoke something (streamed early lines
+ * and/or a final remainder handoff). The fail-safe forward (session
+ * down / timeout: forward = raw utterance, no speech, nothing streamed)
+ * did NOT ack - there the deep pre-tool ack is the safety net so the
+ * operator still hears one ack. Pure + exported so it pins without a
+ * socket. */
+export function _topOwnsAckAfterForwardImpl(args: {
+  earlySpokenCount: number;
+  remainderSpeech: string | null;
+}): boolean {
+  return args.earlySpokenCount > 0 || args.remainderSpeech !== null;
+}
+
+/* Whether the deep (Lex) pre-tool ack should be spoken. Suppressed once
+ * the top owns the ack (no double-ack, no stale race); spoken as the
+ * fallback when the top produced no handoff at all. */
+export function _shouldSpeakDeepAckImpl(args: { topOwnsAck: boolean }): {
+  speak: boolean;
+  reason: string;
+} {
+  if (args.topOwnsAck) return { speak: false, reason: 'top-owns-ack' };
+  return { speak: true, reason: 'no-top-ack-fallback' };
+}
+
 export function attachLexVoiceWs(socket: FastifyWS): void {
   logFn(`[voice-ws] client connected (attach)`);
   /* 2026-07-16 smoke-test fix 3: boot the voice brain the moment a
@@ -1614,6 +1655,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     pendingUserUtterances: [],
     topTurnInFlight: false,
     pendingTopUtterances: [],
+    topOwnsAck: false,
     directLlmAbort: null,
     brainstormId: null,
     runtimeMode: null,
@@ -2430,14 +2472,29 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
              * - it yields the clamped ack to speak OR a NAMED drop when
              * it clamps to the canned sentinel. A drop is logged loudly
              * here (this session an ack reached the surface and vanished
-             * with no trace); it is never a silent nothing. */
-            const ackDecision = decidePreToolAck(text);
-            if (ackDecision.speak) {
-              speakViaBrain(ackDecision.speak, true);
-            } else {
+             * with no trace); it is never a silent nothing.
+             *
+             * P1 top-owned ack: once the TOP layer has spoken its own
+             * handoff for this forward (state.topOwnsAck), the deep
+             * pre-tool ack is redundant - a double-ack and the stale-ack
+             * race. Suppress it; it only speaks as the fallback when the
+             * top produced no handoff at all (fail-safe forward). */
+            const deepAck = _shouldSpeakDeepAckImpl({
+              topOwnsAck: state.topOwnsAck,
+            });
+            if (!deepAck.speak) {
               logFn(
-                `[voice-ws] TOP-LAYER ACK DROPPED reason=${ackDecision.dropReason} text=${JSON.stringify(text.slice(0, 80))}`,
+                `[voice-ws] deep pre-tool ack suppressed reason=${deepAck.reason} text=${JSON.stringify(text.slice(0, 80))}`,
               );
+            } else {
+              const ackDecision = decidePreToolAck(text);
+              if (ackDecision.speak) {
+                speakViaBrain(ackDecision.speak, true);
+              } else {
+                logFn(
+                  `[voice-ws] TOP-LAYER ACK DROPPED reason=${ackDecision.dropReason} text=${JSON.stringify(text.slice(0, 80))}`,
+                );
+              }
             }
           } else {
             /* TTS is hooked ONLY to the top layer (operator directive
@@ -2459,6 +2516,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * the same Lex turn will run artifacts / attention / large-fs /
      * compaction on the full message text. */
     if (isPreToolAck) return;
+    /* P1 top-owned ack: this end_turn is the deep turn boundary, so the
+     * top no longer owns an ack for it. The next escalated utterance
+     * sets topOwnsAck fresh from its own handoff. */
+    state.topOwnsAck = false;
     /* DRIVE-QUEUE 1b: this IS Lex's turn boundary (awaitingResponseSince
      * was just cleared above). Push a fresh small digest derived from
      * Lex's synthesized reply so the haiku fast lane / persona speak from
@@ -4357,6 +4418,15 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * fires now so Lex drops the interrupted reply. */
     confirmRealBarge(true);
     result = { text: tl.forward, ms: result.ms };
+    /* P1 top-owned ack: the top owns this forward's ack iff it actually
+     * spoke a handoff (streamed early lines and/or a final remainder).
+     * While it does, the deep pre-tool ack is suppressed. A fail-safe
+     * forward (no speech at all) leaves this false, so the deep ack is
+     * the fallback and the operator still hears exactly one ack. */
+    state.topOwnsAck = _topOwnsAckAfterForwardImpl({
+      earlySpokenCount: earlySpoken.length,
+      remainderSpeech,
+    });
     /* Three-way transcript (2026-07-18): the TOP layer is routing the
      * operator's intent DOWN to the MID (deep) layer. Surface the
      * handoff so the you -> voice -> deep hop is visible in the panel;
