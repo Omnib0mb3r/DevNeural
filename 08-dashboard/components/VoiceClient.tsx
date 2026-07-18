@@ -13,6 +13,12 @@ import { emitVoiceSettingUpdate, onVoiceSettingUpdate } from "@/lib/voice-settin
 import { emitTranscriptTurn } from "@/lib/transcript-bus";
 import { shouldFinalizeUtteranceOnMute } from "@/lib/mute-finalize";
 import {
+  resolveActiveBrainstormId,
+  readPersistedVoiceState,
+  writePersistedActiveBrainstorm,
+  writePersistedVoiceEnabled,
+} from "@/lib/voice-active-anchor";
+import {
   createDedupe,
   getSpeechRecognitionCtor,
   processWakeResults,
@@ -375,18 +381,38 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     queryFn: () => lexAnchors({ status: "live", limit: 20 }),
     refetchInterval: 5_000,
   });
-  const selectedAnchorId: string | null =
+  const urlBrainstormId: string | null =
     typeof window !== "undefined"
       ? new URL(window.location.href).searchParams.get("brainstorm")
       : null;
+  /* SESSIONS-VIEW defect 2: PIN the voice bind to the ACTIVE brainstorm,
+   * decoupled from whatever session the operator is merely VIEWING.
+   * Opening a session (which carries no ?brainstorm=) must keep voice on
+   * the brainstorm it was already on, never snap to the newest PTY and
+   * never blip. The pin is the URL selection when present, else the last
+   * one (persisted so a remount restores it). Only a cold visit with
+   * neither falls back to newest-PTY. */
+  const [pinnedBrainstorm, setPinnedBrainstorm] = useState<string | null>(
+    () => readPersistedVoiceState().activeBrainstorm,
+  );
+  useEffect(() => {
+    if (urlBrainstormId) {
+      setPinnedBrainstorm(urlBrainstormId);
+      writePersistedActiveBrainstorm(urlBrainstormId);
+    }
+  }, [urlBrainstormId]);
+  const activeBrainstormId = resolveActiveBrainstormId(
+    urlBrainstormId,
+    pinnedBrainstorm,
+  );
   const brainstormPtys = (ptysQ.data?.ptys ?? []).filter(
     (p) => !p.exited && /\/brainstorm\/?$/i.test(p.cwd.replace(/\\/g, "/")),
   );
-  const selectedAnchor = selectedAnchorId
-    ? (anchorsQ.data?.anchors ?? []).find((a) => a.id === selectedAnchorId) ??
+  const selectedAnchor = activeBrainstormId
+    ? (anchorsQ.data?.anchors ?? []).find((a) => a.id === activeBrainstormId) ??
       null
     : null;
-  const lexPty: PtyEntry | undefined = selectedAnchorId
+  const lexPty: PtyEntry | undefined = activeBrainstormId
     ? selectedAnchor?.current_pty_id
       ? brainstormPtys.find((p) => p.ptyId === selectedAnchor.current_pty_id)
       : undefined
@@ -416,7 +442,19 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   }, [pathname, lexPty?.ptyId]);
 
   const [status, setStatus] = useState<Status>("idle");
-  const [enabled, setEnabled] = useState<boolean>(false);
+  /* SESSIONS-VIEW defect 2: persist `enabled` (sessionStorage) so a
+   * remount or hard reload WITHIN the tab restores live voice instead of
+   * coming back off - viewing/switching must never leave voice dead. A
+   * brand-new tab still starts off (sessionStorage clears on tab close),
+   * and an explicit stop writes the OFF state, so the old "stuck flag
+   * resurrects voice forever" failure (which is why enabled used to be
+   * unpersisted) cannot recur. */
+  const [enabled, setEnabled] = useState<boolean>(
+    () => readPersistedVoiceState().enabled,
+  );
+  useEffect(() => {
+    writePersistedVoiceEnabled(enabled);
+  }, [enabled]);
   const [muted, setMuted] = useState<boolean>(false);
 
   /* Auto-stop voice when Lex disappears, but debounced so a kill→
