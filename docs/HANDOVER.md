@@ -6,12 +6,28 @@ Update this file IN PLACE every time the cursor moves; never add a new
 dated file. Ground every claim against git before asserting; this doc
 reflects what was true at the last update.
 
-## Cursor (2026-07-18 afternoon, VOICE END-TO-END WORKING; 5 commits, daemon restart pending)
+## Cursor (2026-07-18 afternoon, VOICE WORKING - PENDING SMOKE; 5 commits, daemon LIVE)
 
-Voice was dead all afternoon on the wave client; root-caused and fixed
-end to end. Capture + audible TTS + smart coalescing all verified live.
-The remaining daemon-side fixes are built but need ONE operator daemon
-restart to activate. Safe to /clear.
+**DO NOT REWORK VOICE.** Voice capture + audible TTS + smart coalescing
+are WORKING and verified live. The wave client did NOT need reverting;
+the fix was surgical (one mic-feed swap + one recovery-window formula).
+If voice misbehaves next session it is a TUNING/smoke item, not a
+"rip it out" item. Read the commit rundown before touching anything.
+
+Daemon HAS been restarted and is running all of this session's commits:
+proven live at 17:40:58Z - an operator End-button press logged the new
+SM-23 path end to end: `[lex-anchor] /end: queueing session-end
+pipeline reason=dashboard-end-button` -> `[distill-pending] queued` ->
+`[chunks-fallback] status='ended' flipped` -> `[chunks-fallback]
+last_summary written chars=3180` -> `[distill-pending] completed
+brainstorm=4bbafb48 drafts=0 summary=true`. The End-hang fix and the
+guaranteed-distill-on-end both confirmed in prod. (Same trace shows the
+known SM-26 open defect: `per-session distill skipped:
+no_session_scoped_chunks` - summary written via fallback, content may
+lag; root cause still open.)
+
+Remaining before "done": run the smoke checklist below, then strip the
+diagnostic probes. Safe to /clear.
 
 ### This session's commits (all on master, tree clean)
 
