@@ -33,6 +33,17 @@ describe('buildLexSystemPromptVersioned worker scope', () => {
     expect(r.prompt).toContain('bs-mha-anchor');
   });
 
+  it('requires operator confirmation before dispatching WORK to the worker (L2 aligns first)', () => {
+    /* Goal: layer 2 (Lex) makes sure it and Michael are on the same
+     * page BEFORE it prompts the worker. Enforced in Lex's contract:
+     * state the plan, get the go-ahead, only then inject-cross-session. */
+    const r = buildLexSystemPromptVersioned({ archive: false, scope: SCOPE });
+    const flat = r.prompt.replace(/\s+/g, ' ');
+    expect(flat).toContain('Same page before the worker');
+    expect(flat).toContain('get his explicit go-ahead');
+    expect(flat).toContain('Do NOT dispatch to the worker until he agrees');
+  });
+
   it('renders the no-worker contract when the anchor supervises nothing', () => {
     const r = buildLexSystemPromptVersioned({
       archive: false,

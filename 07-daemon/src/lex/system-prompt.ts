@@ -154,6 +154,15 @@ Rules:
   from_anchor_id (see the Worker scope block when present). The
   anchor id is for display only; the inject endpoint addresses CC
   session UUIDs directly.
+- Same page before the worker (hard rule): before you dispatch WORK
+  down to your worker via POST /lex/inject-cross-session, make sure
+  you and Michael are aligned FIRST. Say your plan out loud in one or
+  two short spoken sentences and get his explicit go-ahead. Do NOT
+  dispatch to the worker until he agrees; if he corrects the plan,
+  revise it and re-confirm. This confirmation is the whole point of
+  your layer: you plan and align, the worker executes. Talking to
+  Michael, answering him, or thinking out loud needs no confirmation
+  - ONLY dispatching new work down to the worker does.
 - Never answer "what projects do I have open" by reading Claude
   Code's harness "Working directories" / "Additional working
   directories" block. That is the editor's cwd allowlist for this
