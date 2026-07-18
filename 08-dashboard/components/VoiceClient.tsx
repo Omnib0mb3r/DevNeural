@@ -456,6 +456,14 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   useEffect(() => {
     writePersistedVoiceEnabled(enabled);
   }, [enabled]);
+  /* Warmup lock (2026-07-18): `mode` is a dep of the big WS/VAD effect,
+   * so switching mode tears the pipeline down + brings it back up. While
+   * the engine is still connecting/warming the WS has not finished its
+   * handshake; closing a CONNECTING socket makes the browser report
+   * close code 1006 (abnormal) and drops voice into a reconnect loop -
+   * the "switched to push-to-talk and it errored out" repro. Lock the
+   * mode switch until the top brain reports ready. */
+  const warmingUp = enabled && (status === "connecting" || status === "warming");
   const [muted, setMuted] = useState<boolean>(false);
 
   /* Auto-stop voice when Lex disappears, but debounced so a kill→
@@ -3462,6 +3470,15 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * sends a server-side mode-set so the daemon respects notes-mode
    * silence. */
   function changeMode(next: Mode): void {
+    /* Warmup lock: refuse the switch while the WS is still opening.
+     * Doing it mid-handshake closes a CONNECTING socket (code 1006) and
+     * breaks voice; the button is disabled during this window too, this
+     * is the belt-and-suspenders guard. Tell the operator instead of
+     * silently eating the tap. */
+    if (warmingUp) {
+      showInfoToast("Voice is still warming up. Mode locked until it's ready.");
+      return;
+    }
     setMode(next);
     sendJson({ t: "set-mode", mode: next });
   }
@@ -3641,11 +3658,17 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             key={m}
             type="button"
             onClick={() => changeMode(m)}
+            disabled={warmingUp}
+            title={
+              warmingUp
+                ? "Voice is warming up — mode locked until it's ready."
+                : undefined
+            }
             className={`text-nano px-2.5 py-1 rounded-pill hairline font-mono ${
               mode === m
                 ? "bg-brand/20 text-brandSoft ring-1 ring-brand/40"
                 : "bg-surface2 text-txt2 hover:bg-surface3"
-            }`}
+            } ${warmingUp ? "opacity-50 cursor-not-allowed" : ""}`}
           >
             {MODE_LABEL[m]}
           </button>
