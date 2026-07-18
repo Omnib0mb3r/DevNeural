@@ -144,7 +144,7 @@ import { checkToolGate, notifyLargeFsRead, LARGE_FS_READ_LINE_THRESHOLD } from '
 import { runDistillationFlush } from '../lex/session-end-pipeline.js';
 import { queueSessionEndPipeline } from '../lex/distill-pending.js';
 import { appendUtterance as appendSessionAudio } from './audio-bundle.js';
-import { selectTtsContent, clampAck } from './select-tts-content.js';
+import { selectTtsContent, decidePreToolAck } from './select-tts-content.js';
 import {
   HEARTBEAT_INTERVAL_MS,
   HEARTBEAT_TICK_MS,
@@ -2424,9 +2424,21 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
              * grammar (the top layer's forward handoff line already
              * acknowledged the request out loud). Only a REAL first
              * sentence from Lex's own text speaks, delivered by the
-             * brain with Lex's words as the miss fallback. */
-            const ack = clampAck(text);
-            if (ack !== 'On it.') speakViaBrain(ack, true);
+             * brain with Lex's words as the miss fallback.
+             *
+             * P0 no-silent-drop (2026-07-18): decidePreToolAck is total
+             * - it yields the clamped ack to speak OR a NAMED drop when
+             * it clamps to the canned sentinel. A drop is logged loudly
+             * here (this session an ack reached the surface and vanished
+             * with no trace); it is never a silent nothing. */
+            const ackDecision = decidePreToolAck(text);
+            if (ackDecision.speak) {
+              speakViaBrain(ackDecision.speak, true);
+            } else {
+              logFn(
+                `[voice-ws] TOP-LAYER ACK DROPPED reason=${ackDecision.dropReason} text=${JSON.stringify(text.slice(0, 80))}`,
+              );
+            }
           } else {
             /* TTS is hooked ONLY to the top layer (operator directive
              * 2026-07-15): the voice brain delivers Lex's body in its

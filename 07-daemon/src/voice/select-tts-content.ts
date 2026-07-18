@@ -84,6 +84,54 @@ export function clampAck(text: string): string {
   return 'On it.';
 }
 
+/* ── P0: no silent drops (2026-07-18 VOICE-TOP-LAYER-SMARTS-SPEC) ─────
+ *
+ * THE INVARIANT: anything handed to the top layer for speaking is
+ * either spoken (reaches speak()) or LOUDLY LOGGED as dropped with a
+ * NAMED reason. No silent drops, ever. This session an ack reached the
+ * surface and was not spoken (clampAck fell back to the canned 'On it.'
+ * sentinel, which the no-hardcoded-talking rule refuses, and the caller
+ * then did nothing at all - a silent drop).
+ *
+ * These two pure decisions are TOTAL: each returns exactly one of
+ * `speak` (text to say) or `dropReason` (a named reason), never both,
+ * never neither. The WS speaks `speak` or logs `dropReason`; the guard
+ * lives here so it is unit-provable without a socket. */
+export interface SpeechAccount {
+  /** Text to actually speak, or null when nothing is spoken. */
+  speak: string | null;
+  /** Named drop reason when nothing is spoken; null when speak is set.
+   * Exactly one of speak / dropReason is populated (totality). */
+  dropReason: string | null;
+}
+
+/* Decide the spoken form of a pre-tool ack. clampAck returns the canned
+ * 'On it.' sentinel when Lex's first sentence is not a short speakable
+ * ack (>10 words with no early period, or empty); that sentinel is
+ * never spoken (the literal died with the grammar), so it becomes a
+ * NAMED drop instead of the old silent nothing. A real short first
+ * sentence is spoken verbatim. */
+export function decidePreToolAck(text: string): SpeechAccount {
+  const ack = clampAck(text);
+  if (ack === 'On it.') {
+    return { speak: null, dropReason: 'ack-clamped-to-canned' };
+  }
+  return { speak: ack, dropReason: null };
+}
+
+/* Generic emission guard: any speakable string the top layer hands up
+ * is spoken (trimmed) or named-dropped for the reason it is unspeakable
+ * (null vs empty). The WS routes its top-layer speak sites through this
+ * so an empty/absent emission is a logged drop, never a silent one. */
+export function accountSpeech(text: string | null | undefined): SpeechAccount {
+  if (text === null || text === undefined) {
+    return { speak: null, dropReason: 'null' };
+  }
+  const t = text.trim();
+  if (!t) return { speak: null, dropReason: 'empty' };
+  return { speak: t, dropReason: null };
+}
+
 export function selectTtsContent(
   rec: AssistantJsonlRecord,
   alreadySpoken: ReadonlySet<string>,

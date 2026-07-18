@@ -15,7 +15,9 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  accountSpeech,
   clampAck,
+  decidePreToolAck,
   hashSegment,
   selectTtsContent,
   type AssistantJsonlRecord,
@@ -187,6 +189,85 @@ describe('clampAck', () => {
   it('falls back to canned ack on empty input', () => {
     expect(clampAck('')).toBe('On it.');
     expect(clampAck('   ')).toBe('On it.');
+  });
+});
+
+/* P0 (2026-07-18 VOICE-TOP-LAYER-SMARTS-SPEC): no silent drops. Every
+ * speech emission decision is TOTAL - it either yields text to speak or
+ * a NAMED drop reason, never a silent nothing. These pins prove the
+ * invariant at the decision layer; the WS logs the named reason. */
+describe('decidePreToolAck (P0 no-silent-drop)', () => {
+  it('yields the clamped ack to speak for a short first sentence', () => {
+    const d = decidePreToolAck('Got it boss, looking now');
+    expect(d.speak).toBe('Got it boss, looking now');
+    expect(d.dropReason).toBeNull();
+  });
+
+  it('names the drop when the ack clamps to the canned sentinel', () => {
+    /* A fat, answer-bearing ack (>10 words, no early period) clamps to
+     * the canned 'On it.' - which the no-hardcoded-talking rule refuses
+     * to speak. Pre-fix this was a SILENT nothing; now it is a NAMED
+     * drop the caller logs loudly. */
+    const fat =
+      'Right you cold-started me after the bounce that is the only reason I have context';
+    const d = decidePreToolAck(fat);
+    expect(d.speak).toBeNull();
+    expect(d.dropReason).toBe('ack-clamped-to-canned');
+  });
+
+  it('names the drop on empty / whitespace ack text', () => {
+    expect(decidePreToolAck('').dropReason).toBe('ack-clamped-to-canned');
+    expect(decidePreToolAck('   ').dropReason).toBe('ack-clamped-to-canned');
+  });
+
+  it('is TOTAL: every input yields exactly one of speak / dropReason', () => {
+    const samples = [
+      'On it.',
+      'Short ack.',
+      'Got it boss, looking now',
+      'Hold on. Let me check.',
+      'Right you cold-started me after the bounce that is the only reason I have context',
+      '',
+      '   ',
+      'word '.repeat(40),
+    ];
+    for (const s of samples) {
+      const d = decidePreToolAck(s);
+      const speakSet = d.speak !== null;
+      const dropSet = d.dropReason !== null;
+      /* exactly one populated - never both, never neither (no silent drop) */
+      expect(speakSet !== dropSet).toBe(true);
+    }
+  });
+});
+
+describe('accountSpeech (P0 no-silent-drop)', () => {
+  it('speaks trimmed non-empty text', () => {
+    const a = accountSpeech('  hello there  ');
+    expect(a.speak).toBe('hello there');
+    expect(a.dropReason).toBeNull();
+  });
+
+  it('names the drop for null / undefined / empty / whitespace', () => {
+    expect(accountSpeech(null).dropReason).toBe('null');
+    expect(accountSpeech(undefined).dropReason).toBe('null');
+    expect(accountSpeech('').dropReason).toBe('empty');
+    expect(accountSpeech('   ').dropReason).toBe('empty');
+  });
+
+  it('is TOTAL: every input yields exactly one of speak / dropReason', () => {
+    const samples: Array<string | null | undefined> = [
+      'hi',
+      '  spaced  ',
+      '',
+      '   ',
+      null,
+      undefined,
+    ];
+    for (const s of samples) {
+      const a = accountSpeech(s);
+      expect((a.speak !== null) !== (a.dropReason !== null)).toBe(true);
+    }
   });
 });
 

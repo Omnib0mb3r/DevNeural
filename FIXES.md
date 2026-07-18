@@ -7,7 +7,13 @@ file is for live status only.
 
 Status legend: ⏳ queued, 🔄 in progress, ✅ shipped, ❌ blocked.
 
-## 2026-07-16 voice smoke-test fixes (bugs 1-4, evidence in daemon.log 03:25-03:31Z)
+## 2026-07-18 voice top-layer smarts (VOICE-TOP-LAYER-SMARTS-SPEC, tests-first, additive-only)
+
+Spec `C:\dev\data\skill-connections\brainstorm\VOICE-TOP-LAYER-SMARTS-SPEC.md`. Daemon NOT restarted (operator-only); rebuild required before live verify.
+
+| # | Title | Status | Commit | Evidence + fix |
+|---|-------|--------|--------|-----------------|
+| VS-P0 | Silent drop at the top layer: an ack reached the surface and was never spoken or logged | ✅ shipped, awaiting rebuild + live verify | (this commit) | **Evidence (spec P0):** live session, a pre-tool ack reached the speak path and produced no audio and no log line - `clampAck` fell back to the canned `'On it.'` sentinel, which the no-hardcoded-talking rule refuses to speak, and the caller's `if (ack !== 'On it.')` then did NOTHING: no `speak()`, no log. A silent drop, undiagnosable. **Fix (additive):** two TOTAL pure decisions in `select-tts-content.ts` - `decidePreToolAck(text)` yields either `speak` (the clamped ack) or a NAMED `dropReason` (`ack-clamped-to-canned`), and generic `accountSpeech(text)` yields `speak` (trimmed) or a named `null`/`empty` drop. Each returns exactly one of speak / dropReason - never both, never neither (the invariant: no silent nothing). The WS pre-tool-ack site now speaks `decision.speak` or logs `[voice-ws] TOP-LAYER ACK DROPPED reason=<named>`. **Tests:** 7 new pins in `tests/select-tts-content.test.ts` incl. a totality property over 8 sample inputs for each decision. Suite green, tsc clean. **Rebuild:** yes (daemon). |
 
 All four shipped, committed, daemon NOT yet restarted (per operator instruction). Rebuild + restart required before live verification.
 
