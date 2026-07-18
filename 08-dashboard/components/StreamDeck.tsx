@@ -256,6 +256,7 @@ export function StreamDeck() {
                             key={s.session_id}
                             session={s}
                             onTap={handleTileTap}
+                            nested
                           />
                         ))}
                       </div>
@@ -266,26 +267,48 @@ export function StreamDeck() {
             </div>
           )}
 
-          {groups
-            .filter(
+          {/* Orphan workers: open CC sessions with no supervising
+            * brainstorm. Rendered in the same file-tree shape as a
+            * supervised pair, but the parent slot is a dashed shadow
+            * placeholder so the missing brainstorm is visible instead
+            * of the worker floating flat (2026-07-18 operator ask). */}
+          {(() => {
+            const orphans = groups.filter(
               ({ slug }) =>
                 !tiles.some((t) => t.supervised_project_slug === slug),
-            )
-            .map(({ slug, label, sessions }) => (
-            <div key={slug} className="space-y-2">
-              {sessions.length > 1 && (
+            );
+            if (orphans.length === 0) return null;
+            return (
+              <div className="space-y-2">
                 <div className="flex items-center justify-between px-1 pt-1">
-                  <div className="text-nano text-txt2 font-emphasized">{label}</div>
+                  <div className="text-nano text-txt2 font-emphasized">
+                    Workers
+                  </div>
                   <span className="text-nano text-txt3 font-mono">
-                    {sessions.length} sessions
+                    {orphans.reduce((n, g) => n + g.sessions.length, 0)} live
                   </span>
                 </div>
-              )}
-              {sessions.map((s) => (
-                <DeckTile key={s.session_id} session={s} onTap={handleTileTap} />
-              ))}
-            </div>
-          ))}
+                {orphans.map(({ slug, sessions }) => (
+                  <div key={slug} className="space-y-1.5">
+                    <ShadowBrainstormTile />
+                    <div
+                      data-testid="deck-orphan-worker"
+                      className="ml-4 pl-2 border-l border-dashed border-border2 space-y-1.5"
+                    >
+                      {sessions.map((s) => (
+                        <DeckTile
+                          key={s.session_id}
+                          session={s}
+                          onTap={handleTileTap}
+                          nested
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
 
           <a
             href="/sessions"
@@ -337,9 +360,15 @@ export function StreamDeck() {
 interface DeckTileProps {
   session: SessionSummary;
   onTap: (s: SessionSummary, focusFn: () => void) => void;
+  /* Worker tiles nested under a brainstorm (real or shadow) render
+   * one step smaller than the brainstorm parent so the deck reads as
+   * a file tree: parent full-size, children subordinate. Flat
+   * (non-nested) rendering keeps the original size. 2026-07-18
+   * operator ask. */
+  nested?: boolean;
 }
 
-function DeckTile({ session: s, onTap }: DeckTileProps) {
+function DeckTile({ session: s, onTap, nested = false }: DeckTileProps) {
   const state = tileState(s);
   const led = ledStatus(state);
   const project = projectFromSlug(s.project_slug);
@@ -369,19 +398,35 @@ function DeckTile({ session: s, onTap }: DeckTileProps) {
       type="button"
       onClick={() => onTap(s, () => focusM.mutate())}
       disabled={focusM.isPending}
-      className={`w-full block text-left p-3 rounded-card bg-surface1 hairline lift transition-shadow ${ring} ${
-        focusM.isPending ? "ring-1 ring-brand/60" : ""
-      }`}
-      aria-label={`Focus VS Code window for ${tileLabel} (${state}). Tap again to enter nav mode.`}
+      className={`w-full block text-left rounded-card bg-surface1 hairline lift transition-shadow ${
+        nested ? "p-2" : "p-3"
+      } ${ring} ${focusM.isPending ? "ring-1 ring-brand/60" : ""}`}
+      aria-label={`Focus VS Code window for ${tileLabel} (${state})${
+        nested ? ", worker" : ""
+      }. Tap again to enter nav mode.`}
     >
-      <div className="flex items-center justify-between mb-1.5">
-        <div className="font-display text-sm font-emphasized truncate text-txt1">
+      <div
+        className={`flex items-center justify-between ${nested ? "mb-1" : "mb-1.5"}`}
+      >
+        <div
+          className={`font-display font-emphasized truncate text-txt1 ${
+            nested ? "text-xs" : "text-sm"
+          }`}
+        >
           {tileLabel}
         </div>
         <StatusDot status={led} pulse={pulseOnLed} />
       </div>
-      <div className="text-xs text-txt2 font-mono mb-1">{stateLabel}</div>
-      <div className="flex items-center justify-between text-[11px] font-mono text-txt3">
+      <div
+        className={`text-txt2 font-mono mb-1 ${nested ? "text-[11px]" : "text-xs"}`}
+      >
+        {nested ? `worker · ${stateLabel}` : stateLabel}
+      </div>
+      <div
+        className={`flex items-center justify-between font-mono text-txt3 ${
+          nested ? "text-[10px]" : "text-[11px]"
+        }`}
+      >
         {/* Prefer the lex anchor uuid for brainstorm sessions
          * (matches /lex Past Sessions and Lex's own self-report);
          * fall back to claude session id for everything else. */}
@@ -399,6 +444,30 @@ function DeckTile({ session: s, onTap }: DeckTileProps) {
         </span>
       </div>
     </button>
+  );
+}
+
+/* Shadow brainstorm placeholder (2026-07-18 operator ask). An open
+ * worker with NO supervising brainstorm still renders in the file-tree
+ * shape - but where the brainstorm parent would sit there is a dashed,
+ * muted ghost slot instead of a real tile, so the MISSING parent is
+ * visible rather than the worker just floating flat. Purely visual;
+ * the worker itself (nested below) stays the interactive tile. */
+function ShadowBrainstormTile() {
+  return (
+    <div
+      data-testid="deck-shadow-brainstorm"
+      aria-hidden="true"
+      className="w-full block text-left p-3 rounded-card border border-dashed border-border2 bg-surface1/30 opacity-70 select-none"
+    >
+      <div className="flex items-center justify-between mb-1.5">
+        <div className="font-display text-sm italic text-txt3 truncate">
+          no brainstorm
+        </div>
+        <StatusDot status="idle" pulse={false} />
+      </div>
+      <div className="text-xs text-txt3/70 font-mono">unsupervised worker</div>
+    </div>
   );
 }
 
