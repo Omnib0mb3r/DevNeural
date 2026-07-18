@@ -71,6 +71,11 @@ import {
 } from '../lex/system-prompt.js';
 import { buildLexSpawnPrompt } from '../lex/spawn-prompt.js';
 import { spawnLexSession } from '../lex/spawn-lex-session.js';
+import {
+  midModel,
+  midPermissionMode,
+  workerModel,
+} from '../lex/layer-model.js';
 import { listAnchorTiles } from '../lex/anchor-tiles.js';
 import {
   getLexSession,
@@ -1708,7 +1713,19 @@ export async function registerDashboardRoutes(
         cwd,
         title: body.title,
         kind,
-        extraArgs: ['--dangerously-skip-permissions'],
+        /* L2 MID (2026-07-18): opus (live-switchable to fable via
+         * runtime_config mid_model) + --permission-mode (default 'plan',
+         * live-switchable to 'bypassPermissions' via mid_permission_mode
+         * if headless plan mode stalls on plan-approval). Both read
+         * per-spawn so POST /runtime-config/:key flips them with no
+         * rebuild. 'bypassPermissions' is exactly the old
+         * --dangerously-skip-permissions behavior. */
+        extraArgs: [
+          '--model',
+          midModel(store.db),
+          '--permission-mode',
+          midPermissionMode(store.db),
+        ],
         buildSystemPrompt: (prep) => {
           built = buildLexSpawnPrompt({
             lexSessionId: prep.lexSession.id,
@@ -1847,7 +1864,19 @@ export async function registerDashboardRoutes(
         const r = spawnLexSession({
           lexSessionId: id,
           cwd: row.cwd,
-          extraArgs: ['--dangerously-skip-permissions'],
+          /* L2 MID (2026-07-18): opus (live-switchable to fable via
+         * runtime_config mid_model) + --permission-mode (default 'plan',
+         * live-switchable to 'bypassPermissions' via mid_permission_mode
+         * if headless plan mode stalls on plan-approval). Both read
+         * per-spawn so POST /runtime-config/:key flips them with no
+         * rebuild. 'bypassPermissions' is exactly the old
+         * --dangerously-skip-permissions behavior. */
+        extraArgs: [
+          '--model',
+          midModel(store.db),
+          '--permission-mode',
+          midPermissionMode(store.db),
+        ],
           systemPrompt: built.prompt,
         });
         log(
@@ -3749,9 +3778,13 @@ export async function registerDashboardRoutes(
         };
       }
     }
-    const command = body.dangerous
-      ? 'claude --dangerously-skip-permissions'
-      : 'claude';
+    /* L3 WORKER (2026-07-18): opus (live-switchable to fable via
+     * runtime_config worker_model) + --dangerously-skip-permissions
+     * (do-not-ask; the executor runs autonomously). workerModel is
+     * whitelisted (layer-model.ts) so it is safe to interpolate into
+     * this command string the bridge types into a terminal. Read
+     * per-request so the live switch takes effect on the next start. */
+    const command = `claude --model ${workerModel(store.db)} --dangerously-skip-permissions`;
     const warnings: string[] = [];
     /* WP-H: coarse bridge-liveness precheck. If NOT ONE bridge window
      * anywhere has posted a fresh presence heartbeat, no VS Code
