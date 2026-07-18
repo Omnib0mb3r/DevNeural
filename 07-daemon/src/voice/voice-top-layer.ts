@@ -196,6 +196,47 @@ export function isRepeatRequest(utterance: string): boolean {
   return REPEAT_REQUEST_RE.test(utterance);
 }
 
+/* ── P2: the top FIELDS trivial turns itself (2026-07-18 spec) ────────
+ *
+ * A clearly trivial conversational turn - a greeting, chit-chat, a
+ * thank-you, a bare acknowledgement, a sign-off - is answered by the
+ * TOP layer directly and NEVER escalated to the deep PTY. Only
+ * substance goes down. The decision lives here in the top layer; when
+ * unsure, escalate (fail toward substance), so the match is STRICT: the
+ * WHOLE normalized utterance must be a trivial phrase, never a
+ * substring. "thanks for breaking the build, what happened" is NOT
+ * trivial. */
+const TRIVIAL_TOP_RES: readonly RegExp[] = [
+  /^(?:hi|hey+|hiya|hello+|yo|howdy|sup|heya)$/,
+  /^(?:good\s+(?:morning|afternoon|evening|night)|mornin[g']?|evenin[g']?|g'?night)$/,
+  /^(?:how\s+(?:are\s+(?:you|ya|things)|is\s+it\s+going|goes\s+it)|how'?s\s+it\s+going|what'?s\s+up|whats\s+up|you\s+good)(?:\s+(?:doing|going))?$/,
+  /^(?:thanks|thank\s+you|thanks\s+(?:a\s+lot|so\s+much|man|boss|bud|mate|dude)|thx|ty|cheers|appreciate\s+it|much\s+appreciated|nice\s+work|good\s+work)$/,
+  /^(?:ok|okay|k|kk|cool|nice|great|awesome|perfect|sweet|sounds\s+good|got\s+it|gotcha|roger|understood|makes\s+sense|good\s+stuff|right\s+on|word|fair\s+enough)$/,
+  /^(?:bye|goodbye|see\s+ya|see\s+you|see\s+you\s+later|later|catch\s+you\s+later|good\s+night|night|take\s+care)$/,
+  /^(?:you\s+there|you\s+up|still\s+there|you\s+around)$/,
+];
+
+/* Normalize for the trivial match: lowercase, drop trailing sentence
+ * punctuation, collapse whitespace, and strip a leading or trailing
+ * "lex" address token so "hey lex" / "thanks, lex" / "lex you there"
+ * still read as trivial (the operator addresses the voice as Lex). */
+function normalizeForTrivial(u: string): string {
+  let s = (u ?? '').toLowerCase().trim();
+  s = s.replace(/[.,!?;:]+$/g, '').trim();
+  s = s.replace(/\s+/g, ' ');
+  s = s.replace(/^lex[\s,]+/, '').replace(/[\s,]+lex$/, '').trim();
+  return s;
+}
+
+/** True when the entire utterance is an unambiguously trivial turn the
+ * top layer must field itself (never escalate). Strict on purpose:
+ * anything with real content fails this and escalates. */
+export function isTrivialTopTurn(utterance: string): boolean {
+  const s = normalizeForTrivial(utterance);
+  if (!s) return false;
+  return TRIVIAL_TOP_RES.some((re) => re.test(s));
+}
+
 /** True when the utterance is a complaint or otherwise references a
  * prior turn / what was or was not said - substance the talk layer
  * must never answer itself. */
@@ -304,7 +345,11 @@ export function parseTopLayerReply(
 function topLayerSystem(): string {
   return (
     'You are on a live voice call. Reply with what you say out loud, ' +
-    'exactly as speech, nothing else. When the turn needs real work, ' +
+    'exactly as speech, nothing else. Trivial conversational turns - ' +
+    'greetings, chit-chat, thanks, a bare acknowledgement, a sign-off ' +
+    '- you answer YOURSELF in one short spoken line with NO FORWARD; ' +
+    'only real substance goes to your deeper reasoning. When the turn ' +
+    'needs real work, ' +
     'project facts, code, or worker action, add a final line FORWARD: ' +
     "with what to hand to your deeper reasoning, in the operator's " +
     'intent, and keep your spoken part to a natural short handoff. On ' +
@@ -502,6 +547,17 @@ export async function topLayerTurn(
     } else {
       result.earlySpeechMismatch = true;
     }
+  }
+  /* P2: the top FIELDS trivial turns itself. When the utterance is
+   * unambiguously trivial (greeting / thanks / ack) AND the top already
+   * produced speech to answer it (streamed early and/or a remainder),
+   * strip any FORWARD the model over-emitted so NOTHING reaches the
+   * deep PTY - the top handled it. Fail toward substance: with no top
+   * speech there is nothing to field with, so the forward survives and
+   * Lex answers; a non-trivial turn always keeps its forward. */
+  const topSpoke = result.speech !== null || consumed.length > 0;
+  if (result.forward !== null && topSpoke && isTrivialTopTurn(utterance)) {
+    result.forward = null;
   }
   /* Fabrication guard, post-parse: speech carrying a self-memory
    * claim or an action promise is never spoken. The strip must not

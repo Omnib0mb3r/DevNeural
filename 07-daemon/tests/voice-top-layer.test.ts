@@ -11,6 +11,7 @@ import {
   parseTopLayerReply,
   topLayerTurn,
   isRepeatRequest,
+  isTrivialTopTurn,
   referencesPriorTurns,
   guardTopLayerSpeech,
   type AskFn,
@@ -396,6 +397,114 @@ describe('topLayerTurn', () => {
  * take. These pin the deterministic guards: substance forwards without
  * ever reaching the talk model, self-memory claims and action promises
  * are stripped from speech, and the utterance always reaches Lex. */
+/* P2 (2026-07-18 VOICE-TOP-LAYER-SMARTS-SPEC): the TOP layer FIELDS
+ * trivial turns itself. Greetings, chit-chat, thanks, bare acks are
+ * answered at the top and NEVER escalated to the deep PTY. Only
+ * substance goes down. Decision lives in the top layer; when unsure,
+ * escalate (fail toward substance). */
+describe('isTrivialTopTurn (P2)', () => {
+  it('is true for greetings, thanks, acks, and sign-offs', () => {
+    for (const t of [
+      'hi',
+      'hey',
+      'heyyy',
+      'hello',
+      'yo',
+      'good morning',
+      'morning',
+      'good night',
+      'how are you',
+      "how's it going",
+      "what's up",
+      'thanks',
+      'thank you',
+      'thanks boss',
+      'cheers',
+      'appreciate it',
+      'ok',
+      'okay',
+      'cool',
+      'nice',
+      'got it',
+      'sounds good',
+      'perfect',
+      'bye',
+      'see ya',
+      'you there',
+    ]) {
+      expect(isTrivialTopTurn(t)).toBe(true);
+    }
+  });
+
+  it('strips a leading / trailing "lex" address token', () => {
+    expect(isTrivialTopTurn('hey lex')).toBe(true);
+    expect(isTrivialTopTurn('good morning lex')).toBe(true);
+    expect(isTrivialTopTurn('thanks, lex')).toBe(true);
+    expect(isTrivialTopTurn('lex you there')).toBe(true);
+  });
+
+  it('tolerates trailing punctuation and case', () => {
+    expect(isTrivialTopTurn('Good Morning!')).toBe(true);
+    expect(isTrivialTopTurn('THANKS.')).toBe(true);
+    expect(isTrivialTopTurn("What's up?")).toBe(true);
+  });
+
+  it('is false for substance (fail toward substance)', () => {
+    for (const t of [
+      'why did the build break',
+      'restart the daemon',
+      "what's the status of the ingest worker",
+      'thanks for breaking the build, what happened',
+      'good morning can you check the logs',
+      'kill the stuck worker',
+      'yes',
+      'no',
+      'the smart-compact race',
+    ]) {
+      expect(isTrivialTopTurn(t)).toBe(false);
+    }
+  });
+
+  it('is false for empty / whitespace', () => {
+    expect(isTrivialTopTurn('')).toBe(false);
+    expect(isTrivialTopTurn('   ')).toBe(false);
+  });
+});
+
+describe('topLayerTurn P2 fielding', () => {
+  it('drops a stray FORWARD on a trivial turn the top already answered', async () => {
+    /* The model answered "good morning" (speech) but over-escalated
+     * with a FORWARD. P2 strips the forward so nothing reaches the deep
+     * PTY - the top fielded it. */
+    const ask: AskFn = async () =>
+      'Morning boss.\nFORWARD: greet the operator and check in';
+    const r = await topLayerTurn('good morning', makeCtx(ask));
+    expect(r.speech).toBe('Morning boss.');
+    expect(r.forward).toBeNull();
+    expect(r.control).toBeNull();
+  });
+
+  it('keeps the FORWARD on a substantive turn', async () => {
+    const ask: AskFn = async () =>
+      'On it.\nFORWARD: what is the status of the ingest worker';
+    const r = await topLayerTurn(
+      "what's the status of the ingest worker",
+      makeCtx(ask),
+    );
+    expect(r.speech).toBe('On it.');
+    expect(r.forward).toBe('what is the status of the ingest worker');
+  });
+
+  it('does NOT strip when a trivial turn produced no speech to answer with (escalate)', async () => {
+    /* Fail toward substance: with no top speech there is nothing to
+     * field the turn with, so the forward survives and Lex answers. */
+    const ask: AskFn = async () => 'FORWARD: greet the operator';
+    const r = await topLayerTurn('good morning', makeCtx(ask));
+    expect(r.speech).toBeNull();
+    expect(r.forward).toBe('greet the operator');
+  });
+});
+
 describe('topLayerTurn fabrication guards', () => {
   it('an operator complaint about a prior line never reaches the talk model: silent forward', async () => {
     let askCalled = false;
