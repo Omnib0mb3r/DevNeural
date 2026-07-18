@@ -6,37 +6,82 @@ Update this file IN PLACE every time the cursor moves; never add a new
 dated file. Ground every claim against git before asserting; this doc
 reflects what was true at the last update.
 
-## Cursor (2026-07-17, voice engine replacement wave)
+## Cursor (2026-07-18, voice Phase 2 + layer config - DEPLOYED)
 
-- **HEAD:** 0485e13 on master (VE-6 warmup re-probe + VE-7 lazy-spawn
-  hygiene), tree clean after the docs commit.
-- **PROD:** daemon pid 135480 booted 13:22:38Z - NOT via
-  start-daemon.ps1 but via a hook lazy-spawn that won the restart race
-  (VE-7): it runs with cwd=REPO ROOT and a leaked live-session env,
-  and it predates VE-6/VE-7, so the swallowed-probe warmup bug is
-  still live in it. It DOES run the voice-engine wave code (dist was
-  rebuilt 02:39). Next operator restart via the task/script picks up
-  0485e13 dist (rebuilt 13:49) AND clears the wrong cwd/env.
-- **13:25Z incident (the operator's "spoke to Lex, nothing happened"):**
-  first voice spawn after the restart storm; claude booted slower than
-  the 3s probe delay, the probe text was swallowed pre-paint, bare-CR
-  nudges no-opped 4.5min, warmup killed the session. Full chain +
-  ConPTY repro evidence in FIXES.md VE-6/VE-7.
-- **Audit notes:** Smart Turn v3 has been integrated since 07-15
-  (model on disk, live holds in tonight's log); deck worker nesting
-  live since 4779d7b. VE-5 closed the one real endpointing gap: held
-  fragments now ship at the 3s governor ceiling instead of starving.
-- **On restart the engine goes live:** word-gated barge (words
-  interrupt, noise never), media-element playback (AEC finally sees
-  the TTS), fuzzy echo discard, drain-window fix, deterministic
-  stop-class mid-turn interrupts, played-ms context truncation,
-  delivery dedupe, quiet bell (telemetry reclassed, idle_prompt
-  debounced), cross-session delivery confirmation.
-- **Operator verification after restart:** FIXES.md VE-table lists the
-  six live metrics; the barge cooldown + pause sliders are now inert
-  by design (engine self-manages; panels untouched per spec).
+- **HEAD:** 3b8ef37 on master, tree clean (after this docs commit). 7
+  feature commits this session (see Tonight's work).
+- **PROD:** daemon bounced TWICE via `POST /admin/daemon/restart`
+  (endpoint arms the DevNeural-Daemon-Restart scheduled task; both
+  came back clean, ~6-24s). Final pid 34592, running the freshly-built
+  dist with EVERYTHING. Client `08-dashboard/out/` rebuilt (served
+  per-request by @fastify/static). Fully DEPLOYED - no pending restart.
+- **The "spoke to Lex / listening but nothing happened" bug is FIXED.**
+  Root cause proven in the live log: the old heavy top layer returned
+  `speech=null` and the turn was DROPPED (`top-layer turn speech=null
+  forward=null control=none`). Phase 2 fixes it two ways: R1 haiku top
+  (fast, warms in seconds not 33s) and R4 fail-safe (a null top turn
+  now FORWARDS the utterance to Lex instead of dropping).
+- **Layer config (live):** L1 top = haiku headless. L2 mid = opus,
+  `--permission-mode bypassPermissions` (NOT plan - headless plan mode
+  STALLS on the plan-approval prompt; see FUTURE-FEATURES "L2
+  mechanical confirm-gate"). L3 worker = `claude --model opus
+  --dangerously-skip-permissions`. LIVE opus<->fable switch, no
+  rebuild: `POST /runtime-config/{mid_model,worker_model,
+  mid_permission_mode} {"value":...}` - read per-spawn
+  (`src/lex/layer-model.ts`, whitelisted = injection-safe). "ultracode"
+  is NOT wired: not a claude flag (zero repo hits), it's a VS Code
+  terminal setting the operator manages.
+- **L2-confirms-before-worker:** Lex's core prompt now requires it to
+  state the plan + get the operator's go-ahead before `POST
+  /lex/inject-cross-session`. Prompt-enforced; mechanical gate deferred
+  to FUTURE-FEATURES.
+- **Operator verification:** (1) reload the PWA (SW auto-updates) for
+  the client changes - three-way transcript, warming pill, /lex worker
+  mirror, touch scrollbars, home Start-Claude button; (2) reopen the
+  brainstorm to get the confirm-first Lex + haiku top; (3) talk - voice
+  should respond. Confirm-before-dispatch + new models take effect on
+  the NEXT mid/worker spawn.
+- **Pre-existing reds (NOT this session):** full daemon suite = 2 fails
+  = grooming-routes (FIXES.md SM-7 baseline) + one identity-file
+  test-isolation flake (passes isolated). Dashboard = 2 playwright e2e
+  spec files vitest can't collect (run via `npm run e2e`).
 
 ## Tonight's work (newest first)
+
+- **Voice Phase 2 + layer config + dashboard fixes (2026-07-18, 7
+  commits 4fa678d..3b8ef37, DEPLOYED via 2 daemon bounces):**
+  - `926ecd1` Phase 2 "top layer always-live + fast" (VOICE-TOP-LAYER-
+    SPEC.md Phase 2): TOP session now spawns `--model haiku --tools ""
+    --strict-mcp-config` (was NO --model = booted account default,
+    ~33s; the root cause of dropped first turns). Client stays
+    "connecting" until the top brain is warm then goes live (daemon
+    `voice-brain {ready}` frame, fail-open cap, no-op when disabled).
+    mid-turn-no-tts hold queue retired (`_shouldDeferForwardToMidTurn
+    Boundary` always false) - operator forward routes to mid LIVE (CC
+    composer buffers it); the null-top-turn fail-safe (forward the
+    utterance) is locked; top stays context-thin (uses pty-host.spawnLex
+    directly, never the cold-start path). "askVoice queue" read as the
+    operator-holding paths, NOT the single-PTY IO serialization (kept).
+  - `6fe6939` Three-way transcript: the /lex transcript labels turns by
+    layer - you (operator) -> lex (voice, the top hop `to Lex: ...`) ->
+    lex (deep, the mid reply). daemon tags `transcript`/`assistant-text`
+    with `layer` + emits a `layer-hop` frame; client renders it. Plus
+    client deploy-order fail-open (new client no longer strands on
+    "connecting" against an old daemon that never sends voice-brain).
+  - `e1ff047` Honest status: pill says "warming" while the backend
+    boots, "ready" only when ready to WORK (was "ready" the instant the
+    WS bound).
+  - `a86c54c` /lex worker terminal mirror (read from the tracked
+    supervises binding, no anchor-logic change) + 14px touch-grabbable
+    scrollbars on the terminal viewports and the page (AppShell main).
+  - `4bb1608` Per-layer model + permission modes with a LIVE opus<->
+    fable switch via runtime_config (`src/lex/layer-model.ts`, 10 test
+    pins incl. command-injection guard). See Cursor for the config.
+  - `3b8ef37` L2 confirms alignment before dispatching to the worker
+    (prompt-enforced in Lex's contract).
+  - `4fa678d` Restored the Start-Claude button on home ProjectsGrid
+    tiles (voice-wave cc26d96 had made them read-only); wired to the
+    existing startClaude path, rendering-only.
 
 - **Voice engine replacement wave (VE-0..VE-5, 14eaded..4dfe56b, per
   VOICE-TOP-LAYER-SPEC.md):** full replacement, not patches, 100+ new

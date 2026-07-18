@@ -2,9 +2,15 @@
 
 Forward-looking scope. Index of what's planned but not built (or only partly built). Each entry links to its spec doc when one exists, plus a one-line "why" so future-us knows whether the motivation still holds.
 
-Last updated: 2026-05-13.
+Last updated: 2026-07-18.
 
 ## Near term (next milestone)
+
+### L2 mechanical confirm-gate before worker dispatch
+- Today (`3b8ef37`, 2026-07-18) the "Lex (L2) confirms alignment with the operator before it prompts the worker (L3)" rule is PROMPT-enforced in the core Lex prompt (`system-prompt.ts` worker-inject section): state the plan out loud, get the go-ahead, only then `POST /lex/inject-cross-session`. Reliable (rides the existing voice conversation) but not mechanically guaranteed.
+- Future: gate `/lex/inject-cross-session` itself on an operator voice-confirm. When Lex calls it, the daemon HOLDS the dispatch, speaks the plan/intent to the operator through Layer 1, waits for a voice yes/no, then releases (dispatch) or rejects (tell Lex to revise). Bulletproof: Lex literally cannot prompt the worker until the operator agrees. Mirrors the existing loose-ends gate pattern (`enforceLooseEndsGate` on `/projects/:id/start-claude`, returns 409 + report for a banner).
+- Related: route the CC-native plan-approval prompt to Layer 1 so `--permission-mode plan` works headless on the mid. Blocker: the daemon only has a time-based boot-banner prompt hold (`isAwaitingSystemPrompt`), no ExitPlanMode/plan-approval detector; needs a real detector on the mid PTY output plus an approval inject. Until then `mid_permission_mode` defaults to `bypassPermissions` (headless `plan` mode stalls on the unanswered approval); flip live with `POST /runtime-config/mid_permission_mode {"value":"plan"}` once the routing exists.
+- Why: mechanical enforcement guarantees the layer contract even if the model drifts from the prompt, and it makes true CC plan mode viable for the supervisor layer.
 
 ### Event-driven supervision
 - Spec: `docs/spec/EVENT-DRIVEN-SUPERVISION.md`
