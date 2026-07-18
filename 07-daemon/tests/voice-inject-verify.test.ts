@@ -169,6 +169,68 @@ describe('_verifyInjectDeliveryImpl', () => {
   });
 });
 
+/* ── SECONDARY (2026-07-18 VOICE-TOP-LAYER-SMARTS-SPEC): signal-based
+ * false-stuck fix. When the deep PTY is busy mid-long-turn, the
+ * injected prompt waits in the composer and cannot submit until the
+ * turn ends. The fixed ~16s window used to false-fire the stuck banner
+ * AND fire CR retries into a busy composer. Now: an assistant record
+ * appearing in the bound jsonl this interval means the deep layer is
+ * ACTIVELY producing (the prompt is queued, not stuck) - pause the
+ * stuck clock, fire no CR. The timeout bounds TRUE SILENCE only; an
+ * assistant-less silent stretch still recovers/fails exactly as before.
+ * Mirrors the SM-15/17 signal-based liveness fix. */
+describe('_verifyInjectDeliveryImpl signal-based busy-turn (SECONDARY)', () => {
+  it('a busy deep turn (assistant records streaming) fires NO CR retry and confirms when the prompt finally submits', async () => {
+    const rig = makeRig({
+      onTick: (t) => {
+        if (t <= 5) {
+          rig.file.content += assistantRecordLine(
+            `deep turn still producing chunk ${t}`,
+          );
+        } else if (t === 6) {
+          rig.file.content += userRecordLine(
+            '[voice mode] the operator words ride here after the long turn',
+          );
+        }
+      },
+    });
+    const result = await _verifyInjectDeliveryImpl(rig.deps);
+    expect(result).toBe('confirmed');
+    /* No stray CR/Enter injected into the busy composer, no banner. */
+    expect(rig.retries).toEqual([]);
+    expect(rig.failures).toBe(0);
+  });
+
+  it('a long busy turn that never submits stops without a stuck banner (pending, no failure)', async () => {
+    const rig = makeRig({
+      onTick: () => {
+        rig.file.content += assistantRecordLine('deep turn producing forever');
+      },
+    });
+    rig.deps.maxWaitMs = 50; // interval 10 -> ~5 iterations then the wall
+    const result = await _verifyInjectDeliveryImpl(rig.deps);
+    expect(result).toBe('pending');
+    expect(rig.retries).toEqual([]);
+    expect(rig.failures).toBe(0);
+  });
+
+  it('a single stale assistant record does NOT permanently pause: silence after it still recovers via CR + fails', async () => {
+    const rig = makeRig({
+      onTick: (t) => {
+        if (t === 1) {
+          rig.file.content += assistantRecordLine('one chunk then silence');
+        }
+      },
+    });
+    const result = await _verifyInjectDeliveryImpl(rig.deps);
+    expect(result).toBe('failed');
+    /* The busy interval paused the clock once; the ensuing SILENCE
+     * still escalates the full CR ladder and fails. */
+    expect(rig.retries).toEqual([1, 2, 3]);
+    expect(rig.failures).toBe(1);
+  });
+});
+
 /* ── content integrity (2026-07-16 third wave: FRONT truncation) ─────
  *
  * Three live losses tonight, all on the voice->Lex paste path, all

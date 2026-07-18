@@ -1175,8 +1175,20 @@ export interface _VerifyInjectDeliveryDeps {
   log?: (msg: string) => void;
   /** Interval between checks. Default 4000ms. */
   intervalMs?: number;
-  /** CR retries before declaring failure. Default 3. */
+  /** CR retries before declaring failure. Default 3. Counts SILENT
+   * intervals only (SECONDARY 2026-07-18): an interval where the deep
+   * layer was actively producing output does not strike. */
   maxAttempts?: number;
+  /** Absolute wall (SECONDARY): when the deep layer keeps producing
+   * past this bound without the prompt ever submitting, stop verifying
+   * and return 'pending' WITHOUT a stuck banner. Default 300000ms. */
+  maxWaitMs?: number;
+  /** Optional external "deep PTY is actively producing" signal, OR'd
+   * with the intrinsic jsonl-assistant-activity signal. Left unset by
+   * the WS (jsonl growth suffices); a future pty-output-recency seam
+   * can wire it. Must NOT be a "we injected and are awaiting" flag - an
+   * IDLE stuck composer produces no output and must still recover. */
+  deepBusy?: () => boolean;
 }
 
 /* Single-line head/tail probes for a pasted payload. First and last
@@ -1211,17 +1223,28 @@ function userRecordText(rec: Record<string, unknown>): string | null {
 
 export async function _verifyInjectDeliveryImpl(
   deps: _VerifyInjectDeliveryDeps,
-): Promise<'confirmed' | 'failed' | 'no-jsonl'> {
+): Promise<'confirmed' | 'failed' | 'no-jsonl' | 'pending'> {
   const { jsonlPath, fingerprint } = deps;
   if (!jsonlPath || !fingerprint) return 'no-jsonl';
   const intervalMs = deps.intervalMs ?? 4_000;
   const maxAttempts = deps.maxAttempts ?? 3;
+  const maxWaitMs = deps.maxWaitMs ?? 300_000;
   const log = deps.log ?? logFn;
   let offset = deps.startOffset;
   let repasteUsed = false;
-  for (let attempt = 0; attempt <= maxAttempts; attempt++) {
+  /* SECONDARY (2026-07-18): count SILENT intervals only. An interval in
+   * which the deep layer produced output (an assistant record) does not
+   * strike and fires no CR - the injected prompt is queued behind an
+   * in-flight turn, not stuck. `iterations` bounds the wait against the
+   * absolute wall so a perpetually-busy turn eventually stops verifying
+   * (returns 'pending') instead of looping forever. */
+  let silentStrikes = 0;
+  let iterations = 0;
+  while (iterations * intervalMs < maxWaitMs) {
     await deps.sleep(intervalMs);
+    iterations++;
     let sawPartial = false;
+    let sawDeepActivity = false;
     const size = deps.statSize(jsonlPath);
     if (size !== null && size > offset) {
       const chunk = deps.readRange(jsonlPath, offset, size - offset);
@@ -1236,6 +1259,12 @@ export async function _verifyInjectDeliveryImpl(
           } catch {
             continue;
           }
+          /* Deep layer ACTIVELY producing (assistant record): the
+           * queued prompt is not stuck, so this interval is not silent.
+           * tool_result records are type 'user' and do not count on
+           * their own; a real mid-turn always interleaves assistant
+           * records, and an IDLE stuck composer produces none. */
+          if (rec.type === 'assistant') sawDeepActivity = true;
           const text = userRecordText(rec);
           if (text === null || text === '') continue;
           /* Delivery contract (2026-07-17 00:50Z duplicate-turn fix):
@@ -1263,9 +1292,9 @@ export async function _verifyInjectDeliveryImpl(
               log(
                 '[voice-ws] inject delivery confirmed INTACT after repaste (partial landing repaired)',
               );
-            } else if (attempt > 0) {
+            } else if (silentStrikes > 0) {
               log(
-                `[voice-ws] inject delivery confirmed after ${attempt} CR retr${attempt === 1 ? 'y' : 'ies'}`,
+                `[voice-ws] inject delivery confirmed after ${silentStrikes} CR retr${silentStrikes === 1 ? 'y' : 'ies'}`,
               );
             }
             return 'confirmed';
@@ -1286,15 +1315,37 @@ export async function _verifyInjectDeliveryImpl(
       deps.repaste();
       continue;
     }
-    if (attempt < maxAttempts) {
+    /* SECONDARY signal-based liveness: if the deep layer produced output
+     * this interval (or an external busy signal is set), the prompt is
+     * queued behind an in-flight turn, not stuck. Pause the stuck clock
+     * and fire NO CR into a busy composer; the timeout bounds true
+     * SILENCE only. */
+    const deepBusy = sawDeepActivity || (deps.deepBusy?.() ?? false);
+    if (deepBusy) {
       log(
-        `[voice-ws] inject delivery unconfirmed ${Math.round(((attempt + 1) * intervalMs) / 1000)}s after commit; firing CR retry ${attempt + 1}/${maxAttempts}`,
+        '[voice-ws] inject delivery pending: deep layer actively producing (prompt queued behind an in-flight turn), not retrying',
       );
-      deps.retryCr(attempt + 1);
+      continue;
+    }
+    /* True silence: escalate the CR ladder, then fail once exhausted. */
+    silentStrikes++;
+    if (silentStrikes <= maxAttempts) {
+      log(
+        `[voice-ws] inject delivery unconfirmed after ${silentStrikes} silent interval(s); firing CR retry ${silentStrikes}/${maxAttempts}`,
+      );
+      deps.retryCr(silentStrikes);
+    } else {
+      deps.onFailure();
+      return 'failed';
     }
   }
-  deps.onFailure();
-  return 'failed';
+  /* Absolute wall: the deep layer never stopped producing and the
+   * prompt never submitted. Stop verifying WITHOUT a stuck banner - the
+   * prompt is still legitimately queued, not lost. */
+  log(
+    `[voice-ws] inject delivery verification stopped after ${Math.round(maxWaitMs / 1000)}s while the deep layer kept producing; prompt still queued (no stuck banner)`,
+  );
+  return 'pending';
 }
 
 /* Single meaningful words that must reach Lex despite the wordCount<2
