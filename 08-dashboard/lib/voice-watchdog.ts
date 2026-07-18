@@ -85,7 +85,7 @@ export function runWatchdogChecks(
   return results;
 }
 
-export type VoiceHealthStatus = "fail" | "healed" | "heal_failed";
+export type VoiceHealthStatus = "fail" | "healed" | "heal_failed" | "probe";
 
 export interface VoiceHealthEvent {
   ts_ms: number;

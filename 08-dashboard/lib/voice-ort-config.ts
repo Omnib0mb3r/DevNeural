@@ -77,8 +77,22 @@ export function configureVadOrt(mod: unknown): string[] {
   const wasm = m?.ort?.env?.wasm;
   if (!wasm) return [];
   const written: string[] = [];
+  /* 2026-07-18 silent-mic investigation: cache-busted EXPLICIT file
+   * map instead of the bare '/vad/' base path. The PWA hard reset
+   * clears CacheStorage and the service worker but NOT the browser
+   * HTTP disk cache; a truncated ort-wasm download (13MB file,
+   * multi-second fetches under load, operator reloading mid-fetch)
+   * leaves a poisoned disk-cache entry that later 304s keep alive,
+   * and WebAssembly.instantiate on the short buffer throws the
+   * "no available backend found ... RangeError" cascade seen live
+   * 14:27-14:34Z. The ?v= query forces a full re-fetch of fresh
+   * bytes; bump the version if the ORT assets are ever replaced. */
+  const wasmPathMap = {
+    mjs: `${VAD_WASM_PATHS}ort-wasm-simd-threaded.mjs?v=st1`,
+    wasm: `${VAD_WASM_PATHS}ort-wasm-simd-threaded.wasm?v=st1`,
+  };
   const tries: Array<[string, unknown]> = [
-    ['wasmPaths', VAD_WASM_PATHS],
+    ['wasmPaths', wasmPathMap],
     ['numThreads', VAD_NUM_THREADS],
     ['simd', VAD_SIMD],
     ['proxy', VAD_PROXY],

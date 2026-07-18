@@ -2541,6 +2541,32 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         }
       }
 
+      /* Capture-chain probe (2026-07-18 silent-mic investigation).
+       * Live A/B against the pre-wave client proved the daemon side
+       * is healthy; the regression is in this client's capture
+       * chain. Fields, reported via voice_health "cp:" rows:
+       *   w  = AudioWorklet tap frames (raw mic alive)
+       *   v  = vad-web onFrameProcessed frames (silero fed)
+       *   m  = max isSpeech probability (silero hears speech)
+       *   la = average isSpeech over the trailing ~20 frames
+       *        (what silero hears during SILENCE; if this floats
+       *        above the 0.4 negative threshold the utterance can
+       *        never close no matter the redemption window)
+       *   ss/se = onSpeechStart / onSpeechEnd fire counts
+       *   mu = hard-mute flag, rd = live redemption ms
+       * Diagnostic only; remove once the capture regression is
+       * fixed and verified. */
+      const captureProbe = {
+        workletFrames: 0,
+        vadFrames: 0,
+        maxProb: 0,
+        recentProbs: [] as number[],
+        speechStarts: 0,
+        speechEnds: 0,
+        ticks: 0,
+        timer: null as ReturnType<typeof setInterval> | null,
+      };
+
       async function initParallelCapture(): Promise<void> {
         /* Open a dedicated mic stream and run a 16 kHz int16 frame
          * collector in parallel with silero VAD. We only ship from
@@ -2618,6 +2644,9 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           const proc = new AudioWorkletNode(ctx, "vad-tap");
           captureProcRef.current = proc;
           proc.port.onmessage = (ev: MessageEvent<Float32Array>) => {
+            /* Probe count BEFORE any gating so it reflects the raw
+             * worklet cadence, not the capture-armed windows. */
+            captureProbe.workletFrames += 1;
             if (!captureCapturingRef.current) return;
             /* Drop frames while the TTS gate is active. tts-start
              * already disarmed captureCapturingRef but a buffer
@@ -2720,19 +2749,21 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
            * applied to triggering) when the shared rig failed to come
            * up, matching this function's existing "VAD path keeps
            * working" resilience when initParallelCapture fails. */
-          const sharedVadStream = micVadStreamRef.current;
-          const vadStreamOverrides = sharedVadStream
-            ? {
-                getStream: async () => sharedVadStream,
-                pauseStream: async () => {
-                  /* No-op: do not stop the shared stream's tracks.
-                   * Its lifecycle is owned by teardown()/
-                   * captureCtxRef, not by this VAD instance's own
-                   * pause/resume cycling. */
-                },
-                resumeStream: async () => sharedVadStream,
-              }
-            : {};
+          /* 2026-07-18 silent-mic FIX: the R3 synthetic-stream
+           * injection is disabled. With the synthetic GainNode ->
+           * MediaStreamAudioDestinationNode feed the live capture
+           * probe showed silero OPENING speech (ss>0) but NEVER
+           * closing it (se=0 across every session) - the utterance
+           * never finalized and no audio ever shipped. The A/B run
+           * of the pre-wave client (MicVAD opens its own raw
+           * getUserMedia grant) against the current daemon worked
+           * immediately in this same browser/room, which also
+           * proves the own-grant + ORT init path is healthy in
+           * this environment. Restore that acquisition path. Cost:
+           * the mic-gain slider no longer shapes VAD triggering
+           * (it still shapes the transcribed bytes via the
+           * parallel-capture rig), matching pre-wave behavior. */
+          const vadStreamOverrides = {};
 
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const vad: any = await (mod as any).MicVAD.new({
@@ -2740,6 +2771,9 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             onnxWASMBasePath: "/vad/",
             ...vadStreamOverrides,
             onSpeechStart: () => {
+              /* Probe count BEFORE the mute gate so the snapshot
+               * shows whether vad-web fired the callback at all. */
+              captureProbe.speechStarts += 1;
               if (mutedRef.current) return;
               /* No more micGated early-return here. Path 1 of the
                * voice-cmd-blocked-during-TTS audit: VAD stays live
@@ -2827,6 +2861,8 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
               }, MAX_UTTERANCE_MS);
             },
             onSpeechEnd: (audio: Float32Array) => {
+              /* Probe count BEFORE the mute gate (see onSpeechStart). */
+              captureProbe.speechEnds += 1;
               /* Disarm parallel capture; VAD's audio is the source
                * of truth on the normal end-of-utterance path. */
               captureCapturingRef.current = false;
@@ -2853,18 +2889,56 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
               isSpeech: number;
               notSpeech: number;
             }) => {
+              /* Probe counts BEFORE the listener-open gate so they
+               * reflect whether silero receives frames at all and
+               * what it hears during silence. */
+              captureProbe.vadFrames += 1;
+              if (probs.isSpeech > captureProbe.maxProb) {
+                captureProbe.maxProb = probs.isSpeech;
+              }
+              captureProbe.recentProbs.push(probs.isSpeech);
+              if (captureProbe.recentProbs.length > 20) {
+                captureProbe.recentProbs.shift();
+              }
               if (!vadListenerOpenRef.current) return;
+              /* 2026-07-18 silent-mic FIX (the actual regression):
+               * this recovery used the fixed 1500ms window, and the
+               * rolling average crosses below the 0.4 floor after
+               * only ~915ms of real end-of-utterance silence, while
+               * the FrameProcessor's redemption close needs
+               * redemptionMs (1400ms = 14 legacy frames = 1344ms).
+               * The recovery therefore ALWAYS fired first, and
+               * vad.pause() with vad-web's default
+               * submitUserSpeechOnPause:false runs reset(): the
+               * buffered utterance audio is DISCARDED and SpeechEnd
+               * never fires. Live signature: voice_health cp: rows
+               * with ss>0, se=0, la=0.02 forever; the operator saw
+               * "listening" that never became "transcribing". The
+               * pre-wave client had no such recovery, which is why
+               * the A/B of the old bundle worked. Fix: derive the
+               * evaluation window from the LIVE redemption setting
+               * plus a wide margin so legitimate silence always
+               * closes through redemption first; the recovery only
+               * catches a listener that redemption failed to close
+               * (its original purpose: the stuck-open bug). */
               const now = Date.now();
+              const recoveryWindowMs = Math.max(
+                VAD_PROB_WINDOW_MS,
+                vadRedemptionRef.current + 1500,
+              );
               const w = probWindowRef.current;
               w.push({ t: now, p: probs.isSpeech });
-              while (w.length > 0 && now - w[0]!.t > VAD_PROB_WINDOW_MS) {
+              while (w.length > 0 && now - w[0]!.t > recoveryWindowMs) {
                 w.shift();
               }
-              /* Require a full window before evaluating so the first
-               * 1.5s of an utterance can't trip the floor before
-               * we've actually heard the speaker. */
+              /* Require a full window before evaluating so the
+               * opening stretch of an utterance can't trip the
+               * floor before we've actually heard the speaker. */
               if (w.length === 0) return;
-              if (now - w[0]!.t < VAD_PROB_WINDOW_MS - VAD_PROB_WINDOW_SLOP_MS) {
+              if (
+                now - w[0]!.t <
+                recoveryWindowMs - VAD_PROB_WINDOW_SLOP_MS
+              ) {
                 return;
               }
               let sum = 0;
@@ -2925,6 +2999,40 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           vadInstance = vad;
           vadRef.current = vad;
           vad.start();
+          /* Arm the capture-probe reporter: 6 snapshots, 5s apart,
+           * shipped to the daemon voice_health table. See the
+           * captureProbe declaration above for field meanings. */
+          captureProbe.timer = setInterval(() => {
+            captureProbe.ticks += 1;
+            if (captureProbe.ticks > 6 || cancelled) {
+              if (captureProbe.timer) clearInterval(captureProbe.timer);
+              captureProbe.timer = null;
+              return;
+            }
+            const rp = captureProbe.recentProbs;
+            const la =
+              rp.length > 0
+                ? rp.reduce((a, b) => a + b, 0) / rp.length
+                : 0;
+            const kind =
+              `cp:w=${captureProbe.workletFrames}` +
+              `,v=${captureProbe.vadFrames}` +
+              `,m=${captureProbe.maxProb.toFixed(2)}` +
+              `,la=${la.toFixed(2)}` +
+              `,ss=${captureProbe.speechStarts}` +
+              `,se=${captureProbe.speechEnds}` +
+              `,mu=${mutedRef.current ? 1 : 0}` +
+              `,rd=${vadRedemptionRef.current}`;
+            void postVoiceHealth([
+              {
+                ts_ms: Date.now(),
+                check_kind: kind.slice(0, 64),
+                status: "probe",
+                heal_attempt: Math.min(9, captureProbe.ticks),
+                recovered: 0,
+              },
+            ]);
+          }, 5_000);
         } catch (err) {
           /* Fix 2026-05-25: mic-init OOM recurrence on mobile Safari.
            * Clear the cached vadModulePromise + vadModuleConfigured
@@ -2942,6 +3050,21 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             undefined,
             "error",
           );
+          /* Silent-mic investigation (2026-07-18): mirror the mic
+           * init failure to the daemon voice_health table so the
+           * exact error name+message is readable server-side
+           * without DevTools on the affected device. */
+          void postVoiceHealth([
+            {
+              ts_ms: Date.now(),
+              check_kind: `vad-err:${(err as Error).name}:${
+                (err as Error).message
+              }`.slice(0, 64),
+              status: "probe",
+              heal_attempt: 0,
+              recovered: 0,
+            },
+          ]);
           setStatus("error");
           setErrMsg(`mic init failed: ${(err as Error).message}`);
         }
@@ -3047,6 +3170,21 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             undefined,
             "error",
           );
+          /* Silent-mic investigation (2026-07-18): mirror the mic
+           * init failure to the daemon voice_health table so the
+           * exact error name+message is readable server-side
+           * without DevTools on the affected device. */
+          void postVoiceHealth([
+            {
+              ts_ms: Date.now(),
+              check_kind: `vad-err:${(err as Error).name}:${
+                (err as Error).message
+              }`.slice(0, 64),
+              status: "probe",
+              heal_attempt: 0,
+              recovered: 0,
+            },
+          ]);
           setStatus("error");
           setErrMsg(`mic init failed: ${(err as Error).message}`);
         }
