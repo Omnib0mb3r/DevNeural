@@ -130,7 +130,7 @@ Restart the daemon so it picks up the new env vars. Upload a small
 mp3 to the dashboard:
 
 ```powershell
-curl.exe -X POST -F "file=@C:\path\to\sample.mp3" http://localhost:7474/upload
+curl.exe -X POST -F "file=@C:\path\to\sample.mp3" http://localhost:3747/upload
 ```
 
 Watch the daemon log for a line like:

@@ -2,7 +2,7 @@
 
 > How DevNeural fits alongside the existing Claude setup recorded at https://github.com/Omnib0mb3r/Claude-Setup, plus other plugins (superpowers, GSD, deep-implement, deep-plan, etc.) without nuking them.
 >
-> **Personalized contents are completed in Phase 5 (settings audit).** This file holds the structure and the coexistence rules. Once Phase 5 runs and inspects the actual `~/.claude/settings.json` and `~/.claude/CLAUDE.md` content on `OTLCDEV`, the placeholders below are filled with the concrete inventory.
+> This file holds the coexistence rules plus the concrete inventory of the actual `~/.claude/settings.json` and `~/.claude/CLAUDE.md` content on `OTLCDEV`, captured by the Phase 5 settings audit.
 
 ---
 
@@ -10,7 +10,7 @@
 
 `Claude-Setup` is the canonical record of how the user's Claude Code installation is configured: hooks, MCPs, statusline, plugins, global `CLAUDE.md`. It is the recovery source if `~/.claude/` is wiped.
 
-`DevNeural` is one *contributor* to that configuration. It adds 4 hook entries to `~/.claude/settings.json` and reads (but never writes) several other things in `~/.claude/`.
+`DevNeural` is one *contributor* to that configuration. It adds 6 hook entries to `~/.claude/settings.json` and reads (but never writes) several other things in `~/.claude/`.
 
 The rule: **DevNeural never assumes ownership of any file it didn't create.** Anything in `~/.claude/` that pre-exists is treated as "user-owned, do not modify."
 
@@ -29,6 +29,7 @@ Of all the things in `~/.claude/`, only `settings.json` is modified by DevNeural
 | `UserPromptSubmit` | (none) | `prompt` | Captures prompt + posts to `/curate` for injection |
 | `Stop` | (none) | `stop` | Marks session_stop, clears any pending permission prompt |
 | `Notification` | (none) | `notification` | Captures CC's permission/elicitation message; posts to `/sessions/:id/pending-prompt` so the dashboard surfaces it with answer buttons |
+| `SessionStart` | (none) | `session_start` | Marks the prior session in this workspace as superseded on `/clear` |
 
 Each entry is materialized by `install-hooks.ts` as a wscript-wrapped invocation of `silent-runner.vbs <phase>`, which in turn launches `node "07-daemon/dist/capture/hooks/hook-runner.js" <phase>`. The whole thing is then re-wrapped by `silence-all-hooks.ps1` in `silent-shim.exe` so the hook runs invisibly (no console flash) on Windows.
 
@@ -44,7 +45,7 @@ Each entry is materialized by `install-hooks.ts` as a wscript-wrapped invocation
 
 1. Back up `~/.claude/settings.json` to `~/.claude/settings.json.devneural.bak`.
 2. Strip any existing DevNeural v1 or v2 entries from the `hooks` block.
-3. Add the four v2 entries above.
+3. Add the six v2 entries above.
 4. Write the file. All non-DevNeural entries (other hooks, plugin entries, MCP servers, model preferences, statusline, etc.) are preserved exactly.
 
 ---
@@ -203,7 +204,7 @@ Re-running `cd 07-daemon && npm run install-hooks` will **not** dedupe non-DevNe
 
 ### Migration note: v1 → v2
 
-This snapshot shows DevNeural **v1** hooks (`01-data-layer/...`, `04-session-intelligence/...`). The v2 install-hooks installer (`07-daemon/dist/capture/hooks/install-hooks.js`) is designed to detect both v1 paths and replace them with the four v2 entries that route through `07-daemon/dist/capture/hooks/hook-runner.js`. Run it once to migrate:
+This snapshot shows DevNeural **v1** hooks (`01-data-layer/...`, `04-session-intelligence/...`). The v2 install-hooks installer (`07-daemon/dist/capture/hooks/install-hooks.js`) is designed to detect both v1 paths and replace them with the six v2 entries that route through `07-daemon/dist/capture/hooks/hook-runner.js`. Run it once to migrate:
 
 ```powershell
 cd C:\dev\Projects\DevNeural\07-daemon
@@ -274,7 +275,7 @@ Push the redacted version of items 1–4 into `Claude-Setup` after each material
 | MCP server registrations (other than DevNeural's) | DevNeural's own MCP registration if/when added |
 | Statusline config | (none) |
 | Theme / model preferences | (none) |
-| The reference copy of `settings.json` (your canonical version) | The four hook entries DevNeural adds at install time |
+| The reference copy of `settings.json` (your canonical version) | The six hook entries DevNeural adds at install time |
 
 Treat them as independent: Claude-Setup is your machine's nervous system config, DevNeural is one organ that hooks into it.
 
@@ -295,7 +296,7 @@ If `OTLCDEV` is wiped and you need to rebuild from scratch:
 4. **Pull the ollama model** (`ollama pull qwen3:8b`).
 5. **Clone DevNeural** to `C:/dev/Projects/DevNeural/`.
 6. **Run setup**: `cd 07-daemon && npm install && npm run setup`.
-7. The setup will detect existing hooks (from step 3), not nuke them, and add DevNeural's five entries (Pre/Post/Prompt/Stop/Notification). Then run `npm run silence-hooks` to wrap every hook in `silent-shim.exe`.
+7. The setup will detect existing hooks (from step 3), not nuke them, and add DevNeural's six entries (Pre/Post/Prompt/Stop/Notification/SessionStart). Then run `npm run silence-hooks` to wrap every hook in `silent-shim.exe`.
 8. **Optionally restore your wiki** from a backup (see `06-recovery-and-reconstruction.md`).
 9. **Run npm run status** to verify.
 

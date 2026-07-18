@@ -13,7 +13,11 @@ guarantees a given reply is synthesized at most once even when several
 dashboard tabs or watchers are open. You should never hear Lex
 double-talk; if you do, that is a bug worth reporting, not a setting.
 
-## The two layers
+## The three layers
+
+The stack is three layers: TOP, the quick voice you talk to, hands
+off to MID, Lex the thinker, which in turn drives BOTTOM, the
+workers that do the actual code work.
 
 - **Quick layer (top layer).** A fast conversational model that hears
   every utterance first. Small talk, status questions, and device

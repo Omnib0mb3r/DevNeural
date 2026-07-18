@@ -1,8 +1,0 @@
-{
-  "vault_path": "/absolute/path/to/your/obsidian/vault",
-  "notes_subfolder": "DevNeural/Projects",
-  "data_root": "/absolute/path/to/devneural/data",
-  "api_base_url": "http://localhost:3747",
-  "prepend_sessions": true,
-  "claude_model": "claude-haiku-4-5-20251001"
-}

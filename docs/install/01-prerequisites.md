@@ -89,7 +89,7 @@ If not, open VS Code, press `Ctrl+Shift+P`, run "Shell Command: Install 'code' c
 
 ### Claude Code
 
-**Why:** DevNeural attaches to Claude Code via hooks (PreToolUse, PostToolUse, UserPromptSubmit, Stop) and reads session transcripts written under `~/.claude/projects/<slug>/`.
+**Why:** DevNeural attaches to Claude Code via hooks (PreToolUse, PostToolUse, UserPromptSubmit, Stop, Notification, SessionStart) and reads session transcripts written under `~/.claude/projects/<slug>/`.
 
 **Install:**
 - Follow https://docs.claude.com/en/docs/claude-code/getting-started

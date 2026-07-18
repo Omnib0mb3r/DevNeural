@@ -30,7 +30,7 @@ A tiny Node script listens on a different port (e.g. 3748) for `POST /heartbeat`
 
 **Why a separate process:** not implicated in a daemon hang.
 
-Install steps (placeholder; the watcher repo lands in `07-daemon/heartbeat-watcher/` in a follow-up commit):
+Install steps (the watcher already exists at `07-daemon/heartbeat-watcher/`: `src/watcher.js`, `package.json`, `README.md`):
 
 ```powershell
 cd 07-daemon\heartbeat-watcher

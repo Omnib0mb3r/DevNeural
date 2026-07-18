@@ -12,7 +12,7 @@
 
 Implementation:
 - `08-dashboard/components/VoiceClient.tsx`
-  (`SPEED_STORAGE_KEY = "devneural.voice.length_scale"`).
+  (`SPEED_STORAGE_KEY = "lex-tts-speed"`).
 - Server-side persistence: `voice-preferences.json` under the data
   root.
 
@@ -30,11 +30,11 @@ Implementation:
 
 | Setting | Storage key | Server file |
 |---|---|---|
-| TTS length_scale | `devneural.voice.length_scale` | `voice-preferences.json` |
-| Mic gain | `devneural.voice.mic_gain` | `voice-preferences.json` |
-| Barge cooldown | `devneural.voice.barge_cooldown_ms` | `voice-preferences.json` |
-| VAD sensitivity | `devneural.voice.vad_sensitivity` | `voice-preferences.json` |
-| VAD redemption | `devneural.voice.vad_redemption_ms` | `voice-preferences.json` |
+| TTS length_scale / speed | `lex-tts-speed` | `voice-preferences.json` |
+| Mic gain | `lex-mic-gain` | `voice-preferences.json` |
+| Barge cooldown | `lex-barge-cooldown-ms` | `voice-preferences.json` |
+| VAD sensitivity | `lex-vad-sensitivity` | `voice-preferences.json` |
+| VAD redemption | `lex-vad-redemption-ms` | `voice-preferences.json` |
 
 All of them follow the same shape: bounded constants
 (`<NAME>_MIN`, `<NAME>_MAX`, `<NAME>_DEFAULT`), localStorage
@@ -51,7 +51,7 @@ This is a feature, not a bug.
 
 - `08-dashboard/app/lex/page.tsx` "Talk to Lex" textarea →
   `ptyInject(target, text, true)` (`lib/daemon-client.ts`).
-- Voice path: utterance frames → WS `/lex/voice` → daemon whisper
+- Voice path: utterance frames → WS `/voice/lex-ws` → daemon whisper
   → daemon inject → `assistant-text` event → Piper TTS frames
   back over the same WS.
 
@@ -167,7 +167,7 @@ key change.
 3. **Verify on the daemon**:
    - `<dataRoot>/dashboard/push-subscriptions.jsonl` gained one
      row with the device's endpoint.
-   - `GET /push/subscriptions` (auth-gated) lists the new row.
+   - `GET /push/subscriptions` lists the new row.
 4. **Fire a test reminder** that is already due:
    ```
    POST /reminders

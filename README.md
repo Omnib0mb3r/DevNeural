@@ -34,7 +34,7 @@ A second brain has six properties. DevNeural has all six.
 | 3.1 | Daemon API extensions (auth, system metrics, services, sessions, search/all, reminders, notifications, projects/new, dashboard health) | done, shipped |
 | 3.2 | Reference corpus pipeline (PDF, image, markdown, DOCX upload + extract + chunk + embed) | done, shipped |
 | 3.3 | Session bridge VS Code extension | done, shipped |
-| 3.4 | Dashboard frontend (Next.js 15 + Tailwind v4 + Tanstack Query, PIN auth, all panels real, mobile responsive, PWA) | done, shipped |
+| 3.4 | Dashboard frontend (Next.js 15 + Tailwind v4 + Tanstack Query, no PIN gate; trust boundary is the host + Tailscale, only /auth/cross-session-token remains, all panels real, mobile responsive, PWA) | done, shipped |
 | 3.5 | Audio + video processing (whisper.cpp + ffmpeg wrappers) | done, shipped (whisper.cpp + ffmpeg binaries installed on OTLCDEV; setup instructions for fresh hosts below) |
 | 3.6 | Stream Deck + session detail polish | done in 3.4.2 |
 | 3.7 | Notifications + reminders + web push (VAPID) | done, shipped |
@@ -48,7 +48,7 @@ A second brain has six properties. DevNeural has all six.
 | 6 | Notification hook → dashboard permission UI (CC permission/elicitation prompts surface in /sessions with answer buttons) | done, shipped |
 | 7 | Lex supervisory voice loop: daemon-PTY hosts a personality-typed Claude Code session; whisper.cpp cuBLAS STT in, Piper TTS out, silero VAD with mute auto-finalize, three voice modes (conversation / notes / push-to-talk), browser voice picker, barge-in. First-class brainstorm_sessions records, source-classed retrieval (`/lex/recall`), fenced-JSON artifact extraction, supervisor primitives, conflict-overlap signal on retrieval. | **shipped**: Slice A (brainstorm_sessions schema + WS pipeline), Slice B (`/lex/recall` source-classed retrieval), Slice C (fenced-JSON artifact extraction for research-note / wiki-draft / project-intent / notes-summary), Slice D (system prompt mode contracts + synthesis directive), Slice E (`/lex/steer` + `/lex/capture` + `/lex/snapshot`), voice UX (mute auto-finalize, AudioContext warm, notes-summary artifact emit, barge-in cooldown), STT-config defence (whisper-bin validator + cuBLAS auto-correct). **Follow-on (Phase Two work track, separately scoped)**: cross-session supervision, awareness broadcaster, personality fine-tune, smart compact, six-section resume, dashboard supervisor. Tracked in `docs/spec/PHASE-TWO-IMPLEMENTATION.md` with wave-by-wave detail. |
 
-See [docs/SESSION-HANDOVER.md](docs/SESSION-HANDOVER.md) for what state the repo was in at the most recent session boundary. Active multi-session work is tracked under `docs/HANDOVER-*.md` plus the spec files under `docs/spec/`.
+See [docs/HANDOVER.md](docs/HANDOVER.md) for what state the repo was in at the most recent session boundary. Active multi-session work is tracked in `docs/HANDOVER.md` plus the spec files under `docs/spec/`.
 
 ---
 
@@ -80,7 +80,7 @@ npm run dedupe-hooks                                        # optional cleanup o
 # 3. Build the dashboard for production serve
 cd C:\dev\Projects\DevNeural\08-dashboard
 npm install --legacy-peer-deps
-$env:NODE_ENV='production'; npx next build                  # produces 08-dashboard/out/
+npm run build                                              # produces 08-dashboard/out/ (prebuild rimraf + next build + SW version stamp)
 
 # 4. Install the session bridge (lets the dashboard send prompts to running Claude terminals)
 cd C:\dev\Projects\DevNeural\09-bridge
@@ -98,12 +98,13 @@ npm run install-backup-task                                 # default: daily 03:
 
 # 6. Start the daemon
 npm run start                                               # listens on 0.0.0.0:3747, serves the dashboard at /
+npm run install-daemon-autostart                           # persist across reboot: Task Scheduler DevNeural-Daemon -> start-daemon.ps1 (npm run start alone does NOT survive a reboot)
 
 # 7. Optional: HTTPS via Tailscale Serve (required for service worker + push notifications + PWA install)
 tailscale serve --bg --https=443 http://localhost:3747      # phones hit https://otlcdev.tail-XXXXX.ts.net
 ```
 
-Then open `http://localhost:3747` in a browser, set a PIN on first launch, and you're in.
+Then open `http://localhost:3747` in a browser and you're in. There is no PIN gate; the trust boundary is the host plus your Tailscale tailnet.
 
 For Tailscale remote access from your phone, follow [docs/install/TAILSCALE.md](docs/install/TAILSCALE.md). The HTTPS step (7) is required for push and PWA install; plain HTTP works for everything else. For audio/video uploads, follow [docs/install/AUDIO-VIDEO.md](docs/install/AUDIO-VIDEO.md). For full-machine recovery, follow [docs/install/08-personalized-recovery.md](docs/install/08-personalized-recovery.md).
 
@@ -150,7 +151,7 @@ See [docs/spec/devneural-v2.md section 7](docs/spec/devneural-v2.md) for the ful
 
 ```
 Claude Code session(s)
-  ├─ hooks (Pre/Post/UserPromptSubmit/Stop) → hook-runner
+  ├─ hooks (Pre/Post/UserPromptSubmit/Stop/Notification/SessionStart) → hook-runner
   └─ transcripts → ~/.claude/projects/<slug>/<session>.jsonl
                         │
                         ▼
@@ -200,11 +201,10 @@ For the LLM's standing instructions on writing wiki pages, read [docs/spec/DEVNE
 | `07-daemon/scripts/` | `backup.ps1`, `restore.ps1`, `verify-backup.ps1`, `install-backup-task.ps1`, `dedupe-hooks.ps1`, `silence-all-hooks.ps1` (silent-shim wrap), `silent-shim/` (native invisible launcher), `repair-double-wrapped-hooks.ps1` + `reescape-hook-args.ps1` (one-shot migrations). |
 | `08-dashboard/` | Next.js 15 + Tailwind v4 + Tanstack Query. Statically exported; daemon serves the build. |
 | `09-bridge/` | VS Code extension that pastes queued prompts into terminals. Phase 3.3. |
-| `03-web-app/` | The orb (legacy v1 visual; superseded by `/orb` route in dashboard). |
 | `archive/v1/` | Archived v1 modules (01-data-layer, 02-api-server, 04-session-intelligence). |
 | `docs/spec/` | System architecture, schema, phase plans (3, 4, 5). |
 | `docs/install/` | Install (01–04), coexistence audit (05), recovery (06, 08), troubleshooting (07), Tailscale, audio/video. |
-| `docs/SESSION-HANDOVER.md` | Current state at most recent session boundary. |
+| `docs/HANDOVER.md` | Current state at most recent session boundary. |
 | `INSTALL.md` | Top-level install entry point. |
 | `SHIP-CHECKLIST.md` | Production-readiness gate before declaring a build deployable. |
 
@@ -216,6 +216,7 @@ For the LLM's standing instructions on writing wiki pages, read [docs/spec/DEVNE
 cd C:\dev\Projects\DevNeural\07-daemon
 
 npm run start                       # daemon on :3747 (serves dashboard)
+npm run install-daemon-autostart    # persist across reboot (Task Scheduler DevNeural-Daemon -> start-daemon.ps1); npm run start alone does not survive a reboot
 npm run status                      # health check across daemon, ollama, hooks, data root
 npm run install-hooks               # re-register hooks (idempotent, backs up settings)
 npm run dedupe-hooks                # remove duplicate hooks from other installers
@@ -254,7 +255,7 @@ Dashboard:
 ```powershell
 cd C:\dev\Projects\DevNeural\08-dashboard
 npm run dev                         # localhost:3000 with rewrite proxy to daemon for development
-$env:NODE_ENV='production'; npx next build       # static export to out/, daemon serves it
+npm run build                                    # static export to out/, daemon serves it (prebuild rimraf + next build + SW version stamp)
 ```
 
 ---

@@ -31,12 +31,12 @@ Toggle via runtime_config:
 
 ```bash
 # turn the dev server off (kills port 3000)
-curl -X POST http://localhost:3747/dashboard/config -H 'Content-Type: application/json' \
-  --data-binary '{"key":"dashboard_supervisor_enabled","value":"off"}'
+curl -X POST http://localhost:3747/runtime-config/dashboard_supervisor_enabled \
+  -H 'Content-Type: application/json' --data-binary '{"value":"off"}'
 
 # turn it back on
-curl -X POST http://localhost:3747/dashboard/config -H 'Content-Type: application/json' \
-  --data-binary '{"key":"dashboard_supervisor_enabled","value":"on"}'
+curl -X POST http://localhost:3747/runtime-config/dashboard_supervisor_enabled \
+  -H 'Content-Type: application/json' --data-binary '{"value":"on"}'
 ```
 
 Env override (boot-time only): `DEVNEURAL_DASHBOARD_SUPERVISOR=off`.

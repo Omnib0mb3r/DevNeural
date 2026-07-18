@@ -74,9 +74,11 @@ sections are dropped, never padded.
 
 ## Wake-word / voice command
 
-A spoken phrase starting with `lex` that triggers a state change
-(mute, unmute, standby, listen, disable, panic, end session). See
-the Voice commands section above for the full catalog.
+The only mechanical spoken keyword is `lex emergency stop`, the
+panic phrase that halts the live worker with no AI in the loop.
+There is no other command grammar: everything else you say is just
+talked to the voice layer and interpreted, not matched against a
+fixed keyword list.
 
 ## Reinforcement
 

@@ -277,8 +277,10 @@ inject target; if it returns null, the event is dropped with
 `PATCH /projects/:id` accepts `{supervision_mode: 'polling' | 'event'
 | 'off'}`. Dashboard wrapper:
 `patchProjectAnchor(anchorId, {supervision_mode})` in
-`08-dashboard/lib/daemon-client.ts`. The project tile menu UI for
-the toggle is still pending; HTTP + client are ready.
+`08-dashboard/lib/daemon-client.ts`. The project tile toggle UI is
+live: `SupervisionModeToggle` is mounted in each project tile
+(`08-dashboard/components/ProjectsGrid.tsx`) and drives
+`patchProjectAnchor` over the HTTP route above.
 
 ---
 
@@ -541,12 +543,14 @@ The supervisor surfaces four escalations through a
 - `double-fire` — supervisor tried to advance the same
   assistant turn uuid twice. The idempotency gate blocked it;
   alert exists so operators see the race.
-- `kill-switch` — operator-driven hard stop. Implemented in the
-  next phase.
+- `kill-switch` — operator-driven hard stop. Whether this is wired in the
+  current build is not asserted here; verify against the code.
 
-Phase 4 leaves the sink unwired in production (the daemon
-bootstrap does not pass `voiceAlert`); a future phase plugs it
-into `logVoice` + push notifications.
+Whether the `VoiceAlertSink` is actually wired in production (i.e.
+whether the daemon bootstrap passes `voiceAlert` through to
+`logVoice` + push notifications) is not asserted here; verify the
+current bootstrap wiring against the code before relying on these
+escalations reaching the operator.
 
 ### Symptom-first debug table
 

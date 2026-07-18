@@ -7,7 +7,7 @@
 ## What's already done on the daemon side
 
 - Daemon binds `0.0.0.0:3747`. Anything on the tailnet that can reach `OTLCDEV` can reach the daemon.
-- Auth is PIN + signed cookie. Tailscale is the network perimeter; the PIN is the per-person guard.
+- There is no PIN gate. The tailnet is the trust boundary: anything that can reach `OTLCDEV` on the tailnet reaches the dashboard. Only `/auth/cross-session-token` remains, and it issues short-lived tokens for cross-session inject, not a login.
 - Production builds of the dashboard are served by the daemon at the same port. There's no separate Next.js dev server in prod.
 
 You don't need to change any daemon config to enable remote access. The pieces below are about your tailnet.
@@ -103,7 +103,7 @@ Open the HTTPS URL in the browser (substitute your tailnet name from `tailscale 
 https://otlcdev.tail-XXXXX.ts.net
 ```
 
-First load redirects to `/set-pin` (if you haven't set one yet on this install) or `/unlock`. After unlock, the dashboard loads, the cookie is set on that origin, and subsequent loads on that device skip the unlock until the cookie expires (12 hours of inactivity).
+The dashboard loads directly. There is no `/set-pin` or `/unlock` step; the tailnet is the trust boundary, so any device already on the tailnet reaches the dashboard without a login.
 
 Plain HTTP (`http://otlcdev:3747`) still works on the tailnet for read/write but **does not** allow service worker registration or push subscription. Always use the HTTPS URL on phones and tablets.
 
@@ -126,7 +126,6 @@ After install, push notifications opt-in is available on the Reminders tab via t
 | Push button missing on /reminders even on HTTPS | Hard-refresh the page (browser caches the HTTP version's missing-button state in service worker scope). On iOS, you must Add to Home Screen first. |
 | 200 from `/health` but 404 on `/` | You haven't run `npm run build` in `08-dashboard/`, or `08-dashboard/out/` doesn't exist. Daemon log will say so. |
 | Dashboard loads but API calls fail with CORS errors | You're hitting the dev port (3000) remotely, not the daemon (3747). Use the daemon URL only for tailnet access. The Next dev server is for local development only. |
-| Login form keeps bouncing back to /unlock | Cookie isn't being set on the right origin. Make sure you're hitting the daemon port (3747), not the Next dev port (3000), from remote devices. |
 | MagicDNS name doesn't resolve | DNS hasn't propagated. Try the numeric `100.x.y.z` form. Or restart the Tailscale client on both ends. |
 | Push notifications don't fire on iOS | iOS only delivers web push to PWAs installed via "Add to Home Screen". Re-install via Safari Share → Add to Home Screen. |
 | `tailscale status` on OTLCDEV shows it as inactive | Run `tailscale up` from PowerShell. May prompt you to re-auth in a browser. |

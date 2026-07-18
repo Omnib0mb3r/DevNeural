@@ -17,16 +17,13 @@ These live in `C:/dev/Projects/DevNeural/` and are owned by the project. A clean
 | `07-daemon/package-lock.json` | Lock file. Committed. |
 | `08-dashboard/` (Phase 3) | Next.js dashboard app. |
 | `09-bridge/` (Phase 3) | VS Code extension for session bridge. |
-| `03-web-app/` | The orb (Phase 4 rebind). |
-| `05-voice-interface/` | Voice query layer. |
-| `06-notebooklm-integration/` | Obsidian sync. |
 | `archive/v1/` | (After Phase 2) Old 01/02/04 modules. |
 | `docs/spec/` | System architecture and phase plans. |
 | `docs/install/` | This documentation. |
 | `INSTALL.md` | Top-level entry point. |
-| `README.md` | (Will be rewritten in Phase 2) Public-facing overview. |
-| `start.bat` | (Will be rewritten in Phase 2) Quick-launch script. |
-| `devneural.jsonc` | DevNeural's own project metadata. Stage and tags only after v2. |
+| `README.md` | Public-facing overview. |
+| `start.bat` | Quick-launch script. |
+| `devneural.jsonc` | DevNeural's own project metadata. |
 
 ---
 
@@ -37,7 +34,7 @@ These live in `C:/dev/Projects/DevNeural/` and are owned by the project. A clean
 **Owner:** Claude Code itself. Edited by user, plugins, and tools (including DevNeural).
 
 **What DevNeural does:**
-- Adds 5 hook entries (PreToolUse, PostToolUse, UserPromptSubmit, Stop, Notification) pointing at `07-daemon/dist/capture/hooks/hook-runner.js` via `silent-runner.vbs`.
+- Adds 6 hook entries (PreToolUse, PostToolUse, UserPromptSubmit, Stop, Notification, SessionStart) pointing at `07-daemon/dist/capture/hooks/hook-runner.js` via `silent-runner.vbs`.
 - The Notification entry forwards CC's permission/elicitation message to the daemon so the dashboard can render the question with answer buttons.
 - Removes any v1 DevNeural hook entries (paths matching `01-data-layer/dist/hook-runner.js` or `04-session-intelligence/dist/session-start.js`).
 - Leaves all OTHER hook entries intact (Claude-Setup hooks, plugin hooks, GSD hooks, your custom hooks, etc).
@@ -157,7 +154,7 @@ C:/dev/data/skill-connections/
     <session-id>.in
 
   dashboard/                              # (Phase 3) dashboard state.
-    auth.json                             # PIN hash + lockout state.
+    auth.json                             # HMAC secret {version, secret} for signing cross-session tokens (no PIN hash; the PIN gate was removed).
     notifications.jsonl
     reminders.jsonl
     push-subscriptions.jsonl

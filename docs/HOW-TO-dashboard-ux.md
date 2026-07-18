@@ -26,11 +26,12 @@ pressing ESC twice at the worker keyboard.
 
 ### Where it lives
 
-Top bar, immediately right of the voice stop control. A `<kbd>` badge
-shows the keybind `Ctrl+Alt+.` next to the button (hidden below `md:`
-to keep narrow viewports clean). Tooltip carries the canonical
-description: "Send double-ESC to active worker (interrupt current
-tool / generation). Keybind: Ctrl+Alt+."
+Top bar, immediately right of the voice stop control. The visible
+`<kbd>` badge that used to show `Ctrl+Alt+.` next to the button was
+removed; the keybind still fires, but it is now surfaced only through
+the button tooltip. That tooltip carries the canonical description:
+"Send double-ESC to active worker (interrupt current tool /
+generation). Keybind: Ctrl+Alt+."
 
 ### States
 
@@ -71,26 +72,24 @@ cannot false-fire the panic path.
 
 ### Lex voice-command suite
 
-The full set of Lex-prefixed voice commands, dispatched from
-`07-daemon/src/voice/lex-voice-commands.ts` and consumed by the
-dashboard via `08-dashboard/components/VoiceClient.tsx`:
+The hard-coded, `Lex`-prefixed keyword grammar was torn out
+2026-07-15 (voice top layer v2).
+`07-daemon/src/voice/lex-voice-commands.ts` now matches only the
+panic phrase (`matchPanicCommand`, "Lex emergency stop"); every other
+voice control is interpreted by the voice top layer rather than
+pattern-matched. The top layer emits trailing `CONTROL:` directive
+lines as part of its natural turn (`mute` / `unmute` / `standby` /
+`listen` / `disable` / `end_session` / `stop_speaking` /
+`interrupt_work`); those lines are stripped from speech and dispatched
+server-side through `dispatchVoiceCommand` in
+`07-daemon/src/voice/lex-voice-ws.ts`.
 
-- `Lex disable` — equivalent to clicking the dashboard stop button.
-  Cancels in-flight TTS, clears the queue, tears down the WS / mic /
-  AudioContext. Lex's thinking and worker actions continue; there is
-  no voice resume path. The user must click `start voice` again.
-- `Lex mute` / `Lex shut up` / `Lex be quiet` / `Lex stop talking` —
-  soft mute. Halts outbound TTS only. Transcript turns keep arriving
-  and render with a silent marker; an unread-silent badge surfaces
-  on the pill. Badge clears only on unmute (no auto-stale).
-- `Lex unmute` — resume soft mute. Future TTS plays normally;
-  messages received during the mute window are NOT auto-replayed.
-  The phrase `Lex resume` is reserved for a future broader command
-  and explicitly does NOT match unmute.
-- `Lex emergency stop` — panic (above).
-- `Lex end session` — distillation + end. Routes through the
-  existing `fireSessionEndPipeline` to ingest + summarize + RAG-embed
-  before the WS close.
+So there is no fixed phrase list to memorise any more: you ask Lex to
+stop talking, stand by, wrap up the session, and so on in natural
+language, and the top layer maps the intent to the right control
+effect. Only "Lex emergency stop" stays a mechanical keyword, checked
+before anything else so the operator can always halt the system even
+when the top layer is down.
 
 ### Per-project interrupt
 
@@ -214,12 +213,16 @@ scrollable row.
 
 `08-dashboard/components/VoiceClient.tsx`:
 
-The `VoiceTopBarPill` swaps the `Mic` lucide icon to `MicOff` and
-the label to `muted (tts)` whenever the daemon is streaming TTS.
-The hard mic gate (driven by `tts-start` / `tts-end` WS events)
-fully pauses silero VAD + the parallel capture rig + the
-push-to-talk path so the speaker's own audio cannot loop back
-through whisper as the user's "next utterance".
+While the daemon is streaming TTS the pill keeps the `Mic` lucide
+icon and shows a "mic paused" overlay; it does NOT swap to `MicOff`
+and there is no "muted (tts)" label. Labelling the gate "muted (tts)"
+while Lex was audibly talking was an inverted-label bug, and keeping
+`Mic` reflects that the always-on wake-word recognizer is still
+listening. Only an explicit user mute flips the icon to `MicOff`.
+The hard mic gate (driven by `tts-start` / `tts-end` WS events) still
+fully pauses silero VAD + the parallel capture rig + the push-to-talk
+path so the speaker's own audio cannot loop back through whisper as
+the user's "next utterance".
 
 Tooltip on the pill while gated:
 `Mic paused while Lex is speaking. Resumes automatically when TTS

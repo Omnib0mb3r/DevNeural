@@ -98,12 +98,12 @@ git clone https://github.com/Omnib0mb3r/design-system         C:\dev\Projects\de
 cd C:\dev\Projects\DevNeural\07-daemon
 npm install
 npm run setup                                # builds + scaffolds wiki at c:/dev/data/skill-connections/wiki/
-npm run install-hooks                        # registers 5 v2 hook entries (Pre/Post/Prompt/Stop/Notification); replaces any v1 entries from step 4
+npm run install-hooks                        # registers 6 v2 hook entries (Pre/Post/Prompt/Stop/Notification/SessionStart); replaces any v1 entries from step 4
 npm run silence-hooks                        # wraps every hook in silent-shim.exe so child spawns run hidden; idempotent
 
 cd C:\dev\Projects\DevNeural\08-dashboard
 npm install --legacy-peer-deps               # @tremor/react has a React-18 peer expectation; works on 19
-$env:NODE_ENV='production'; npx next build   # produces 08-dashboard/out/
+npm run build                                # produces 08-dashboard/out/ (prebuild rimraf + next build + SW version stamp)
 
 cd C:\dev\Projects\DevNeural\09-bridge
 npm install
@@ -130,11 +130,12 @@ If you want Phase 3.5 (audio/video upload) working, follow `docs/install/AUDIO-V
 
 ```powershell
 cd C:\dev\Projects\DevNeural\07-daemon
-npm run start              # daemon listens on 0.0.0.0:3747
-                           # auto-detects 08-dashboard/out/ and serves the dashboard at the same port
+npm run start                        # daemon listens on 0.0.0.0:3747
+                                     # auto-detects 08-dashboard/out/ and serves the dashboard at the same port
+npm run install-daemon-autostart     # reboot recovery: Task Scheduler DevNeural-Daemon -> start-daemon.ps1 (npm run start alone does not survive a reboot)
 ```
 
-Open `http://otlcdev:3747` in any browser on the tailnet, set a fresh PIN, you're back.
+Open `http://otlcdev:3747` in any browser on the tailnet, you're back (no PIN gate; the tailnet is the trust boundary).
 
 ---
 
@@ -144,7 +145,7 @@ Run from any tailnet device:
 
 ```powershell
 curl http://otlcdev:3747/health                  # 200 with phase=P3.2-reference-corpus
-curl http://otlcdev:3747/auth/status             # {pin_set: false} on first install, true after step 9
+curl http://otlcdev:3747/health                  # ok:true confirms the daemon is up; there is no PIN gate (trust boundary is host + tailnet)
 curl http://otlcdev:3747/dashboard/health        # rolls up service statuses
 curl http://otlcdev:3747/graph                   # graph data for the orb
 ```

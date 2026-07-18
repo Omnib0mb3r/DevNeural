@@ -69,7 +69,7 @@
 ```
    ┌──────────────────────────────────────────────┐
    │  08-dashboard (Next.js, served by daemon)    │
-   │  - PIN auth                                   │
+   │  - No auth gate (tailnet trust boundary)      │
    │  - Stream Deck of sessions                    │
    │  - Wiki/reference search + upload             │
    │  - System metrics + service status            │
@@ -95,9 +95,6 @@
 | Path | Role | Phase |
 |---|---|---|
 | `07-daemon/` | The brain. Capture, ingest, query, lint, reinforcement, HTTP/WS API, in-process vector store + SQLite, embedder, ollama client | Phase 1 (built) |
-| `03-web-app/` | The orb (Three.js visualization). Currently bound to v1; rebinds to wiki data model | Phase 4 |
-| `05-voice-interface/` | Voice query layer | reshapes later |
-| `06-notebooklm-integration/` | Obsidian / NotebookLM sync | reshapes later |
 | `08-dashboard/` | Central control dashboard, Next.js + PWA | Phase 3 |
 | `09-bridge/` | VS Code extension for session bridge + window focus | Phase 3 |
 | `archive/v1/` | v1 modules (01-data-layer, 02-api-server, 04-session-intelligence) once burndown completes | Phase 2 |
@@ -135,17 +132,17 @@ External (separate repo):
 | `next` | Dashboard frontend |
 | `react`, `react-dom` | Same |
 | `tailwindcss` | Styling |
-| `@radix-ui/*`, `lucide-react`, `class-variance-authority`, `tailwind-merge`, `clsx` | shadcn/ui dependencies |
-| `tremor`, `recharts` | Charts |
+| `@tremor/react` | Charts, sparklines, KPI tiles |
+| `lucide-react` | Icons |
+| `@xterm/xterm` + `@xterm/addon-*` | Terminal mirror in the dashboard |
+| `react-force-graph-2d` | Force-directed wiki graph (Orb) |
 | `@tanstack/react-query` | Client state |
 | `pdf-parse` | PDF text extraction |
 | `tesseract.js` | OCR for images and scanned PDFs |
-| `whisper-node` (or similar wrapper) | Local audio transcription via whisper.cpp |
-| `ffmpeg-static` | Audio extraction from video |
 | `mammoth` | DOCX parsing |
 | `web-push` | PWA push notifications |
 | `@fastify/multipart` | File upload handling |
-| `bcryptjs` | PIN hashing |
+| `bcryptjs` | Legacy dep from the removed PIN gate; the auth secret is now a random HMAC key |
 
 ### External binaries
 
@@ -158,9 +155,9 @@ External (separate repo):
 | `code` | Open VS Code from new-project flow | No (prereq) |
 | `claude` | Claude Code CLI | No (prereq) |
 | `tailscale` | Remote access for dashboard | No (prereq, Phase 3+) |
-| `ffmpeg` | Bundled via `ffmpeg-static` npm | Yes |
+| `ffmpeg` | Audio extraction from video | No (winget prereq: `winget install Gyan.FFmpeg`) |
 | `tesseract` | Bundled via `tesseract.js` (WASM) | Yes |
-| `whisper.cpp` | Bundled via wrapper or downloaded by setup | Yes (Phase 3.5) |
+| `whisper.cpp` | Local audio transcription (STT) | No (manual clone + cmake build; see `AUDIO-VIDEO.md`) |
 
 ---
 
@@ -168,8 +165,7 @@ External (separate repo):
 
 | Port | Bound by | Bind interface | Notes |
 |---|---|---|---|
-| `3747` | 07-daemon HTTP + WS | `127.0.0.1` (Phase 1) → `0.0.0.0` (Phase 3, behind Tailscale) | DevNeural API |
-| `7474` | 08-dashboard (planned) | served by daemon at `:3747/dashboard` (Phase 3) | Configurable |
+| `3747` | 07-daemon HTTP + WS (serves the dashboard at `/`) | `0.0.0.0` (bound unconditionally so Tailscale can route in; set `DEVNEURAL_BIND=127.0.0.1` to lock down) | DevNeural API + dashboard |
 | `11434` | ollama | `127.0.0.1` | Default ollama bind |
 
 **No port collisions with common dev tools.** 3747 is unusual on purpose.

@@ -78,7 +78,7 @@ All three should exist.
 npm test
 ```
 
-Expect: 47+ tests passing across 7 test files.
+Expect: the daemon suite passing (703 unit + integration tests as of 2026-05-16).
 
 If a test fails, do not continue. Open an issue or read the failure carefully. Most failures here mean a Node version mismatch or a missing native binary.
 
@@ -132,13 +132,14 @@ setup done.
 
 ## Step 6: Verify hooks are wired (without firing the daemon)
 
-Open `~/.claude/settings.json` and look at the `hooks` block. You should see five entries that resolve to `07-daemon/dist/capture/hooks/hook-runner.js` (after the silent-shim wrap is applied, the path appears inside `silent-runner.vbs`'s args; the raw form is shown below for clarity):
+Open `~/.claude/settings.json` and look at the `hooks` block. You should see six entries that resolve to `07-daemon/dist/capture/hooks/hook-runner.js` (after the silent-shim wrap is applied, the path appears inside `silent-runner.vbs`'s args; the raw form is shown below for clarity):
 
 - `PreToolUse` (matcher `*`) → runs `hook-runner.js pre`
 - `PostToolUse` (matcher `*`) → runs `hook-runner.js post`
 - `UserPromptSubmit` → runs `hook-runner.js prompt`
 - `Stop` → runs `hook-runner.js stop`
 - `Notification` → runs `hook-runner.js notification` (forwards CC's permission/elicitation message to the daemon so the dashboard surfaces it with answer buttons)
+- `SessionStart` → runs `hook-runner.js session_start` (marks the prior session in this workspace as superseded on `/clear`)
 
 Other entries (Claude-Setup hooks, plugin hooks, your own hooks) should be unchanged.
 
@@ -176,7 +177,7 @@ curl http://127.0.0.1:3747/health
 
 **Expected:**
 ```json
-{"ok":true,"pid":<some-number>,"phase":"P6-lint","raw_chunks":0,"wiki_pages":0,"llm":{...}}
+{"ok":true,"pid":<some-number>,"phase":"P3.2-reference-corpus","raw_chunks":0,"wiki_pages":0,"llm":{...}}
 ```
 
 If you see this, the daemon is alive and listening.
@@ -271,39 +272,30 @@ If everything is green: install complete.
 
 ---
 
-## Optional: configure Tailscale for remote access (Phase 3)
+## Optional: configure Tailscale for remote access
 
-If you want to hit the dashboard from outside `OTLCDEV` once Phase 3 ships:
+If you want to hit the dashboard from outside `OTLCDEV`:
 
 1. Install Tailscale (`winget install tailscale.tailscale`)
 2. `tailscale up` and authenticate
 3. Note your tailnet domain (e.g. `OTLCDEV.<tailnet-name>.ts.net`)
-4. The Phase 3 dashboard will bind `0.0.0.0:7474` on `OTLCDEV` and be reachable at that URL from any device on your tailnet
+4. The dashboard is served by the daemon on `0.0.0.0:3747` at `/` on `OTLCDEV` and is reachable at that URL from any device on your tailnet
 
-You don't need to do anything in Phase 1 / Phase 2 for this. Tailscale is a Phase 3 prerequisite, not a Phase 1 one.
+Tailscale is only needed for remote access; local daemon operation on `OTLCDEV` does not require it.
 
 ---
 
 ## Optional: enable autostart
 
-Until Phase 3 wires this properly, manual setup is one of:
+DevNeural ships this as a one-liner. From `07-daemon`:
 
-**A. Task Scheduler (recommended).**
-- Open Task Scheduler
-- Create Task → name "DevNeural daemon"
-- Trigger: At log on
-- Action: Start a program → `node` → arguments `C:\dev\Projects\DevNeural\07-daemon\dist\daemon.js`
-- Run with highest privileges: not required
-- Conditions: uncheck "Start the task only if the computer is on AC power" if applicable
+```powershell
+npm run install-daemon-autostart
+```
 
-**B. Startup folder.**
-- Create a `start-devneural.bat` containing `node C:\dev\Projects\DevNeural\07-daemon\dist\daemon.js > C:\dev\data\skill-connections\daemon.log 2>&1`
-- Drop a shortcut to it in `shell:startup`
+This registers a Task Scheduler task (`DevNeural-Daemon`) that runs `start-daemon.ps1` at log on, so the daemon comes back after a reboot without waiting for the first Claude Code hook to lazy-start it. Undo with `npm run uninstall-daemon-autostart`.
 
-**C. Don't bother.**
-- The hook lazy-starts the daemon on first tool call. If you're going to use Claude immediately on log on, this is fine.
-
-Phase 3 will provide a polished setup option.
+If you would rather not autostart: the hook lazy-starts the daemon on the first tool call, so if you use Claude immediately after log on that works too.
 
 ---
 
@@ -315,8 +307,8 @@ The bridge makes the dashboard's "focus VSCode window" and "send prompt to termi
 cd C:/dev/Projects/DevNeural/09-bridge
 npm install
 npm run build
-npx vsce package --no-dependencies
-& "C:\Users\michael\AppData\Local\Programs\Microsoft VS Code\bin\code.cmd" --install-extension .\devneural-bridge-0.1.0.vsix
+npm run package
+& "C:\Users\michael\AppData\Local\Programs\Microsoft VS Code\bin\code.cmd" --install-extension .\devneural-bridge.vsix
 ```
 
 After install, reload the VS Code window (Command Palette → "Developer: Reload Window") so the extension activates. Confirm with `code --list-extensions | findstr devneural`. The output channel "DevNeural Bridge" prints activation, watched dir, and every send/focus event.
@@ -359,7 +351,7 @@ DevNeural runs sensibly with no env vars set. The following exist for cases wher
 | `DEVNEURAL_SUMMARY_TURNS` | `8` | Turns between rolling session-summary refreshes |
 | `DEVNEURAL_SUMMARY_MIN_MS` | `300000` (5 min) | Minimum time between summary refreshes when turns aren't hitting the threshold |
 | `ANTHROPIC_API_KEY` | unset | Required when using anthropic provider or Pass 2 fallback |
-| `DEVNEURAL_WHISPER_BIN` | auto-detected | Path to `whisper-server.exe` (cuBLAS) for voice STT |
+| `DEVNEURAL_WHISPER_BIN` | auto-detected | Path to `whisper-cli.exe` (cuBLAS) for voice STT |
 
 ### Recommended for borderline local-LLM hardware
 

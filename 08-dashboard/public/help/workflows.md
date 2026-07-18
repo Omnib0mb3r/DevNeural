@@ -12,12 +12,16 @@ context stays clean.
 
 ## Kicking off a project
 
-From Home, click the new-project button on the Projects panel
-(or use `/projects/new`). Lex walks you through naming, picking
-a directory, and registering the project anchor. After registration
-the project tile appears on Home and `/projects`; supervision
-defaults to polling. Flip the chip to event once Lex has watched
-the project for a few sessions.
+Go to `/projects` and click the **new project** button (or open
+the command palette with `Ctrl+K` and pick "New project", which
+jumps to `/projects?new=1`). There is no `/projects/new` route,
+and the Home projects panel only has a "view all" link, so the
+button lives on the Projects page. It opens a static form modal:
+give the project a name, a stage, and tags, then create it. This
+is a plain form, not a Lex conversation. After registration the
+project tile appears on `/projects` and the Home projects panel;
+supervision defaults to polling. Flip the chip to event once Lex
+has watched the project for a few sessions.
 
 ## What the morning report tells you
 
@@ -31,7 +35,8 @@ shortest path to knowing what changed overnight.
 ## How reminders fire
 
 Reminders are time- or condition-triggered. The daemon checks
-the reminder index every minute. When a reminder is due, it lands
+the reminder index every five minutes by default. When a reminder
+is due, it lands
 in `/reminders`, fires a web push notification (if you granted
 permission) and a `followup`-class notification in the top-bar
 bell. Reminders never auto-dismiss; click the dismiss button

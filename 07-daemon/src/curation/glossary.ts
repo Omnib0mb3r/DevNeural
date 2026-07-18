@@ -12,7 +12,7 @@
  *   project_name: ...
  *   updated: ...
  *   ---
- *   - "the orb" = 03-web-app, the Three.js visualization
+ *   - "the orb" = the /orb route in the dashboard, the graph visualization
  *   - "the daemon" = 07-daemon, the brain
  *
  * Updated incrementally: existing entries are preserved unless the
@@ -216,7 +216,7 @@ async function runGlossary(
 }> {
   const system = `You maintain a glossary of project-specific shorthand terms used by a developer.
 
-A glossary entry maps a SHORTHAND ("the orb", "the daemon") to a CONCRETE referent ("03-web-app, the Three.js visualization") within ONE project.
+A glossary entry maps a SHORTHAND ("the orb", "the daemon") to a CONCRETE referent ("the /orb route in the dashboard, the graph visualization") within ONE project.
 
 Output strictly this JSON shape:
 {

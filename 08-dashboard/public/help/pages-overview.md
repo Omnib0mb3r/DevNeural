@@ -65,6 +65,27 @@ to the next task, voice diagnostics log, cold-start preload,
 panic history, and the daemon restart control. The page is
 the operator's cockpit.
 
+## Knowledge map
+
+The `/orb` tab. A single force-directed graph that puts your
+brainstorms, wiki pages, projects, and meetings in one view so you
+can see how everything Lex knows connects. Pan and zoom to explore
+the web of related work at a glance.
+
+## Knowledge index
+
+The `/knowledge` tab. A project-scoped, browsable map of the
+markdown knowledge stores. Narrower than the Knowledge map: where
+`/orb` shows the global brainstorm, wiki, and project graph, this
+one indexes the knowledge for a project so you can drill into it.
+
+## Settings
+
+Reached from the gear icon rather than a top-nav tab. Persistent
+preferences stored on the daemon, chiefly the voice settings.
+Daemon controls (restart, live vitals, services, and the log tail)
+live on System; Settings just links you there.
+
 ## Lex
 
 The brainstorm panel. Start or resume a Lex conversation; voice

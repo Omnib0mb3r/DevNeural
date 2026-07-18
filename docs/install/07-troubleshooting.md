@@ -192,7 +192,7 @@ The corpus seed will resume on its own after 3 consecutive failures (the abort-a
    ```powershell
    curl http://127.0.0.1:3747/health
    ```
-   Should report `phase: P5-reinforcement` or later.
+   Should report `phase: P3.2-reference-corpus`.
 
 2. Check `daemon.log` for `[transcript-watcher]` lines as you use Claude. Should show `+N chunks` events.
 

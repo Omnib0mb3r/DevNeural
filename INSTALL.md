@@ -57,13 +57,14 @@ This is the short version. The detailed steps are in `04-step-by-step.md` and th
 [ ] Repo cloned to C:/dev/Projects/DevNeural/
 [ ] Default model pulled (`ollama pull qwen3:8b`)
 [ ] cd 07-daemon && npm install && npm run setup
-[ ] cd 07-daemon && npm run install-hooks       # registers 5 v2 hook entries (Pre/Post/Prompt/Stop/Notification); backs up settings.json
+[ ] cd 07-daemon && npm run install-hooks       # registers 6 v2 hook entries (Pre/Post/Prompt/Stop/Notification/SessionStart); backs up settings.json
 [ ] cd 07-daemon && npm run silence-hooks       # wraps every hook in silent-shim.exe so spawns run hidden; idempotent
-[ ] cd 08-dashboard && npm install --legacy-peer-deps && NODE_ENV=production npx next build
+[ ] cd 08-dashboard && npm install --legacy-peer-deps && npm run build
 [ ] cd 09-bridge && npm install && npm run build && npm run package
 [ ]   code --install-extension devneural-bridge.vsix
 [ ] cd 07-daemon && npm run install-backup-task # CRITICAL — your data root is irreplaceable
 [ ] cd 07-daemon && npm run start               # daemon on :3747; dashboard at /
+[ ] cd 07-daemon && npm run install-daemon-autostart  # persist across reboot (Task Scheduler DevNeural-Daemon); npm run start alone does not survive a reboot
 [ ] Open http://localhost:3747, verify the home view loads
 [ ] Verify: npm run status returns all green or actionable warnings
 [ ] Optional: install Tailscale on phone + sign into same tailnet (docs/install/TAILSCALE.md)

@@ -10,7 +10,6 @@ rendered UI.
 |----------------|-------------------------------------------------|
 | `Ctrl+K`       | Open the command palette. Fuzzy-search every page, brainstorm, project, and reference doc. |
 | `Ctrl+Alt+.`   | Fire the panic button. Halts the live worker session and lands a panic-log row. Confirmation toast appears in the top bar. |
-| `Esc Esc`      | Double-press anywhere to fire the panic button. Same effect as the Ctrl+Alt+. chord. |
 
 ## Lex chat
 
@@ -21,9 +20,19 @@ rendered UI.
 
 ## Voice panel
 
-The voice panel exposes one button per voice control rather than
-keyboard chords. Voice commands themselves are spoken (see the
-Voice commands section above). The dashboard mic icon toggles
+The voice panel exposes one button per voice control, and the
+same controls are also bound to keyboard chords as a fallback for
+when speech recognition is unavailable (Firefox, or offline builds
+that cannot reach the cloud STT backend):
+
+| Shortcut       | What it does                                    |
+|----------------|-------------------------------------------------|
+| `Ctrl+Alt+M`   | Mute Lex. Works mid-reply, so you can silence the current turn without speaking. |
+| `Ctrl+Alt+U`   | Unmute Lex. |
+| `Ctrl+Alt+D`   | Disable the voice layer entirely. |
+
+The chords are ignored while you are typing in an input, textarea,
+select, or contentEditable field. The dashboard mic icon toggles
 mic capture without speaking; the speaker icon toggles soft mute.
 
 ## Notes
