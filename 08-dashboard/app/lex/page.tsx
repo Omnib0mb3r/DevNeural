@@ -299,12 +299,26 @@ export default function LexPage() {
     refetchInterval: 10_000,
     enabled: Boolean(supervisedProjectAnchorId),
   });
-  const workerSessionId =
+  const supervisedTile =
     (supervisedProjectAnchorId
       ? tilesQ.data?.tiles?.find(
           (t) => t.anchor_id === supervisedProjectAnchorId,
-        )?.current_session_id
+        )
       : null) ?? null;
+  const workerSessionId = supervisedTile?.current_session_id ?? null;
+  /* WIRE (2026-07-19): the project label each mirror shows, resolved
+   * here off the authoritative anchor->project binding rather than the
+   * mirror's own /sessions lookup (which is empty for the Lex/anchor
+   * session and stale for a worker uuid that rotated on /clear). The Lex
+   * terminal is the brainstorm's own session, so it shows the brainstorm
+   * name; the worker terminal shows the supervised project's slug. */
+  const workerProjectSlug =
+    supervisedTile?.project_slug ?? supervisedTile?.title ?? null;
+  const lexProjectLabel =
+    activeAnchor?.title ??
+    activeAnchor?.derived_title ??
+    supervisedTile?.project_slug ??
+    null;
 
   /* No auto-spawn. Landing on /lex with no live brainstorm PTY
    * renders the empty state ("Lex isn't running. Click start lex")
@@ -499,6 +513,7 @@ export default function LexPage() {
             <TerminalMirror
               sessionId={lexPty?.sessionId ?? ""}
               title="Lex terminal"
+              projectSlug={lexProjectLabel}
             />
             {/* Worker terminal mirror: the session this Lex supervises
              * (read-only, resolved from the tracked supervises binding).
@@ -507,6 +522,7 @@ export default function LexPage() {
               <TerminalMirror
                 sessionId={workerSessionId}
                 title="Worker terminal"
+                projectSlug={workerProjectSlug}
               />
             )}
             <LexArtifactsPanel

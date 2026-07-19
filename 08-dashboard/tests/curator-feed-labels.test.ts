@@ -6,7 +6,10 @@
  */
 import { describe, expect, it } from "vitest";
 import { feedDestinationLabel } from "../components/RightRail";
-import { mirrorWatchLabel } from "../components/TerminalMirror";
+import {
+  mirrorWatchLabel,
+  resolveMirrorProjectSlug,
+} from "../components/TerminalMirror";
 
 describe("feedDestinationLabel", () => {
   it("names wiki links, terminal links, and generic links", () => {
@@ -38,5 +41,31 @@ describe("mirrorWatchLabel", () => {
     expect(mirrorWatchLabel("  ", "abc12345")).toBe(
       "watching unknown project · session abc12345 · read-only",
     );
+  });
+});
+
+describe("resolveMirrorProjectSlug (WIRE: label reads the authoritative anchor->project binding)", () => {
+  it("prefers the explicit page-resolved slug over the /sessions lookup", () => {
+    /* The /sessions find is keyed by the raw session id: it is EMPTY for
+     * a Lex/anchor session (never a project worker → "unknown project")
+     * and STALE for a worker whose uuid rotated on /clear. The page
+     * resolves the real project off the anchor->project binding and
+     * passes it explicitly; that must win. */
+    expect(resolveMirrorProjectSlug("DevNeural Testing", null)).toBe(
+      "DevNeural Testing",
+    );
+    expect(resolveMirrorProjectSlug("devneural", "stale-slug")).toBe(
+      "devneural",
+    );
+  });
+
+  it("falls back to the /sessions slug when the page provides none (legacy worker mirror)", () => {
+    expect(resolveMirrorProjectSlug(null, "devneural")).toBe("devneural");
+    expect(resolveMirrorProjectSlug(undefined, "devneural")).toBe("devneural");
+  });
+
+  it("returns null (label shows 'unknown project') only when neither source has a value", () => {
+    expect(resolveMirrorProjectSlug(null, null)).toBeNull();
+    expect(resolveMirrorProjectSlug("  ", "  ")).toBeNull();
   });
 });

@@ -319,6 +319,12 @@ interface Props {
    * terminal" / "Worker terminal" when more than one mirror shares a
    * page so they are tellable apart. */
   title?: string;
+  /** WIRE (2026-07-19): the project label to show in the "watching …"
+   * header, resolved by the page from the authoritative anchor->project
+   * binding. Overrides the /sessions lookup (which is empty for a
+   * Lex/anchor session and stale for a rotated worker uuid). Omit to
+   * keep the legacy /sessions-derived label. */
+  projectSlug?: string | null;
 }
 
 /* Header label naming what this mirror is actually watching
@@ -334,7 +340,25 @@ export function mirrorWatchLabel(
   return `watching ${proj} · session ${sess} · read-only`;
 }
 
-export function TerminalMirror({ sessionId, title }: Props) {
+/* WIRE (2026-07-19): resolve which project label the mirror header
+ * shows. The /sessions lookup (sessionEntry.project_slug) is keyed by
+ * the raw session id, so it is EMPTY for a Lex/anchor session (never a
+ * project worker → "unknown project") and STALE for a worker whose uuid
+ * rotated on /clear. The page already resolves the real project off the
+ * authoritative anchor->project binding (the supervised project tile /
+ * the brainstorm anchor) and passes it as `projectSlug`; prefer it, and
+ * fall back to the /sessions slug only when the page supplied none.
+ * Exported for tests. */
+export function resolveMirrorProjectSlug(
+  explicit: string | null | undefined,
+  sessionEntrySlug: string | null | undefined,
+): string | null {
+  if (explicit?.trim()) return explicit;
+  if (sessionEntrySlug?.trim()) return sessionEntrySlug;
+  return null;
+}
+
+export function TerminalMirror({ sessionId, title, projectSlug }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<unknown>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -781,7 +805,10 @@ export function TerminalMirror({ sessionId, title }: Props) {
           className="text-nano font-mono text-txt3"
           title="A live read-only view of this session's terminal. Nothing you type here is sent to the worker."
         >
-          {mirrorWatchLabel(sessionEntry?.project_slug ?? null, sessionId)}
+          {mirrorWatchLabel(
+            resolveMirrorProjectSlug(projectSlug, sessionEntry?.project_slug),
+            sessionId,
+          )}
         </span>
         <span
           className={`text-nano font-mono ml-2 ${

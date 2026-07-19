@@ -129,6 +129,52 @@ describe('listSessions anchor-backed liveness', () => {
     expect(sessions.map((s) => s.session_id)).not.toContain(ccId);
   });
 
+  it('reaps a replaced session: a stale live row still holding the retired uuid as current does not surface as a phantom worker', () => {
+    /* WIRE (2026-07-19): a worker /clear replaces OLD with NEW on its
+     * anchor (current=NEW, previous=OLD). A duplicate/stale live row that
+     * still lists OLD as its current_session_id would otherwise surface
+     * OLD as a SECOND live worker - the phantom "no brainstorm /
+     * unsupervised" card next to the real one. OLD is provably retired
+     * (it is a live anchor's previous_session_id), so it must be reaped
+     * from the live set; NEW stays. */
+    const cwdReal = 'C:/dev/Projects/wire';
+    const cwdDup = 'C:/dev/Projects/wire-dup';
+    const OLD = 'dddddddd-4444-4444-4444-444444444444';
+    const NEW = 'eeeeeeee-5555-5555-5555-555555555555';
+    writeJsonl('c--dev-Projects-wire', NEW, cwdReal);
+    writeJsonl('c--dev-Projects-wire-dup', OLD, cwdDup);
+    /* Real anchor: flipped OLD -> NEW, OLD stashed as previous. */
+    db.insertProjectSession({
+      id: 'anchor-wire',
+      project_slug: 'wire',
+      cwd: cwdReal,
+      title: 'wire',
+      status: 'live',
+      current_session_id: NEW,
+      current_bridge_id: 'b-real',
+      current_pty_id: null,
+      created_ms: 1,
+      last_seen_ms: 100,
+    });
+    db.updateProjectSession('anchor-wire', { previous_session_id: OLD });
+    /* Phantom duplicate anchor still holding the retired OLD as current. */
+    db.insertProjectSession({
+      id: 'anchor-wire-dup',
+      project_slug: 'wire-dup',
+      cwd: cwdDup,
+      title: 'wire-dup',
+      status: 'live',
+      current_session_id: OLD,
+      current_bridge_id: 'b-dup',
+      current_pty_id: null,
+      created_ms: 1,
+      last_seen_ms: 100,
+    });
+    const ids = listSessions().map((s) => s.session_id);
+    expect(ids).toContain(NEW);
+    expect(ids).not.toContain(OLD);
+  });
+
   it('omits sessions whose anchor is dormant even if the jsonl exists', () => {
     const cwd = 'C:/dev/Projects/dormie';
     const ccId = 'cccccccc-3333-3333-3333-333333333333';

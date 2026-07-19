@@ -1538,7 +1538,18 @@ export async function registerDashboardRoutes(
     }
     const cols = typeof body.cols === 'number' ? body.cols : undefined;
     const rows = typeof body.rows === 'number' ? body.rows : undefined;
-    pushTerminalData(id, body.data, cols, rows);
+    /* WIRE (2026-07-19): align the PRODUCER key with the SUBSCRIBER key.
+     * The terminal-replay GET and terminal-ws both subscribe under
+     * resolveMirrorSessionId(id) (the anchor's live current_session_id);
+     * this POST wrote under whatever raw id the VS Code bridge chose. If
+     * the bridge posts under a stale/alternate uuid, its frames land in a
+     * ring no mirror reads and the worker panel paints blank while the WS
+     * still reports "live". Resolve the incoming id through the SAME
+     * mapping so bridge frames always fill the ring the mirror watches -
+     * regardless of connection type. Read-only pass-through when there is
+     * no redirect. */
+    const ringId = resolveMirrorSessionId(store.db, id);
+    pushTerminalData(ringId, body.data, cols, rows);
     reply.code(204);
     return null;
   });

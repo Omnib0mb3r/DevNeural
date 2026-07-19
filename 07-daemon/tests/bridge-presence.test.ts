@@ -688,6 +688,71 @@ describe('reconcileBridgePresence', () => {
     expect(resolveLiveSessionForCwd).not.toHaveBeenCalled();
   });
 
+  it('WIRE: a replaced worker resolves to the NEW cc id, not the stale sibling the bridge listed first', () => {
+    /* Live failure: after a worker /clear the bridge window still lists
+     * the RETIRED session alongside the live one, in file order (NOT
+     * recency). A blind ccSessionIds[0] pins the STALE uuid as the
+     * anchor's live worker, and every surface that reads
+     * current_session_id (inject resolution, GET /sessions liveness,
+     * the Workers panel, the terminal mirror) then points at a dead
+     * transcript. Rank the authoritative newest-active jsonl signal
+     * (the same one the dashboard trusts) ABOVE the bridge's array
+     * order, scoped to the claimed set. */
+    const now = 8_500_000;
+    writePresence(
+      'replaced.json',
+      {
+        cwd: 'C:/dev/Projects/proj-a',
+        bridge_id: 'bridge-w1',
+        /* OLD listed first (stale), NEW is the live worker. */
+        cc_session_ids: ['cc-OLD-stale', 'cc-NEW-live'],
+      },
+      now,
+    );
+    const resolveLiveSessionForCwd = vi.fn(
+      (cwd: string) =>
+        cwd === 'C:/dev/Projects/proj-a' ? 'cc-NEW-live' : null,
+    );
+
+    reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => now,
+      resolveLiveSessionForCwd,
+    });
+
+    const row = db.getProjectSession('anchor-A')!;
+    expect(row.current_session_id).toBe('cc-NEW-live');
+  });
+
+  it('WIRE: falls back to the first claimed cc id when the authoritative signal is outside the bridge-claimed set (never binds an unrelated session)', () => {
+    /* Defensive: the newest jsonl in the project dir belongs to a
+     * session the bridge does NOT claim (e.g. a bare `claude` run in the
+     * same folder outside the dashboard). It must not hijack the anchor
+     * binding; keep the bridge's first claim. */
+    const now = 8_600_000;
+    writePresence(
+      'unrelated.json',
+      {
+        cwd: 'C:/dev/Projects/proj-a',
+        bridge_id: 'bridge-w1',
+        cc_session_ids: ['cc-claimed-1', 'cc-claimed-2'],
+      },
+      now,
+    );
+    const resolveLiveSessionForCwd = vi.fn(() => 'cc-unrelated-external');
+
+    reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => now,
+      resolveLiveSessionForCwd,
+    });
+
+    const row = db.getProjectSession('anchor-A')!;
+    expect(row.current_session_id).toBe('cc-claimed-1');
+  });
+
   it('preserves existing current_session_id when bridge omits cc_session_ids', () => {
     const now = 8_000_000;
     db.updateProjectSession('anchor-A', {

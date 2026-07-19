@@ -368,8 +368,32 @@ export function reconcileBridgePresence(
      * the bridge hasn't shipped that field yet. */
     const priorSession = anchor.current_session_id;
     let currentSession = priorSession;
-    if (primary.ccSessionIds.length > 0) {
-      currentSession = primary.ccSessionIds[0]!;
+    const claimed = primary.ccSessionIds;
+    if (claimed.length === 1) {
+      /* Unambiguous single claim: trust the bridge's one cc id. Fast
+       * path - no disk scan (see the WIRE branch below for why the
+       * multi-claim case cannot). */
+      currentSession = claimed[0]!;
+    } else if (claimed.length > 1) {
+      /* WIRE (2026-07-19): the bridge window listed MULTIPLE cc sessions
+       * for this cwd - across a worker /clear or restart it still lists
+       * the RETIRED sibling next to the live one, in file order, which
+       * is NOT recency. A blind ccSessionIds[0] can therefore pin a
+       * STALE uuid as the anchor's ONE live-worker binding
+       * (current_session_id), and every surface that reads it then
+       * points at a dead transcript: inject/supervision resolution, GET
+       * /sessions liveness, the Workers panel's supervised/nested state,
+       * and the terminal mirror's ring key. Rank the authoritative
+       * newest-active-jsonl signal (the SAME source the dashboard
+       * already trusts - resolveLiveSessionForCwd) ABOVE the bridge's
+       * array order, scoped to the claimed set so an unrelated session
+       * active in the same folder (a bare `claude` run outside the
+       * dashboard) can never hijack the binding. */
+      const authoritative = resolveLiveSessionForCwd(cwd, now, fresh);
+      currentSession =
+        authoritative && claimed.includes(authoritative)
+          ? authoritative
+          : claimed[0]!;
     } else if (!priorSession) {
       /* VB-2 (2026-07-18): the bridge reports presence for this cwd but
        * has not listed a cc session id yet, and the anchor has none.

@@ -93,9 +93,28 @@ function readLiveSessionIds(): Set<string> {
       status: 'live',
       limit: 500,
     });
+    /* Reap replaced sessions (WIRE, 2026-07-19). When a worker session is
+     * replaced (/clear, restart), reconcileBridgePresence binds the new
+     * uuid as current_session_id and stashes the retired one as
+     * previous_session_id. A stale or duplicate-cwd live row that still
+     * holds the RETIRED uuid as its own current_session_id would
+     * otherwise surface it here as a SECOND live worker - the phantom
+     * "no brainstorm / unsupervised" card the operator sees next to the
+     * real worker. Any session that is a live anchor's previous_session_id
+     * has provably been superseded, so subtract those from the live set.
+     * A genuinely live worker is a CURRENT and never a live anchor's
+     * PREVIOUS (an anchor's own current is never its own previous, and cc
+     * session uuids do not migrate across anchors), so this only removes
+     * retired duplicates - the single authoritative liveness chokepoint
+     * every worker surface reads. */
+    const replaced = new Set<string>();
+    for (const row of live) {
+      if (row.previous_session_id) replaced.add(row.previous_session_id);
+    }
     const ids = new Set<string>();
     for (const row of live) {
-      if (row.current_session_id) ids.add(row.current_session_id);
+      const cur = row.current_session_id;
+      if (cur && !replaced.has(cur)) ids.add(cur);
     }
     return ids;
   } catch {
