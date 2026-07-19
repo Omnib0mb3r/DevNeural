@@ -3612,15 +3612,16 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         }
       },
       onFailure: () => {
+        /* No user-facing error. Time-based voice errors are removed by
+         * directive: a dormant/slow worker (or a brainstorm forward that
+         * legitimately never lands a PTY record) tripped this watchdog
+         * dozens of times a night as a false alarm. The CR-retry ladder
+         * (retryCr, escalating to space+Enter) still runs silently and
+         * self-recovers a genuinely stuck paste; the log line stays so a
+         * real stuck paste is still auditable. The scary pill is gone. */
         logFn(
-          `[voice-ws] INJECT DELIVERY FAILED: committed prompt never produced a user record after CR retries (stuck paste?) fingerprint=${JSON.stringify(fingerprint.slice(0, 40))}`,
+          `[voice-ws] inject delivery unconfirmed after CR retries (silent; no user error by directive) fingerprint=${JSON.stringify(fingerprint.slice(0, 40))}`,
         );
-        send({
-          t: 'error',
-          code: 'inject-delivery',
-          message:
-            'voice prompt appears stuck at the Lex terminal; press Enter there or re-speak',
-        });
       },
       sleep: (ms) =>
         new Promise((r) => {
@@ -4613,7 +4614,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * operator's intent DOWN to the MID (deep) layer. Surface the
      * handoff so the you -> voice -> deep hop is visible in the panel;
      * the MID reply comes back later as an assistant-text (layer 'mid'). */
-    send({ t: 'layer-hop', layer: 'top', text: `to Lex: ${tl.forward}` });
+    send({ t: 'layer-hop', layer: 'top', text: `to Lex (brain): ${tl.forward}` });
     /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
      * Direct-llm branch: no PTY, no jsonl watch. Build the system
      * prompt + brainstorm chunks history, call ollama, stream the
