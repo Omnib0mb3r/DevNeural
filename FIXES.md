@@ -7,6 +7,14 @@ file is for live status only.
 
 Status legend: ⏳ queued, 🔄 in progress, ✅ shipped, ❌ blocked.
 
+## 2026-07-19 false "voice dead" banner (client watchdog, no time-based errors)
+
+Client-only fix. Distinct from VB-3 below (that was the server-side inject delivery-verify banner); this is the dashboard voice-output watchdog. No daemon restart; `out/` rebuilt in place.
+
+| # | Title | Status | Commit | Evidence + fix |
+|---|-------|--------|--------|-----------------|
+| VD-1 | False "voice dead" banner on long Lex replies (client watchdog), purely time-based | ✅ built + verified (client-only, `out/` rebuilt) | (this commit) | **Cause:** the dashboard voice-output watchdog (`08-dashboard/lib/voice-watchdog.ts` + the driving `useEffect` in `VoiceClient.tsx`) flips `voiceWatchdogDead` after 2 consecutive failing ticks of the time gates `frame_timeout` (30s) / `buffer_stuck` (10s) while `ttsActive`. On a long reply the synth has legitimate gaps (Fix 51 serialized piper, deep-brain thinking) with no new PCM frame or buffer-progress event even though the already-buffered audio plays fine, so the pure timeout trips and the "voice dead" banner shows though nothing actually faulted. Exactly the recurring "long output pops up voice dead but it's a lie" report. **Fix (no time-based errors, standing operator rule):** new `REAL_FAULT_KINDS` (`ctx_state` only) + pure `failsWarrantBanner(fails)` in `voice-watchdog.ts`; `VoiceClient.tsx` now gates `setVoiceWatchdogDead(true)` on `failsWarrantBanner(fails)`, so a purely time-based stall still heals (ctx.resume / resetVoiceAudio) and still emits `heal_failed` telemetry to `/dashboard/voice-health`, but NEVER raises the visible banner. Only a genuine dead AudioContext (suspended AND both heal steps failed to resume) surfaces. The server delivery-verify path (VB-3) was already reclassified to `pending`/`queued`, so both directions now honor no-time-based-errors. **Tests:** new `tests/voice-watchdog.test.ts`, 12 pins (runWatchdogChecks tts-gating + the `failsWarrantBanner` reclassification). Voice test group 52 green, tsc clean, `npm run build` clean + `out/` regenerated. **Rebuild:** no (client-only; `out/` already rebuilt, no daemon restart). |
+
 ## 2026-07-18 voice / supervision binding fixes (SPEC-2026-07-18-voice-binding-fixes, tests-first, additive)
 
 Spec `docs/SPEC-2026-07-18-voice-binding-fixes.md`. Two investigator passes grounded each cause before any fix. Daemon NOT restarted (operator-only, kills the live Lex); rebuild required before live verify.

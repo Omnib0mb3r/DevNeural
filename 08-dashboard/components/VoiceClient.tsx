@@ -48,6 +48,7 @@ import {
 } from "@/lib/mic-gain-migration";
 import {
   runWatchdogChecks,
+  failsWarrantBanner,
   postVoiceHealth,
   type VoiceHealthEvent,
   type WatchdogCheckKind,
@@ -1604,7 +1605,14 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
               recovered: 0,
             });
           }
-          if (consecutiveHealFailures >= 2) {
+          /* No time-based voice errors (standing operator rule). A
+           * buffer/frame stall still heals above and still emits
+           * heal_failed telemetry, but it must NOT raise the visible
+           * dead banner — it fires on long Lex replies whose synth has
+           * legitimate gaps while the buffered audio plays fine. Only a
+           * real fault (a suspended AudioContext that would not resume)
+           * flips the banner. */
+          if (consecutiveHealFailures >= 2 && failsWarrantBanner(fails)) {
             setVoiceWatchdogDead(true);
           }
         } else {

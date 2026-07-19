@@ -85,6 +85,25 @@ export function runWatchdogChecks(
   return results;
 }
 
+/* Which check kinds represent a genuine subsystem fault rather than a
+ * time-based stall. Standing operator rule: NO time-based voice
+ * errors. `buffer_stuck` and `frame_timeout` are timeouts — they fire
+ * on a long Lex reply whose synth has legitimate gaps even though the
+ * already-buffered audio plays fine, so they must heal silently and
+ * NEVER raise the user-visible "voice dead" banner. Only `ctx_state`
+ * (the AudioContext is suspended and both heal steps failed to resume
+ * it) is a real fault worth surfacing — audio genuinely cannot play. */
+export const REAL_FAULT_KINDS: WatchdogCheckKind[] = ["ctx_state"];
+
+/* Gate for the visible dead banner. A failing check set warrants the
+ * banner ONLY when it contains a real fault; a purely time-based stall
+ * (buffer/frame) still heals and still emits telemetry, but stays
+ * invisible to the operator. This is the fix for the recurring "long
+ * Lex reply pops up 'voice dead' but it's a lie" report. */
+export function failsWarrantBanner(fails: WatchdogCheckKind[]): boolean {
+  return fails.some((k) => REAL_FAULT_KINDS.includes(k));
+}
+
 export type VoiceHealthStatus = "fail" | "healed" | "heal_failed" | "probe";
 
 export interface VoiceHealthEvent {
