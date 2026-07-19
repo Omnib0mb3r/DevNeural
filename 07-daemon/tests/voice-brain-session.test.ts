@@ -575,6 +575,31 @@ describe('timeout: resolves null, never throws', () => {
     expect(pty.killCalls.length).toBe(0); // one timeout alone does not kill
   });
 
+  it('a conversational turn (noLivenessStrike) times out to null WITHOUT a strike, and two in a row do NOT kill the session', async () => {
+    /* Fix #1 (2026-07-18): the top-layer conversational turn must never
+     * be an error path. A turn slow to its FIRST byte (regular on this
+     * box) used to score a liveness strike; two consecutive strikes
+     * killed the session mid-conversation - the false "voice error".
+     * The fail-safe (forward to Lex) already covers a hung brain, so a
+     * slow/long turn only nulls (forward), never strikes, never kills. */
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty, { respawnCooldownMs: 100_000 }));
+    await warmSession(io, pty, 1);
+    // No record ever scheduled: both asks exhaust their deadline with
+    // zero life (recordsSeen 0, no jsonl growth) - the exact shape that
+    // used to strike.
+
+    const t1 = await askVoice({ prompt: 'q1', timeoutMs: 100, noLivenessStrike: true });
+    const t2 = await askVoice({ prompt: 'q2', timeoutMs: 100, noLivenessStrike: true });
+
+    expect(t1).toBeNull();
+    expect(t2).toBeNull();
+    expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(0);
+    expect(pty.killCalls.length).toBe(0);
+    expect(isVoiceBrainSessionWarm()).toBe(true);
+  });
+
   it('uses DEVNEURAL_VOICE_BRAIN_TIMEOUT_MS as the default deadline when timeoutMs is omitted', async () => {
     process.env.DEVNEURAL_VOICE_BRAIN_TIMEOUT_MS = '300';
     const io = makeVirtualIo();

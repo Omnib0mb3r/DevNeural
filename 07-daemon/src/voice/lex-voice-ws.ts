@@ -247,6 +247,16 @@ interface ConnState {
    * mutes the mic, so a pulse over the user makes Lex deaf to them. */
   userSpeaking: boolean;
   lastUserSpeechEndMs: number;
+  /* Absolute user floor (#4, 2026-07-19). True while the user physically
+   * holds push-to-talk (the client sends utterance-start on PTT down,
+   * utterance-end on release). While held, Lex emits ZERO audio: speak()
+   * drops every segment so nothing plays over the user. Distinct from
+   * userSpeaking on purpose - userSpeaking is also set by vad-onset on
+   * mere mic ENERGY (noise), and gating audio on that would truncate
+   * Lex's own in-flight reply. PTT is the one unambiguous floor signal,
+   * so only it silences the mouth. VAD interrupts are handled by the
+   * word-gated barge, which stops playback only on real non-echo words. */
+  pttFloorHeld: boolean;
   /* Talkback speak-suppression gate (2026-06-19). Set true when the
    * turn was triggered by TYPED input (text-input frame), false when
    * triggered by a real voice utterance. The talkback watcher and the
@@ -1808,6 +1818,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     utteranceStartedDuringTts: false,
     userSpeaking: false,
     lastUserSpeechEndMs: 0,
+    pttFloorHeld: false,
     suppressSpeakForTurn: false,
     compaction: { compactedAt: 0 },
     currentTtsText: null,
@@ -2609,51 +2620,43 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
          * record uuid) is never suppressed. */
         const speakKey = `${state.watchSessionId ?? state.jsonlPath ?? state.bindKey ?? ''}::${uuid || decision.new_hashes[0] || text.slice(0, 64)}::${isPreToolAck ? 'ack' : 'body'}`;
         if (claimSpokenRecord(speakKey)) {
-          /* Hard cap: a pre-tool ack speaks a short heard-you signal
-           * only, never the answer. The answer is spoken once, at
-           * end_turn. Structural enforcement so a fat ack can never be
-           * heard as a second response. The visual frame + chunk above
-           * still carry the full text.
+          /* Mid-turn (tool_use) text and the end_turn body are spoken
+           * the SAME way: in full, via the voice brain, sentence-split
+           * so piper starts on sentence one and the segments chain
+           * gaplessly. There is no mid-turn/end-turn divergence anymore.
            *
-           * Spec v2: the end_turn body is sentence-split before
-           * queueing (the confirmed producer-consumer TTS pattern) so
-           * piper starts on sentence one instead of the whole block,
-           * the segments chain gaplessly via continuation frames, and
-           * a barge-in kills mid-body cleanly. The live-haiku restyle
-           * that used to gate the body behind an extra LLM round trip
-           * is gone. */
+           * 2026-07-19: the old clampAck truncated every mid-turn reply
+           * to its first sentence (or dropped it to the canned sentinel),
+           * so the operator heard silence after the first period on every
+           * substantive thing Lex said before a tool call. That
+           * divergence WAS the "reply cut at the first sentence" bug. Per-
+           * segment hash dedupe (spokenSegmentHashes, stamped above) still
+           * stops an identical end_turn block from being re-spoken. */
           if (isPreToolAck) {
-            /* No hardcoded talking: the 'On it.' literal died with the
-             * grammar (the top layer's forward handoff line already
-             * acknowledged the request out loud). Only a REAL first
-             * sentence from Lex's own text speaks, delivered by the
-             * brain with Lex's words as the miss fallback.
-             *
-             * P0 no-silent-drop (2026-07-18): decidePreToolAck is total
-             * - it yields the clamped ack to speak OR a NAMED drop when
-             * it clamps to the canned sentinel. A drop is logged loudly
-             * here (this session an ack reached the surface and vanished
-             * with no trace); it is never a silent nothing.
-             *
-             * P1 top-owned ack: once the TOP layer has spoken its own
-             * handoff for this forward (state.topOwnsAck), the deep
-             * pre-tool ack is redundant - a double-ack and the stale-ack
-             * race. Suppress it; it only speaks as the fallback when the
-             * top produced no handoff at all (fail-safe forward). */
+            /* P1 top-owned ack: once the TOP layer has spoken its own
+             * handoff for this forward (state.topOwnsAck), the first deep
+             * mid-turn line is redundant with it - a double-ack and the
+             * stale-ack race. Suppress it; it only speaks as the fallback
+             * when the top produced no handoff at all (the common case:
+             * the top forwards silently, speech=null). Otherwise the
+             * mid-turn substance is spoken IN FULL. */
             const deepAck = _shouldSpeakDeepAckImpl({
               topOwnsAck: state.topOwnsAck,
             });
             if (!deepAck.speak) {
               logFn(
-                `[voice-ws] deep pre-tool ack suppressed reason=${deepAck.reason} text=${JSON.stringify(text.slice(0, 80))}`,
+                `[voice-ws] deep mid-turn line suppressed reason=${deepAck.reason} text=${JSON.stringify(text.slice(0, 80))}`,
               );
             } else {
+              /* decidePreToolAck is total (P0 no-silent-drop): the full
+               * mid-turn text to speak, or a NAMED drop only when it is
+               * empty (which selectTtsContent already excludes here). */
               const ackDecision = decidePreToolAck(text);
               if (ackDecision.speak) {
                 speakViaBrain(ackDecision.speak, true);
               } else {
                 logFn(
-                  `[voice-ws] TOP-LAYER ACK DROPPED reason=${ackDecision.dropReason} text=${JSON.stringify(text.slice(0, 80))}`,
+                  `[voice-ws] mid-turn line dropped reason=${ackDecision.dropReason} text=${JSON.stringify(text.slice(0, 80))}`,
                 );
               }
             }
@@ -2936,6 +2939,18 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     if (state.closed) {
       logFn(
         `[voice-ws] SPEAKABLE REPLY DROPPED: no live voice sink (ws closed); text=${JSON.stringify(text.slice(0, 80))}`,
+      );
+      return;
+    }
+    /* #4 absolute user floor: while the operator physically holds PTT,
+     * Lex emits ZERO audio. Drop the segment (never defer - stale audio
+     * must not replay after the user releases). The panel still shows
+     * the text; a real turn re-answers after release. Gated on PTT only,
+     * NOT userSpeaking, so a VAD energy blip (noise) can never truncate
+     * Lex's own in-flight reply. */
+    if (state.pttFloorHeld) {
+      logFn(
+        `[voice-ws] SPEECH SUPPRESSED (user holds PTT floor): text=${JSON.stringify(text.slice(0, 80))}`,
       );
       return;
     }
@@ -4968,6 +4983,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         /* User holds the floor until utterance-end; suppress any
          * working-heartbeat pulse for the duration. */
         state.userSpeaking = true;
+        /* #4 absolute floor: utterance-start is PTT-down. While the
+         * button is held, speak() drops every segment so Lex emits ZERO
+         * audio over the user (cleared on utterance-end / release). */
+        state.pttFloorHeld = true;
         killActiveTts('utterance-start');
         state.micBuf = [];
         state.micBufBytes = 0;
@@ -5089,6 +5108,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
          * stamp the moment so the cooldown keeps a pulse off the heels
          * of their last word. */
         state.userSpeaking = false;
+        /* #4 absolute floor released: PTT is up (or the VAD utterance
+         * ended), so Lex may speak again. handleUtteranceEnd below
+         * processes this turn and the reply flows after this point. */
+        state.pttFloorHeld = false;
         state.lastUserSpeechEndMs = Date.now();
         void handleUtteranceEnd();
         break;

@@ -67,6 +67,10 @@ export type AskFn = (args: {
    * lands; the promise still resolves with the full concatenated
    * text on end_turn. Only passed when deps.onSpeech is provided. */
   onPartial?: (text: string) => void;
+  /** Fix #1 (2026-07-18): conversational asks pass this so a timed-out
+   * turn/delivery/pulse fail-safes (null) WITHOUT scoring a liveness
+   * strike. The turn timeout is a soft bound, never an error path. */
+  noLivenessStrike?: boolean;
 }) => Promise<string | null>;
 
 export interface TopLayerDeps {
@@ -526,6 +530,7 @@ export async function topLayerTurn(
       system: topLayerSystem(),
       prompt: topLayerPrompt(utterance, ctx, now),
       timeoutMs: turnTimeoutMs(ctx.deps?.timeoutMs),
+      noLivenessStrike: true,
       ...(onPartial ? { onPartial } : {}),
     });
   } catch {
@@ -684,6 +689,7 @@ export async function voiceHeartbeat(
         `It is ${buildLocalContext(now).timeLabel}. Your deeper reasoning ` +
         `has been on the current turn for about ${minutes} minute${minutes === 1 ? '' : 's'}.`,
       timeoutMs: heartbeatTimeoutMs(deps?.timeoutMs),
+      noLivenessStrike: true,
     });
   } catch {
     raw = null;
@@ -736,6 +742,7 @@ export async function voiceLexReply(
         'facts:\n\n' +
         text,
       timeoutMs: lexReplyTimeoutMs(text.length, ctx.deps?.timeoutMs),
+      noLivenessStrike: true,
       onPartial,
     });
   } catch {

@@ -16,7 +16,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   accountSpeech,
-  clampAck,
   decidePreToolAck,
   hashSegment,
   selectTtsContent,
@@ -168,64 +167,60 @@ describe('selectTtsContent', () => {
   });
 });
 
-describe('clampAck', () => {
-  it('keeps a short single-sentence ack as-is', () => {
-    expect(clampAck('On it.')).toBe('On it.');
-    expect(clampAck('Got it boss, looking now')).toBe('Got it boss, looking now');
-  });
-
-  it('keeps only the first sentence when an ack runs on', () => {
-    expect(clampAck('Hold on. If you pressed restart something is off. Let me check.')).toBe(
-      'Hold on.',
-    );
-  });
-
-  it('replaces a fat answer-bearing ack with a canned ack (over 10 words, no early period)', () => {
-    const fat =
-      'Right you cold-started me after the bounce that is the only reason I have context';
-    expect(clampAck(fat)).toBe('On it.');
-  });
-
-  it('falls back to canned ack on empty input', () => {
-    expect(clampAck('')).toBe('On it.');
-    expect(clampAck('   ')).toBe('On it.');
-  });
-});
-
-/* P0 (2026-07-18 VOICE-TOP-LAYER-SMARTS-SPEC): no silent drops. Every
- * speech emission decision is TOTAL - it either yields text to speak or
- * a NAMED drop reason, never a silent nothing. These pins prove the
- * invariant at the decision layer; the WS logs the named reason. */
-describe('decidePreToolAck (P0 no-silent-drop)', () => {
-  it('yields the clamped ack to speak for a short first sentence', () => {
+/* Mid-turn (tool_use) speech is spoken IN FULL, identical to the
+ * end_turn body (2026-07-19). The old clampAck truncated every mid-turn
+ * reply to its first sentence or dropped it to the canned 'On it.'
+ * sentinel, so the operator heard silence after the first period on
+ * every substantive mid-turn reply. The fundamental mid-turn vs
+ * end-turn divergence WAS the bug; decidePreToolAck now speaks the whole
+ * thing. Double-speak of an identical end_turn block is still prevented
+ * by the caller's per-segment hash dedupe, not by clamping. P0 no-silent-
+ * drop still holds: empty text yields a NAMED drop, never a silent
+ * nothing. */
+describe('decidePreToolAck (mid-turn spoken IN FULL, no clamp)', () => {
+  it('speaks a short mid-turn line in full', () => {
     const d = decidePreToolAck('Got it boss, looking now');
     expect(d.speak).toBe('Got it boss, looking now');
     expect(d.dropReason).toBeNull();
   });
 
-  it('names the drop when the ack clamps to the canned sentinel', () => {
-    /* A fat, answer-bearing ack (>10 words, no early period) clamps to
-     * the canned 'On it.' - which the no-hardcoded-talking rule refuses
-     * to speak. Pre-fix this was a SILENT nothing; now it is a NAMED
-     * drop the caller logs loudly. */
+  it('speaks a MULTI-SENTENCE substantive mid-turn reply IN FULL (2026-07-19 live drop)', () => {
+    /* The live failure: every substantive mid-turn reply was clamped to
+     * its first sentence or dropped, so the operator heard nothing after
+     * the first period. */
+    const body =
+      "Confirmed drop: the worker's transcript is byte-for-byte unchanged. " +
+      'The inject never landed. Re-firing into the live session now.';
+    const d = decidePreToolAck(body);
+    expect(d.speak).toBe(body);
+    expect(d.dropReason).toBeNull();
+  });
+
+  it('speaks a long answer-bearing mid-turn line in full (no canned clamp)', () => {
     const fat =
       'Right you cold-started me after the bounce that is the only reason I have context';
     const d = decidePreToolAck(fat);
-    expect(d.speak).toBeNull();
-    expect(d.dropReason).toBe('ack-clamped-to-canned');
+    expect(d.speak).toBe(fat);
+    expect(d.dropReason).toBeNull();
   });
 
-  it('names the drop on empty / whitespace ack text', () => {
-    expect(decidePreToolAck('').dropReason).toBe('ack-clamped-to-canned');
-    expect(decidePreToolAck('   ').dropReason).toBe('ack-clamped-to-canned');
+  it('trims but preserves the whole body', () => {
+    const d = decidePreToolAck('  Found the real problem, and it is the binding bug.  ');
+    expect(d.speak).toBe('Found the real problem, and it is the binding bug.');
+    expect(d.dropReason).toBeNull();
+  });
+
+  it('names the drop on empty / whitespace text (no silent drop)', () => {
+    expect(decidePreToolAck('').speak).toBeNull();
+    expect(decidePreToolAck('').dropReason).not.toBeNull();
+    expect(decidePreToolAck('   ').dropReason).not.toBeNull();
   });
 
   it('is TOTAL: every input yields exactly one of speak / dropReason', () => {
     const samples = [
       'On it.',
       'Short ack.',
-      'Got it boss, looking now',
-      'Hold on. Let me check.',
+      'Confirmed drop: transcript unchanged. Re-firing now.',
       'Right you cold-started me after the bounce that is the only reason I have context',
       '',
       '   ',

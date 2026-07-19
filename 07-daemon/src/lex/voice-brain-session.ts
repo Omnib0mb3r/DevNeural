@@ -84,6 +84,16 @@ export interface AskVoiceInput {
    * 'end_turn'; when omitted, the first text-bearing record resolves
    * the ask. A throwing onPartial is logged and ignored. */
   onPartial?: (text: string) => void;
+  /** Fix #1 (2026-07-18): mark this as a CONVERSATIONAL ask whose
+   * timeout is a soft bound, never an error path. When true, a timed-out
+   * ask nulls (the caller's fail-safe forward-to-Lex fires) but scores
+   * NO liveness strike and can never contribute to the two-consecutive-
+   * timeouts session kill. The top layer's turn, delivery, and heartbeat
+   * asks all set this: a slow or long turn is not evidence of a dead
+   * session, and on this box claude turn latency regularly exceeds the
+   * bound. Session death is still detected by an exited PTY (ensureSpawned)
+   * and by the boot warmup probe - both independent of this flag. */
+  noLivenessStrike?: boolean;
 }
 
 /* Bounds time-to-first-SIGNAL, not total reply time (2026-07-17
@@ -822,6 +832,16 @@ async function askVoiceInner(input: AskVoiceInput): Promise<string | null> {
     ptyId,
   );
   if (result.timedOut) {
+    if (input.noLivenessStrike) {
+      /* Fix #1 (2026-07-18): conversational asks are never an error
+       * path. The turn timed out - the caller's fail-safe (forward to
+       * Lex) fires - but a slow/long turn scores NO strike and can
+       * never contribute to the two-consecutive-timeouts kill. */
+      deps.log(
+        `[voice-brain] conversational ask timed out (records=${result.recordsSeen} bytes_grew=${result.sawBytes}); no liveness strike by contract (streak stays ${state.consecutiveTimeouts})`,
+      );
+      return null;
+    }
     if (!_shouldCountLivenessStrikeImpl(result)) {
       /* The session showed life during the wait (assistant records
        * streamed, or the jsonl grew at all - claude accepted the
