@@ -6,7 +6,99 @@ Update this file IN PLACE every time the cursor moves; never add a new
 dated file. Ground every claim against git before asserting; this doc
 reflects what was true at the last update.
 
-## Cursor (2026-07-18 afternoon, VOICE WORKING - PENDING SMOKE; 5 commits, daemon LIVE)
+## Cursor (2026-07-19, WIRE + VOICE + BELL batch; 4 commits, daemon NOT restarted - PENDING operator restart)
+
+Four fixes committed on master this session, tree clean. Daemon and
+dashboard both build clean (tsc + `next build`). The RUNNING daemon
+predates all four; the deployed client (`08-dashboard/out/`) predates the
+two dashboard-touching changes in the wire commit. ONE operator daemon
+restart plus a `08-dashboard` rebuild activates everything. No
+auto-restart; operator deploys.
+
+### This session's commits (newest first, all on master)
+
+- `63641c0` fix(notifications): keep telemetry sources off the
+  input-needed bell. The bell surfaced background telemetry as if it were
+  user notifications. Verified against the live notifications.jsonl: the
+  real leak is grooming/housekeeping (source `grooming-watch`) at
+  signal@alert riding the generic emergency lane (39 live rows). New
+  `TELEMETRY_SOURCES` set (grooming-watch, curator, reinforcement) gated
+  in `passesSurfaceFilter`: those sources never bell regardless of
+  class/severity; they stay on the activity surface. idle_prompt (source
+  `permission`, followup) still bells. DAEMON. Test:
+  notifications-class-filter (grooming@alert dropped, daemon-down@alert
+  still passes).
+- `925eecb` fix(voice): render typed-input Lex replies in the transcript.
+  FIXES the prior cursor's open-defect #1 ("typed-only shows the
+  question, never the answer"). The transcript panel renders from live
+  `assistant-text` WS frames, not a brainstorm_chunks poll; the
+  direct-llm reply path delivered the reply ONLY through `speak()`, so a
+  typed turn (suppressSpeakForTurn) persisted the reply but never emitted
+  assistant-text and was invisible. New pure `planDirectLlmReplyDelivery`
+  decouples render from TTS: assistant-text (layer 'mid') now fires before
+  the TTS gate for every turn. Typed renders + silent; voice renders +
+  spoken. DAEMON. Test: voice-direct-llm-delivery.
+- `4da9157` fix(wire): one authoritative
+  worker<->anchor<->brainstorm<->session binding. Four symptoms, one root:
+  `project_session.current_session_id` (the single anchor->worker binding
+  every surface reads) was populated and reaped inconsistently. (a)
+  reconcileBridgePresence ranks the authoritative newest-active-jsonl
+  signal above the bridge's ccSessionIds order for multi-claim windows, so
+  a retired sibling can no longer be pinned as the live worker (the
+  dispatch redirect is no longer load-bearing). (b) worker/Lex terminal
+  mirror label reads the page's authoritative anchor->project binding via
+  a projectSlug prop, killing "WATCHING UNKNOWN PROJECT". (c)
+  readLiveSessionIds subtracts any live anchor's previous_session_id, so a
+  replaced session cannot linger as a phantom "no brainstorm" worker card.
+  (d) POST /sessions/:id/terminal-stream resolves the producer key through
+  the same resolveMirrorSessionId the subscribers use, so bridge frames
+  fill the ring the worker mirror watches (blank mirror now paints).
+  DAEMON + DASHBOARD. Tests: bridge-presence, sessions-anchor-liveness,
+  cross-session-resolve, curator-feed-labels.
+- `61da1b0` fix(voice): barge kill emits tts-cancel off client playback,
+  not synth ctx. Barge detection fired ("barge word-gate FIRED") but
+  audio never stopped: killActiveTts only sent the client tts-cancel when
+  speakCtrl.killActive() returned true, which is false whenever
+  state.ttsActive is null, and a real barge interrupts CLIENT-buffered
+  playback that outlives the daemon synth ctx. New `_killActiveTtsDecision`
+  emits tts-cancel whenever cancelled OR clientPlaybackActive; the
+  destructive parts (bargeStash / PTY Ctrl+C) stay gated on a real
+  cancellation so a phantom barge never hard-interrupts the worker.
+  DAEMON. Test: voice-barge-kill.
+
+Builds on the earlier 2026-07-19 voice/bell/binding batch already on
+master (ff5c167 worker-terminal mismatch, 465c21e inject-delivery
+pill / brain-hop label, 78059c0 brain-replied label, 002833e smoke doc,
+2e4ac40 client auto-reload).
+
+### Deployed vs pending
+
+- DAEMON (dist built, tsc clean): all four fixes are in the built dist;
+  the RUNNING daemon predates them. One operator restart activates them.
+  Every commit body ends `Rebuild: yes`.
+- CLIENT (`08-dashboard/out/`): the wire commit's label + mirror changes
+  are DASHBOARD, so they need `npm run build` in 08-dashboard (out/ is
+  gitignored) before they show. The other three commits are daemon-only.
+
+### Restart-verify (this batch)
+
+1. Barge (61da1b0): during a Lex TTS reply, speak over it. Audio stops
+   immediately, not just "barge FIRED" in the log.
+2. Wire (4da9157): after a worker /clear or restart, inject/supervision
+   resolves the NEW session with no redirect; the worker terminal label
+   shows the real project (not UNKNOWN PROJECT); the Workers panel shows
+   ONE worker card (no phantom "no brainstorm" card); the worker terminal
+   mirror PAINTS (not blank).
+3. Typed transcript (925eecb): type to Lex (no voice). The reply RENDERS
+   in the transcript with zero audio. A voice reply still renders AND is
+   spoken.
+4. Bell (63641c0): the notification bell shows only input-needed items
+   (idle_prompt "Claude waiting on you"); no "Grooming:" rows, no "Lex
+   injected raw:" rows.
+
+Evidence is pre-wired in daemon.log; grep there first on any failure.
+
+## Previous cursor (2026-07-18 afternoon, VOICE WORKING - PENDING SMOKE; 5 commits, daemon LIVE)
 
 **DO NOT REWORK VOICE.** Voice capture + audible TTS + smart coalescing
 are WORKING and verified live. The wave client did NOT need reverting;
