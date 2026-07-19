@@ -791,6 +791,15 @@ export interface BridgeMirrorState {
   last_resolution_failure_reason: string | null;
   last_post_error: string | null;
   last_post_error_at: string | null;
+  /* Daemon-enriched (not written by the bridge): the project_slug that
+   * last_flush_session_id belongs to, resolved off the ONE anchor->worker
+   * binding (project_session.current_session_id / previous_session_id).
+   * null when the last flush is not a known project worker - e.g. a dead
+   * voice-brain session the bridge still lists. The worker-terminal panel
+   * uses this to fire the "streaming other session" warning ONLY on a
+   * genuine cross-PROJECT flush (a wrong registered cwd), not on a stale
+   * flush that merely differs from the watched session id. */
+  last_flush_project?: string | null;
 }
 
 export interface BridgeStatus {
@@ -806,12 +815,30 @@ const BRIDGE_MIRROR_STATE_FILE = path.posix.join(
 );
 
 function readMirrorState(): BridgeMirrorState | null {
+  let mirror: BridgeMirrorState | null;
   try {
     const raw = fs.readFileSync(BRIDGE_MIRROR_STATE_FILE, 'utf-8');
-    return JSON.parse(raw) as BridgeMirrorState;
+    mirror = JSON.parse(raw) as BridgeMirrorState;
   } catch {
     return null;
   }
+  /* Enrich with the last-flush session's PROJECT off the same anchor->
+   * worker binding every other surface reads, so the terminal panel can
+   * tell a genuine cross-project misroute (warn) from a stale flush that
+   * merely predates the current bound session (no warn). null = the flush
+   * session is no project's worker (a dead voice-brain, etc.). */
+  let last_flush_project: string | null = null;
+  if (mirror.last_flush_session_id) {
+    try {
+      last_flush_project =
+        getStore().db.findProjectSessionBySessionId(
+          mirror.last_flush_session_id,
+        )?.project_slug ?? null;
+    } catch {
+      last_flush_project = null;
+    }
+  }
+  return { ...mirror, last_flush_project };
 }
 
 export function bridgeStatus(): BridgeStatus {

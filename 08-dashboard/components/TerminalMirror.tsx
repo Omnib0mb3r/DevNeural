@@ -23,6 +23,10 @@ interface MirrorState {
   last_resolution_failure_reason: string | null;
   last_post_error: string | null;
   last_post_error_at: string | null;
+  /* Daemon-enriched: the project the last-flush session belongs to (off
+   * the anchor->worker binding), or null when it is no project's worker.
+   * Drives the cross-project mismatch warning below. */
+  last_flush_project?: string | null;
 }
 
 interface BridgeStatusResponse {
@@ -77,6 +81,7 @@ function describeBridge(
   sessionId: string,
   daemonPtyOwnsSession: boolean,
   daemonPtyPending: boolean,
+  watchedProject: string | null,
 ): { label: string; tone: "ok" | "warn" | "err"; detail: string } {
   if (daemonPtyOwnsSession) {
     /* When this session is hosted by a daemon-PTY (Lex / Start-Claude
@@ -134,14 +139,29 @@ function describeBridge(
       detail: m.reason ?? "subscription failed",
     };
   }
-  if (m.last_flush_session_id && m.last_flush_session_id !== sessionId) {
+  /* Cross-PROJECT mismatch only. The bridge multiplexes every VS Code
+   * terminal, so its single last_flush_session_id is just whichever
+   * terminal produced bytes most recently - comparing it to THIS panel's
+   * session id false-fired constantly (e.g. a dead voice-brain flushed
+   * last while this worker is streaming fine). Warn only when the last
+   * flush belongs to a DIFFERENT project than the one we watch: that is a
+   * genuine "registered the wrong cwd". A stale flush from no project
+   * (last_flush_project null) or from THIS project never warns. Both
+   * sides resolve off the one anchor->worker binding, so A == B. */
+  if (
+    m.last_flush_session_id &&
+    m.last_flush_session_id !== sessionId &&
+    m.last_flush_project &&
+    watchedProject &&
+    m.last_flush_project !== watchedProject
+  ) {
     return {
-      label: "mirror: streaming other session",
+      label: "mirror: streaming other project",
       tone: "warn",
-      detail: `bridge is sending bytes to ${m.last_flush_session_id.slice(
+      detail: `bridge is sending bytes to ${m.last_flush_project} (${m.last_flush_session_id.slice(
         0,
         8,
-      )}…, not this one. Check StreamDeck.App registered the right cwd.`,
+      )}…), not ${watchedProject}. Check StreamDeck.App registered the right cwd.`,
     };
   }
   if (!m.last_flush_at) {
@@ -749,6 +769,7 @@ export function TerminalMirror({ sessionId, title }: Props) {
     sessionId,
     daemonPtyOwnsSession,
     daemonPtyPending,
+    sessionEntry?.project_slug ?? null,
   );
 
   return (
