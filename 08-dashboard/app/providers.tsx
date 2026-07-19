@@ -3,6 +3,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState, type ReactNode } from "react";
 import { VoiceClient } from "@/components/VoiceClient";
+import { BuildAutoUpdate } from "@/components/BuildAutoUpdate";
 
 export function Providers({ children }: { children: ReactNode }) {
   const [client] = useState(
@@ -26,6 +27,7 @@ export function Providers({ children }: { children: ReactNode }) {
    * route. */
   return (
     <QueryClientProvider client={client}>
+      <BuildAutoUpdate />
       <VoiceClient>{children}</VoiceClient>
     </QueryClientProvider>
   );

@@ -24,6 +24,15 @@ if (!existsSync(swPath)) {
 }
 
 const stamp = new Date().toISOString();
+
+// Deploy-version marker the running client polls (BuildAutoUpdate) to
+// detect a new build and reload itself. Written unconditionally when a
+// static export exists, even if the SW sentinel was already replaced by
+// an earlier run, so the marker never goes stale relative to the bundle.
+const versionPath = join(here, '..', 'out', 'version.json');
+writeFileSync(versionPath, JSON.stringify({ v: stamp }) + '\n', 'utf-8');
+console.log(`[postbuild-sw-version] wrote version.json ${stamp}`);
+
 const before = readFileSync(swPath, 'utf-8');
 if (!before.includes('__BUILD_VERSION__')) {
   console.warn(`[postbuild-sw-version] sentinel not found in ${swPath}; skipping (already stamped or sentinel removed)`);
