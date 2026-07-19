@@ -89,6 +89,67 @@ export interface ReconcileOptions {
    * scanning ~/.claude/projects/<slug>/<cc>.jsonl. Tests can override
    * to avoid touching the user's transcript dir. */
   resolveJsonlPath?: (ccSessionId: string) => string;
+  /** VB-2 (2026-07-18): backfill current_session_id for a fresh live
+   * worker whose bridge presence file has not yet listed a cc session
+   * id. Given the anchor cwd + clock + freshness window, resolve the
+   * most-recent ACTIVE cc session (newest jsonl written within freshMs)
+   * under the project's ~/.claude/projects dir, or null when none is
+   * active. Injected for tests; the filesystem default scans the claude
+   * projects dir. */
+  resolveLiveSessionForCwd?: (
+    cwd: string,
+    nowMs: number,
+    freshMs: number,
+  ) => string | null;
+}
+
+/* VB-2 default resolver: map an anchor cwd to its ~/.claude/projects
+ * dir and return the newest jsonl written within `freshMs` (an active
+ * session), or null. Claude Code names each project dir by replacing
+ * every non-alphanumeric char in the cwd with '-', preserving the
+ * drive-letter case however the cwd was cased when CC started - the
+ * same c:/ vs C:/ divergence normalizeCwd papers over - so the slug is
+ * matched case-INSENSITIVELY. The freshness window is the "a session
+ * is active" gate: a stale jsonl from a prior worker cannot bind. */
+export function defaultResolveLiveSessionForCwd(
+  cwd: string,
+  nowMs: number,
+  freshMs: number,
+): string | null {
+  const root = defaultClaudeProjectsDir();
+  if (!fs.existsSync(root)) return null;
+  const wantSlug = cwd.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase();
+  let slugs: string[];
+  try {
+    slugs = fs.readdirSync(root);
+  } catch {
+    return null;
+  }
+  const dirName = slugs.find((s) => s.toLowerCase() === wantSlug);
+  if (!dirName) return null;
+  const dir = path.posix.join(root, dirName);
+  let files: string[];
+  try {
+    files = fs.readdirSync(dir);
+  } catch {
+    return null;
+  }
+  let best: { id: string; mtimeMs: number } | null = null;
+  for (const f of files) {
+    if (!f.endsWith('.jsonl')) continue;
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(path.posix.join(dir, f));
+    } catch {
+      continue;
+    }
+    if (!stat.isFile()) continue;
+    if (nowMs - stat.mtimeMs > freshMs) continue; /* not an active session */
+    if (!best || stat.mtimeMs > best.mtimeMs) {
+      best = { id: f.replace(/\.jsonl$/, ''), mtimeMs: stat.mtimeMs };
+    }
+  }
+  return best?.id ?? null;
 }
 
 function normalizeCwd(cwd: string): string {
@@ -266,6 +327,8 @@ export function reconcileBridgePresence(
   const fresh = opts.freshMs ?? DEFAULT_BRIDGE_TIMEOUT_MS;
   const now = (opts.now ?? Date.now)();
   const resolveJsonlPath = opts.resolveJsonlPath ?? defaultResolveJsonlPath;
+  const resolveLiveSessionForCwd =
+    opts.resolveLiveSessionForCwd ?? defaultResolveLiveSessionForCwd;
   const records = readPresenceDir(dir, now, fresh);
   const byCwd = groupByCwd(records);
 
@@ -307,6 +370,19 @@ export function reconcileBridgePresence(
     let currentSession = priorSession;
     if (primary.ccSessionIds.length > 0) {
       currentSession = primary.ccSessionIds[0]!;
+    } else if (!priorSession) {
+      /* VB-2 (2026-07-18): the bridge reports presence for this cwd but
+       * has not listed a cc session id yet, and the anchor has none.
+       * Without a backfill the anchor flips 'live' with a null
+       * current_session_id, so anchor-tiles omits the tile, inject
+       * auto-target returns 422 bound-project-dormant, and the
+       * supervisor label renders an empty worker= for the whole window.
+       * Resolve the fresh worker's active cc session from disk so
+       * supervision binds promptly. Only fires when the anchor has no
+       * session at all (never overrides a known binding); a later
+       * bridge cc report takes precedence above. */
+      const resolved = resolveLiveSessionForCwd(cwd, now, fresh);
+      if (resolved) currentSession = resolved;
     }
     /* Fix 15 — preserve the prior uuid so /lex/inject-cross-session
      * can map a stale uuid back to this anchor and redirect to the

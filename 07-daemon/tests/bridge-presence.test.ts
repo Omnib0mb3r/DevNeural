@@ -577,6 +577,117 @@ describe('reconcileBridgePresence', () => {
     expect(byCc.get('cc-new')!.closed_ms).toBeNull();
   });
 
+  it('VB-2: backfills current_session_id for a fresh live worker from the resolved active cc jsonl when the bridge has not reported a cc id yet', () => {
+    const now = 8_100_000;
+    /* anchor-A is a fresh live worker: the bridge reports presence for
+     * its cwd but has not yet listed a cc session id, and the anchor
+     * has no current_session_id. Without a backfill it flips 'live'
+     * with a null session, so anchor-tiles omits the tile and inject
+     * auto-target returns 422 bound-project-dormant for the whole
+     * window. */
+    writePresence(
+      'fresh-worker.json',
+      {
+        cwd: 'C:/dev/Projects/proj-a',
+        bridge_id: 'bridge-fresh',
+        /* no cc_session_ids */
+      },
+      now,
+    );
+    const resolveLiveSessionForCwd = vi.fn(
+      (cwd: string) =>
+        cwd === 'C:/dev/Projects/proj-a' ? 'cc-live-from-disk' : null,
+    );
+
+    reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => now,
+      resolveLiveSessionForCwd,
+    });
+
+    const row = db.getProjectSession('anchor-A')!;
+    expect(row.status).toBe('live');
+    expect(row.current_session_id).toBe('cc-live-from-disk');
+    /* The backfill also opens the transcript_ref so the tile has
+     * something to read. */
+    const refs = db.listProjectTranscriptRefs('anchor-A');
+    expect(refs.map((r) => r.cc_session_id)).toContain('cc-live-from-disk');
+  });
+
+  it('VB-2: leaves current_session_id null when no active cc jsonl resolves (no live worker to bind)', () => {
+    const now = 8_200_000;
+    writePresence(
+      'no-worker.json',
+      { cwd: 'C:/dev/Projects/proj-a', bridge_id: 'bridge-idle' },
+      now,
+    );
+    const resolveLiveSessionForCwd = vi.fn(() => null);
+
+    reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => now,
+      resolveLiveSessionForCwd,
+    });
+
+    const row = db.getProjectSession('anchor-A')!;
+    expect(row.status).toBe('live');
+    expect(row.current_session_id).toBeNull();
+    expect(resolveLiveSessionForCwd).toHaveBeenCalled();
+  });
+
+  it('VB-2: does not consult the disk resolver (nor override) when the anchor already has a current_session_id', () => {
+    const now = 8_300_000;
+    db.updateProjectSession('anchor-A', {
+      status: 'live',
+      current_session_id: 'prior-cc',
+      current_bridge_id: 'prior-bridge',
+    });
+    writePresence(
+      'window1.json',
+      { cwd: 'C:/dev/Projects/proj-a', bridge_id: 'bridge-w1' },
+      now,
+    );
+    const resolveLiveSessionForCwd = vi.fn(() => 'cc-should-not-be-used');
+
+    reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => now,
+      resolveLiveSessionForCwd,
+    });
+
+    const row = db.getProjectSession('anchor-A')!;
+    expect(row.current_session_id).toBe('prior-cc');
+    expect(resolveLiveSessionForCwd).not.toHaveBeenCalled();
+  });
+
+  it('VB-2: a real bridge cc id still wins over the disk resolver', () => {
+    const now = 8_400_000;
+    writePresence(
+      'window1.json',
+      {
+        cwd: 'C:/dev/Projects/proj-a',
+        bridge_id: 'bridge-w1',
+        cc_session_ids: ['cc-from-bridge'],
+      },
+      now,
+    );
+    const resolveLiveSessionForCwd = vi.fn(() => 'cc-from-disk');
+
+    reconcileBridgePresence(db, {
+      presenceDir: env.presenceDir,
+      freshMs: 30_000,
+      now: () => now,
+      resolveLiveSessionForCwd,
+    });
+
+    const row = db.getProjectSession('anchor-A')!;
+    expect(row.current_session_id).toBe('cc-from-bridge');
+    expect(resolveLiveSessionForCwd).not.toHaveBeenCalled();
+  });
+
   it('preserves existing current_session_id when bridge omits cc_session_ids', () => {
     const now = 8_000_000;
     db.updateProjectSession('anchor-A', {
