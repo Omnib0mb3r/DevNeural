@@ -311,15 +311,16 @@ describe('topLayerTurn', () => {
     expect(prompt).not.toContain('Last line you spoke');
   });
 
-  it('duringTts adds the echo note', async () => {
+  it('duringTts adds the rethink-vs-finish policy note', async () => {
     let prompt = '';
     const ask: AskFn = async (args) => {
       prompt = args.prompt;
       return 'ok';
     };
     await topLayerTurn('stop', makeCtx(ask, { duringTts: true }));
-    expect(prompt).toContain('WHILE you were speaking');
-    expect(prompt).toContain('echo');
+    expect(prompt).toContain('mid-sentence');
+    expect(prompt).toContain('FINISH');
+    expect(prompt).toContain('echoed');
   });
 
   it('lexBusy adds the mid-task note', async () => {

@@ -4659,6 +4659,20 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       applyTopLayerControl(tl.control, remainderSpeech);
       return;
     }
+    /* Rethink-vs-finish (VOICE-TOP-LAYER-SPEC point 6, replaces the old
+     * failSafeForward shape-check). The top layer judged this barge did
+     * NOT change the in-flight answer (an aside, agreement, or Lex's own
+     * echo): resume the interrupted thought instead of forwarding or
+     * absorbing. resumeBargedSpeech is a no-op when nothing was stashed
+     * (playback never stopped), so a stray FINISH is harmless. The
+     * decision is the model's explicit signal, not a guess at output
+     * shape - a real correction returns forward/speech, never FINISH. */
+    if (tl.finish) {
+      logFn('[voice-ws] top-layer FINISH: resuming the interrupted reply');
+      resumeBargedSpeech('finish');
+      state.utteranceStartedDuringTts = false;
+      return;
+    }
     const fullReply = [...earlySpoken, remainderSpeech ?? '']
       .join(' ')
       .trim();
@@ -4689,32 +4703,13 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * (the researched latency mask - it replaces the canned bridge
      * pool); it speaks while the inject proceeds below. */
     if (remainderSpeech) speak(remainderSpeech);
-    /* AEC-residual guard, fail-safe path only. When the top layer
-     * actually answered (streamed or final speech, a control, or a
-     * rewritten forward) it SAW the during-TTS note and judged the
-     * turn real. But when the session was down/timed out, the forward
-     * is the raw fail-safe echo of the utterance; during TTS that
-     * text is most likely Lex's own audio bleeding back in, and
-     * injecting it would derail the brainstorm. Preserve the old
-     * suppression for exactly that case. */
-    const failSafeForward =
-      tl.speech === null &&
-      tl.control === null &&
-      earlySpoken.length === 0 &&
-      tl.forward === trimmed;
-    if (wasDuringTts && failSafeForward) {
-      logFn(
-        `[voice-ws] suppressed fail-safe forward during TTS: ${JSON.stringify(result.text.slice(0, 80))}`,
-      );
-      /* Judged to be Lex's own audio bleeding back in: the barge was
-       * phantom, so the interrupted body resumes instead of staying
-       * half-spoken (Fix 24 live repro, 2026-07-16). */
-      resumeBargedSpeech('echo-suppressed');
-      return;
-    }
-    /* Words confirmed a real operator turn: no resume, and the
-     * deferred barge Ctrl+C (if the turn started over live TTS)
-     * fires now so Lex drops the interrupted reply. */
+    /* Rethink (VOICE-TOP-LAYER-SPEC point 6): a real forward reached
+     * here, which means the top layer did NOT return FINISH - it judged
+     * the barge a genuine turn. So no resume, and the deferred barge
+     * Ctrl+C (if the turn started over live TTS) fires now so Lex drops
+     * the interrupted reply. The old failSafeForward shape-check that
+     * inferred "phantom echo" from output shape is gone; the resume
+     * decision is now the model's explicit FINISH signal, handled above. */
     confirmRealBarge(true);
     result = { text: tl.forward, ms: result.ms };
     /* P1 top-owned ack: the top owns this forward's ack iff it actually

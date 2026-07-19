@@ -49,6 +49,12 @@ export interface TopLayerResult {
   forward: string | null;
   /** Device-control effect for dispatchVoiceCommand, or null. */
   control: TopLayerControl | null;
+  /** Rethink-vs-finish policy (VOICE-TOP-LAYER-SPEC point 6): true when
+   * this utterance arrived mid-TTS and the model judged it did NOT
+   * change the in-flight answer (an aside, agreement, or its own echo).
+   * The caller resumes the interrupted reply ("finish the thought")
+   * instead of forwarding. Only meaningful when ctx.duringTts. */
+  finish?: boolean;
   /** Streaming turns only: true when the final parsed speech does not
    * start with the early-emitted prefix (the model rewrote text it had
    * already streamed). speech then carries the FULL parsed speech and
@@ -144,6 +150,10 @@ const defaultAsk: AskFn = async (args) => {
 
 const FORWARD_LINE = /^\s*forward:(.*)$/i;
 const CONTROL_LINE = /^\s*control:(.*)$/i;
+/* Rethink-vs-finish (VOICE-TOP-LAYER-SPEC point 6). A bare directive,
+ * no payload: the model emits it (optionally with a colon) to say "this
+ * barge did not change my answer, let me finish the thought." */
+const FINISH_LINE = /^\s*finish\s*:?\s*$/i;
 
 /* ── fabrication guards (2026-07-16, kill-canned-glue mandate) ───────
  *
@@ -266,7 +276,12 @@ export function guardTopLayerSpeech(speech: string): string | null {
  * final parse is strictly safer than speaking it early. */
 function containsDirectiveLine(text: string): boolean {
   for (const line of text.split(/\r?\n/)) {
-    if (FORWARD_LINE.test(line) || CONTROL_LINE.test(line)) return true;
+    if (
+      FORWARD_LINE.test(line) ||
+      CONTROL_LINE.test(line) ||
+      FINISH_LINE.test(line)
+    )
+      return true;
   }
   return false;
 }
@@ -298,10 +313,19 @@ export function parseTopLayerReply(
   const speechLines: string[] = [];
   const forwardLines: string[] = [];
   let control: TopLayerControl | null = null;
+  let finish = false;
   let sawForward = false;
   let collectingForward = false;
 
   for (const line of raw.split(/\r?\n/)) {
+    /* FINISH is the highest-precedence directive: it IS the decision
+     * (resume the interrupted thought). It closes any forward block and
+     * suppresses stray speech - a FINISH turn speaks/forwards nothing. */
+    if (FINISH_LINE.test(line)) {
+      finish = true;
+      collectingForward = false;
+      continue;
+    }
     const fwd = line.match(FORWARD_LINE);
     if (fwd) {
       if (!sawForward) {
@@ -333,6 +357,12 @@ export function parseTopLayerReply(
     else speechLines.push(line);
   }
 
+  /* FINISH is the whole decision: resume the interrupted thought,
+   * speak/forward nothing. A model that emits FINISH plus stray text is
+   * off-contract; the directive wins. */
+  if (finish) {
+    return { speech: null, forward: null, control: null, finish: true };
+  }
   const speechJoined = speechLines.join('\n').trim();
   const speech =
     speechJoined.length === 0
@@ -393,10 +423,16 @@ function topLayerPrompt(
   if (ctx.duringTts) {
     lines.push(
       '',
-      'NOTE: this was heard WHILE you were speaking, so it may be your',
-      'own line echoed back at you. If it reads like an echo or a',
-      'fragment of what you just said, reply with nothing at all: no',
-      'speech, no directives.',
+      'NOTE: you were mid-sentence when this came in. Decide:',
+      '- If it does NOT change what you were saying (an aside, a nod,',
+      '  "yeah"/"ok"/"right", a "keep going", or your own words echoed',
+      '  back), output ONLY the single line FINISH and nothing else. You',
+      '  will finish the sentence you were on.',
+      '- If it DOES change your answer (a correction, a new direction, a',
+      '  question needing a different reply), do NOT output FINISH: drop',
+      '  the sentence and respond to the new input (a short spoken line',
+      '  and/or a FORWARD). When unsure, treat it as real and respond -',
+      '  never FINISH over a genuine correction.',
     );
   }
   if (ctx.lexBusy) {
@@ -540,8 +576,12 @@ export async function topLayerTurn(
   if (
     result.speech === null &&
     result.forward === null &&
-    result.control === null
+    result.control === null &&
+    !result.finish
   ) {
+    /* Ask down / timeout / empty: the operator's words always reach Lex.
+     * A FINISH is an explicit decision, NOT an all-null fail-safe, so it
+     * is exempt - it must resume the thought, never become a forward. */
     return { speech: null, forward: utterance, control: null };
   }
   if (consumed.length > 0) {
