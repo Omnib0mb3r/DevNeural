@@ -10,10 +10,11 @@ reflects what was true at the last update.
 
 Four fixes committed on master this session, tree clean. Daemon and
 dashboard both build clean (tsc + `next build`). The RUNNING daemon
-predates all four; the deployed client (`08-dashboard/out/`) predates the
-two dashboard-touching changes in the wire commit. ONE operator daemon
-restart plus a `08-dashboard` rebuild activates everything. No
-auto-restart; operator deploys.
+predates all four. The client (`08-dashboard/out/`) is ALREADY CURRENT:
+it was rebuilt during this session's verification and carries the wire
+commit's label + mirror changes (proven below). ONE operator daemon
+restart deploys everything, no separate build step. No auto-restart;
+operator deploys.
 
 ### This session's commits (newest first, all on master)
 
@@ -76,9 +77,14 @@ pill / brain-hop label, 78059c0 brain-replied label, 002833e smoke doc,
 - DAEMON (dist built, tsc clean): all four fixes are in the built dist;
   the RUNNING daemon predates them. One operator restart activates them.
   Every commit body ends `Rebuild: yes`.
-- CLIENT (`08-dashboard/out/`): the wire commit's label + mirror changes
-  are DASHBOARD, so they need `npm run build` in 08-dashboard (out/ is
-  gitignored) before they show. The other three commits are daemon-only.
+- CLIENT (`08-dashboard/out/`, gitignored): ALREADY CURRENT, no build
+  step before deploy. A fresh `next build` this session changed ONLY the
+  build-id-derived HTML/txt and the sw.js/version.json timestamp stamp;
+  ZERO `_next/static/chunks` changes, i.e. the compiled bundles were
+  byte-identical, so out/ already contained the wire commit's label +
+  mirror changes (built during the earlier wire verification). Served
+  per-request; no restart needed for the client. (Correcting an earlier
+  note in this cursor that claimed out/ was stale.)
 
 ### Restart-verify (this batch)
 
