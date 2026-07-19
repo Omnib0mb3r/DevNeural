@@ -138,6 +138,134 @@ describe('_resumeBargedSpeechImpl (phantom barge resume)', () => {
   });
 });
 
+/* Fix 24 tail-loss (2026-07-18 spec, Fix 1): once Fix 51 synth-
+ * serialization ships every sentence to the client ahead of realtime
+ * playback, the mid/deep body has drained off the server ttsQueue by
+ * barge time, so the per-segment stash captures only the in-flight
+ * sentence. The remainder-resume reconstructs the UN-heard tail of the
+ * WHOLE original body from the full spoken run + the client's played
+ * offset, so sentences 2..N are never lost. */
+describe('_resumeBargedSpeechImpl (full-body remainder resume)', () => {
+  const FULL = 'One two three. Four five six. Seven eight nine.';
+
+  it('re-speaks the un-played remainder of the whole body from played_ms, not the drained segment snapshot', () => {
+    const spoken: string[] = [];
+    /* Segment snapshot lost the tail: only sentence 1 survived on the
+     * server queue. playedMs covers just sentence 1 (14 chars at
+     * 10ms/char = 140ms). */
+    const resumed = _resumeBargedSpeechImpl({
+      stash: stash({
+        interruptedSegment: 'One two three.',
+        queuedSegments: [],
+        fullRunText: FULL,
+        playedMs: 140,
+      }),
+      nowMs: 2_000,
+      ttsBusy: false,
+      partialChain: [],
+      speak: (t) => spoken.push(t),
+      reason: 'echo-filter',
+      log: () => undefined,
+      msPerChar: 10,
+    });
+    expect(resumed).toBe(true);
+    /* One unsplit resume segment carrying the whole unheard tail -
+     * mirrors the top layer, which resumes its single segment whole. */
+    expect(spoken).toEqual(['Four five six. Seven eight nine.']);
+  });
+
+  it('appends still-queued segments that never shipped to the run text', () => {
+    const spoken: string[] = [];
+    /* fullRunText only covers what got a tts-start (sentences 1-2);
+     * sentence 3 was still on the queue at barge time, absent from the
+     * run text - it must still resume. */
+    const resumed = _resumeBargedSpeechImpl({
+      stash: stash({
+        interruptedSegment: 'Four five six.',
+        queuedSegments: ['Seven eight nine.'],
+        fullRunText: 'One two three. Four five six.',
+        playedMs: 140,
+      }),
+      nowMs: 2_000,
+      ttsBusy: false,
+      partialChain: [],
+      speak: (t) => spoken.push(t),
+      reason: 'echo-filter',
+      log: () => undefined,
+      msPerChar: 10,
+    });
+    expect(resumed).toBe(true);
+    expect(spoken).toEqual(['Four five six. Seven eight nine.']);
+  });
+
+  it('falls back to the per-segment snapshot when the client reported no offset (legacy client / playedMs null)', () => {
+    const spoken: string[] = [];
+    const resumed = _resumeBargedSpeechImpl({
+      stash: stash({
+        interruptedSegment: 'Sentence three was cut here.',
+        queuedSegments: ['Sentence four.'],
+        fullRunText: FULL,
+        playedMs: null,
+      }),
+      nowMs: 2_000,
+      ttsBusy: false,
+      partialChain: [],
+      speak: (t) => spoken.push(t),
+      reason: 'empty',
+      log: () => undefined,
+    });
+    expect(resumed).toBe(true);
+    expect(spoken).toEqual(['Sentence three was cut here.', 'Sentence four.']);
+  });
+
+  it('does not resume when the whole body was already heard and nothing is queued', () => {
+    const spoken: string[] = [];
+    const resumed = _resumeBargedSpeechImpl({
+      stash: stash({
+        interruptedSegment: 'Seven eight nine.',
+        queuedSegments: [],
+        fullRunText: FULL,
+        playedMs: 100_000,
+      }),
+      nowMs: 2_000,
+      ttsBusy: false,
+      partialChain: [],
+      speak: (t) => spoken.push(t),
+      reason: 'echo-filter',
+      log: () => undefined,
+      msPerChar: 10,
+    });
+    expect(resumed).toBe(false);
+    expect(spoken).toEqual([]);
+  });
+
+  it('pops the partialChain entry the kill pushed, in the remainder path too', () => {
+    const chain = [
+      {
+        intended_text: 'One two three.',
+        started_at_ms: 900,
+        cancelled_at_ms: 1_000,
+      },
+    ];
+    _resumeBargedSpeechImpl({
+      stash: stash({
+        interruptedSegment: 'One two three.',
+        queuedSegments: [],
+        fullRunText: FULL,
+        playedMs: 140,
+      }),
+      nowMs: 2_000,
+      ttsBusy: false,
+      partialChain: chain,
+      speak: () => undefined,
+      reason: 'echo-filter',
+      log: () => undefined,
+      msPerChar: 10,
+    });
+    expect(chain.length).toBe(0);
+  });
+});
+
 describe('lexReplyTimeoutMs (brain-path delivery deadline scales with body)', () => {
   it('keeps the render floor for short bodies (8s time-to-first-record, 2026-07-16)', () => {
     expect(lexReplyTimeoutMs(20)).toBe(8_000);

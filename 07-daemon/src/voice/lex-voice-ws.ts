@@ -1574,6 +1574,21 @@ export interface BargeStashEntry {
   queuedSegments: string[];
   atMs: number;
   ctrlCPending: boolean;
+  /* Fix 24 tail-loss (2026-07-18): the full spoken run shipped to the
+   * client at barge time (every segment that got a tts-start, joined).
+   * Fix 51 synth-serialization ships every sentence to the client
+   * ahead of realtime playback, so by barge time the mid/deep body has
+   * drained off the server ttsQueue and the interruptedSegment +
+   * queuedSegments snapshot holds only the in-flight sentence. This +
+   * playedMs reconstructs the UN-heard tail of the WHOLE body so
+   * sentences 2..N are never lost. */
+  fullRunText?: string;
+  /* Client-reported played offset (ms) from the playback-stopped
+   * frame, filled in AFTER the barge fired (the client reports it when
+   * it stops the audio element). null until the client reports - or
+   * forever on a legacy client with no playback-stopped, where the
+   * resume falls back to the per-segment snapshot. */
+  playedMs?: number | null;
 }
 
 export interface _ResumeBargedSpeechDeps {
@@ -1591,21 +1606,17 @@ export interface _ResumeBargedSpeechDeps {
   reason: string;
   log?: (msg: string) => void;
   windowMs?: number;
+  /* Per-char synth-duration estimate for the played_ms -> heard-chars
+   * mapping. Omitted in production (truncateToHeard's default); tests
+   * pass it for a deterministic offset. */
+  msPerChar?: number;
 }
 
-export function _resumeBargedSpeechImpl(deps: _ResumeBargedSpeechDeps): boolean {
-  const windowMs = deps.windowMs ?? BARGE_RESUME_WINDOW_MS;
-  if (deps.nowMs - deps.stash.atMs > windowMs) return false;
-  if (deps.ttsBusy) return false;
-  const segments = [
-    ...(deps.stash.interruptedSegment ? [deps.stash.interruptedSegment] : []),
-    ...deps.stash.queuedSegments,
-  ];
-  if (segments.length === 0) return false;
-  /* The kill pushed the interrupted segment onto partialChain as an
-   * "interrupted reply". We are un-interrupting it; leaving the entry
-   * would tell Lex a line was cut that the operator actually heard in
-   * full. */
+/* The kill pushed the interrupted segment onto partialChain as an
+ * "interrupted reply". We are un-interrupting it; leaving the entry
+ * would tell Lex a line was cut that the operator actually heard in
+ * full. */
+function _unInterruptPartialChain(deps: _ResumeBargedSpeechDeps): void {
   const lastPartial = deps.partialChain[deps.partialChain.length - 1];
   if (
     deps.stash.interruptedSegment &&
@@ -1614,6 +1625,54 @@ export function _resumeBargedSpeechImpl(deps: _ResumeBargedSpeechDeps): boolean 
   ) {
     deps.partialChain.pop();
   }
+}
+
+export function _resumeBargedSpeechImpl(deps: _ResumeBargedSpeechDeps): boolean {
+  const windowMs = deps.windowMs ?? BARGE_RESUME_WINDOW_MS;
+  if (deps.nowMs - deps.stash.atMs > windowMs) return false;
+  if (deps.ttsBusy) return false;
+
+  /* Preferred path (Fix 24 tail-loss, 2026-07-18): re-speak the
+   * UN-played remainder of the WHOLE original body, reconstructed from
+   * the full spoken run + the client's played offset. The per-segment
+   * snapshot loses sentences 2..N once Fix 51 synth-serialization ships
+   * them ahead of realtime playback (they drain off the server
+   * ttsQueue before the barge). The full-run remainder never loses the
+   * tail. Re-spoken as ONE unsplit segment, mirroring the top layer,
+   * which resumes its single segment whole. Any still-queued segment
+   * (never shipped, so absent from the run text) is appended so a body
+   * barged before its tail synthesized still resumes complete. */
+  const fullRun = deps.stash.fullRunText?.trim() ?? '';
+  if (fullRun && deps.stash.playedMs != null) {
+    const heard = truncateToHeard(
+      fullRun,
+      deps.stash.playedMs,
+      deps.msPerChar != null ? { msPerChar: deps.msPerChar } : {},
+    );
+    const remainder = fullRun.slice(heard.length).trimStart();
+    const tail = [remainder, ...deps.stash.queuedSegments]
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+      .join(' ');
+    /* Whole body already heard and nothing queued: genuinely nothing
+     * to resume. */
+    if (!tail) return false;
+    _unInterruptPartialChain(deps);
+    (deps.log ?? logFn)(
+      `[voice-ws] resuming barged TTS remainder (${deps.reason}): heard=${heard.length}/${fullRun.length} chars, remainder=${tail.length} chars`,
+    );
+    deps.speak(tail);
+    return true;
+  }
+
+  /* Legacy fallback: no client offset (playback-stopped never landed).
+   * Resume the per-segment snapshot exactly as before. */
+  const segments = [
+    ...(deps.stash.interruptedSegment ? [deps.stash.interruptedSegment] : []),
+    ...deps.stash.queuedSegments,
+  ];
+  if (segments.length === 0) return false;
+  _unInterruptPartialChain(deps);
   (deps.log ?? logFn)(
     `[voice-ws] resuming barged TTS after phantom utterance (${deps.reason}): segments=${segments.length}`,
   );
@@ -3352,6 +3411,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         queuedSegments,
         atMs: Date.now(),
         ctrlCPending: true,
+        /* Snapshot the full spoken run NOW, before playback-stopped
+         * clears spokenRunTexts: this is every sentence shipped to the
+         * client, the source the remainder-resume slices the unheard
+         * tail from (Fix 24 tail-loss, 2026-07-18). */
+        fullRunText: spokenRunTexts.join(' ').trim(),
+        playedMs: null,
       };
       return;
     }
@@ -4967,6 +5032,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
             : 0;
         const fullRun = spokenRunTexts.join(' ').trim();
         spokenRunTexts = [];
+        /* Fix 24 tail-loss (2026-07-18): if a barge is pending phantom
+         * resolution, record the played offset so resumeBargedSpeech
+         * can slice the UN-heard remainder of the whole body. The
+         * client sends this right after the tts-cancel, well before
+         * the phantom is resolved (whisper / top-layer round trip). */
+        if (bargeStash) bargeStash.playedMs = playedMs;
         if (fullRun) {
           const heard = truncateToHeard(fullRun, playedMs);
           if (heard.length < fullRun.length) {

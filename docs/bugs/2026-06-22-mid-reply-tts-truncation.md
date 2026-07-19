@@ -90,3 +90,67 @@ flag-gated; flag-off path byte-identical.
   over-trigger on short replies.
 - `tests/voice-haiku-wiring.test.ts`: flag ON, a long reply whose render
   is cut speaks IN FULL (safe render), tail included.
+
+## Real cause (2026-07-18, supersedes the haiku diagnosis above)
+
+The haiku `max_tokens: 512` path described above was REMOVED in the
+2026-07-15 spec-v2 rework (the live-haiku restyle died; the body now
+goes to piper as-is - see `lex-voice-speak-controller.ts` speakOne, the
+render is gone). The truncation kept recurring after that, so the
+haiku render was never the live cause. The verified cause against
+current code:
+
+**It is not the feed. Every sentence is enqueued and shipped.** The cut
+only manifests on a *phantom barge*:
+
+1. During playback the mic stays hot (AEC rework). Lex's own spoken
+   sentence-1 bleeds back into streaming ASR. The barge word-gate
+   (`barge-word-gate.ts`) fires because the echo check
+   (`isEchoText` -> `classifyEcho`) does NOT recognize the short,
+   ASR-mangled interim as Lex's own audio: a 2-word interim whose
+   token-overlap against the remembered full segment falls under the
+   0.72 `ECHO_SCORE_THRESHOLD` (or a 1-word final that hits the
+   single-token no-suppress guard). The later WHOLE-transcript whisper
+   echo filter DOES match cleanly - which is why the same words show up
+   as `echo-dropped` a beat after the kill already happened.
+2. The fired gate calls `killActiveTts('utterance-start')`, which
+   snapshots the SERVER queue for the barge stash
+   (`lex-voice-ws.ts` killActiveTts: `interruptedSegment =
+   state.currentTtsText`, `queuedSegments = state.ttsQueue`).
+3. But Fix 51 serializes synth on piper pcm `end`, and synth is far
+   faster than realtime playback, so by barge time every sentence has
+   already been synth-started and shipped to the client ahead of
+   playback. `state.ttsQueue` has drained; the snapshot captures at
+   most the one in-flight sentence. `_resumeBargedSpeechImpl` then
+   restored only that sentence. Sentences 2..N were gone -> "first
+   sentence only".
+4. The TOP layer speaks its whole reply as ONE unsplit `speak()`
+   segment, so its stash captures the body whole and it resumes in
+   full - which is why only mid/deep replies truncated.
+
+### Fix (2026-07-18)
+
+On phantom-barge resume, re-speak the UN-played remainder of the WHOLE
+original body instead of the drained per-segment snapshot. The full
+spoken run (`spokenRunTexts`, every segment that got a `tts-start`) is
+snapshotted into the barge stash at kill time as `fullRunText`; the
+client's `played_ms` (already reported on `playback-stopped`,
+`VoiceClient.tsx`) is recorded into the stash when it lands.
+`_resumeBargedSpeechImpl` slices the unheard tail via `truncateToHeard`
+and speaks it as one segment (mirroring the top layer), appending any
+still-queued segment that never shipped. Falls back to the old
+per-segment snapshot when the client reported no offset (legacy). This
+is a robust defense: even when the phantom barge fires, the full body
+always resumes.
+
+The echo/self-barge TRIGGER (step 1) is left as-is: retuning
+`ECHO_SCORE_THRESHOLD` down risks eating a real operator barge (the
+filter's safety contract is "never eat a real turn"), so it is not
+changed without operator sign-off. The remainder-resume makes the
+phantom harmless regardless.
+
+Regression tests: `tests/voice-barge-resume.test.ts` -
+"full-body remainder resume" describe block (remainder from `played_ms`
+not the drained snapshot; appends still-queued segments; legacy
+fallback when `playedMs` null; no resume when the whole body was heard;
+partialChain pop in the remainder path).
