@@ -37,9 +37,18 @@ export interface AnchorTile {
   transcript_count: number;
   /** project_slug of the worker anchor this brainstorm supervises
    * (lex_session.supervises_project_anchor_id resolved), or null when
-   * unbound. The Stream Deck nests the supervised worker's session
-   * tiles under the brainstorm tile (2026-07-16 operator ask). */
+   * unbound. Retained for display/diagnostics; the Stream Deck no
+   * longer nests off this (see supervised_worker_session_id). */
   supervised_project_slug: string | null;
+  /** Live worker SESSION ID of the anchor this brainstorm supervises
+   * (project_session.current_session_id resolved), or null when unbound
+   * / not yet resolved. The Stream Deck nests the worker under the
+   * brainstorm by matching THIS against the session tiles, because the
+   * tile-side project_slug (a short name) and the session-side group
+   * slug (the mangled ~/.claude/projects dir name) are different
+   * formats that never string-match. The session id is the
+   * authoritative binding the rest of the code already resolves. */
+  supervised_worker_session_id: string | null;
 }
 
 /** Resolve the supervised worker's project_slug for one lex session
@@ -56,8 +65,26 @@ export function supervisedSlugFor(
   }
 }
 
+/** Resolve the supervised worker's live SESSION ID for one lex session
+ * row (project_session.current_session_id). Pure over the injected
+ * resolver so it pins without a store. Null when unbound, the resolver
+ * is missing, the anchor is unknown, or no live worker session has been
+ * resolved onto the anchor yet (fresh worker before backfill). */
+export function supervisedWorkerSessionIdFor(
+  row: { supervises_project_anchor_id?: string | null },
+  resolveWorkerSessionId?: (anchorId: string) => string | null,
+): string | null {
+  if (!row.supervises_project_anchor_id || !resolveWorkerSessionId) return null;
+  try {
+    return resolveWorkerSessionId(row.supervises_project_anchor_id) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function listAnchorTiles(
   resolveProjectSlug?: (anchorId: string) => string | null,
+  resolveWorkerSessionId?: (anchorId: string) => string | null,
 ): AnchorTile[] {
   const live = listLexSessions({ status: 'live', limit: 200 });
   const liveSet = getLivePtyIds();
@@ -98,6 +125,10 @@ export function listAnchorTiles(
       last_activity_ms: lastActivity,
       transcript_count: refs.length,
       supervised_project_slug: supervisedSlugFor(row, resolveProjectSlug),
+      supervised_worker_session_id: supervisedWorkerSessionIdFor(
+        row,
+        resolveWorkerSessionId,
+      ),
     });
   }
   tiles.sort((a, b) => b.last_activity_ms - a.last_activity_ms);

@@ -7,6 +7,14 @@ file is for live status only.
 
 Status legend: ⏳ queued, 🔄 in progress, ✅ shipped, ❌ blocked.
 
+## 2026-07-19 Stream Deck worker nesting (BUG-001)
+
+Rebuild required (daemon + dashboard); no daemon restart (operator-only). Binding untouched per operator.
+
+| # | Title | Status | Commit | Evidence + fix |
+|---|-------|--------|--------|-----------------|
+| SD-5 | Worker not nested under its brainstorm in the Stream Deck (binding correct everywhere else) | 🔄 built, awaiting operator rebuild+restart | (this commit) | **Cause (grounded against the live index.db):** deck nesting at `StreamDeck.tsx:244` did `groups.find(g => g.slug === t.supervised_project_slug)` — an exact, case-sensitive match between two DIFFERENT slug formats. Tile side `supervised_project_slug` = `project_session.project_slug` = a short name (live values: `"DevNeural"`, `"bridger-base-camp"`, `"Material-Handling-Academy"`). Session side `group.slug` = the `~/.claude/projects/<dir>` name = the full mangled cwd (`"c--dev-Projects-DevNeural"`). Never `===`, so the worker fell through to the orphan branch. Case is also unreliable (CC lowercases the drive letter in the dir; the VB-2 mangler `bridge-presence.ts:121` lowercases everything), so slug matching is fragile regardless. Binding is NOT the cause: `project_session.current_session_id` already resolves the exact worker session id (verified: the DevNeural anchor → this worker's session `2994e119`), which is why the Lex tab supervision label and the worker terminal window both name the right worker. **Fix (nest by authoritative id, binding untouched):** tile now emits `supervised_worker_session_id` (= `project_session.current_session_id`) via a new pure `supervisedWorkerSessionIdFor` resolver in `anchor-tiles.ts`, wired at the `/lex/anchor-tiles` route. New pure `08-dashboard/lib/deck-nesting.ts` (`supervisedGroupFor` / `isGroupSupervised`) matches the tile's worker session id against the session groups; `StreamDeck.tsx` uses it for both nesting and orphan detection. `supervised_project_slug` retained for display only. **Tests:** 3 new daemon pins (`lex-anchor-tiles-supervised-slug.test.ts` — resolve/unbound/throwing) + 7 new dashboard pins (`deck-nesting.test.ts` — the exact regression: slugs differ but session id matches → nests; null id / missing group / orphan). Daemon tsc + `npm run build` clean, dashboard tsc + `npm run build` clean, `out/` regenerated. **Rebuild:** yes (daemon + dashboard). |
+
 ## 2026-07-19 false "voice dead" banner (client watchdog, no time-based errors)
 
 Client-only fix. Distinct from VB-3 below (that was the server-side inject delivery-verify banner); this is the dashboard voice-output watchdog. No daemon restart; `out/` rebuilt in place.

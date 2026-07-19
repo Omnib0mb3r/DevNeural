@@ -15,6 +15,7 @@ import { StatusDot } from "./StatusDot";
 import { NavGrid } from "./NavGrid";
 import { lexPickStable } from "@/lib/lex";
 import { subscribeDashboardEvents } from "@/lib/dashboard-events";
+import { supervisedGroupFor, isGroupSupervised } from "@/lib/deck-nesting";
 
 /* Stream Deck rail = remote analog of the physical Elgato deck.
  *
@@ -238,11 +239,13 @@ export function StreamDeck() {
               {tiles.map((t) => {
                 /* Nest the supervised worker's session tiles slightly
                  * under the brainstorm that drives them (2026-07-16
-                 * operator ask) so the pair reads as one unit. Groups
+                 * operator ask) so the pair reads as one unit. Match on
+                 * the worker SESSION ID, not slug: the tile-side
+                 * project_slug ("DevNeural") and the session-side group
+                 * slug ("c--dev-Projects-DevNeural") are different
+                 * formats that never string-match (BUG-001). Groups
                  * consumed here are dropped from the flat list below. */
-                const nested = t.supervised_project_slug
-                  ? groups.find((g) => g.slug === t.supervised_project_slug)
-                  : undefined;
+                const nested = supervisedGroupFor(t, groups);
                 return (
                   <div key={t.anchor_id} className="space-y-1.5">
                     <AnchorDeckTile tile={t} />
@@ -274,8 +277,7 @@ export function StreamDeck() {
             * of the worker floating flat (2026-07-18 operator ask). */}
           {(() => {
             const orphans = groups.filter(
-              ({ slug }) =>
-                !tiles.some((t) => t.supervised_project_slug === slug),
+              (g) => !isGroupSupervised(g, tiles),
             );
             if (orphans.length === 0) return null;
             return (

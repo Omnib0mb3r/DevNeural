@@ -674,9 +674,14 @@ export interface AnchorTile {
   pending_prompt: PendingPrompt | null;
   last_activity_ms: number;
   transcript_count: number;
-  /** project_slug of the worker anchor this brainstorm supervises;
-   * the deck nests that worker's session tiles under the brainstorm. */
+  /** project_slug of the worker anchor this brainstorm supervises.
+   * Retained for display/diagnostics; the deck no longer nests off
+   * this (tile/session slug formats differ). */
   supervised_project_slug: string | null;
+  /** Live worker SESSION ID of the anchor this brainstorm supervises.
+   * The deck nests the worker under the brainstorm by matching this
+   * against the session tiles, the authoritative binding id. */
+  supervised_worker_session_id: string | null;
 }
 export const lexAnchorTiles = () =>
   request<{ ok: boolean; tiles: AnchorTile[] }>(`/lex/anchor-tiles`);

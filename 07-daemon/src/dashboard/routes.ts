@@ -2098,6 +2098,8 @@ export async function registerDashboardRoutes(
       ok: true,
       tiles: listAnchorTiles(
         (anchorId) => store.db.getProjectSession(anchorId)?.project_slug ?? null,
+        (anchorId) =>
+          store.db.getProjectSession(anchorId)?.current_session_id ?? null,
       ),
     };
   });
