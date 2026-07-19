@@ -33,6 +33,19 @@ function assistantRecordLine(text: string): string {
   );
 }
 
+/* Claude Code queues a prompt typed while the assistant is mid-turn
+ * rather than submitting it. The queued prompt lands as a
+ * queue-operation (operation:'enqueue', content:<payload>) and/or a
+ * queued_command (prompt:<payload>) record - NOT a user record. These
+ * are the shapes observed live in the bound session jsonl. */
+function queueOperationLine(content: string, operation = 'enqueue'): string {
+  return JSON.stringify({ type: 'queue-operation', operation, content }) + '\n';
+}
+
+function queuedCommandLine(prompt: string): string {
+  return JSON.stringify({ type: 'queued_command', prompt }) + '\n';
+}
+
 /* Mutable virtual jsonl + instant sleep. `onTick` runs before every
  * sleep so a test can land content at a chosen attempt boundary. */
 function makeRig(opts?: { onTick?: (tick: number) => void }): {
@@ -228,6 +241,103 @@ describe('_verifyInjectDeliveryImpl signal-based busy-turn (SECONDARY)', () => {
      * still escalates the full CR ladder and fails. */
     expect(rig.retries).toEqual([1, 2, 3]);
     expect(rig.failures).toBe(1);
+  });
+});
+
+/* ── VB-3 (2026-07-18): a queued command is a DELIVERED prompt, not a
+ * stuck paste. Live root cause: confirmed=1 vs failed=42. When Lex is
+ * mid-turn the injected prompt is ACCEPTED into Claude Code's queue and
+ * runs at the turn boundary - it lands as a queue-operation /
+ * queued_command record carrying the fingerprint, never a user record
+ * while busy. The verifier recognized only user records, so it counted
+ * the queued prompt as silence, fired CR retries into the busy composer,
+ * and raised the false 'voice error' banner. A genuinely stuck paste
+ * writes NEITHER record (unsubmitted composer text), so the stuck-paste
+ * failure path is preserved. */
+describe('_verifyInjectDeliveryImpl queued-command recognition (VB-3)', () => {
+  it('recognizes a queue-operation enqueue carrying the fingerprint as delivered: no CR retry, no failure', async () => {
+    const rig = makeRig({
+      onTick: (t) => {
+        if (t === 1) {
+          rig.file.content += queueOperationLine(
+            '[voice mode] the operator words ride here (queued behind Lex mid-turn)',
+          );
+        }
+      },
+    });
+    const result = await _verifyInjectDeliveryImpl(rig.deps);
+    expect(result).toBe('queued');
+    expect(rig.retries).toEqual([]);
+    expect(rig.failures).toBe(0);
+  });
+
+  it('recognizes a queued_command (prompt field) carrying the fingerprint as delivered', async () => {
+    const rig = makeRig({
+      onTick: (t) => {
+        if (t === 1) {
+          rig.file.content += queuedCommandLine(
+            'preamble the operator words ride here trailing',
+          );
+        }
+      },
+    });
+    const result = await _verifyInjectDeliveryImpl(rig.deps);
+    expect(result).toBe('queued');
+    expect(rig.retries).toEqual([]);
+    expect(rig.failures).toBe(0);
+  });
+
+  it('a busy-turn inject that queues (assistant streaming, then an enqueue record) never fires the false banner', async () => {
+    /* The exact live shape: the deep layer streams assistant chunks
+     * (mid-turn) and the injected prompt lands as an enqueue record,
+     * not a user record. Pre-fix this false-failed with three CR
+     * retries and the banner. */
+    const rig = makeRig({
+      onTick: (t) => {
+        if (t <= 2) {
+          rig.file.content += assistantRecordLine(`deep chunk ${t}`);
+        } else if (t === 3) {
+          rig.file.content += queueOperationLine(
+            'the operator words ride here while Lex was busy',
+          );
+        }
+      },
+    });
+    const result = await _verifyInjectDeliveryImpl(rig.deps);
+    expect(result).toBe('queued');
+    expect(rig.retries).toEqual([]);
+    expect(rig.failures).toBe(0);
+  });
+
+  it('a non-enqueue queue-operation (dequeue/remove) is NOT treated as delivery: the stuck-paste path still runs', async () => {
+    const rig = makeRig({
+      onTick: (t) => {
+        if (t === 1) {
+          rig.file.content += queueOperationLine(
+            'the operator words ride here',
+            'dequeue',
+          );
+        }
+      },
+    });
+    const result = await _verifyInjectDeliveryImpl(rig.deps);
+    expect(result).toBe('failed');
+    expect(rig.retries).toEqual([1, 2, 3]);
+    expect(rig.failures).toBe(1);
+  });
+
+  it('a real user record still wins immediately (idle submit unaffected)', async () => {
+    const rig = makeRig({
+      onTick: (t) => {
+        if (t === 1) {
+          rig.file.content += userRecordLine(
+            'plain the operator words ride here now',
+          );
+        }
+      },
+    });
+    const result = await _verifyInjectDeliveryImpl(rig.deps);
+    expect(result).toBe('confirmed');
   });
 });
 

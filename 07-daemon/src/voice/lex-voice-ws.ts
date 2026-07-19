@@ -1221,9 +1221,32 @@ function userRecordText(rec: Record<string, unknown>): string | null {
       : '';
 }
 
+/* VB-3 (2026-07-18): a prompt injected while the deep layer is mid-turn
+ * is not submitted as a user turn - Claude Code ACCEPTS it into its
+ * command queue and runs it at the turn boundary. It lands as a
+ * queue-operation (operation:'enqueue', content:<payload>) and/or a
+ * queued_command (prompt:<payload>) record, NOT a user record. A queued
+ * prompt IS delivered; the composer registered the Enter (that is why
+ * it queued), so it is the OPPOSITE of a stuck paste. Recognizing it
+ * stops the verifier counting it as silence, firing CR retries into a
+ * busy composer, and raising the false 'voice error' banner. A genuinely
+ * stuck paste writes NEITHER record (unsubmitted composer text), so the
+ * stuck-paste failure path is untouched. Only 'enqueue' counts: a
+ * dequeue/remove is a cancellation, not a delivery. */
+function queuedCommandText(rec: Record<string, unknown>): string | null {
+  if (rec.type === 'queue-operation') {
+    if (rec.operation !== undefined && rec.operation !== 'enqueue') return null;
+    return typeof rec.content === 'string' ? rec.content : null;
+  }
+  if (rec.type === 'queued_command') {
+    return typeof rec.prompt === 'string' ? rec.prompt : null;
+  }
+  return null;
+}
+
 export async function _verifyInjectDeliveryImpl(
   deps: _VerifyInjectDeliveryDeps,
-): Promise<'confirmed' | 'failed' | 'no-jsonl' | 'pending'> {
+): Promise<'confirmed' | 'failed' | 'no-jsonl' | 'pending' | 'queued'> {
   const { jsonlPath, fingerprint } = deps;
   if (!jsonlPath || !fingerprint) return 'no-jsonl';
   const intervalMs = deps.intervalMs ?? 4_000;
@@ -1265,6 +1288,18 @@ export async function _verifyInjectDeliveryImpl(
            * their own; a real mid-turn always interleaves assistant
            * records, and an IDLE stuck composer produces none. */
           if (rec.type === 'assistant') sawDeepActivity = true;
+          /* VB-3 (2026-07-18): the prompt was queued behind an in-flight
+           * turn. That is a DELIVERED prompt (it runs at the turn
+           * boundary), not a stuck paste - stop here so no CR retry fires
+           * into the busy composer and no false 'voice error' banner is
+           * raised. Only 'enqueue' of OUR utterance counts. */
+          const queuedText = queuedCommandText(rec);
+          if (queuedText !== null && queuedText.includes(fingerprint)) {
+            log(
+              `[voice-ws] inject delivery confirmed QUEUED: the prompt was accepted into Claude Code's queue behind an in-flight turn and will run at the turn boundary (no stuck paste, no CR retry)`,
+            );
+            return 'queued';
+          }
           const text = userRecordText(rec);
           if (text === null || text === '') continue;
           /* Delivery contract (2026-07-17 00:50Z duplicate-turn fix):
