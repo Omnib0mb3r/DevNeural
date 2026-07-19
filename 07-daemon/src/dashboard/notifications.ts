@@ -57,6 +57,26 @@ export const BELL_NOTIFY_CLASSES: ReadonlySet<NotifyClass> = new Set([
   'signal',
 ]);
 
+/** Sources that are pure internal mechanics / telemetry: Lex injection
+ * plumbing + reinforcement bookkeeping (source 'curator'/'reinforcement'),
+ * and background grooming / distillation housekeeping (source
+ * 'grooming-watch'). None are ever user-actionable, so they must NEVER
+ * reach the bell - not even at signal@alert. grooming-watch in particular
+ * escalates its own housekeeping gaps to 'alert' severity, which the
+ * generic signal@alert emergency lane would otherwise let onto the bell;
+ * a housekeeping gap is not a user emergency. These rows still land on
+ * the activity rail / debug view - they are only suppressed from the
+ * input-needed bell (operator directive 2026-07-19: the bell is
+ * input-needed ONLY). A genuine input-needed item that happens to arise
+ * from grooming (e.g. a parked question) must be raised through an
+ * actionable source ('lex-attention' / 'permission'), not this telemetry
+ * channel. */
+export const TELEMETRY_SOURCES: ReadonlySet<string> = new Set([
+  'grooming-watch',
+  'curator',
+  'reinforcement',
+]);
+
 /** Push payload event-type taxonomy. 'reminder' is the legacy default
  * (scheduled reminder went due); 'attention' is the new real-time
  * Lex attention-needed signal (a question that requires a yes/no or
@@ -260,6 +280,11 @@ function passesSurfaceFilter(
   surface: NotificationScope | undefined,
 ): boolean {
   if (surface !== 'bell') return true;
+  /* Telemetry / internal-mechanics sources never bell, regardless of
+   * class or severity - this catches background grooming that escalates
+   * to signal@alert (a housekeeping gap is not a user emergency) and any
+   * future telemetry emit that forgets to tag itself 'conversation'. */
+  if (TELEMETRY_SOURCES.has(n.source)) return false;
   /* Default to 'conversation' for un-tagged legacy rows so they get
    * filtered out of the bell. */
   const cls: NotifyClass = n.notify_class ?? 'conversation';

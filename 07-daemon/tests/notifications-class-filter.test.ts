@@ -253,6 +253,42 @@ describe('notify_class surface filter', () => {
     expect(mod.listNotifications({ surface: 'activity' }).length).toBe(3);
   });
 
+  it('telemetry sources never reach the bell, even at signal@alert (grooming/housekeeping is not a user emergency)', async () => {
+    /* 2026-07-19 operator directive: the bell is input-needed ONLY.
+     * Background grooming/housekeeping (source 'grooming-watch') rides
+     * the 'signal' class and escalates its own gaps to 'alert', which the
+     * generic signal@alert emergency lane would otherwise let onto the
+     * bell. A housekeeping gap is not a user emergency - suppress every
+     * telemetry-source emit from the bell regardless of severity. A real
+     * emergency from a non-telemetry source (daemon down) still bells. */
+    const mod = await import('../src/dashboard/notifications.js');
+    mod.emitNotification({
+      severity: 'alert',
+      source: 'grooming-watch',
+      notify_class: 'signal',
+      title: 'Grooming: distill_error_repeat (4bbaf000)',
+    });
+    mod.emitNotification({
+      severity: 'info',
+      source: 'curator',
+      notify_class: 'conversation',
+      title: 'Lex injected raw: abc123',
+    });
+    mod.emitNotification({
+      severity: 'alert',
+      source: 'daemon',
+      notify_class: 'signal',
+      title: 'daemon down',
+    });
+    const bellTitles = mod
+      .listNotifications({ surface: 'bell' })
+      .map((n) => n.title);
+    expect(bellTitles).toEqual(['daemon down']);
+    /* All three remain on the activity surface (nothing dropped from the
+     * full stream). */
+    expect(mod.listNotifications({ surface: 'activity' }).length).toBe(3);
+  });
+
   it('BELL-ACTIONABLE-ONLY: fired reminder + needs-you + alert emergency are the only bell passes', async () => {
     const mod = await import('../src/dashboard/notifications.js');
     mod.emitNotification({
