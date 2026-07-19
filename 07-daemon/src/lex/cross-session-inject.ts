@@ -306,6 +306,10 @@ function defaultVerifyDelivery(args: {
               title: 'Worker never received an inject',
               body: `An accepted ${args.transport} inject never landed in the worker session; its composer likely holds a stuck paste. Press Enter in that terminal or re-send.`,
               link,
+              /* One collapsing/expiring bell row per stuck worker, not one
+               * per failed inject. Cleared by the TTL backstop when the
+               * paste eventually clears; keyed to the durable anchor. */
+              dedup_key: `inject-fail:${anchorId ?? args.sessionId ?? 'unknown'}`,
               ...(anchorId ? { push_data: { anchor_id: anchorId } } : {}),
             });
           })().catch(() => undefined);

@@ -160,6 +160,7 @@ import {
   dismissNotification,
   dismissAllNotifications,
   emitNotification,
+  resolveNotifications,
   unreadCount,
   events as notificationEvents,
   type Notification,
@@ -1398,24 +1399,46 @@ export async function registerDashboardRoutes(
     if (
       shouldNotifyPendingPrompt(promptKind, lastIdlePromptNotifiedMs(id), now)
     ) {
-      if (promptKind === 'idle_prompt') markIdlePromptNotified(id, now);
       /* BELL-ACTIONABLE-ONLY task 3: point this needs-you at the STABLE
        * anchor (survives the worker's /clear) instead of the ephemeral
        * session uuid; carry the anchor id in push_data as the durable
        * reference. Falls back to the session link for a non-anchor
        * session. */
       const waitTarget = workerActionItemLink(store.db, id);
-      emitNotification({
-        severity: 'warn',
-        source: 'permission',
-        notify_class: 'followup',
-        title: `Claude waiting on you (${promptKind})`,
-        body: body.message.slice(0, 200),
-        link: waitTarget.link,
-        ...(waitTarget.anchor_id
-          ? { push_data: { anchor_id: waitTarget.anchor_id } }
-          : {}),
-      });
+      /* SPEC-2026-07-18 bell task 3: a worker going idle under an ACTIVE
+       * supervising Lex is NOT a needs-you - Lex owns keeping it busy, so
+       * it never reaches the user's bell. Only the conversational
+       * idle_prompt is gated; a real permission / elicitation prompt still
+       * bells even under supervision. Genuine user-blocked idles (no live
+       * supervisor for the anchor) surface as before. */
+      const supervised =
+        promptKind === 'idle_prompt' &&
+        waitTarget.anchor_id !== null &&
+        store.db.listLexSessionsBySupervises(waitTarget.anchor_id, {
+          status: 'live',
+        }).length > 0;
+      if (supervised) {
+        log(
+          `[pending-prompt] idle_prompt suppressed (anchor ${waitTarget.anchor_id} has a live supervising Lex); not belling the user`,
+        );
+      } else {
+        if (promptKind === 'idle_prompt') markIdlePromptNotified(id, now);
+        /* Dedup key ties every repeat of this condition (idle for one
+         * worker) to one collapsing/expiring/resolvable bell row. */
+        const dedupKey = `idle:${waitTarget.anchor_id ?? id}`;
+        emitNotification({
+          severity: 'warn',
+          source: 'permission',
+          notify_class: 'followup',
+          title: `Claude waiting on you (${promptKind})`,
+          body: body.message.slice(0, 200),
+          link: waitTarget.link,
+          dedup_key: dedupKey,
+          ...(waitTarget.anchor_id
+            ? { push_data: { anchor_id: waitTarget.anchor_id } }
+            : {}),
+        });
+      }
     }
     return { ok: true };
   });
@@ -1423,6 +1446,12 @@ export async function registerDashboardRoutes(
   app.delete('/sessions/:id/pending-prompt', async (req) => {
     const id = (req.params as { id: string }).id;
     clearPending(id);
+    /* The worker stopped waiting (prompt answered / it went active): the
+     * idle condition resolved, so clear its collapsed bell row instead of
+     * leaving it to age out on the TTL. Keyed to the same durable anchor
+     * the emit used. */
+    const target = workerActionItemLink(store.db, id);
+    resolveNotifications(`idle:${target.anchor_id ?? id}`);
     return { ok: true };
   });
 
