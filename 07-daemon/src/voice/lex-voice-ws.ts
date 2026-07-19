@@ -185,6 +185,41 @@ export function setVoiceWsLogger(log: (msg: string) => void): void {
  * events in every mode so the on-screen panel updates regardless. */
 type VoiceMode = 'conversation' | 'notes' | 'push-to-talk';
 
+/* Direct-llm reply delivery plan (typed-input transcript fix,
+ * 2026-07-19). The Lex transcript panel is fed by LIVE WS frames
+ * (assistant-text), never by a brainstorm_chunks poll, so the
+ * assistant-text frame is the ONLY channel that renders a reply as text.
+ * The direct-llm reply path previously delivered the reply ONLY through
+ * speak(), so suppressing TTS for a typed turn (suppressSpeakForTurn)
+ * also made the reply INVISIBLE - it was persisted to brainstorm_chunks
+ * but never rendered. This decouples the two decisions: renderTranscript
+ * fires for EVERY turn with text (typed or voice), independent of
+ * whether we speak. speak/ttsSkipped preserve the prior behavior exactly
+ * (voice speaks; typed is silent with a tts-skipped frame; notes is
+ * silent with no frame). Pure + exported so the decoupling pins without
+ * a live WS. */
+export interface DirectLlmReplyDelivery {
+  /** Emit the assistant-text transcript frame (renders in the panel). */
+  renderTranscript: boolean;
+  /** Synthesize + speak the reply audio. */
+  speak: boolean;
+  /** Reason for a tts-skipped frame when audio is intentionally skipped;
+   * null when we speak, or when nothing is emitted (notes). */
+  ttsSkippedReason: 'text-input' | null;
+}
+
+export function planDirectLlmReplyDelivery(input: {
+  replyText: string;
+  mode: VoiceMode;
+  suppressSpeakForTurn: boolean;
+}): DirectLlmReplyDelivery {
+  const hasText = Boolean(input.replyText);
+  const speak =
+    hasText && input.mode !== 'notes' && !input.suppressSpeakForTurn;
+  const ttsSkippedReason = input.suppressSpeakForTurn ? 'text-input' : null;
+  return { renderTranscript: hasText, speak, ttsSkippedReason };
+}
+
 interface ConnState {
   ws: FastifyWS;
   /* The Lex session/PTY this socket is bound to. We accept either a
@@ -3285,9 +3320,31 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       } finally {
         if (state.directLlmAbort === controller) state.directLlmAbort = null;
       }
-      /* Step 3: persist the assistant turn + speak it. */
+      /* Step 3: render the reply in the transcript, persist it, then
+       * (voice only) speak it. The assistant-text frame is the ONLY
+       * channel that puts the reply into the transcript panel, so it must
+       * fire BEFORE the TTS gate for EVERY turn - a typed
+       * (suppressSpeakForTurn) reply still renders as text even though it
+       * is never spoken. Mirrors the cc-pty path, which emits
+       * assistant-text ahead of its own speak gate. */
+      const replyTurnId = randomUUID();
+      const delivery = planDirectLlmReplyDelivery({
+        replyText: reply.text,
+        mode: state.mode,
+        suppressSpeakForTurn: state.suppressSpeakForTurn,
+      });
+      if (delivery.renderTranscript) {
+        send({
+          t: 'assistant-text',
+          text: reply.text,
+          /* layer 'mid': the deep (brainstorm Lex) reply delivered back
+           * up to the operator's transcript. */
+          layer: 'mid',
+          turn_id: replyTurnId,
+          brainstorm_id: bsId,
+        });
+      }
       try {
-        const replyTurnId = randomUUID();
         const turnIdx = store.db.nextTurnIndex(bsId);
         store.db.insertBrainstormChunk({
           id: replyTurnId,
@@ -3304,12 +3361,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           `[voice-ws] direct-llm assistant chunk insert failed: ${(err as Error).message}`,
         );
       }
-      if (state.mode !== 'notes' && !state.suppressSpeakForTurn) {
+      if (delivery.speak) {
         await speak(reply.text);
-      } else if (state.suppressSpeakForTurn) {
-        /* Typed input to Lex-as-LLM: reply lands as text only (panel +
-         * chunk already persisted above), never spoken. */
-        send({ t: 'tts-skipped', reason: 'text-input' });
+      } else if (delivery.ttsSkippedReason) {
+        /* Typed input to Lex-as-LLM: reply already rendered as text via
+         * the assistant-text frame above; never spoken. */
+        send({ t: 'tts-skipped', reason: delivery.ttsSkippedReason });
       }
       send({ t: 'injected' });
       /* Plan section M (2026-05-22): scan both the user's turn and
