@@ -41,7 +41,7 @@ export interface TranscriptTurn {
 function turnLabel(t: TranscriptTurn): string {
   if (t.layer === "operator") return "you:";
   if (t.layer === "top") return "lex (voice):";
-  if (t.layer === "mid") return "lex (deep):";
+  if (t.layer === "mid") return "lex (brain):";
   return t.role === "assistant" ? "lex:" : "you:";
 }
 
@@ -112,10 +112,13 @@ export function TranscriptHistory({
     });
   }
 
-  const rendered = turns.slice(-maxTurns);
-  /* P4: fold deep (MID) turns under their voice line so the transcript
-   * reads as a two-party operator <-> VOICE conversation. */
-  const groups = groupTranscriptTurns(rendered);
+  /* P4 + slot-fix (2026-07-19): group the FULL turn list FIRST, then keep
+   * the last maxTurns GROUPS. Deep (MID) brain replies fold under their
+   * voice line and must NOT consume a conversation slot. Slicing raw turns
+   * before grouping let a burst of brain replies evict the you <-> voice
+   * lines from the last-N window (the "brain replies eat the slots" bug);
+   * windowing over groups counts only top-level conversation turns. */
+  const groups = groupTranscriptTurns(turns).slice(-maxTurns);
   const showPlaceholder = status === "thinking";
 
   return (
@@ -143,7 +146,7 @@ export function TranscriptHistory({
       </header>
       {!collapsed && (
         <div id="lex-transcript-body" className="px-5 py-3 space-y-2 text-xs">
-          {rendered.length === 0 && !showPlaceholder && (
+          {groups.length === 0 && !showPlaceholder && (
             <div className="text-txt3">No transcript yet.</div>
           )}
           {groups.map((g, gi) => {
@@ -182,7 +185,7 @@ export function TranscriptHistory({
                     >
                       <span aria-hidden="true">{deepOpen ? "▾" : "▸"}</span>
                       <span>
-                        deep replied
+                        brain replied
                         {g.deep.length > 1 ? ` (${g.deep.length})` : ""}
                       </span>
                     </button>

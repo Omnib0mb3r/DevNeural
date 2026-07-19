@@ -94,6 +94,28 @@ describe("TranscriptHistory - three-way layer labels", () => {
     expect(turns[1]).toHaveTextContent(/voice/i);
   });
 
+  it("brain (mid) replies do not consume conversation slots in the last-N window", () => {
+    const turns = [
+      { id: "o", role: "user" as const, layer: "operator" as const, text: "the real question" },
+      { id: "t", role: "assistant" as const, layer: "top" as const, text: "voice answer" },
+      /* A burst of brain replies (like a long investigation). These fold
+       * under the voice line and must NOT evict the you <-> voice pair from
+       * the last-N window. Regression for the "brain replies eat the slots"
+       * bug: slicing raw turns before grouping dropped the conversation. */
+      ...Array.from({ length: 12 }, (_, i) => ({
+        id: `m${i}`,
+        role: "assistant" as const,
+        layer: "mid" as const,
+        text: `brain step ${i}`,
+      })),
+    ];
+    render(<TranscriptHistory turns={turns} maxTurns={5} />);
+    const rows = screen.getAllByTestId("lex-turn");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveTextContent(/you:/);
+    expect(rows[1]).toHaveTextContent(/voice/i);
+  });
+
   it("falls back to role labels when no layer is set (back-compat)", () => {
     render(
       <TranscriptHistory
@@ -121,7 +143,7 @@ describe("TranscriptHistory - P4 deep collapse", () => {
     render(<TranscriptHistory turns={exchange} />);
     /* Deep is a thin collapsed step-down node, not a bubble. */
     const toggle = screen.getByTestId("lex-deep-toggle");
-    expect(toggle).toHaveTextContent(/deep replied/i);
+    expect(toggle).toHaveTextContent(/brain replied/i);
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     /* The deep TEXT is not rendered anywhere until expanded. */
     expect(screen.queryByText(/build kicked off/)).not.toBeInTheDocument();
