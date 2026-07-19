@@ -9,6 +9,40 @@ Last refreshed: 2026-06-20 after all three pillars wired + committed and
 the distill-scheduler tests fixed. Switch-live pending operator restart.
 See ACTIVE BATCH below.
 
+## PENDING RESTART VERIFY (2026-07-19): voice top-layer + bell + binding-terminal
+
+Shipped, committed, full dist rebuilt (daemon tsc + dashboard next build).
+Dormant until the operator restarts the daemon AND hard-refreshes the PWA.
+Commits: voice `3768ec4`, bell `67dc213`, binding-terminal `ff5c167`.
+Nothing below is hardware-verified.
+
+- [ ] **Stream Deck nesting** (operator-flagged 2026-07-19): the worker
+  tile nests UNDER its brainstorm tile AND stays nested across a daemon
+  restart / worker restart / new session. No code changed here -
+  StreamDeck.tsx already nests off `supervised_project_slug`; this is a
+  pure smoke test that the anchor->worker binding
+  (`project_session.current_session_id`) follows a restart. If it renders
+  as two separate tiles after a restart, that stale binding is the bug to
+  chase, not the nesting code.
+- [ ] **Voice #1** slow / long turn: no "voice error", no session death,
+  no clipped restart (the turn timeout no longer scores a liveness
+  strike; conversational asks pass `noLivenessStrike`).
+- [ ] **Voice #2** a mid-turn reply Lex makes before a tool call is spoken
+  IN FULL, not cut after the first period (`clampAck` deleted; mid-turn
+  now speaks like the end_turn body).
+- [ ] **Voice #4** hold PTT while Lex would speak: ZERO audio over you
+  (`state.pttFloorHeld` gates `speak()`; VAD energy alone does not).
+- [ ] **Bell** dropdown shows ONLY actionable rows, no idle_prompt /
+  "Worker stalled" / telemetry pileup (live query went 310 -> 14; confirm
+  on the running notifications surface, and that a supervised worker going
+  idle produces NO bell row).
+- [ ] **Worker-terminal panel** shows no "streaming other session / check
+  StreamDeck.App registered" false warning when a worker is bound (the
+  stale bridge flush `0e98cc74` resolves to no project -> null -> no warn;
+  verified against the live mirror-state, needs the daemon restart to
+  serve `last_flush_project`). A genuine cross-project misroute must still
+  warn.
+
 ## ACTIVE BATCH (2026-06-20): INVESTIGATOR-PIPELINE — cold-start, distillation, voice
 
 The current program. Goal (Michael, 2026-06-19): **one system** with three
