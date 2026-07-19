@@ -1725,6 +1725,55 @@ export function _resumeBargedSpeechImpl(deps: _ResumeBargedSpeechDeps): boolean 
   return true;
 }
 
+/* Barge kill decision (2026-07-19, SPEC-2026-07-18-voice-binding-fixes).
+ *
+ * Live failure: the barge word-gate FIRED during active TTS but audio
+ * never stopped. killActiveTts only shipped the client tts-cancel when
+ * speakCtrl.killActive() returned true, and killActive() returns false
+ * whenever state.ttsActive is null. During a REAL barge the audio is
+ * CLIENT-buffered playback that outlives the daemon synth ctx (voice-
+ * brain "ask replied" fires before the client finishes playing), so
+ * state.ttsActive is already null, killActive() returns false, and NO
+ * tts-cancel frame reached the client - audio kept playing.
+ *
+ * Principle (locked): arm AND kill both point at the SPEECH/PLAYBACK
+ * layer (clientPlaybackActive), never the brain (state.ttsActive). So:
+ *   - emitCancel keys off the PLAYBACK layer: ship tts-cancel whenever a
+ *     real synth ctx was cancelled OR the client is still playing
+ *     buffered audio. The client's resetTtsPlayback() is idempotent
+ *     (bumps gen, pauses the media element, reports played_ms via
+ *     playback-stopped), so a redundant cancel is harmless.
+ *   - runTeardown stays gated on a real synth cancellation (`cancelled`)
+ *     ONLY, so the destructive parts (bargeStash queue-loss + PTY Ctrl+C)
+ *     never fire off a phantom barge and hard-interrupt the worker.
+ *
+ * Pure + exported so the gate-fire -> cancel-emitted contract pins
+ * without a live socket, same seam pattern as _resumeBargedSpeechImpl. */
+export interface KillActiveTtsDecisionInput {
+  /** speakCtrl.killActive() returned true: a real in-flight synth ctx
+   * was cancelled (false when state.ttsActive was already null). */
+  cancelled: boolean;
+  /** The client is currently playing buffered TTS audio (the
+   * SPEECH/PLAYBACK layer - outlives the daemon synth ctx). */
+  clientPlaybackActive: boolean;
+}
+
+export interface KillActiveTtsDecision {
+  /** Ship { t:'tts-cancel' } to the client so it stops the audio. */
+  emitCancel: boolean;
+  /** Run the destructive turn-teardown (bargeStash / PTY Ctrl+C). */
+  runTeardown: boolean;
+}
+
+export function _killActiveTtsDecision(
+  input: KillActiveTtsDecisionInput,
+): KillActiveTtsDecision {
+  return {
+    emitCancel: input.cancelled || input.clientPlaybackActive,
+    runTeardown: input.cancelled,
+  };
+}
+
 /* SM-25: combine utterances that piled up while a top-layer ask was
  * in flight into ONE message so the voice brain answers them
  * cohesively instead of stacking discrete replies. Module-level +
@@ -3443,15 +3492,25 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     /* Fix 40 (2026-05-26): controller owns the ctx + queue + partial-
      * chain bookkeeping. It returns true when a real in-flight ctx
      * was cancelled (vs an idle state with a possibly non-empty
-     * queue). The tts-cancel WS frame + PTY Ctrl+C only fire on a
-     * real cancellation per the existing Fix 20 contract — an
-     * idle-state kill is just a queue-clear and should be silent
-     * on the wire. */
+     * queue).
+     *
+     * Barge kill path (2026-07-19): the tts-cancel frame now keys off
+     * the SPEECH/PLAYBACK layer, not the brain. A real barge often
+     * interrupts CLIENT-buffered playback that outlives the daemon synth
+     * ctx (voice-brain "ask replied" fires before the client finishes
+     * playing), so state.ttsActive is already null and killActive()
+     * returns false - yet audio is still playing and the cancel MUST
+     * reach the client. _killActiveTtsDecision emits the cancel whenever
+     * a synth ctx was cancelled OR clientPlaybackActive is true, and
+     * keeps the destructive parts (bargeStash queue-loss + PTY Ctrl+C)
+     * gated on a real cancellation only, so a phantom barge never hard-
+     * interrupts the worker (the existing Fix 20 contract). */
     const interruptedSegment = state.currentTtsText;
     const queuedSegments = state.ttsQueue.map((q) => q.cleanText);
     const cancelled = speakCtrl.killActive();
-    if (!cancelled) return;
-    send({ t: 'tts-cancel', reason });
+    const decision = _killActiveTtsDecision({ cancelled, clientPlaybackActive });
+    if (decision.emitCancel) send({ t: 'tts-cancel', reason });
+    if (!decision.runTeardown) return;
     if (reason === 'utterance-start') {
       /* VAD energy, not yet words: stop the audio now, defer the
        * destructive parts (queue loss + PTY Ctrl+C) until the
