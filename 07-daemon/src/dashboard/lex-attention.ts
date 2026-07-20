@@ -111,17 +111,18 @@ export function detectAttentionInText(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed) return false;
   if (YES_NO_RE.test(trimmed)) return true;
-  /* Pull the tail clause: last block ending with '?' (or the whole
-   * text when no '?' exists). We split on hard newlines first so
-   * a long paragraph above a one-line question doesn't pollute
-   * the word count. */
+  /* Only a GENUINE decision ask bells (2026-07-20 operator directive:
+   * "Lex needs you" was false-firing on any soft / rhetorical tail
+   * question - "make sense?", "sound good?", "cool?"). Fire only on an
+   * explicit yes/no marker (handled above) or a decision-head question on
+   * the tail line ("should I", "want me to", "which option", ...). A bare
+   * tail question with no decision head is NOT a blocking ask, so it stays
+   * off the bell; it is still visible on the activity rail / transcript.
+   * We split on hard newlines so a long paragraph above the question does
+   * not get scanned as the tail. */
   const lines = trimmed.split(/\n+/).map((l) => l.trim()).filter(Boolean);
   const tailLine = lines.length > 0 ? lines[lines.length - 1]! : trimmed;
   if (DECISION_HEAD_RE.test(tailLine) && tailLine.endsWith('?')) return true;
-  if (tailLine.endsWith('?')) {
-    const words = tailLine.split(/\s+/).filter(Boolean);
-    if (tailLine.length <= 200 && words.length <= 24) return true;
-  }
   return false;
 }
 
@@ -243,7 +244,11 @@ export function fireForStall(
       ? `/projects/${encodeURIComponent(input.anchor_id)}`
       : '/lex';
   const notification = emit({
-    severity: deps.severity ?? 'alert',
+    /* A worker stall is automated supervision (the supervisor / Lex owns
+     * unsticking it), NOT a user emergency. 2026-07-20 operator directive:
+     * it must not ride the bell's signal@alert emergency lane. Emit at
+     * 'warn' so it stays a signal on the activity rail only. */
+    severity: deps.severity ?? 'warn',
     source: 'lex-attention',
     title: 'Worker stalled',
     body: input.reason.slice(0, 200),

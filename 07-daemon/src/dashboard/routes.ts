@@ -13,6 +13,7 @@ import type { MultipartFile } from '@fastify/multipart';
 import type { Store } from '../store/index.js';
 import {
   shouldNotifyPendingPrompt,
+  pendingPromptNotifyClass,
   markIdlePromptNotified,
   lastIdlePromptNotifiedMs,
 } from './pending-prompt-notify.js';
@@ -1428,7 +1429,11 @@ export async function registerDashboardRoutes(
         emitNotification({
           severity: 'warn',
           source: 'permission',
-          notify_class: 'followup',
+          /* idle_prompt -> 'signal' (activity rail only, off the bell);
+           * a real permission / elicitation prompt -> 'followup' (bells).
+           * 2026-07-20 operator directive: the CC idle "still working?"
+           * prompt is not a user action item. */
+          notify_class: pendingPromptNotifyClass(promptKind),
           title: `Claude waiting on you (${promptKind})`,
           body: body.message.slice(0, 200),
           link: waitTarget.link,

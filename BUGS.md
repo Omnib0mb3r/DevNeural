@@ -24,6 +24,7 @@ real bug intentionally parked.
 | BUG-006 | SMOKE-TESTING | Fresh dashboard-launched worker shows unsupervised / inject auto-target 422s (VB-2). Committed d357f12; awaiting rebuild+live. |
 | BUG-007 | DEFERRED | Sessions-page terminal mirror does not follow a session swap that happens WHILE the page is open (SV-4). Blank-on-open already fixed by SV-1. |
 | BUG-008 | DEFERRED | L1 haiku voice-brain returns `chars=0` (empty end_turn) on EVERY conversational ask, so the smart top layer never classifies/speaks and always fail-safe-forwards verbatim. Bypassed at baseline (`DEVNEURAL_L1_SMART` off, ask torn out of the live path). Must be root-caused before the L1 smart rebuild. |
+| BUG-009 | SMOKE-TESTING | Bell showed telemetry despite prior fixes. Three mis-classifications: (1) "Worker stalled" emitted `signal@alert` -> rode the bell emergency lane; (2) `idle_prompt` emitted `followup` -> belled; (3) "Lex needs you" false-fired on any soft tail question. Fixed: stall -> `warn`, idle_prompt -> `signal`, attention detector requires a decision-head/yes-no ask. Awaiting operator restart + live verify. |
 <!-- INDEX END -->
 
 <!-- DETAILS START -->
@@ -80,5 +81,14 @@ real bug intentionally parked.
 - **Status:** DEFERRED
 - **Area:** `08-dashboard/app/sessions/detail`
 - **Note:** see FIXES.md SV-4. Blank-on-open (the reported symptom) is fixed by SV-1 (anchor-resolved at connect). The remaining edge — following a swap that happens while the page is already open — needs client-side session->anchor->live polling on the Sessions detail page (mirroring the Lex page). Parked as a scoped follow-up, not added blind.
+
+## BUG-009 — Bell still showed telemetry (worker stalled / idle / false needs-you)
+- **Status:** SMOKE-TESTING
+- **Found:** 2026-07-20 · **Fixed:** 2026-07-20 (awaiting operator restart + live verify)
+- **Area:** `07-daemon/src/dashboard/lex-attention.ts`, `pending-prompt-notify.ts`, `routes.ts`
+- **Symptom:** the bell/pill kept showing non-actionable telemetry after two prior fixes (67dc213, 63641c0). Live notifications.jsonl showed the bell-eligible set was dominated by `lex-attention/signal/alert` "Worker stalled" (14 in the last 400 rows) plus `permission/followup/warn` "Claude waiting on you (idle_prompt)", and "Lex needs you" fired when Lex was not actually asking.
+- **Root cause (grounded against the live log, exhaustive emit-site sweep):** three independent mis-classifications, none caught by the earlier patches. (1) `fireForStall` emitted at `signal@alert`; the bell admits every `signal@alert` as an emergency (the "daemon down" lane), so automated supervision stalls belled. (2) The pending-prompt route tagged `idle_prompt` as `followup`, which always bells. (3) `detectAttentionInText` fired on ANY tail question <= 24 words (no decision head required), so soft/rhetorical closers ("make sense?", "sound good?") tripped "Lex needs you"; the voice path passes only text, so the heuristic decides.
+- **Fix:** stall severity default `alert -> warn` (signal@warn stays on the activity rail, off the bell); `idle_prompt -> notify_class 'signal'` via `pendingPromptNotifyClass` (real permission/elicitation prompts stay `followup` and still bell); removed the catch-all tail-question rule so "Lex needs you" fires only on a yes/no marker or a decision-head question. Existing on-disk rows collapse + age off the bell via the 6h followup/signal TTL. Tests: lex-attention (25), pending-prompt-notify (8), notifications-class-filter (10) green.
+- **Note:** the bell now carries only user-set reminders, "Lex needs you" (genuine asks), real permission/elicitation prompts, the cross-inject "never received an inject" followup (operator kept this one), and true `signal@alert` emergencies.
 
 <!-- DETAILS END -->

@@ -19,9 +19,23 @@ import {
 } from '../src/dashboard/lex-attention.js';
 
 describe('detectAttentionInText', () => {
-  it('matches short question tails ending with ?', () => {
+  it('matches decision-head question tails', () => {
     expect(detectAttentionInText('Want me to ship it?')).toBe(true);
     expect(detectAttentionInText('Should we keep the cap at 5?')).toBe(true);
+    expect(detectAttentionInText('Which option do you want?')).toBe(true);
+  });
+
+  it('rejects soft / rhetorical tail questions (2026-07-20: no more false "Lex needs you")', () => {
+    /* These end in a question but carry no decision head and no y/n
+     * marker - conversational rhythm, not a blocking ask. They must NOT
+     * bell; the activity rail still shows them. */
+    expect(detectAttentionInText('Make sense?')).toBe(false);
+    expect(detectAttentionInText('Sound good?')).toBe(false);
+    expect(detectAttentionInText('Cool?')).toBe(false);
+    expect(detectAttentionInText('Does that look right?')).toBe(false);
+    expect(
+      detectAttentionInText('I shipped the fix and reran the suite. Any questions?'),
+    ).toBe(false);
   });
 
   it('matches explicit yes/no markers anywhere in the text', () => {
@@ -245,7 +259,11 @@ describe('fireForStall', () => {
     );
     expect(r.outcome).toBe('fired');
     const call = emit.mock.calls[0]![0] as Record<string, unknown>;
-    expect(call.severity).toBe('alert');
+    /* 2026-07-20: a stall is warn-level supervision, not an alert-level
+     * emergency, so it stays off the bell (signal@warn) and on the
+     * activity rail. */
+    expect(call.severity).toBe('warn');
+    expect(call.notify_class).toBe('signal');
     expect(call.event_type).toBe('attention');
     expect((call.push_data as Record<string, unknown>).kind).toBe('stall');
     expect((call.push_data as Record<string, unknown>).reason).toBe(

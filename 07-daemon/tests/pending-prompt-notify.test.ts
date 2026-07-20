@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   shouldNotifyPendingPrompt,
+  pendingPromptNotifyClass,
   IDLE_PROMPT_DEBOUNCE_MS,
 } from '../src/dashboard/pending-prompt-notify.js';
 
@@ -13,6 +14,18 @@ import {
  * conversation, an ask only when they PERSIST: debounce per session.
  * Real permission/elicitation prompts block Claude and stay instant.
  */
+describe('pendingPromptNotifyClass: bell only for real asks (2026-07-20)', () => {
+  it('idle_prompt is a signal (activity rail only, off the bell)', () => {
+    expect(pendingPromptNotifyClass('idle_prompt')).toBe('signal');
+  });
+
+  it('a real permission / elicitation prompt is a followup (bells)', () => {
+    expect(pendingPromptNotifyClass('permission')).toBe('followup');
+    expect(pendingPromptNotifyClass('elicitation')).toBe('followup');
+    expect(pendingPromptNotifyClass('notification')).toBe('followup');
+  });
+});
+
 describe('shouldNotifyPendingPrompt: idle rhythm vs real asks', () => {
   it('permission prompts always notify', () => {
     expect(

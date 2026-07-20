@@ -30,6 +30,16 @@ export function shouldNotifyPendingPrompt(
   return nowMs - lastNotifiedMs > IDLE_PROMPT_DEBOUNCE_MS;
 }
 
+/** Bell class for a pending-prompt notification (2026-07-20 operator
+ * directive: cut idle_prompt from the bell). A real permission /
+ * elicitation prompt (or anything not idle) BLOCKS Claude until answered,
+ * so it is a user action item -> 'followup' (bells). An idle_prompt is the
+ * Claude Code housekeeping "still working?" rhythm, not an ask -> 'signal'
+ * (activity rail / transcript only, never the bell). */
+export function pendingPromptNotifyClass(kind: string): 'followup' | 'signal' {
+  return kind === 'idle_prompt' ? 'signal' : 'followup';
+}
+
 /* Per-session last-notified stamps for idle_prompt. Bounded: sessions
  * churn, so cap the map and drop the oldest entry past the cap. */
 const idleNotifiedAt = new Map<string, number>();
