@@ -23,15 +23,21 @@ export const VAD_PRE_SPEECH_PAD_MS = 256;
 export const VAD_MIN_SPEECH_MS = 256;
 
 /* Map a 0-1 sensitivity knob to silero positive/negative speech
- * thresholds. Higher knob = more sensitive = lower threshold. The
- * 0.1 delta between positive and negative matches the legacy tuning
- * (positive 0.5 / negative 0.4 at sensitivity 0.5). */
+ * thresholds. Higher knob = more sensitive = lower threshold.
+ *
+ * Rescaled 2026-07-20 (2026-07-20-mic-tuning-design.md). The old linear
+ * `0.7 - 0.4*s` only spanned 0.30-0.70, so even the lowest knob (0.68 at
+ * "5/100") still cleared silero on almost any sound - low values were
+ * not meaningfully deaf. The new curve spans 0.30-0.97 with an `^0.8`
+ * shape: the low end is near-deaf (knob 5 -> ~0.91) so "5 barely works",
+ * and the useful band (~0.4-0.7) gets more travel across the upper-middle
+ * of the knob. The 0.1 delta between positive and negative is unchanged. */
 export function vadThresholds(sensitivity: number): {
   positive: number;
   negative: number;
 } {
   const s = Math.max(0, Math.min(1, sensitivity));
-  const positive = 0.7 - 0.4 * s;
+  const positive = 0.97 - 0.67 * Math.pow(s, 0.8);
   const negative = positive - 0.1;
   return { positive, negative };
 }

@@ -16,19 +16,31 @@ import {
   vadThresholds,
 } from "../lib/voice-vad-options";
 
-describe("vadThresholds", () => {
-  it("matches the legacy 0.5/0.4 pair at sensitivity 0.5", () => {
-    const t = vadThresholds(0.5);
-    expect(t.positive).toBeCloseTo(0.5, 5);
-    expect(t.negative).toBeCloseTo(0.4, 5);
+describe("vadThresholds (rescaled 2026-07-20)", () => {
+  it("spans 0.97 (near deaf) at 0 to 0.30 (very sensitive) at 1", () => {
+    expect(vadThresholds(0).positive).toBeCloseTo(0.97, 5);
+    expect(vadThresholds(1).positive).toBeCloseTo(0.3, 5);
   });
 
-  it("lowers thresholds as sensitivity rises", () => {
-    const low = vadThresholds(0);
-    const high = vadThresholds(1);
-    expect(low.positive).toBeCloseTo(0.7, 5);
-    expect(high.positive).toBeCloseTo(0.3, 5);
-    expect(high.positive).toBeLessThan(low.positive);
+  it("keeps the low end near-deaf so a knob of 5 barely triggers", () => {
+    /* display 5 = s 0.05 -> positive ~0.91: silero must be very
+     * confident to clear it, which is the operator's ask. */
+    const t = vadThresholds(0.05);
+    expect(t.positive).toBeGreaterThan(0.88);
+    expect(t.positive).toBeLessThan(0.94);
+  });
+
+  it("is monotonic: higher sensitivity always lowers the threshold", () => {
+    let prev = Infinity;
+    for (const s of [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1]) {
+      const p = vadThresholds(s).positive;
+      expect(p).toBeLessThan(prev);
+      prev = p;
+    }
+  });
+
+  it("puts the mid of the useful band (~0.585) around knob 50", () => {
+    expect(vadThresholds(0.5).positive).toBeCloseTo(0.585, 2);
   });
 
   it("keeps a constant 0.1 gap between positive and negative", () => {

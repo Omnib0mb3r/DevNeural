@@ -11,12 +11,7 @@ import {
   supportsSinkSelection,
   type AudioOutputDevice,
 } from "@/lib/audio-output";
-
-const BARGE_STORAGE_KEY = "lex-barge-cooldown-ms";
-const BARGE_MIN = 0;
-const BARGE_MAX = 2000;
-const BARGE_STEP = 50;
-const BARGE_DEFAULT = 250;
+import { MicTuner } from "./MicTuner";
 
 const VAD_STORAGE_KEY = "lex-vad-sensitivity";
 const VAD_MIN = 0;
@@ -59,7 +54,6 @@ interface PiperStatus {
   active_voice: string;
   rate: number;
   speed: number;
-  barge_cooldown_ms: number;
   vad_sensitivity: number;
   mic_gain: number;
   voices?: VoiceOption[];
@@ -83,14 +77,6 @@ function prettyVoiceLabel(name: string): string {
  * back through the dedicated /voice/set-* endpoints; localStorage holds
  * an optimistic seed so the slider does not snap on remount. */
 export function VoiceSettingsPanel() {
-  const [bargeCooldownMs, setBargeCooldownMs] = useState<number>(() => {
-    if (typeof window === "undefined") return BARGE_DEFAULT;
-    const raw = window.localStorage.getItem(BARGE_STORAGE_KEY);
-    const n = raw ? Number(raw) : NaN;
-    return Number.isFinite(n) && n >= BARGE_MIN && n <= BARGE_MAX
-      ? n
-      : BARGE_DEFAULT;
-  });
   const [vadSensitivity, setVadSensitivity] = useState<number>(() => {
     if (typeof window === "undefined") return VAD_DEFAULT;
     const raw = window.localStorage.getItem(VAD_STORAGE_KEY);
@@ -125,7 +111,6 @@ export function VoiceSettingsPanel() {
   const [sinkSelectionSupported] = useState<boolean>(() =>
     supportsSinkSelection(),
   );
-  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const vadSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const micGainSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
@@ -189,19 +174,6 @@ export function VoiceSettingsPanel() {
                 !!v && typeof v.name === "string",
             ),
           );
-        }
-        if (
-          typeof j.barge_cooldown_ms === "number" &&
-          Number.isFinite(j.barge_cooldown_ms)
-        ) {
-          const clamped = Math.max(
-            BARGE_MIN,
-            Math.min(BARGE_MAX, j.barge_cooldown_ms),
-          );
-          setBargeCooldownMs(clamped);
-          if (typeof window !== "undefined") {
-            window.localStorage.setItem(BARGE_STORAGE_KEY, String(clamped));
-          }
         }
         if (
           typeof j.vad_sensitivity === "number" &&
@@ -288,37 +260,6 @@ export function VoiceSettingsPanel() {
         headers: { "Content-Type": "application/json" },
         credentials: "include",
         body: JSON.stringify({ value: clamped }),
-      })
-        .then(() => {
-          setSaveStatus("saved");
-          if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
-          idleTimerRef.current = setTimeout(
-            () => setSaveStatus("idle"),
-            1500,
-          );
-        })
-        .catch(() => setSaveStatus("idle"));
-    }, 250);
-  }
-
-  function changeBargeCooldown(next: number): void {
-    const clamped = Math.max(
-      BARGE_MIN,
-      Math.min(BARGE_MAX, Math.round(next)),
-    );
-    setBargeCooldownMs(clamped);
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(BARGE_STORAGE_KEY, String(clamped));
-    }
-    emitVoiceSettingUpdate({ key: "barge_cooldown_ms", value: clamped });
-    setSaveStatus("saving");
-    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(() => {
-      void fetch("/voice/set-barge-cooldown", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ ms: clamped }),
       })
         .then(() => {
           setSaveStatus("saved");
@@ -519,48 +460,16 @@ export function VoiceSettingsPanel() {
             id="vad-sensitivity-help"
             className="text-nano text-txt3 leading-relaxed"
           >
-            How easily the mic triggers a turn. Lower values ignore
-            background noise (better for loud rooms or open offices);
-            higher values pick up softer speech but also catch more
-            ambient sound. 50 is the default; drop to 20-30 in noisy
-            environments. Applies live to a running voice session; no
-            need to toggle voice off and back on.
+            How easily any sound triggers a turn. The scale was rebuilt so
+            low is nearly deaf: below ~10 barely reacts, 20-35 suits a loud
+            room, 50+ picks up soft speech (and more ambient noise). Use the
+            tuner below to set it by eye. Applies live to a running voice
+            session; no need to toggle voice off and back on.
           </p>
         </div>
 
-        <div className="space-y-2">
-          <div className="flex items-center justify-between">
-            <label
-              htmlFor="barge-cooldown"
-              className="text-sm text-txt1 font-emphasized"
-            >
-              Barge-in cooldown
-            </label>
-            <span className="text-xs font-mono text-txt2 tabular-nums">
-              {bargeCooldownMs} ms
-            </span>
-          </div>
-          <input
-            id="barge-cooldown"
-            type="range"
-            min={BARGE_MIN}
-            max={BARGE_MAX}
-            step={BARGE_STEP}
-            value={bargeCooldownMs}
-            onChange={(e) => changeBargeCooldown(Number(e.target.value))}
-            className="w-full accent-brandSoft"
-            aria-describedby="barge-cooldown-help"
-          />
-          <p
-            id="barge-cooldown-help"
-            className="text-nano text-txt3 leading-relaxed"
-          >
-            After Lex starts speaking, ignore mic-driven interrupts for this
-            many milliseconds. Stops self-echo (Lex&apos;s own audio bleeding
-            into the mic) from triggering a barge-in loop. 0 disables the
-            guard entirely. 250 ms is the default and works for most laptop
-            speaker setups; bump higher if echo is severe.
-          </p>
+        <div className="pt-1">
+          <MicTuner sensitivity={vadSensitivity} />
         </div>
 
         <div className="space-y-2 pt-2 border-t border-border1">

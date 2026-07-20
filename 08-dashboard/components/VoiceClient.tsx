@@ -225,15 +225,6 @@ const SPEED_DEFAULT = 1.0;
  * choice survives a reload. No stored value yet -> default true. */
 const MEETING_KIND_STORAGE_KEY = "lex-notes-meeting-kind";
 
-/* Barge-in cooldown is edited on the /settings page; VoiceClient just
- * consumes it. Stored on the server in voice-preferences.json; mirrored
- * to localStorage as an optimistic seed so the gate works on the very
- * first reply before piper-status comes back. */
-const BARGE_STORAGE_KEY = "lex-barge-cooldown-ms";
-const BARGE_MIN = 0;
-const BARGE_MAX = 2000;
-const BARGE_DEFAULT = 250;
-
 /* Mic VAD sensitivity is edited on the /settings page; VoiceClient only
  * consumes it. localStorage is the optimistic seed so the very first
  * VAD init (before piper-status returns) uses the user's last value
@@ -608,20 +599,6 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       : SPEED_DEFAULT;
   });
   const speedSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  /* Barge-in cooldown (ms). Suppress VAD-driven barge-in for this long
-   * after each tts-start so Lex's own audio bleeding into the mic does
-   * not trigger a self-interrupt loop. Server-persisted; localStorage
-   * is just optimistic seed so the slider does not snap on remount. */
-  const [bargeCooldownMs, setBargeCooldownMs] = useState<number>(() => {
-    if (typeof window === "undefined") return BARGE_DEFAULT;
-    const raw = window.localStorage.getItem(BARGE_STORAGE_KEY);
-    const n = raw ? Number(raw) : NaN;
-    return Number.isFinite(n) && n >= BARGE_MIN && n <= BARGE_MAX
-      ? n
-      : BARGE_DEFAULT;
-  });
-  const bargeCooldownRef = useRef<number>(BARGE_DEFAULT);
-  bargeCooldownRef.current = bargeCooldownMs;
   /* Mic VAD sensitivity. Read at VAD init via the ref, and reapplied
    * live to a running VAD instance through vad.setOptions() (see the
    * vad_sensitivity case in the settings-bus subscription below). The
@@ -1674,19 +1651,6 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           }
         }
         if (
-          typeof j.barge_cooldown_ms === "number" &&
-          Number.isFinite(j.barge_cooldown_ms)
-        ) {
-          const clamped = Math.max(
-            BARGE_MIN,
-            Math.min(BARGE_MAX, j.barge_cooldown_ms),
-          );
-          setBargeCooldownMs(clamped);
-          if (typeof window !== "undefined") {
-            window.localStorage.setItem(BARGE_STORAGE_KEY, String(clamped));
-          }
-        }
-        if (
           typeof j.vad_sensitivity === "number" &&
           Number.isFinite(j.vad_sensitivity)
         ) {
@@ -1794,13 +1758,6 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             );
             setVadSensitivity(clamped);
             applyLiveVadOptions(clamped, vadRedemptionRef.current);
-          }
-          break;
-        case "barge_cooldown_ms":
-          if (typeof u.value === "number" && Number.isFinite(u.value)) {
-            setBargeCooldownMs(
-              Math.max(BARGE_MIN, Math.min(BARGE_MAX, u.value)),
-            );
           }
           break;
         case "vad_redemption_ms":
@@ -2214,7 +2171,6 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                 const j = (await r.json()) as {
                   active_voice?: unknown;
                   speed?: unknown;
-                  barge_cooldown_ms?: unknown;
                   vad_sensitivity?: unknown;
                   vad_redemption_ms?: unknown;
                   mic_gain?: unknown;
@@ -2227,15 +2183,6 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                 }
                 if (typeof j.speed === "number" && Number.isFinite(j.speed)) {
                   emitVoiceSettingUpdate({ key: "speed", value: j.speed });
-                }
-                if (
-                  typeof j.barge_cooldown_ms === "number" &&
-                  Number.isFinite(j.barge_cooldown_ms)
-                ) {
-                  emitVoiceSettingUpdate({
-                    key: "barge_cooldown_ms",
-                    value: j.barge_cooldown_ms,
-                  });
                 }
                 if (
                   typeof j.vad_sensitivity === "number" &&

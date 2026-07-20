@@ -21,7 +21,6 @@ export type VoiceSettingKey =
   | "mic_gain"
   | "vad_sensitivity"
   | "vad_redemption_ms"
-  | "barge_cooldown_ms"
   | "speed"
   | "active_voice"
   | "audio_output_device";
