@@ -95,10 +95,8 @@ import {
   type VoiceCommandKind,
 } from './lex-voice-commands.js';
 import {
-  topLayerTurn,
   voiceLexReply,
   voiceHeartbeat,
-  type TopLayerControl,
   type LexReplyOutcome,
 } from './voice-top-layer.js';
 import {
@@ -3498,27 +3496,17 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
   }
 
-  /* The barging utterance resolved as phantom (blank audio, noise
-   * floor, or the top layer judged it Lex's own echo): put the barged
-   * speech back. The interrupted segment restarts from its beginning -
-   * a half-repeated sentence reads as a natural resume. Skips (and
-   * drops) the stash when fresh speech has started since or the stash
-   * is stale. Logic lives in _resumeBargedSpeechImpl (exported, unit-
-   * tested); this closure only supplies the live state. */
-  function resumeBargedSpeech(reason: string): void {
-    const stash = bargeStash;
-    if (!stash) return;
+  /* BASELINE (LAYER-1-CONTROL.md, 2026-07-20): a barge never resumes.
+   * Drop the stash and STAY stopped on the noise / echo / finish paths
+   * that used to call resumeBargedSpeech. The audio the barge cut is
+   * gone; the full L2/L1 statement stays readable as text via the jsonl
+   * transcript. The pure resume mechanism (_resumeBargedSpeechImpl) is
+   * retained for the documented L1 rebuild but no longer on the hot
+   * path. */
+  function dropBargeStash(reason: string): void {
+    if (!bargeStash) return;
     bargeStash = null;
-    _resumeBargedSpeechImpl({
-      stash,
-      nowMs: Date.now(),
-      ttsBusy: Boolean(
-        state.ttsActive || state.ttsQueueRunning || state.ttsQueue.length > 0,
-      ),
-      partialChain: state.partialChain,
-      speak: (text) => speak(text),
-      reason,
-    });
+    logFn(`[voice-ws] barge: stopped, no resume (reason=${reason})`);
   }
 
   /* Words confirmed a real operator turn behind the barge: drop the
@@ -3759,45 +3747,6 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * the most recent fire timestamp per kind and the source tag is
    * surfaced in the log so audit can tell which path won the race. */
   const VOICE_CMD_DEDUPE_MS = 1500;
-  /* Interpreted-control dispatch (spec v2). The voice top layer reads
-   * intent ("be quiet", "we're done here") and returns one of eight
-   * control names; this maps each onto the SAME effects the keyword
-   * grammar used to fire, so client frames and downstream behavior
-   * are unchanged. The optional ack line is spoken only for controls
-   * that leave the mouth on; acking a mute with more speech would
-   * defeat the point. */
-  function applyTopLayerControl(
-    control: TopLayerControl,
-    ack: string | null,
-  ): void {
-    switch (control) {
-      case 'stop_speaking': {
-        /* Quiet: silence the voice locally, zero Lex round-trip. NOT a
-         * PTY Ctrl+C; Lex keeps working. Same semantics as the old
-         * control lane's kill-tts action. */
-        const cancelled = speakCtrl.killActive();
-        if (cancelled) send({ t: 'tts-cancel', reason: 'quiet' });
-        return;
-      }
-      case 'interrupt_work':
-        /* Hard abort of Lex's current activity with recap, the old
-         * "lex hold up" behavior. */
-        dispatchVoiceCommand('hold_up', 'transcript');
-        return;
-      case 'mute':
-      case 'disable':
-      case 'end_session':
-        dispatchVoiceCommand(control, 'transcript');
-        return;
-      case 'unmute':
-      case 'standby':
-      case 'listen': {
-        dispatchVoiceCommand(control, 'transcript');
-        if (ack) speak(ack);
-        return;
-      }
-    }
-  }
 
   function dispatchVoiceCommand(
     kind: VoiceCommandKind,
@@ -4259,10 +4208,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         `[voice-ws] dropped whisper utterance: reason=${reason} words=${wordCount} text=${JSON.stringify(trimmed)}`,
       );
       send({ t: 'transcript', text: '', ms: result.ms });
-      /* Fix 24 live repro (2026-07-16): this drop is the phantom-barge
-       * signature - VAD fired on echo/noise, killed the spoken body,
-       * and whisper heard nothing real. Put the barged speech back. */
-      resumeBargedSpeech(reason);
+      /* BASELINE (LAYER-1-CONTROL.md): VAD fired on echo/noise and killed
+       * the spoken body, whisper heard nothing real. Pre-baseline this
+       * resumed the barged speech; now a barge NEVER resumes - drop the
+       * stash and stay stopped. */
+      dropBargeStash(reason);
       return;
     }
     /* layer 'operator': the operator's own utterance, layer 0 of the
@@ -4372,7 +4322,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         `[voice-ws] ECHO DROPPED: transcript matches Lex's own recent TTS (score=${(engineVerdict.echoScore ?? 0).toFixed(2)} matched=${JSON.stringify((engineVerdict.echoMatched ?? '').slice(0, 60))}) text=${JSON.stringify(trimmed.slice(0, 80))}`,
       );
       send({ t: 'echo-dropped', text: trimmed });
-      resumeBargedSpeech('echo-filter');
+      dropBargeStash('echo-filter');
       state.utteranceStartedDuringTts = false;
       return;
     }
@@ -4602,130 +4552,36 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     sttMs: number,
   ): Promise<string | void> {
     let result: { text: string; ms: number } = { text: trimmed, ms: sttMs };
-    const wasDuringTts = state.utteranceStartedDuringTts;
-    /* Streaming partials (spec v2 phase 2): each directive-free record
-     * from the voice brain speaks the moment it lands; the resolved
-     * result carries only the unspoken remainder (or the directives).
-     * Caller rule per voice-top-layer.ts: speak every onSpeech line as
-     * it arrives, then speak result.speech if non-null. */
-    const earlySpoken: string[] = [];
-    const tl = await topLayerTurn(trimmed, {
-      lastSpoken: lastSpokenText,
-      duringTts: wasDuringTts,
-      lexBusy: state.awaitingResponseSince > 0,
-      deps: {
-        onSpeech: (line) => {
-          earlySpoken.push(line);
-          speak(line);
-        },
-      },
-    });
     state.utteranceStartedDuringTts = false;
-    logFn(
-      `[voice-ws] top-layer turn speech=${tl.speech ? JSON.stringify(tl.speech.slice(0, 60)) : 'null'} forward=${tl.forward ? JSON.stringify(tl.forward.slice(0, 60)) : 'null'} control=${tl.control ?? 'none'} duringTts=${wasDuringTts}`,
-    );
-    /* On an early-speech mismatch the remainder is the FULL parsed
-     * speech (the model rewrote already-spoken text); speaking it
-     * would double-talk what was streamed. Drop it and log. */
-    const remainderSpeech = tl.earlySpeechMismatch ? null : tl.speech;
-    if (tl.earlySpeechMismatch) {
-      logFn(
-        `[voice-ws] top-layer early-speech mismatch; remainder dropped (${earlySpoken.length} line(s) already spoken)`,
-      );
-    }
-    /* SM-25: newer utterances arrived while this ask ran and NOTHING
-     * of this reply has reached the speakers (no streamed lines).
-     * Discard the unspoken result and re-ask once with everything
-     * combined so the operator hears one cohesive answer instead of
-     * stacked discrete replies. Control verdicts are never
-     * superseded - they are immediate effects, not speech. */
-    if (
-      !tl.control &&
-      earlySpoken.length === 0 &&
-      state.pendingTopUtterances.length > 0
-    ) {
+    /* Layer 1 is UNWIRED (LAYER-1-CONTROL.md, 2026-07-20). The smart
+     * haiku talk-layer ask is gone: it returned an empty (chars=0) turn
+     * every time and fail-safe-forwarded the operator's words to L2
+     * anyway. The operator utterance now forwards straight to L2 - no
+     * classify, no rethink/finish, no top-layer speech, no ack round
+     * trip, no chars=0. The L1 intelligence is rebuilt on top of this
+     * later; see the doc. */
+    logFn(`[voice-ws] forward to L2: ${JSON.stringify(trimmed.slice(0, 80))}`);
+    /* Coalesce (COALESCE-UTTERANCE-QUEUE point 5): utterances that
+     * stacked up while this turn was resolving combine into ONE forward,
+     * so L2 gets one cohesive turn instead of stacked replies. */
+    if (state.pendingTopUtterances.length > 0) {
       const extras = state.pendingTopUtterances.splice(0);
       logFn(
-        `[voice-ws] top-layer coalesce: unspoken reply superseded by ${extras.length} newer utterance(s); re-asking combined`,
+        `[voice-ws] coalesce: combining ${extras.length} newer utterance(s) into one forward`,
       );
       return mergeOperatorUtterances([trimmed, ...extras]);
     }
-    if (tl.control) {
-      /* Real interpreted control: drop any barge stash (never resume
-       * over an explicit instruction) but without the PTY Ctrl+C -
-       * stop_speaking's contract is "silence the voice, Lex keeps
-       * working" and the other controls run their own effects. */
-      confirmRealBarge(false);
-      applyTopLayerControl(tl.control, remainderSpeech);
-      return;
-    }
-    /* Rethink-vs-finish (VOICE-TOP-LAYER-SPEC point 6, replaces the old
-     * failSafeForward shape-check). The top layer judged this barge did
-     * NOT change the in-flight answer (an aside, agreement, or Lex's own
-     * echo): resume the interrupted thought instead of forwarding or
-     * absorbing. resumeBargedSpeech is a no-op when nothing was stashed
-     * (playback never stopped), so a stray FINISH is harmless. The
-     * decision is the model's explicit signal, not a guess at output
-     * shape - a real correction returns forward/speech, never FINISH. */
-    if (tl.finish) {
-      logFn('[voice-ws] top-layer FINISH: resuming the interrupted reply');
-      resumeBargedSpeech('finish');
-      state.utteranceStartedDuringTts = false;
-      return;
-    }
-    const fullReply = [...earlySpoken, remainderSpeech ?? '']
-      .join(' ')
-      .trim();
-    if (!tl.forward) {
-      confirmRealBarge(true);
-      /* Conversational turn (or interpreted echo/noise: nothing said).
-       * Speak the remainder and absorb: nothing reaches Lex this turn,
-       * so the exchange is persisted and queued onto the asides ring
-       * exactly as the fast lane used to do - streamed lines included. */
-      if (remainderSpeech) speak(remainderSpeech);
-      /* Three-way transcript (2026-07-18): the TOP (fast voice) layer
-       * answered the operator directly - surface it as a layer-1 turn
-       * (no MID hop this turn). Skip pure echo/noise where nothing was
-       * said. Visual only; the audio already went out via speak(). */
-      if (fullReply) {
-        send({ t: 'layer-hop', layer: 'top', text: fullReply });
-      }
-      if (fullReply && shouldCaptureAbsorbedAside(state.mode)) {
-        captureAbsorbedAside(trimmed, fullReply);
-        state.absorbedAsides = _pushAbsorbedAsideImpl(
-          state.absorbedAsides,
-          { atMs: Date.now(), aside: trimmed, reply: fullReply },
-        );
-      }
-      return;
-    }
-    /* Forward turn. The optional speech is the natural handoff line
-     * (the researched latency mask - it replaces the canned bridge
-     * pool); it speaks while the inject proceeds below. */
-    if (remainderSpeech) speak(remainderSpeech);
-    /* Rethink (VOICE-TOP-LAYER-SPEC point 6): a real forward reached
-     * here, which means the top layer did NOT return FINISH - it judged
-     * the barge a genuine turn. So no resume, and the deferred barge
-     * Ctrl+C (if the turn started over live TTS) fires now so Lex drops
-     * the interrupted reply. The old failSafeForward shape-check that
-     * inferred "phantom echo" from output shape is gone; the resume
-     * decision is now the model's explicit FINISH signal, handled above. */
-    confirmRealBarge(true);
-    result = { text: tl.forward, ms: result.ms };
-    /* P1 top-owned ack: the top owns this forward's ack iff it actually
-     * spoke a handoff (streamed early lines and/or a final remainder).
-     * While it does, the deep pre-tool ack is suppressed. A fail-safe
-     * forward (no speech at all) leaves this false, so the deep ack is
-     * the fallback and the operator still hears exactly one ack. */
-    state.topOwnsAck = _topOwnsAckAfterForwardImpl({
-      earlySpokenCount: earlySpoken.length,
-      remainderSpeech,
-    });
-    /* Three-way transcript (2026-07-18): the TOP layer is routing the
-     * operator's intent DOWN to the MID (deep) layer. Surface the
-     * handoff so the you -> voice -> deep hop is visible in the panel;
-     * the MID reply comes back later as an assistant-text (layer 'mid'). */
-    send({ t: 'layer-hop', layer: 'top', text: `to Lex (brain): ${tl.forward}` });
+    /* Barge (baseline): drop the stash and STAY stopped - a barge never
+     * resumes. No deferred Ctrl+C, so L2 finishes its reply and the full
+     * statement stays readable as text; only the TTS audio was cut.
+     * Truncating L2 is reserved for the deterministic emergency stop. */
+    confirmRealBarge(false);
+    /* L1 no longer speaks its own ack; the single ack is the deep (L2)
+     * pre-tool ack. */
+    state.topOwnsAck = false;
+    /* Three-way transcript: surface the you -> voice -> deep hop; the L2
+     * reply comes back later as an assistant-text (layer 'mid'). */
+    send({ t: 'layer-hop', layer: 'top', text: `to Lex (brain): ${trimmed}` });
     /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
      * Direct-llm branch: no PTY, no jsonl watch. Build the system
      * prompt + brainstorm chunks history, call ollama, stream the
@@ -5104,15 +4960,16 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         state.micBufBytes = 0;
         break;
       case 'vad-onset': {
-        /* Word-gated barge (VOICE-TOP-LAYER-SPEC): a VAD onset only
-         * ARMS the gate; nothing dies until real non-echo words
-         * arrive via asr-interim/asr-final. Noise can never kill
-         * playback again, and the mic never gates. */
+        /* Sound-gated barge (LAYER-1-CONTROL.md baseline, 2026-07-20):
+         * a VAD onset during playback STOPS the audio immediately - any
+         * noise over the floor cuts the TTS, no wait for words. The
+         * barge never resumes and the L2/L1 statement stays readable as
+         * text, so a false stop on noise costs only the audio. */
         state.utteranceStartedDuringTts = engineDuringTts();
         state.userSpeaking = true;
         state.micBuf = [];
         state.micBufBytes = 0;
-        bargeGate = advanceBargeGate(
+        const vadGated = advanceBargeGate(
           bargeGate,
           {
             type: 'vad-onset',
@@ -5120,7 +4977,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
             playbackActive: state.utteranceStartedDuringTts,
           },
           { isEchoText: isEchoTextNow },
-        ).state;
+        );
+        bargeGate = vadGated.state;
+        if (vadGated.fire) {
+          logFn('[voice-ws] barge VAD-onset FIRED (sound stops playback)');
+          killActiveTts('barge-in');
+        }
         break;
       }
       case 'asr-interim':

@@ -6,14 +6,14 @@ import {
 } from '../src/voice/engine/barge-word-gate.js';
 
 /**
- * Spec: during TTS playback, silero VAD onset only ARMS a candidate.
- * Playback dies only when streaming ASR yields at least 2 interim words
- * (or 1 final word) that do not match the TTS text. Raw-VAD interruption
- * is the documented anti-pattern (noise kills playback) and is what the
- * pipeline accidentally has today.
+ * Sound-gated barge (LAYER-1-CONTROL.md baseline, 2026-07-20): during TTS
+ * playback a VAD onset FIRES immediately - any noise over the floor stops
+ * the audio, no wait for the transcriber. A barge never resumes and the
+ * L2/L1 statement stays readable as text, so a false stop on noise costs
+ * only the audio. (The earlier word-gate - VAD arms, 2 interim words fire -
+ * is gone.)
  */
 const notEcho = () => false;
-const isEcho = () => true;
 
 function run(
   state: BargeGateState,
@@ -29,15 +29,15 @@ function run(
   return { state, fires };
 }
 
-describe('barge-word-gate: words interrupt, noise never does', () => {
-  it('VAD onset during playback arms but does not fire', () => {
+describe('barge sound-gate: any noise during playback stops the audio', () => {
+  it('VAD onset during playback FIRES immediately (no word wait)', () => {
     const r = advanceBargeGate(
       createBargeGateState(),
       { type: 'vad-onset', atMs: 1_000, playbackActive: true },
       { isEchoText: notEcho },
     );
-    expect(r.state.phase).toBe('armed');
-    expect(r.fire).toBe(false);
+    expect(r.fire).toBe(true);
+    expect(r.state.phase).toBe('fired');
   });
 
   it('VAD onset with no playback stays idle (nothing to interrupt)', () => {
@@ -50,73 +50,47 @@ describe('barge-word-gate: words interrupt, noise never does', () => {
     expect(r.fire).toBe(false);
   });
 
-  it('fires on two interim words that are not echo', () => {
+  it('fires at most once - a second onset while already fired does not re-fire', () => {
+    const { fires, state } = run(createBargeGateState(), [
+      { type: 'vad-onset', atMs: 1_000, playbackActive: true },
+      { type: 'vad-onset', atMs: 1_200, playbackActive: true },
+    ]);
+    expect(fires).toBe(1);
+    expect(state.phase).toBe('fired');
+  });
+
+  it('words arriving after the sound-fire do not re-fire (audio already cut)', () => {
     const { fires } = run(createBargeGateState(), [
       { type: 'vad-onset', atMs: 1_000, playbackActive: true },
       { type: 'words', kind: 'interim', text: 'hold on', atMs: 1_300 },
+      { type: 'words', kind: 'final', text: 'hold on lex', atMs: 1_600 },
     ]);
     expect(fires).toBe(1);
   });
 
-  it('one interim word is not enough', () => {
+  it('a playback-idle resolution disarms so the next onset can fire again', () => {
     const { state, fires } = run(createBargeGateState(), [
       { type: 'vad-onset', atMs: 1_000, playbackActive: true },
-      { type: 'words', kind: 'interim', text: 'uh', atMs: 1_300 },
+      { type: 'playback-idle', atMs: 2_000 },
+      { type: 'vad-onset', atMs: 3_000, playbackActive: true },
     ]);
-    expect(fires).toBe(0);
-    expect(state.phase).toBe('armed');
+    expect(fires).toBe(2);
+    expect(state.phase).toBe('fired');
   });
 
-  it('one FINAL word is enough', () => {
-    const { fires } = run(createBargeGateState(), [
-      { type: 'vad-onset', atMs: 1_000, playbackActive: true },
-      { type: 'words', kind: 'final', text: 'stop', atMs: 1_600 },
-    ]);
-    expect(fires).toBe(1);
-  });
-
-  it('echo words never fire the gate', () => {
-    const { state, fires } = run(
-      createBargeGateState(),
-      [
-        { type: 'vad-onset', atMs: 1_000, playbackActive: true },
-        { type: 'words', kind: 'final', text: 'tests are green', atMs: 1_500 },
-      ],
-      isEcho,
-    );
-    expect(fires).toBe(0);
-    expect(state.phase).toBe('armed');
-  });
-
-  it('phantom resolution disarms without firing', () => {
+  it('phantom resolution disarms without an extra fire', () => {
     const { state, fires } = run(createBargeGateState(), [
       { type: 'vad-onset', atMs: 1_000, playbackActive: true },
       { type: 'phantom', atMs: 2_000 },
     ]);
-    expect(fires).toBe(0);
+    /* the onset fired once; phantom just resets state for the next run */
+    expect(fires).toBe(1);
     expect(state.phase).toBe('idle');
   });
 
-  it('fires at most once per armed cycle', () => {
-    const { fires } = run(createBargeGateState(), [
-      { type: 'vad-onset', atMs: 1_000, playbackActive: true },
-      { type: 'words', kind: 'interim', text: 'hold on a second', atMs: 1_300 },
-      { type: 'words', kind: 'final', text: 'hold on a second lex', atMs: 1_900 },
-    ]);
-    expect(fires).toBe(1);
-  });
-
-  it('words with no prior arm do not fire (no playback context)', () => {
+  it('bare words with no playing audio never fire (no onset context)', () => {
     const { fires } = run(createBargeGateState(), [
       { type: 'words', kind: 'final', text: 'hello there', atMs: 1_000 },
-    ]);
-    expect(fires).toBe(0);
-  });
-
-  it('a stale armed candidate expires: onset long ago, words much later', () => {
-    const { fires } = run(createBargeGateState(), [
-      { type: 'vad-onset', atMs: 1_000, playbackActive: true },
-      { type: 'words', kind: 'interim', text: 'hold on', atMs: 20_000 },
     ]);
     expect(fires).toBe(0);
   });

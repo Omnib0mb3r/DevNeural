@@ -1,12 +1,13 @@
 /**
- * Word-gated barge-in (VOICE-TOP-LAYER-SPEC.md): during TTS playback a
- * silero VAD onset only ARMS a barge candidate; playback dies only when
- * streaming ASR yields at least 2 interim words (or 1 final word) that
- * do not match the TTS text. Raw-VAD interruption is the documented
- * OpenAI Realtime anti-pattern - noise kills playback - and is exactly
- * what the old pipeline had (utterance-start killed TTS
- * unconditionally, then a cooldown knob tried to paper over the
- * feedback loop it caused).
+ * Sound-gated barge-in (LAYER-1-CONTROL.md, 2026-07-20): during TTS
+ * playback a silero VAD onset FIRES immediately - any noise over the
+ * floor stops the audio, with no wait for the transcriber. This is the
+ * operator's baseline: "hear a noise, stop." The earlier word-gate (VAD
+ * only armed; playback died only on 2+ non-echo interim words) is gone.
+ * A false stop on noise is cheap here because a barge NEVER resumes and
+ * the full L2/L1 statement stays readable as text - only the audio was
+ * cut. The `words` path remains for the deterministic stop-class fast
+ * path ("stop" / "hold on") and as a fallback firing.
  *
  * Pure reducer: (state, event, deps) -> {state, fire}. The caller owns
  * the effects (actually stopping playback); `fire` is true exactly once
@@ -76,7 +77,12 @@ export function advanceBargeGate(
         return { state: cur.phase === 'fired' ? cur : { phase: 'idle', armedAtMs: null }, fire: false };
       }
       if (cur.phase === 'fired') return { state: cur, fire: false };
-      return { state: { phase: 'armed', armedAtMs: event.atMs }, fire: false };
+      /* BASELINE (LAYER-1-CONTROL.md, 2026-07-20): sound stops playback.
+       * A VAD onset during playback FIRES immediately - no word gate, no
+       * waiting for the transcriber. Any noise over the floor cuts the
+       * TTS. The barge never resumes and the L2/L1 statement stays
+       * readable as text, so a false stop on noise costs only the audio. */
+      return { state: { phase: 'fired', armedAtMs: event.atMs }, fire: true };
     }
     case 'words': {
       if (cur.phase !== 'armed') return { state: cur, fire: false };
