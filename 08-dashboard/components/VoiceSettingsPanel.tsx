@@ -49,6 +49,11 @@ function applyMicGainMigration(value: number): number {
   });
 }
 
+interface VoiceOption {
+  name: string;
+  sampleRate?: number;
+}
+
 interface PiperStatus {
   ok: boolean;
   active_voice: string;
@@ -57,6 +62,20 @@ interface PiperStatus {
   barge_cooldown_ms: number;
   vad_sensitivity: number;
   mic_gain: number;
+  voices?: VoiceOption[];
+}
+
+/* en_GB-alba-medium -> "Alba (GB, medium)". Falls back to the raw
+ * name for anything that doesn't match the piper locale-speaker-quality
+ * shape, so an oddly-named model still renders instead of vanishing. */
+function prettyVoiceLabel(name: string): string {
+  const m = name.match(/^[a-z]{2}_([A-Z]{2})-(.+)-([a-z]+)$/);
+  if (!m) return name;
+  const [, region, speaker, quality] = m;
+  const spk = speaker
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+  return `${spk} (${region}, ${quality})`;
 }
 
 /* Persistent voice preferences live in voice-preferences.json on the
@@ -89,6 +108,7 @@ export function VoiceSettingsPanel() {
       : MIC_GAIN_DEFAULT;
   });
   const [activeVoice, setActiveVoice] = useState<string>("");
+  const [voices, setVoices] = useState<VoiceOption[]>([]);
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved">(
     "idle",
   );
@@ -162,6 +182,14 @@ export function VoiceSettingsPanel() {
       .then((j: PiperStatus | null) => {
         if (!j) return;
         if (typeof j.active_voice === "string") setActiveVoice(j.active_voice);
+        if (Array.isArray(j.voices)) {
+          setVoices(
+            j.voices.filter(
+              (v): v is VoiceOption =>
+                !!v && typeof v.name === "string",
+            ),
+          );
+        }
         if (
           typeof j.barge_cooldown_ms === "number" &&
           Number.isFinite(j.barge_cooldown_ms)
@@ -304,6 +332,40 @@ export function VoiceSettingsPanel() {
     }, 250);
   }
 
+  /* Switch the TTS voice model. Optimistically reflect the pick, POST it
+   * to the daemon (which validates the .onnx is installed and persists to
+   * voice-preferences.json), and roll back the label if the daemon
+   * rejects it. Applies to the next spoken turn; a running synth finishes
+   * on the old voice. */
+  function changeVoice(name: string): void {
+    if (!name || name === activeVoice) return;
+    const previous = activeVoice;
+    setActiveVoice(name);
+    setSaveStatus("saving");
+    void fetch("/voice/set-voice", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ name }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j: { ok?: boolean } | null) => {
+        if (!j || !j.ok) {
+          setActiveVoice(previous);
+          setSaveStatus("idle");
+          return;
+        }
+        emitVoiceSettingUpdate({ key: "active_voice", value: name });
+        setSaveStatus("saved");
+        if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+        idleTimerRef.current = setTimeout(() => setSaveStatus("idle"), 1500);
+      })
+      .catch(() => {
+        setActiveVoice(previous);
+        setSaveStatus("idle");
+      });
+  }
+
   return (
     <section className="rounded-panel bg-surface1 hairline">
       <header className="px-5 py-3 border-b border-border1 flex items-center justify-between">
@@ -330,6 +392,38 @@ export function VoiceSettingsPanel() {
       </header>
 
       <div className="px-5 py-4 space-y-5">
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <label
+              htmlFor="tts-voice"
+              className="text-sm text-txt1 font-emphasized"
+            >
+              Voice
+            </label>
+          </div>
+          <select
+            id="tts-voice"
+            value={activeVoice}
+            disabled={voices.length === 0}
+            onChange={(e) => changeVoice(e.target.value)}
+            className="w-full h-9 px-3 rounded-input bg-surface2 hairline text-txt1 outline-none focus:ring-1 focus:ring-brand/60 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+            aria-describedby="tts-voice-help"
+          >
+            {voices.length === 0 && (
+              <option value="">{activeVoice || "loading…"}</option>
+            )}
+            {voices.map((v) => (
+              <option key={v.name} value={v.name}>
+                {prettyVoiceLabel(v.name)}
+              </option>
+            ))}
+          </select>
+          <p id="tts-voice-help" className="text-nano text-txt3 leading-relaxed">
+            Which Piper model speaks Lex&apos;s replies. Applies to the next
+            spoken turn; a reply already playing finishes on the old voice.
+          </p>
+        </div>
+
         <div className="space-y-2">
           <div className="flex items-center justify-between">
             <label
