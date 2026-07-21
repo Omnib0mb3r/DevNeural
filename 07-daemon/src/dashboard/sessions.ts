@@ -560,7 +560,10 @@ export function listSessions(): SessionListItem[] {
       // Pending prompt overrides tail-derived phase: if Claude is waiting
       // for an answer, the tile / detail must show 'permission' even
       // though the last jsonl record is still the assistant's question.
-      if (pending) phase = 'permission';
+      // BUT an idle_prompt (CC's "still working?" idle rhythm) is not a
+      // user action item - the bell routes it to 'signal', so the tile
+      // must too; else a plain idle session falsely paints "needs input".
+      if (pending && pending.kind !== 'idle_prompt') phase = 'permission';
       // Optional join with brainstorm_sessions to surface the user's
       // rename onto Stream Deck and Nav tiles. Returns null for any
       // Claude session that was never bound to a Lex brainstorm row.

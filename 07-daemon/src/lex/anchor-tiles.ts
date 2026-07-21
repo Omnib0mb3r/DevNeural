@@ -105,7 +105,12 @@ export function listAnchorTiles(
       const tailPhase = derivePhaseFromTail(current.transcript_path);
       if (tailPhase !== 'unknown') phase = tailPhase;
       pending = getPending(current.cc_session_id);
-      if (pending) phase = 'permission';
+      // idle_prompt (CC's "still working?" idle rhythm) is NOT a user
+      // action item - the bell already routes it to 'signal' (off the
+      // bell); the tile must match, or a plain idle session paints red
+      // "needs input". Only a real permission/elicitation prompt turns
+      // the tile to 'permission'; an idle_prompt leaves it idle.
+      if (pending && pending.kind !== 'idle_prompt') phase = 'permission';
     }
     const lastActivity =
       refs.reduce<number>((acc, r) => {

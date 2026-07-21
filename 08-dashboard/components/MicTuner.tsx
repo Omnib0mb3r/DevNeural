@@ -29,12 +29,17 @@ export function MicTuner({ sensitivity }: { sensitivity: number }) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const vadRef = useRef<any>(null);
   const runningRef = useRef(false);
+  // Identity token for the in-flight start(); a Stop/unmount during async
+  // init clears it, so the stale post-await guard below no longer reads
+  // React state (which is a stale closure and always looked "not starting").
+  const startTokenRef = useRef<object | null>(null);
 
   const threshold = vadThresholds(Math.max(0, Math.min(1, sensitivity))).positive;
   const over = state === "live" && prob >= threshold;
 
   async function teardown(): Promise<void> {
     runningRef.current = false;
+    startTokenRef.current = null;
     const vad = vadRef.current;
     vadRef.current = null;
     if (!vad) return;
@@ -49,6 +54,8 @@ export function MicTuner({ sensitivity }: { sensitivity: number }) {
 
   async function start(): Promise<void> {
     if (runningRef.current) return;
+    const token = {};
+    startTokenRef.current = token;
     setState("starting");
     setErrorMsg(null);
     setProb(0);
@@ -71,8 +78,8 @@ export function MicTuner({ sensitivity }: { sensitivity: number }) {
           setProb((prev) => prev * 0.4 + p * 0.6);
         },
       });
-      if (!runningRef.current && state !== "starting") {
-        // stopped mid-init
+      if (startTokenRef.current !== token) {
+        // stopped / unmounted mid-init
         try {
           vad.destroy?.();
         } catch {
