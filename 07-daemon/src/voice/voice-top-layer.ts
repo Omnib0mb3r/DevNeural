@@ -158,59 +158,10 @@ export function lexReplyTimeoutMs(bodyChars: number, override?: number): number 
   );
 }
 
-/* Heartbeat ask timeout. Deliberately looser than the render/turn
- * timeouts (2026-07-16 smoke-test fix 2): a still-on-it pulse that
- * lands 8s late is still a valid pulse (the caller re-checks that Lex
- * is STILL mid-turn before speaking it), whereas a 3s bound made every
- * pulse a coin flip against normal claude turn latency. */
-const DEFAULT_HEARTBEAT_TIMEOUT_MS = 10_000;
-
-function heartbeatTimeoutMs(override?: number): number {
-  if (override !== undefined) return override;
-  const raw = Number(
-    process.env.DEVNEURAL_VOICE_HEARTBEAT_TIMEOUT_MS ??
-      DEFAULT_HEARTBEAT_TIMEOUT_MS,
-  );
-  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_HEARTBEAT_TIMEOUT_MS;
-}
-
-/* Heartbeat through the brain (operator directive 2026-07-15: no
- * hardcoded talking, everything spoken comes from the top layer). One
- * short grounded still-on-it line in Lex's voice; null on any miss -
- * the pulse is skipped, never replaced by a canned phrase. The
- * never-twice ring applies so consecutive pulses cannot repeat. */
-export async function voiceHeartbeat(
-  lexElapsedMs: number,
-  deps?: Pick<TopLayerDeps, 'ask' | 'timeoutMs' | 'now'>,
-): Promise<string | null> {
-  const ask = deps?.ask ?? defaultAsk;
-  const minutes = Math.max(1, Math.round(lexElapsedMs / 60_000));
-  const now = deps?.now?.() ?? new Date();
-  let raw: string | null = null;
-  try {
-    raw = await ask({
-      system:
-        'You are on a live voice call. Your deeper reasoning is still ' +
-        'working; the operator has heard silence for a while. Say ONE ' +
-        'short natural still-on-it line in your own voice, grounded in ' +
-        'the digest when it has anything. Output only the line.',
-      prompt:
-        buildHaikuPersonaPrompt(getDigest()?.digest ?? null) +
-        '\n\n' +
-        `It is ${buildLocalContext(now).timeLabel}. Your deeper reasoning ` +
-        `has been on the current turn for about ${minutes} minute${minutes === 1 ? '' : 's'}.`,
-      timeoutMs: heartbeatTimeoutMs(deps?.timeoutMs),
-      noLivenessStrike: true,
-    });
-  } catch {
-    raw = null;
-  }
-  const line = raw?.trim();
-  if (!line || containsDirectiveLine(line)) return null;
-  if (wasLastSpoken(line)) return null;
-  rememberSpokenLine(line);
-  return line;
-}
+/* The spoken "still working" heartbeat pulse is gone (operator
+ * directive 2026-07-21: no hard-coded spoken heartbeats, ever). Any
+ * still-on-it cue will be reborn as a Layer 1 system-prompt behavior,
+ * not a daemon-generated line. */
 
 /** Outcome of a brain delivery (2026-07-16 failure 1):
  *  - 'delivered': the reply went out in full (streamed to end_turn,

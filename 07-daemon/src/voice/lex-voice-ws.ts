@@ -96,7 +96,6 @@ import {
 } from './lex-voice-commands.js';
 import {
   voiceLexReply,
-  voiceHeartbeat,
   type LexReplyOutcome,
 } from './voice-top-layer.js';
 import {
@@ -143,11 +142,6 @@ import { runDistillationFlush } from '../lex/session-end-pipeline.js';
 import { queueSessionEndPipeline } from '../lex/distill-pending.js';
 import { appendUtterance as appendSessionAudio } from './audio-bundle.js';
 import { selectTtsContent, decidePreToolAck } from './select-tts-content.js';
-import {
-  HEARTBEAT_INTERVAL_MS,
-  HEARTBEAT_TICK_MS,
-} from './lex-voice-heartbeat.js';
-import { shouldSpeakHeartbeatHaiku } from './voice-heartbeat-haiku.js';
 import {
   renderForSpeech,
   shouldCaptureAbsorbedAside,
@@ -273,11 +267,12 @@ interface ConnState {
    * (matchVoiceCommand returns non-null) still fire via the
    * dispatch path before this gate. */
   utteranceStartedDuringTts: boolean;
-  /* Half-duplex heartbeat gate (2026-06-18). userSpeaking is true
-   * between utterance-start and utterance-end; lastUserSpeechEndMs is
-   * the instant the user last stopped. The working-heartbeat must never
-   * pulse while either says the user holds the floor — Lex speaking
-   * mutes the mic, so a pulse over the user makes Lex deaf to them. */
+  /* Half-duplex mic gate (2026-06-18). userSpeaking is true between
+   * utterance-start and utterance-end; lastUserSpeechEndMs is the
+   * instant the user last stopped. Lex speaking mutes the mic, so any
+   * spoken output while the user holds the floor makes Lex deaf to
+   * them; these fields let the speak path hold back until the floor
+   * clears. */
   userSpeaking: boolean;
   lastUserSpeechEndMs: number;
   /* Absolute user floor (#4, 2026-07-19). True while the user physically
@@ -296,8 +291,9 @@ interface ConnState {
    * direct-llm reply both consult it: typed input gets a text-only
    * reply (panel frame + chunk still land) and is NEVER spoken. Last
    * input source wins, so the user's most recent channel decides
-   * whether Lex talks back. Read at the two speak() sites only; the
-   * visual + persistence paths are unaffected. */
+   * whether Lex talks back. Consulted at the two speak() sites (the
+   * talkback watcher and the direct-llm reply). The visual +
+   * persistence paths are unaffected. */
   suppressSpeakForTurn: boolean;
   /* Mid-session compaction trigger state. Flips compactedAt the
    * moment shouldTriggerCompaction crosses 75% so a trailing
@@ -1919,12 +1915,6 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     absorbedAsides: [],
   };
 
-  /* Working-heartbeat state. lastSpeechMs is the epoch ms of the most
-   * recent TTS activity (start of a speak + every tts-end); the
-   * heartbeat watcher uses it as the silence clock. heartbeatTimer is
-   * the in-flight ticker, started with the jsonl watch and torn down
-   * with it. */
-  let lastSpeechMs = 0;
   /* Last line actually spoken; the haiku fast lane replays it on
    * "say that again" without an Opus round-trip. */
   let lastSpokenText: string | null = null;
@@ -1934,7 +1924,6 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * lane to queue to Lex) the moment a turn boundary advances without a
    * matching push. */
   let lastLexTurnMs = 0;
-  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   /* Replay-on-switch guard: speak the bound session's last reply at most
    * once per socket, even if the read misses or the turn is too old. */
   let replayedOnBind = false;
@@ -1958,7 +1947,6 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     log: logFn,
     onTtsEnd: () => {
       lastTtsEndMs = Date.now();
-      lastSpeechMs = Date.now();
     },
     /* The live-haiku renderSegment restyle is gone (spec v2): it cost a
      * full LLM round trip before the reply body reached piper. */
@@ -2306,7 +2294,6 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   function startJsonlWatch(): void {
     if (state.watchTimer) return;
     state.watchTimer = setInterval(() => pollJsonl(), 250);
-    startHeartbeat();
   }
 
   function stopJsonlWatch(): void {
@@ -2314,7 +2301,6 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       clearInterval(state.watchTimer);
       state.watchTimer = null;
     }
-    stopHeartbeat();
   }
 
   /* Replay-on-switch (item 2). Called once after a bind resolves a
@@ -2363,61 +2349,14 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     });
   }
 
-  /* Periodic "still working" pulse while a turn is in flight. The gate
-   * (lex-voice-heartbeat.ts) only fires after a real gap of silence,
-   * never while audio is playing, and never in notes mode. The pulse
-   * routes through speak() so it serialises with real speech and resets
-   * the silence clock; it carries no answer content. */
-  function startHeartbeat(): void {
-    if (heartbeatTimer) return;
-    heartbeatTimer = setInterval(() => {
-      if (state.closed) return;
-      const now = Date.now();
-      /* shouldSpeakHeartbeatHaiku === shouldHeartbeat when the flag is
-       * off; with it on it adds the single-mouth guard. */
-      const fire = shouldSpeakHeartbeatHaiku({
-        awaitingSince: state.awaitingResponseSince,
-        lastSpeechMs,
-        ttsActive: Boolean(state.ttsActive),
-        userSpeaking: state.userSpeaking,
-        lastUserSpeechEndMs: state.lastUserSpeechEndMs,
-        mode: state.mode,
-        now,
-        intervalMs: HEARTBEAT_INTERVAL_MS,
-      });
-      if (fire && state.awaitingResponseSince) {
-        /* No hardcoded talking: the pulse line comes from the brain or
-         * not at all (a missed pulse is silence, not a canned phrase).
-         * Guard against the ask outliving the wait: only speak if Lex
-         * is STILL mid-turn when the line comes back. A missed pulse
-         * is logged LOUDLY (2026-07-16 smoke-test fix 2): pre-fix a
-         * dead voice brain produced four minutes of dead air with
-         * zero log evidence on the heartbeat path. */
-        const elapsed = now - state.awaitingResponseSince;
-        void voiceHeartbeat(elapsed).then((line) => {
-          if (!line) {
-            logFn(
-              `[voice-ws] HEARTBEAT MISSED: voice brain returned no pulse (lex mid-turn ${Math.round(elapsed / 1000)}s); operator hears silence`,
-            );
-            return;
-          }
-          if (state.awaitingResponseSince > 0 && !state.closed) {
-            speak(line);
-          }
-        });
-      }
-    }, HEARTBEAT_TICK_MS);
-    if (typeof (heartbeatTimer as { unref?: () => void }).unref === 'function') {
-      (heartbeatTimer as { unref: () => void }).unref();
-    }
-  }
-
-  function stopHeartbeat(): void {
-    if (heartbeatTimer) {
-      clearInterval(heartbeatTimer);
-      heartbeatTimer = null;
-    }
-  }
+  /* The daemon-driven spoken "still working" heartbeat is gone
+   * (operator directive 2026-07-21: no hard-coded spoken heartbeats,
+   * ever). A typed cc-pty turn used to speak the heartbeat pulse aloud
+   * because that timer never checked the typed-input suppression gate,
+   * and more fundamentally the operator does not want the daemon
+   * generating spoken filler at all. Any "still working" cue will be
+   * reborn later as a Layer 1 system-prompt behavior, not a hardwired
+   * setInterval that calls speak(). */
 
   /* Track which assistant-text segments have already been TTS'd so the
    * watcher does not double-speak. Per-segment hashing (not per-uuid)
@@ -3036,10 +2975,6 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       );
       return;
     }
-    /* Reset the heartbeat silence clock on any real speech (ack, body,
-     * or a heartbeat pulse itself) so a pulse only fires after a genuine
-     * gap of silence. */
-    lastSpeechMs = Date.now();
     /* Pillar 3: route spoken output through the renderer (preserve-list
      * verbatim guard). Passthrough when the flag is off. The safe
      * markdown strip is the only render now; the live-haiku restyle
@@ -4948,8 +4883,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
          * client drain, not synth end (the drain-tail hole). New
          * clients send vad-onset instead and the word gate decides. */
         state.utteranceStartedDuringTts = engineDuringTts();
-        /* User holds the floor until utterance-end; suppress any
-         * working-heartbeat pulse for the duration. */
+        /* User holds the floor until utterance-end. */
         state.userSpeaking = true;
         /* #4 absolute floor: utterance-start is PTT-down. While the
          * button is held, speak() drops every segment so Lex emits ZERO
@@ -5078,9 +5012,8 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         break;
       }
       case 'utterance-end':
-        /* User released the floor. Clear the heartbeat suppression and
-         * stamp the moment so the cooldown keeps a pulse off the heels
-         * of their last word. */
+        /* User released the floor; stamp the moment so the half-duplex
+         * cooldown keeps Lex's mouth off the heels of their last word. */
         state.userSpeaking = false;
         /* #4 absolute floor released: PTT is up (or the VAD utterance
          * ended), so Lex may speak again. handleUtteranceEnd below

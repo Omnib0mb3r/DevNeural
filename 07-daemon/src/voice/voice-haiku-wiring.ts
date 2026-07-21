@@ -5,8 +5,8 @@
  * that died with the spec-v2 teardown: the voice top layer
  * (voice-top-layer.ts) is the one conversational brain now. What
  * survives here is the small set of helpers the WS coordinator still
- * needs: the safe spoken-output strip, the heartbeat line, and the
- * absorbed-aside ring the top layer's conversational turns feed.
+ * needs: the safe spoken-output strip and the absorbed-aside ring the
+ * top layer's conversational turns feed.
  */
 import { useVoiceHaiku } from './voice-haiku.js';
 import { renderSpoken } from './voice-renderer.js';
@@ -22,9 +22,9 @@ export function renderForSpeech(text: string): string {
   return renderSpoken(text).spoken;
 }
 
-/* heartbeatLine is gone (operator directive 2026-07-15: no hardcoded
- * talking). The heartbeat pulse line now comes from the brain via
- * voice-top-layer.ts voiceHeartbeat, or the pulse is skipped. */
+/* The spoken heartbeat is gone entirely (operator directive
+ * 2026-07-21: no hard-coded spoken heartbeats, ever). Any still-on-it
+ * cue will be reborn as a Layer 1 system-prompt behavior. */
 
 /* Absorbed-aside plumbing (2026-07-15, fast-lane transcript hole fix;
  * retained under spec v2 for the top layer's conversational turns).

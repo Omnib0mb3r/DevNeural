@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { getVadModule } from "@/lib/voice-ort-config";
+import { getVadModule, resetVadModuleCache } from "@/lib/voice-ort-config";
 import { buildVadOptionSet, vadThresholds } from "@/lib/voice-vad-options";
 
 /* Live mic tuner (2026-07-20-mic-tuning-design.md).
@@ -50,6 +50,15 @@ export function MicTuner({ sensitivity }: { sensitivity: number }) {
     } catch {
       /* best-effort teardown */
     }
+    /* destroy() terminates ORT's threaded-backend worker pool but leaves
+     * the shared getVadModule() singleton flagged configured=true. Without
+     * this reset the next MicVAD.new - in the main voice panel OR a second
+     * tuner run - lands on the dead pthread shim and cascades into
+     * "no available backend found ... RangeError: Out of memory ...
+     * previous call to 'initWasm()' failed." VoiceClient already resets on
+     * every teardown/error path; the tuner has to do the same or it
+     * poisons ORT for the whole tab. See lib/voice-ort-config.ts. */
+    resetVadModuleCache();
   }
 
   async function start(): Promise<void> {
