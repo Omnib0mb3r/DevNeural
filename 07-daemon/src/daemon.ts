@@ -168,6 +168,30 @@ async function main(): Promise<void> {
     throw err;
   }
 
+  /* Self-heal project-registry dupes on boot (2026-07-23). Collapses
+   * path-scoped orphans into their remote-scoped twin for the same
+   * folder (the two-"John Simms" split from registering a folder before
+   * its git remote existed). Idempotent; no-op on a clean registry. */
+  try {
+    const { reconcileAllProjects, pruneMissingProjects } = await import(
+      './identity/registry.js'
+    );
+    const { removed } = reconcileAllProjects();
+    if (removed.length > 0) {
+      logger(
+        `project-registry: reconciled ${removed.length} path-scoped dupe(s): ${removed.join(', ')}`,
+      );
+    }
+    const pruned = pruneMissingProjects();
+    if (pruned.removed.length > 0) {
+      logger(
+        `project-registry: pruned ${pruned.removed.length} entr(y/ies) with missing root: ${pruned.removed.join(', ')}`,
+      );
+    }
+  } catch (err) {
+    logger(`project-registry reconcile skipped: ${(err as Error).message}`);
+  }
+
   /* GPU job queue + VRAM monitor (Wave 2 day 1 steps 3 + 4).
    * Lanes 0 and 1 always run (curator + voice). Lanes 2 and 3
    * defer when free VRAM dips below the floor. The VRAM monitor

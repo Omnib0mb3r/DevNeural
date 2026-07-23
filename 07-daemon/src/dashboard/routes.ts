@@ -3806,6 +3806,92 @@ export async function registerDashboardRoutes(
     return result;
   });
 
+  /* Directory browser for the "Add project" folder picker (2026-07-23).
+   * Read-only: returns immediate subdirectories of `path` (default
+   * C:/dev/Projects) plus the parent, so the dashboard modal can walk
+   * the tree and point the registry at a folder. Directory NAMES only,
+   * never file contents; the payload can't leak secrets. `has_git`
+   * flags folders that are git repos so the picker can hint which ones
+   * will auto-tie. */
+  app.get('/fs/list', async (req, reply) => {
+    const q = (req.query ?? {}) as { path?: string };
+    const target = (q.path && q.path.trim() ? q.path : 'C:/dev/Projects')
+      .replace(/\\/g, '/')
+      .replace(/\/+$/, '');
+    if (!fs.existsSync(target)) {
+      reply.code(400);
+      return { ok: false, error: `path not found: ${target}` };
+    }
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(target, { withFileTypes: true });
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, error: `read failed: ${(err as Error).message}` };
+    }
+    const dirs = entries
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+      .map((e) => {
+        const full = path.posix.join(target, e.name);
+        return {
+          name: e.name,
+          path: full,
+          has_git: fs.existsSync(path.posix.join(full, '.git')),
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const parent = path.posix.dirname(target);
+    return {
+      ok: true,
+      path: target,
+      parent: parent !== target ? parent : null,
+      dirs,
+    };
+  });
+
+  /* Register one folder the operator pointed at (2026-07-23). Unlike
+   * scan-and-register (which walks a root's CHILDREN), this registers
+   * the given path ITSELF as a single project: resolveProjectIdentity
+   * reads its git remote (auto-tie) or falls back to a path id, then
+   * recordIdentity persists it and folds any pre-remote path dupe in.
+   * Idempotent: pointing at an already-registered folder just refreshes
+   * last_seen and returns already_registered=true. */
+  app.post('/projects/register-path', async (req, reply) => {
+    const body = (req.body ?? {}) as { path?: string };
+    const target = (body.path ?? '').replace(/\\/g, '/').replace(/\/+$/, '');
+    if (!target) {
+      reply.code(400);
+      return { ok: false, error: 'path required' };
+    }
+    if (!fs.existsSync(target)) {
+      reply.code(400);
+      return { ok: false, error: `path not found: ${target}` };
+    }
+    const { resolveProjectIdentity } = await import('../identity/project-id.js');
+    const { recordIdentity, getProject } = await import(
+      '../identity/registry.js'
+    );
+    const identity = resolveProjectIdentity(target);
+    if (identity.id === 'global') {
+      reply.code(422);
+      return {
+        ok: false,
+        error:
+          'could not resolve a project identity for that folder (not a git repo and no usable path)',
+      };
+    }
+    const already = Boolean(getProject(identity.id));
+    recordIdentity(identity);
+    log(
+      `[dashboard] register-path: ${already ? 'refreshed' : 'registered'} ${identity.name} (${identity.id}) at ${identity.root}`,
+    );
+    return {
+      ok: true,
+      already_registered: already,
+      project: getProject(identity.id) ?? null,
+    };
+  });
+
   /* Start Claude in an existing registered project.
    *
    * Looks up the project root from the registry, drops a workspace-

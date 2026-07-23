@@ -1430,6 +1430,34 @@ export const createProject = (input: {
     { method: "POST", body: input },
   );
 
+// ── Add-existing-folder picker (2026-07-23) ──────────────────────
+export interface FsDir {
+  name: string;
+  path: string;
+  has_git: boolean;
+}
+/* Browse immediate subdirectories of `path` (default C:/dev/Projects on
+ * the daemon). Read-only; directory names only. */
+export const fsList = (path?: string) => {
+  const qs = path ? `?path=${encodeURIComponent(path)}` : "";
+  return request<{
+    ok: boolean;
+    path: string;
+    parent: string | null;
+    dirs: FsDir[];
+    error?: string;
+  }>(`/fs/list${qs}`);
+};
+/* Register one folder the user pointed at. Auto-resolves git identity
+ * (remote if present, else path). Idempotent. */
+export const registerProjectPath = (path: string) =>
+  request<{
+    ok: boolean;
+    already_registered?: boolean;
+    project?: ProjectRecord | null;
+    error?: string;
+  }>("/projects/register-path", { method: "POST", body: { path } });
+
 // ── knowledge index (doc browse, DRIVE-QUEUE 2B) ────────────────
 export interface DocChunkPointer {
   heading: string;
