@@ -30,6 +30,8 @@ real bug intentionally parked.
 | BUG-012 | SMOKE-TESTING | Mic tuner + main voice both fail with `no available backend found ... RangeError: Out of memory ... previous call to 'initWasm()' failed`. Cause: MicTuner's `teardown()` calls `vad.destroy()` (kills ORT's threaded worker pool) but never `resetVadModuleCache()`, leaving the SHARED `getVadModule()` singleton flagged configured=true; the next `MicVAD.new` (tuner or main voice) lands on the dead pthread shim and cascades. VoiceClient already resets on every teardown; the tuner did not. Fix: MicTuner calls `resetVadModuleCache()` in teardown. Awaiting operator live verify. |
 | BUG-013 | SMOKE-TESTING | Typed input spoken aloud (should be text-only, "brain replied"). Cause: the "still working" spoken heartbeat ran on its own `setInterval` (started by `startJsonlWatch` on the cc-pty typed path) and called `speak()` without consulting `suppressSpeakForTurn`; a long worker turn after a typed message fired a spoken pulse. Fix per operator directive 2026-07-21: the hard-coded spoken heartbeat is REMOVED entirely (wiring + `lex-voice-heartbeat.ts` + `voice-heartbeat-haiku.ts` + `voiceHeartbeat` in `voice-top-layer.ts` deleted). Any still-on-it cue returns later as a Layer 1 system-prompt behavior. Awaiting operator live verify. |
 | BUG-014 | OPEN | Pre-existing test failure (not voice-related): `tests/grooming-routes.test.ts:118` expects `recentGroomingNotifications().length === 3`; fails on baseline (verified via stash) both alone and in the full suite. Discovered during the 2026-07-21 voice work; NOT caused by it. `smart-compact-injector.test.ts` also flakes on a 5s timeout in the full run but passes in isolation. |
+| BUG-015 | RESOLVED | Home-page project list shows the same folder twice (observed: two "John Simms"). Identity id is hashed from the git remote when present, else the path; a folder registered before its remote existed (path id) then again after (remote id) splits into two entries. Fixed: `reconcilePathDupes` folds a path-scoped orphan into its remote twin on every `recordIdentity`, plus `reconcileAllProjects` self-heals existing dupes on daemon boot. Verified: registry 9->8, John Simms 1 row. |
+| BUG-016 | RESOLVED | Registry keeps stale entries for renamed/deleted project folders (path-scoped rename = new id = orphan; old entry's root no longer exists, Start Claude would open a dead path). Fixed: `pruneMissingProjects` drops entries whose root is absent on disk, run on daemon boot after reconcile. git-remote projects self-heal instead (same remote -> same id -> root rewritten on next capture). |
 <!-- INDEX END -->
 
 <!-- DETAILS START -->
@@ -143,5 +145,24 @@ real bug intentionally parked.
 - **Symptom:** `tests/grooming-routes.test.ts:118` `expect(recent.length).toBe(3)` fails. Confirmed pre-existing: with the 2026-07-21 voice changes stashed, the test still fails on baseline (BASE_EXIT=1), alone and in the full run.
 - **Note:** `tests/smart-compact-injector.test.ts` ("defers summary inject until awaitSessionReady resolves ready=true") also fails in the full suite on a 5s timeout but PASSES in isolation → a flake/ordering issue, distinct from this real failure.
 - **Root cause:** not investigated (out of scope for the voice work). Left OPEN.
+
+## BUG-015 — Home-page project list shows the same folder twice
+- **Status:** RESOLVED
+- **Found:** 2026-07-23 · **Fixed:** 2026-07-23 (reconcile-on-record + boot self-heal; live-verified)
+- **Area:** `07-daemon/src/identity/registry.ts`, `07-daemon/src/identity/project-id.ts`, `07-daemon/src/daemon.ts`
+- **Symptom:** two "John Simms" tiles in the "Start Claude" list, both pointing at `C:/dev/Projects/John Simms`, registered ~49s apart: `c7d8557a05fd` (remote null) and `54c750174212` (remote `github.com/omnib0mb3r/john-simms-micro-resort`).
+- **Root cause:** `resolveProjectIdentity` hashes the id from the git remote URL when one exists, else from the lowercased path. A project created folder-first (the operator's brainstorm-makes-the-folder workflow) registers path-scoped BEFORE the git remote is added, then remote-scoped AFTER. Two ids, same folder. Nothing reconciled the split.
+- **Fix:** `reconcilePathDupes(identity, reg)` runs inside `recordIdentity`: when a remote identity is recorded, any path-scoped entry with the same normalized root is folded into it (earliest `first_seen` preserved, orphan deleted). `reconcileAllProjects()` applies the same sweep across the whole registry once on daemon boot (`daemon.ts`, after migrations) so pre-existing dupes heal without waiting for a fresh session.
+- **Verified:** registry 9->8 entries; John Simms collapsed to the single remote-scoped `54c750174212`; `register-path` on the same folder returns `already_registered=true` and creates no new row.
+- **Residual:** the orphan's data dir `C:/dev/data/skill-connections/projects/c7d8557a05fd/` remains on disk (observation history). Harmless, unlisted. Purge manually if desired.
+
+## BUG-016 — Registry keeps stale entries for renamed/deleted folders
+- **Status:** RESOLVED
+- **Found:** 2026-07-23 · **Fixed:** 2026-07-23 (boot prune)
+- **Area:** `07-daemon/src/identity/registry.ts` (`pruneMissingProjects`), `07-daemon/src/daemon.ts`
+- **Symptom:** rename or delete a project folder on disk and its old registry entry lingers with a now-dead `root`; Start Claude on it would open a path that no longer exists, and a path-scoped rename also spawns a second entry under the new path.
+- **Root cause:** the registry is append/upsert only and never reconciles against the filesystem. A path-scoped rename produces a new id (the path changed) and orphans the old one; a delete leaves the entry entirely.
+- **Fix:** `pruneMissingProjects()` drops any entry whose `root` is absent (`!fs.existsSync`), run on daemon boot right after `reconcileAllProjects`. git-remote-scoped renames self-heal separately: same remote -> same id -> `recordIdentity` rewrites `root` to the new toplevel on the next capture, so prune only ever removes genuinely dead folders.
+- **Verified:** boot ran clean (registry count held at 8, nothing valid removed); logic only deletes entries with a missing on-disk root.
 
 <!-- DETAILS END -->
