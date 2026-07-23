@@ -657,6 +657,14 @@ export const deleteLexAnchor = (id: string) =>
     `/lex/anchors/${encodeURIComponent(id)}`,
     { method: "DELETE" },
   );
+/* Reversible hide for the Past Sessions list (migration 053). Default
+ * archives (hides) the row; pass { archived: false } to restore. Unlike
+ * deleteLexAnchor this leaves the anchor + transcript refs intact. */
+export const archiveLexAnchor = (id: string, archived = true) =>
+  request<{ ok: boolean; archived?: boolean; error?: string }>(
+    `/lex/anchors/${encodeURIComponent(id)}/archive`,
+    { method: "POST", body: { archived } },
+  );
 
 /* Stream Deck anchor tile feed. Each live anchor renders as a
  * read-only tile alongside CC project tiles; phase reuses the

@@ -79,6 +79,17 @@ export function deleteLexSession(id: string): void {
   db().deleteLexSession(id);
 }
 
+/* Reversible hide/unhide for the Past Sessions list (migration 053).
+ * archived=true drops the row out of GET /lex/anchors without touching
+ * the anchor, its transcript refs, or the paired brainstorm row.
+ * archived=false restores it. */
+export function setLexSessionArchived(
+  id: string,
+  archived: boolean,
+): LexSessionRow | null {
+  return db().updateLexSession(id, { archived: archived ? 1 : 0 });
+}
+
 export function appendTranscriptRef(opts: {
   lexSessionId: string;
   ccSessionId: string;

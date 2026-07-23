@@ -365,6 +365,11 @@ export interface LexSessionRow {
    * target_session as before). Non-null references project_session.id
    * so the inject path can resolve a target without judgment. */
   supervises_project_anchor_id?: string | null;
+  /* Migration 053: reversible hide bit for the Past Sessions list.
+   * 0 = visible (default; every pre-migration row), 1 = archived
+   * (hidden from GET /lex/anchors). Lets the operator clear stale/test
+   * rows out of the /lex window without hard-deleting the anchor. */
+  archived?: number;
 }
 
 /* lex_transcript_ref row. Ordered list of CC jsonl pointers per
@@ -2107,15 +2112,20 @@ export class IndexDb {
     limit?: number;
   } = {}): LexSessionRow[] {
     const limit = opts.limit ?? 50;
+    /* archived = 0 filter hides operator-cleared rows from the Past
+     * Sessions list (migration 053). Reversible: unarchiving restores
+     * the row. The anchor and its transcript refs are untouched. */
     if (opts.status) {
       return this.db
         .prepare(
-          `SELECT * FROM lex_session WHERE status = ? ORDER BY created_ms DESC LIMIT ?`,
+          `SELECT * FROM lex_session WHERE status = ? AND archived = 0 ORDER BY created_ms DESC LIMIT ?`,
         )
         .all(opts.status, limit) as LexSessionRow[];
     }
     return this.db
-      .prepare(`SELECT * FROM lex_session ORDER BY created_ms DESC LIMIT ?`)
+      .prepare(
+        `SELECT * FROM lex_session WHERE archived = 0 ORDER BY created_ms DESC LIMIT ?`,
+      )
       .all(limit) as LexSessionRow[];
   }
 

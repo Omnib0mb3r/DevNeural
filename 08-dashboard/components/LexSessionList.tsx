@@ -9,6 +9,7 @@ import {
   createLexAnchor,
   openLexAnchor,
   endLexAnchor,
+  archiveLexAnchor,
   type LexAnchor,
   type ProjectAnchorTile,
 } from "@/lib/daemon-client";
@@ -176,6 +177,18 @@ export function LexSessionList({
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ["lex-anchors"] });
       qc.invalidateQueries({ queryKey: ["pty-list"] });
+    },
+  });
+
+  /* Reversible "remove from this list". Hides the row via the archive
+   * bit (migration 053) instead of hard-deleting the anchor, so a
+   * misclick on a real session is recoverable (unarchive in the DB).
+   * A confirm guards the click; the row disappears on refetch. */
+  const archiveM = useMutation({
+    mutationFn: (id: string) => archiveLexAnchor(id, true),
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ["lex-anchors"] });
+      qc.invalidateQueries({ queryKey: ["sessions"] });
     },
   });
 
@@ -465,6 +478,34 @@ export function LexSessionList({
                               : isLive
                                 ? "switch to"
                                 : "open"}
+                        </button>
+                      )}
+                      {/* Archive = reversible hide from this list
+                       * (migration 053), not a hard delete. Only
+                       * offered on dormant, non-current rows so you
+                       * cannot archive the session you are actively
+                       * in. */}
+                      {!isCurrent && !isLive && (
+                        <button
+                          type="button"
+                          data-testid={`lex-row-archive-${row.id}`}
+                          onClick={() => {
+                            const label = nameFor(row) || shortId(row.id);
+                            if (
+                              typeof window !== "undefined" &&
+                              !window.confirm(
+                                `Archive "${label}"?\n\nThis hides the row from Past Sessions (reversible). The anchor and its transcripts are kept.`,
+                              )
+                            ) {
+                              return;
+                            }
+                            archiveM.mutate(row.id);
+                          }}
+                          disabled={archiveM.isPending}
+                          className="text-nano px-2 py-1 rounded-pill bg-surface2 hairline hover:bg-surface3 text-txt3 hover:text-txt1 disabled:opacity-40 disabled:cursor-not-allowed"
+                          title="Archive this session (reversible hide; anchor + transcripts kept)"
+                        >
+                          {archiveM.isPending ? "…" : "archive"}
                         </button>
                       )}
                     </div>

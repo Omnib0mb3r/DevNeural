@@ -88,6 +88,7 @@ import {
   setLexSessionTitle,
   setLexSessionStatus,
   deleteLexSession,
+  setLexSessionArchived,
   listTranscriptRefs,
 } from '../lex/lex-session-store.js';
 import {
@@ -2124,6 +2125,36 @@ export async function registerDashboardRoutes(
     }
     deleteLexSession(id);
     return { ok: true };
+  });
+
+  /* Reversible hide for the Past Sessions list (migration 053). Body:
+   *   { archived?: boolean }   (default true)
+   * archived=true drops the row out of GET /lex/anchors; archived=false
+   * restores it. Unlike DELETE this leaves the anchor row, its
+   * transcript refs, and the paired brainstorm row fully intact, so the
+   * operator can clear stale/test rows out of the window without the
+   * cascade blast radius. A live row is flipped dormant first (its PTY
+   * killed) so an archived anchor can never keep a background PTY the
+   * list no longer surfaces. */
+  app.post('/lex/anchors/:id/archive', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { archived?: boolean };
+    const archived = body.archived ?? true;
+    const row = getLexSession(id);
+    if (!row) {
+      reply.code(404);
+      return { ok: false, error: 'anchor not found' };
+    }
+    if (archived && row.current_pty_id) {
+      try {
+        ptyKill(row.current_pty_id);
+      } catch {
+        /* best-effort */
+      }
+      setLexSessionStatus(id, { status: 'dormant', currentPtyId: null });
+    }
+    const updated = setLexSessionArchived(id, archived);
+    return { ok: true, archived: Boolean(updated?.archived) };
   });
 
   /* Legacy /lex/sessions list / get / patch endpoints retired in
