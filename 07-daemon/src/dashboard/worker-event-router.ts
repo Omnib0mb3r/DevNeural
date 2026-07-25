@@ -285,7 +285,18 @@ export function resolveLexTargetSession(
           limit: 5,
         })
       : [];
-    if (candidates.length === 0) {
+    /* Scope isolation (2026-07-25): when the caller supplied a project
+     * anchor, deliver ONLY to that project's bound live supervisor. If
+     * none is live, fall through to no-target — the router's
+     * notifyNoTarget then fires "bind/open a brainstorm for <project>"
+     * — rather than leaking the event onto whatever brainstorm happens
+     * to be newest-live. Regression 2026-07-24: a dormant "Bridger
+     * Brainstorm" (correctly bound to bridger) let bridger worker events
+     * spill into the unrelated live "DevNeural Testing" brainstorm all
+     * evening. The global fallback stays ONLY for the anchorId-absent
+     * legacy branch (cross-session callers that do not know their
+     * project). */
+    if (candidates.length === 0 && !opts.anchorId) {
       candidates = db
         .listLexSessions({ status: 'live', limit: 50 })
         .slice()

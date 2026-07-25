@@ -641,7 +641,14 @@ describe('resolveLexTargetSession', () => {
     ).toBe('cc-right');
   });
 
-  it('falls back to global pick when the project anchor has no supervisor bound', () => {
+  /* Scope isolation (2026-07-25): with a project anchor supplied and NO
+   * live supervisor bound to it, the resolver returns null (no-target)
+   * instead of leaking the event onto whatever brainstorm is
+   * newest-live. Regression it guards: a dormant-but-correctly-bound
+   * brainstorm let another project's worker events spill into an
+   * unrelated live brainstorm. The global fallback survives ONLY for the
+   * anchorId-absent legacy branch, asserted in the same test. */
+  it('returns null (no leak) when an anchor is supplied but no live supervisor is bound', () => {
     db.insertLexSession({
       id: 'lex-only',
       created_ms: 1_000,
@@ -660,12 +667,16 @@ describe('resolveLexTargetSession', () => {
       ordering: 0,
     });
     resetLexTargetCacheForTest();
+    /* anchor supplied, none bound -> scoped no-target (null). */
     expect(
       resolveLexTargetSession(db, {
         now: 5_000,
         anchorId: 'project-anchor-no-supervisor',
       }),
-    ).toBe('cc-fallback');
+    ).toBeNull();
+    /* anchorId ABSENT -> legacy global pick still resolves. */
+    resetLexTargetCacheForTest();
+    expect(resolveLexTargetSession(db, { now: 5_000 })).toBe('cc-fallback');
   });
 
   it('caches per-anchor so a miss on one project does not poison another', () => {
@@ -701,14 +712,15 @@ describe('resolveLexTargetSession', () => {
       ordering: 0,
     });
     resetLexTargetCacheForTest();
-    /* First call for proj-B finds nothing (no supervisor, no global
-     * either - we have a lex_session but its supervises field is
-     * proj-A). Global fallback still returns lex-A's cc id. */
+    /* First call for proj-B: anchor supplied, no supervisor bound to it
+     * -> scope isolation returns null (NOT lex-A, which supervises
+     * proj-A). The null is cached under proj-B's key. */
     expect(
       resolveLexTargetSession(db, { now: 1_000, anchorId: 'proj-B' }),
-    ).toBe('cc-A');
-    /* Subsequent call for proj-A is NOT poisoned by the proj-B
-     * lookup; the anchor-scoped resolver hits a separate cache key. */
+    ).toBeNull();
+    /* Subsequent call for proj-A is NOT poisoned by the proj-B null;
+     * the anchor-scoped resolver hits a separate cache key and finds
+     * lex-A. */
     expect(
       resolveLexTargetSession(db, { now: 1_100, anchorId: 'proj-A' }),
     ).toBe('cc-A');
