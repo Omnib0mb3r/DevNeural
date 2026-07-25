@@ -42,7 +42,7 @@ export function SupervisesPicker({
 }: Props) {
   const q = useQuery({
     queryKey: ["project-anchor-tiles"],
-    queryFn: () => listProjectAnchorTiles(),
+    queryFn: () => listProjectAnchorTiles({ status: "all" }),
     /* The picker is mounted in a few places that re-render on a
      * timer (live row). Stretch the refetch interval so an open
      * dropdown does not lose focus on every dashboard tick. */
@@ -70,7 +70,7 @@ export function SupervisesPicker({
       <option value="">(no project)</option>
       {tiles.map((t) => {
         const label = t.title?.trim() || t.project_slug;
-        const suffix = t.status === "live" ? " · live" : "";
+        const suffix = t.status === "live" ? " · live" : " · offline";
         return (
           <option key={t.anchor_id} value={t.anchor_id}>
             {label}
