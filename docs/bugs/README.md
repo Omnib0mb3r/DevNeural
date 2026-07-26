@@ -4,7 +4,7 @@
 
 | Date | Bug | Status | Severity |
 |------|-----|--------|----------|
-| 2026-07-26 | [Start Claude one-click spawn stalls at first-run "trust this folder" prompt on new folders](./2026-07-26-start-claude-blocked-by-trust-prompt.md) | open (root cause confirmed, fix designed: pre-seed hasTrustDialogAccepted at project creation) | medium |
+| 2026-07-26 | [Start Claude one-click spawn stalls at first-run "trust this folder" prompt on new folders](./2026-07-26-start-claude-blocked-by-trust-prompt.md) | fix committed (72b332b) — pre-seed in queueProjectBootstrap; pending daemon restart + live verify | medium |
 | 2026-05-29 | [Voice PTY paste lands as `[Pasted text #N +5 lines]`, never submits](./2026-05-29-voice-pty-paste-no-commit-regression.md) | investigation shipped 2026-05-29; ship deferred (mirror Fix 32 850ms follow-up into direct-inject path) | high |
 | 2026-05-23 | [Bridge terminal-name match is fragile (binding works, ergonomics)](./2026-05-23-bridge-terminal-name-fragility.md) | open | low |
 

@@ -1,6 +1,6 @@
 # Start Claude one-click spawn stalls at Claude Code first-run "trust this folder" prompt
 
-**Status:** open (root cause confirmed, fix designed, not yet shipped)
+**Status:** fix committed (72b332b) — pending daemon rebuild + restart + live verify
 **Date:** 2026-07-26
 **Severity:** medium
 
@@ -20,9 +20,9 @@ The single blocker is **external to DevNeural**: Claude Code gates every folder 
 
 This is why the pipeline "works 100 times" on already-opened projects but stalls on a freshly created one: existing folders are already trusted; new ones are not. The start-claude path has no step that pre-clears the trust gate.
 
-## Fix (designed, not shipped)
+## Fix (committed 72b332b, pending activation)
 
-Pre-seed the trust flag at project-creation / first-spawn time, scoped to folders DevNeural itself creates:
+Shipped as `seedProjectTrust` in `07-daemon/src/dashboard/projects-new.ts`, called from `queueProjectBootstrap` (the single chokepoint both the Start Claude button and the new-project spawn funnel through) before the launch marker is queued. Pre-seeds the trust flag at first-spawn time, scoped to the workspace being launched:
 
 - When the new-project / start-claude flow prepares a folder, patch `~/.claude.json` to add `projects["<abs path>"]` with `hasTrustDialogAccepted: true` (plus the onboarding flags `hasCompletedProjectOnboarding` / `projectOnboardingSeenCount`) **before** the first claude launch.
 - Race-free: it runs before any claude opens that folder, so there is no concurrent-writer conflict with a running session.
@@ -40,6 +40,8 @@ Activation note: the daemon runs compiled `dist`, and a daemon restart recycles 
 
 ## Open items
 
-- Implement the pre-trust seed in the start-claude path.
-- Decide exact onboarding-flag set needed so Claude Code skips ALL first-run gates (trust + theme/onboarding), not just trust.
-- Rebuild + restart daemon to activate (session-recycling, user-timed).
+- [x] Implement the pre-trust seed in the start-claude path (72b332b, `seedProjectTrust` in queueProjectBootstrap; 7 passing tests).
+- [x] Flag set: `hasTrustDialogAccepted` + `hasCompletedProjectOnboarding` (matches a fully-onboarded entry read from a live ~/.claude.json).
+- [ ] Rebuild + restart daemon to activate (session-recycling, user-timed). Daemon dist rebuilt 2026-07-26 14:01; restart still pending.
+- [ ] Live verify: Start Claude on a fresh scaffolded folder reaches a live session with zero keypresses.
+- [ ] Known trade-off: ~/.claude.json is shared with live sessions; the seed's read-modify-write has a small lost-update window (accepted, see code comment).
