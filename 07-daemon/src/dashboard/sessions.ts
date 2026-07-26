@@ -517,11 +517,36 @@ export function recordClearSupersede(
   return { ok: true, superseded: bestId };
 }
 
+/* Authoritative bridge-backed worker liveness. A bridge-hosted worker
+ * (VS Code terminal) has no daemon PTY and stops touching its StreamDeck
+ * identity file the moment it goes idle - e.g. right after a window
+ * reload - so readLiveSessionIds() drops it and it vanishes from the
+ * Stream Deck even though it is still running and bound. The
+ * project_session anchor, kept current by the bridge-presence reconcile
+ * (which flips the anchor dormant the instant the bridge connection is
+ * lost), is the one authoritative signal every surface should trust.
+ * Returns the live anchors' bound session ids so listSessions and the
+ * /sessions idle-filter can keep a live-but-idle bridge worker visible.
+ * db is injectable for tests. */
+export function liveAnchorSessionIds(db = getStore().db): Set<string> {
+  try {
+    return new Set(
+      db
+        .listProjectSessions({ status: 'live', limit: 1000 })
+        .map((r) => r.current_session_id)
+        .filter((id): id is string => Boolean(id)),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
 export function listSessions(): SessionListItem[] {
   if (!fs.existsSync(sessionsRoot())) return [];
   const out: SessionListItem[] = [];
   const slugs = fs.readdirSync(sessionsRoot(), { withFileTypes: true });
   const liveIds = readLiveSessionIds();
+  const anchorLive = liveAnchorSessionIds();
   for (const slug of slugs) {
     if (!slug.isDirectory()) continue;
     const slugDir = path.posix.join(sessionsRoot(), slug.name);
@@ -538,12 +563,14 @@ export function listSessions(): SessionListItem[] {
       // Claude Code but should not show up as active tiles. The
       // SessionStart hook records them in the superseded store.
       if (isSuperseded(sessionId)) continue;
-      // Strict liveness: only sessions whose StreamDeck.App identity
-      // file is fresh appear in the response. Sessions whose VS Code
-      // window has closed (no fresh identity file) are omitted
-      // entirely. Both physical deck and virtual deck consume this
-      // list, so omission removes the tile from both surfaces.
-      if (!liveIds.has(sessionId)) continue;
+      // Liveness: a session appears when its StreamDeck.App identity file
+      // is fresh OR its project_session anchor is live (bridge-backed).
+      // The anchor arm keeps a bound bridge worker on the deck while it is
+      // momentarily idle - e.g. right after a VS Code reload - when its
+      // identity file has aged out but the bridge still holds the terminal.
+      // A session in neither (window truly closed AND anchor dormant) is
+      // omitted from both the physical and virtual deck surfaces.
+      if (!liveIds.has(sessionId) && !anchorLive.has(sessionId)) continue;
       const file = path.posix.join(slugDir, e.name);
       let stat: fs.Stats;
       try {

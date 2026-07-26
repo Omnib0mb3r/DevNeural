@@ -36,6 +36,7 @@ import { getSystemMetrics } from './system-metrics.js';
 import { checkAll, rollupStatus } from './services.js';
 import {
   listSessions,
+  liveAnchorSessionIds,
   getSessionDetail,
   queueSessionPrompt,
   queueSessionSuggestion,
@@ -1093,9 +1094,20 @@ export async function registerDashboardRoutes(
         .filter((p) => !p.exited && p.sessionId)
         .map((p) => p.sessionId as string),
     );
+    /* A project is "live" (not offered as an idle Start-Claude tile) when
+     * it has an active session that is either daemon-owned OR bound to a
+     * live project_session anchor (a bridge-hosted worker). Without the
+     * anchor arm a running bridge worker was double-listed as an idle
+     * project even while it was live and bound. */
+    const anchorLiveIds = liveAnchorSessionIds();
     const liveSlugs = new Set(
       sessions
-        .filter((s) => s.active && daemonOwnedSessionIds.has(s.session_id))
+        .filter(
+          (s) =>
+            s.active &&
+            (daemonOwnedSessionIds.has(s.session_id) ||
+              anchorLiveIds.has(s.session_id)),
+        )
         .map((s) => s.project_slug.toLowerCase()),
     );
     /* Mirror the bridge's path canonicalisation so a registry root
