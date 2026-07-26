@@ -66,11 +66,31 @@ memory `feedback_verify_live_deploy_state`.
   2026-07-19 batch below) is exactly this. It is committed but the running
   daemon predates it. DO NOT re-implement - the pending restart activates
   it. Verify after restart.
-- **Worker mirror blank (Problem 2): SEPARATE, DEFERRED.** Header renders,
-  body empty. Root cause + hard constraints in
-  `docs/bugs/2026-07-26-worker-mirror-blank-bridge-terminal-data.md`. Keep
-  the worker mirror ported from the VS Code terminal via the bridge; do
-  NOT convert the worker to a daemon-PTY; do NOT touch Lex's mirror.
+- **Worker mirror blank (Problem 2): MIGRATED + INSTALLED this session; pending operator validation.**
+  Root cause CONFIRMED (VS Code 1.130 removed the `terminalDataWriteEvent`
+  proposed API). Migrated `09-bridge/src/extension.ts` capture onto the
+  FINALIZED shell-integration API `window.onDidStartTerminalShellExecution` +
+  `TerminalShellExecution.read()` (read() yields raw bytes incl. escape
+  sequences, so it streams the claude TUI, verified against @types/vscode 1.118
+  + context7). Downstream flush → daemon terminal-stream → dashboard unchanged.
+  `enabledApiProposals` dropped (API is finalized), engines bumped `^1.93.0`.
+  Built + packaged VSIX + `code --install-extension --force`; installed dist
+  verified (5 new-API refs, old only in a comment). **TO VALIDATE (operator):
+  reload the worker's VS Code window, THEN start/restart `claude` in the worker
+  terminal** — `read()` only attaches to an execution that STARTS after the
+  extension is active, so an already-running claude is NOT captured (the #1
+  "looks broken but isn't" trap). Also needs VS Code shell integration active in
+  that terminal (pwsh/bash/zsh/gitbash yes; cmd.exe no). The old
+  `--enable-proposed-api` argv.json entry is now obsolete/harmless. Detail:
+  `docs/bugs/2026-07-26-worker-mirror-blank-bridge-terminal-data.md`.
+
+### Next after the worker stuff is verified OK
+
+Build the two specs in `docs/spec/`: **`SMART-COMPACT.md`** (cold-start / smart
+worker context refresh) and **`LAYER-1-CONTROL.md`** (layer-1 control). These
+also carry the `live_state` deploy-delta / session self-verification work noted
+above. Gate: do this once the worker linking + mirror are confirmed good on live
+hardware.
 
 ### dropship-01 (this session's product work)
 

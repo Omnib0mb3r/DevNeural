@@ -1193,20 +1193,33 @@ function stopWatching(): void {
 
 /* Terminal-output mirror.
  *
- * Subscribes to vscode.window.onDidWriteTerminalData (proposed API
- * gated by enabledApiProposals: ["terminalDataWriteEvent"] in
- * package.json AND launching VS Code with
- * --enable-proposed-api Omnib0mb3r.devneural-bridge). Streams every
- * byte the Claude terminal renders to the daemon as a debounced HTTP
- * POST. The daemon ring-buffers and broadcasts to dashboard clients
- * over WebSocket so an iPad can watch the live TUI.
+ * Subscribes to the FINALIZED shell-integration capture API
+ * (vscode.window.onDidStartTerminalShellExecution +
+ * TerminalShellExecution.read()). This replaces the removed
+ * terminalDataWriteEvent proposal (onDidWriteTerminalData), which
+ * VS Code 1.130 deleted. read() yields an AsyncIterable<string> of the
+ * RAW bytes (including escape sequences) a command writes for the
+ * lifetime of that execution; `claude` runs as one long-lived
+ * execution, so read() streams its full-screen TUI output continuously.
+ * Each chunk is buffered and forwarded to the daemon as a debounced
+ * HTTP POST. The daemon ring-buffers and broadcasts to dashboard
+ * clients over WebSocket so an iPad can watch the live TUI.
+ *
+ * No proposed-API flag is required anymore: the shell-execution API is
+ * finalized (VS Code >= 1.93), so the extension no longer needs
+ * --enable-proposed-api or an argv.json entry.
  *
  * Read-only mirror. Inputs still flow via the existing Steer box and
  * Nav grid. Failure modes:
- *   - Proposed API unavailable -> log once, return; existing flow
- *     keeps working.
+ *   - Shell-execution API unavailable (VS Code < 1.93) -> log once,
+ *     return; existing prompt-delivery flow keeps working.
+ *   - Shell integration inactive in the terminal -> no start events
+ *     fire; nothing to capture until it activates.
+ *   - claude already running when the extension activates -> its start
+ *     event already fired, so no execution to attach read() to; capture
+ *     begins on the next claude launch in that terminal.
  *   - Daemon down -> POST throws; swallowed.
- *   - Terminal not Claude-bearing -> filtered out before any work.
+ *   - Command is not claude -> filtered out before any streaming.
  *
  * Resolves session_id from the terminal's cwd by scanning the
  * StreamDeck identity dir, the same source of truth the daemon
@@ -1312,19 +1325,23 @@ async function refreshDaemonSessions(): Promise<void> {
 }
 
 function startTerminalMirror(context: vscode.ExtensionContext): void {
-  const proposed = vscode.window as unknown as {
-    onDidWriteTerminalData?: (
-      cb: (e: { terminal: vscode.Terminal; data: string }) => void,
-    ) => vscode.Disposable;
-  };
-  if (typeof proposed.onDidWriteTerminalData !== 'function') {
+  /* Finalized shell-integration capture (replaces the removed
+   * terminalDataWriteEvent proposal). Present on VS Code >= 1.93.
+   * Probe via typeof so an older host degrades to a logged no-op
+   * instead of throwing on subscribe. */
+  const shellExecApi = (
+    vscode.window as unknown as {
+      onDidStartTerminalShellExecution?: unknown;
+    }
+  ).onDidStartTerminalShellExecution;
+  if (typeof shellExecApi !== 'function') {
     channel.appendLine(
-      '[mirror] onDidWriteTerminalData not exposed; launch VS Code with --enable-proposed-api omnib0mb3r.devneural-bridge to enable terminal mirroring',
+      '[mirror] window.onDidStartTerminalShellExecution not available; update VS Code to >= 1.93 to enable terminal mirroring',
     );
     mirrorState.api_available = false;
     mirrorState.subscribed = false;
     mirrorState.reason =
-      'proposed API onDidWriteTerminalData not exposed; launch VS Code with --enable-proposed-api omnib0mb3r.devneural-bridge or set "enable-proposed-api": ["omnib0mb3r.devneural-bridge"] in %APPDATA%/Code/User/argv.json';
+      'terminal shell-integration capture API (window.onDidStartTerminalShellExecution) not available; requires VS Code >= 1.93';
     writeMirrorStateDebounced();
     return;
   }
@@ -1334,6 +1351,17 @@ function startTerminalMirror(context: vscode.ExtensionContext): void {
   const buffers = new Map<vscode.Terminal, string>();
   const flushTimers = new Map<vscode.Terminal, NodeJS.Timeout>();
   const sessionIdCache = new Map<vscode.Terminal, string>();
+
+  /* Terminals with at least one in-flight shell execution we are
+   * mirroring. Drives mirrorState.tracked_terminals. A terminal can in
+   * principle host nested executions (a sub-shell launched inside
+   * claude's shell), so this is a refcount keyed by terminal rather
+   * than a boolean set. */
+  const execCount = new Map<vscode.Terminal, number>();
+  function updateTracked(): void {
+    mirrorState.tracked_terminals = execCount.size;
+    writeMirrorStateDebounced();
+  }
 
   function localAppData(): string {
     return (
@@ -1486,19 +1514,72 @@ function startTerminalMirror(context: vscode.ExtensionContext): void {
       });
   }
 
-  context.subscriptions.push(
-    proposed.onDidWriteTerminalData!(async (e) => {
-      try {
-        if (!(await isClaudeTerminal(e.terminal))) return;
-        const prev = buffers.get(e.terminal) ?? '';
-        buffers.set(e.terminal, prev + e.data);
-        mirrorState.tracked_terminals = buffers.size;
-        if (!flushTimers.has(e.terminal)) {
-          flushTimers.set(
-            e.terminal,
-            setTimeout(() => flush(e.terminal), 16),
-          );
+  /* Attach to a single shell execution and pump its raw output into the
+   * same per-terminal buffer/flush pipeline the old onDidWriteTerminalData
+   * handler used, so the downstream (resolveSessionForTerminal + POST to
+   * /sessions/:id/terminal-stream + mirrorState flush fields) is
+   * unchanged. read() MUST be called immediately -- its stream only
+   * carries data written after the first read() -- so this runs with no
+   * awaits before the read() call. */
+  async function streamExecution(
+    t: vscode.Terminal,
+    execution: vscode.TerminalShellExecution,
+  ): Promise<void> {
+    let stream: AsyncIterable<string>;
+    try {
+      stream = execution.read();
+    } catch (err) {
+      channel.appendLine(
+        `[mirror] execution.read() failed: ${(err as Error)?.message ?? String(err)}`,
+      );
+      return;
+    }
+    execCount.set(t, (execCount.get(t) ?? 0) + 1);
+    updateTracked();
+    try {
+      for await (const data of stream) {
+        if (!data) continue;
+        const prev = buffers.get(t) ?? '';
+        buffers.set(t, prev + data);
+        if (!flushTimers.has(t)) {
+          flushTimers.set(t, setTimeout(() => flush(t), 16));
         }
+      }
+    } catch {
+      /* Stream aborted (terminal closed / command killed mid-run). Fall
+       * through to the final flush + refcount cleanup below. */
+    } finally {
+      flush(t);
+      const n = (execCount.get(t) ?? 1) - 1;
+      if (n <= 0) execCount.delete(t);
+      else execCount.set(t, n);
+      updateTracked();
+    }
+  }
+
+  context.subscriptions.push(
+    vscode.window.onDidStartTerminalShellExecution((e) => {
+      try {
+        const cmd = (e.execution.commandLine?.value ?? '').toLowerCase();
+        const pattern = getTerminalPattern();
+        if (pattern && cmd.includes(pattern)) {
+          /* Fast path: the launched command IS claude (or matches the
+           * configured pattern). Attach synchronously so read() catches
+           * the TUI's first full-screen paint with no snapshot delay. */
+          void streamExecution(e.terminal, e.execution);
+          return;
+        }
+        /* Slow path: command line did not match (alias/wrapper launch,
+         * or low-confidence shell-integration command detection).
+         * Confirm the terminal hosts claude via the process-tree probe,
+         * then late-attach. We miss the first frames, but claude's TUI
+         * emits full repaints, so the next redraw restores a complete
+         * frame. */
+        void isClaudeTerminal(e.terminal)
+          .then((ok) => {
+            if (ok) void streamExecution(e.terminal, e.execution);
+          })
+          .catch(() => undefined);
       } catch {
         /* event handler must never throw */
       }
@@ -1512,8 +1593,8 @@ function startTerminalMirror(context: vscode.ExtensionContext): void {
       if (timer) clearTimeout(timer);
       flushTimers.delete(t);
       buffers.delete(t);
-      mirrorState.tracked_terminals = buffers.size;
-      writeMirrorStateDebounced();
+      execCount.delete(t);
+      updateTracked();
     }),
   );
 
@@ -1537,7 +1618,9 @@ function startTerminalMirror(context: vscode.ExtensionContext): void {
   mirrorState.subscribed = true;
   mirrorState.reason = null;
   writeMirrorStateDebounced();
-  channel.appendLine('[mirror] terminal-data subscription active');
+  channel.appendLine(
+    '[mirror] shell-execution capture active (onDidStartTerminalShellExecution + read())',
+  );
 }
 
 export function activate(context: vscode.ExtensionContext): void {

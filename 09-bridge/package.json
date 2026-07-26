@@ -6,7 +6,7 @@
   "publisher": "omnib0mb3r",
   "private": true,
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.93.0"
   },
   "categories": [
     "Other"
@@ -15,9 +15,6 @@
     "onStartupFinished"
   ],
   "main": "./dist/extension.js",
-  "enabledApiProposals": [
-    "terminalDataWriteEvent"
-  ],
   "contributes": {
     "commands": [
       {
@@ -66,7 +63,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "@types/vscode": "^1.85.0",
+    "@types/vscode": "^1.93.0",
     "@vscode/vsce": "^3.2.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.6"

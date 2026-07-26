@@ -1,6 +1,6 @@
 # Worker terminal mirror is blank — bridge terminal-data mirror not flushing
 
-**Status:** open — separate track from the Stream Deck linking bug (do not conflate)
+**Status:** migrated + installed 2026-07-26 (shell-integration API) — pending operator reload + `claude` restart to validate. Separate track from the Stream Deck linking bug (do not conflate).
 **Date:** 2026-07-26
 **Severity:** medium
 
