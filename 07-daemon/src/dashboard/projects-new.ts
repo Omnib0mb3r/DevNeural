@@ -7,6 +7,7 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as os from 'node:os';
 import { createHash } from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { spawn } from 'node:child_process';
@@ -62,7 +63,86 @@ export function injectResultFile(workspace: string): string {
   return path.posix.join(WORKSPACE_INJECT_DIR, `${injectSlug(workspace)}.result.json`);
 }
 
+/* ── Claude Code trust-gate pre-seed ─────────────────────────────────
+ *
+ * Claude Code gates every folder it has never opened before behind a
+ * one-time "Do you trust the files in this folder?" prompt, storing the
+ * acceptance per-path in ~/.claude.json as
+ * projects["<abs path>"].hasTrustDialogAccepted. A bridge-spawned claude
+ * in a brand-new project folder blocks at that prompt BEFORE it inits a
+ * session, so it never writes a transcript and never PTY-binds: the
+ * daemon shows no live session and Lex is blind to it. Pressing Start
+ * then appears to do nothing until a human accepts the prompt.
+ * See docs/bugs/2026-07-26-start-claude-blocked-by-trust-prompt.md. */
+
+export function claudeConfigPath(): string {
+  return path.posix.join(os.homedir().replace(/\\/g, '/'), '.claude.json');
+}
+
+/* Normalize a workspace path to the exact key format Claude Code uses in
+ * ~/.claude.json: forward slashes, uppercase drive letter
+ * (e.g. "C:/dev/Projects/foo"). A mismatched key would leave the gate in
+ * place. */
+export function claudeProjectKey(workspace: string): string {
+  return workspace
+    .replace(/\\/g, '/')
+    .replace(/^([a-z]):/, (_m, d: string) => `${d.toUpperCase()}:`);
+}
+
+/* Pre-accept Claude Code's first-run trust + project-onboarding gates for
+ * `workspace`. Best-effort: never throws, since trust-seeding must not
+ * block a spawn. Returns true if it wrote a change, false if already
+ * trusted or on any failure.
+ *
+ * Tight read-modify-write + tmp-rename for a torn-write-safe update.
+ * ~/.claude.json is shared with live claude sessions, so a concurrent
+ * write could lose an update; the window is milliseconds and this runs at
+ * most once per spawn on a not-yet-trusted folder (the common
+ * already-trusted case short-circuits with no write), so the trade-off is
+ * accepted. */
+export function seedProjectTrust(
+  workspace: string,
+  configPath: string = claudeConfigPath(),
+): boolean {
+  try {
+    const key = claudeProjectKey(workspace);
+    let cfg: { projects?: Record<string, Record<string, unknown>> } & Record<
+      string,
+      unknown
+    > = {};
+    try {
+      cfg = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    } catch {
+      /* missing or unreadable config → start a fresh object */
+      cfg = {};
+    }
+    if (!cfg.projects || typeof cfg.projects !== 'object') cfg.projects = {};
+    const existing = cfg.projects[key];
+    const entry: Record<string, unknown> =
+      existing && typeof existing === 'object' ? existing : {};
+    if (
+      entry.hasTrustDialogAccepted === true &&
+      entry.hasCompletedProjectOnboarding === true
+    ) {
+      return false; /* already trusted; leave the shared file untouched */
+    }
+    entry.hasTrustDialogAccepted = true;
+    entry.hasCompletedProjectOnboarding = true;
+    cfg.projects[key] = entry;
+    const tmp = `${configPath}.dn-tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2), 'utf-8');
+    fs.renameSync(tmp, configPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function queueProjectBootstrap(workspace: string, command: string): void {
+  /* Pre-accept Claude Code's first-run trust gate so a brand-new folder
+   * spawns straight to a live session instead of parking at the prompt.
+   * Best-effort; never blocks the launch. */
+  seedProjectTrust(workspace);
   fs.mkdirSync(WORKSPACE_INJECT_DIR, { recursive: true });
   const normalized = workspace.replace(/\\/g, '/');
   const slug = injectSlug(workspace);
