@@ -20,9 +20,44 @@ Lex runs as a **daemon-PTY** (`pty-host.ts`): the daemon owns both ends and pump
 - Live mirror state (`<DATA_ROOT>/session-bridge/.mirror-state.json`): `api_available:true, subscribed:true, tracked_terminals:0`, all `last_flush_*` null, and `updated_at` **frozen at 2026-07-23** even though the bridge heartbeat is fresh.
 - A full VS Code **window reload did NOT change the mirror state** (still frozen, still `tracked_terminals:0`) and it killed the running worker session + its in-flight research. So reload is not the fix and is destructive.
 
-## Leading root cause (not yet fixed)
+## CONFIRMED root cause (verified 2026-07-26 against the live VS Code install + bridge log)
 
-The running bridge extension's **terminal-data mirror writer is not executing / not tracking terminals** in the current window: presence writer runs (fresh heartbeat) but the mirror writer's state hasn't been touched since 2026-07-23 and tracks 0 terminals. Most likely the installed VSIX (0.1.0) is a stale/older build whose mirror path does not fire, or the proposed-API terminal-data events are not being delivered to it. Needs confirmation with the VS Code extension-host console for the `[mirror]` log lines.
+VS Code **1.130.0 has removed the `terminalDataWriteEvent` proposed API** that
+the mirror is built on. Evidence:
+
+- Live bridge output channel log (window started 13:37): `[mirror] startup
+  failed (non-fatal): Extension 'omnib0mb3r.devneural-bridge' CANNOT use API
+  proposal: terminalDataWriteEvent. Its package.json#enabledApiProposals
+  declares: (empty) but NOT terminalDataWriteEvent.`
+- Both source AND installed `package.json` DO declare `terminalDataWriteEvent`,
+  and `argv.json` enables it. So the manifest is correct; VS Code simply no
+  longer knows the proposal (it strips unknown proposals → "declares: empty").
+- `grep terminalDataWriteEvent` across the VS Code 1.130 app resources → **0
+  hits**. The proposal is gone from the product.
+
+The mirror subscription therefore throws at startup, is caught non-fatally, and
+never tracks a terminal or rewrites `.mirror-state.json` (hence the frozen
+2026-07-23 file and `tracked_terminals:0`). NOT a stale build (installed
+extension.js == source, 62 KB, 2026-07-15), NOT a reload issue (a reload does
+not resurrect a removed API), NOT the daemon.
+
+## Fix = migration (no config tweak can restore a removed API)
+
+Rewrite the bridge's terminal capture (`09-bridge/src/extension.ts`, the
+`onDidWriteTerminalData` path ~1196-1478) onto VS Code's current SUPPORTED
+terminal-read API: **shell integration** —
+`window.onDidStartTerminalShellExecution(e => { for await (const chunk of
+e.execution.read()) { flush(chunk) } })`. Keep the same flush → daemon
+terminal-stream ring → dashboard mirror pipeline downstream. Repackage the VSIX
+and reinstall to test (reload the window when no worker research is running).
+
+Caveat to design: shell integration streams a command's output; Claude Code is
+a long-lived full-screen TUI, so validate that `execution.read()` streams its
+redraws continuously (it should, as one long execution) and that ANSI/cursor
+bytes arrive intact for xterm on the dashboard side.
+
+Constraints unchanged: keep bridge-ported, do NOT daemon-PTY the worker, do NOT
+touch Lex's mirror.
 
 ## Hard constraints from the operator
 
