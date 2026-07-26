@@ -16,6 +16,29 @@ at once. The daemon runs compiled dist, so a restart is required to
 activate. Restarting recycles the Lex CC session (this conversation), so
 it was deferred until the work was committed - it now is.
 
+### Verified running state (2026-07-26 14:44, checked against the live process, NOT docs)
+
+- Running daemon: PID 3932, started 2026-07-24 13:07, and NOT cycled since (a
+  real daemon restart kills the Lex CC session; Lex stayed alive on the same
+  PID across this whole session). Operator "resets" in this window did not
+  cycle the daemon process.
+- Current compiled dist: rebuilt 2026-07-26 14:38 (this session). It carries
+  925eecb + today's 72b332b/27a3546. The running 7/24 daemon is on OLDER dist
+  and does NOT have them. restart != rebuild: prior restarts reloaded stale
+  dist because `npm run build` was never run after the source landed.
+- Net: ONE genuine daemon restart now deploys everything (dist is fresh).
+
+### Planned into the cold-start layers: make every session verify running state
+
+Recurring failure this session: sessions (Lex included) asserted deploy /
+"fixed-in-prod" state from handover/bug/memory notes instead of checking the
+live process + dist mtime + git HEAD, and chased wrong root causes. Fix
+belongs in the cold-start / smart-compact layers (`docs/spec/SMART-COMPACT.md`,
+which already extends `live_state`): add a `live_state` **deploy-delta** line =
+daemon PID + start time, newest dist mtime, git HEAD + commits-behind, injected
+every session so staleness is pushed, not remembered. Backup rule saved as
+memory `feedback_verify_live_deploy_state`.
+
 ### 2026-07-26 commits (newest first, on master, daemon builds clean)
 
 - `27a3546` Keep a bound-but-idle bridge worker on the Stream Deck (trust
