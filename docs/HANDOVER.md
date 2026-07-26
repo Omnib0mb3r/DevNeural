@@ -6,17 +6,80 @@ Update this file IN PLACE every time the cursor moves; never add a new
 dated file. Ground every claim against git before asserting; this doc
 reflects what was true at the last update.
 
-## Cursor (2026-07-19, WIRE + VOICE + BELL batch; 4 commits, daemon NOT restarted - PENDING operator restart)
+## Cursor (2026-07-26, worker-linking + trust-gate + Stream Deck batch; daemon NOT restarted - PENDING operator restart)
 
-Four fixes committed on master this session, tree clean. Daemon and
-dashboard both build clean (tsc + `next build`). The RUNNING daemon
-predates all four. The client (`08-dashboard/out/`) is ALREADY CURRENT:
-it was rebuilt during this session's verification and carries the wire
-commit's label + mirror changes (proven below). ONE operator daemon
-restart deploys everything, no separate build step. No auto-restart;
-operator deploys.
+CRITICAL: a backlog of committed-but-undeployed daemon fixes has stacked
+up. The RUNNING daemon predates BOTH the 2026-07-19 batch (4 commits,
+listed further below) AND today's 2026-07-26 commits. `npm run build` is
+already done (dist fresh); ONE operator daemon restart deploys everything
+at once. The daemon runs compiled dist, so a restart is required to
+activate. Restarting recycles the Lex CC session (this conversation), so
+it was deferred until the work was committed - it now is.
 
-### This session's commits (newest first, all on master)
+### 2026-07-26 commits (newest first, on master, daemon builds clean)
+
+- `27a3546` Keep a bound-but-idle bridge worker on the Stream Deck (trust
+  the live anchor). New shared `liveAnchorSessionIds()` in `sessions.ts`;
+  `listSessions()` + `GET /sessions` now keep a bridge worker visible while
+  idle when its `project_session` anchor is live (bridge-backed). Fixes the
+  worker vanishing from the Stream Deck on a VS Code reload though it was
+  still running and bound (linking layer was fine; the DISPLAY liveness
+  ignored the anchor). Bug: `docs/bugs/2026-07-26-worker-drops-off-streamdeck-when-idle.md`.
+  Test: `live-anchor-session-ids`. DAEMON.
+- `7303b9c` docs: trust-gate tracker status.
+- `72b332b` Pre-seed Claude trust gate so Start Claude is one-click on new
+  folders. `seedProjectTrust` in `queueProjectBootstrap` writes
+  `~/.claude.json` `hasTrustDialogAccepted` before the first spawn, so a
+  brand-new folder no longer parks at Claude's "trust this folder?" prompt.
+  Bug: `docs/bugs/2026-07-26-start-claude-blocked-by-trust-prompt.md`.
+  Test: `project-trust-seed`. DAEMON.
+
+### Open work / do NOT reinvent
+
+- **P3 (typed-to-Lex transcript): ALREADY FIXED, undeployed.** The operator
+  wants a typed turn (their message AND Lex's reply) to render in the
+  Lex-tab transcript above the talk-to-Lex box, like voice does. Commit
+  `925eecb` ("render typed-input Lex replies in the transcript",
+  2026-07-19 batch below) is exactly this. It is committed but the running
+  daemon predates it. DO NOT re-implement - the pending restart activates
+  it. Verify after restart.
+- **Worker mirror blank (Problem 2): SEPARATE, DEFERRED.** Header renders,
+  body empty. Root cause + hard constraints in
+  `docs/bugs/2026-07-26-worker-mirror-blank-bridge-terminal-data.md`. Keep
+  the worker mirror ported from the VS Code terminal via the bridge; do
+  NOT convert the worker to a daemon-PTY; do NOT touch Lex's mirror.
+
+### dropship-01 (this session's product work)
+
+- New DevNeural worker project scaffolded from the dev-template GitHub repo,
+  pushed to `github.com/Omnib0mb3r/dropship-01` (private, first commit
+  `501283b`). Concept: fully-automated, AI-driven dropshipping store,
+  target ~$1k/mo per store on ~20 min/day oversight, maybe 2-3 stores.
+- A deep-research brief (supplier model, payment/ad ban risk, niche margin,
+  automatable-vs-human loop, unit economics → write to
+  `docs/research/dropship-viability.md`) was injected into worker session
+  `c79dfeb9` and it began a 5-phase research workflow, but a VS Code reload
+  KILLED that session mid-research. AFTER RESTART: re-inject the research
+  brief into the fresh dropship-01 worker. Brainstorm `0d5c1ca8` supervises
+  project anchor `b28a42d3` (dropship-01).
+
+### Post-restart verify checklist
+
+1. Trust gate (`72b332b`): Start Claude on a fresh scaffolded folder →
+   live session, zero keypresses.
+2. Stream Deck linking (`27a3546`): reload the dropship-01 VS Code window →
+   worker stays on the Stream Deck and stays bound to brainstorm `0d5c1ca8`.
+3. Typed transcript (`925eecb`): type to Lex (not voice) → your message and
+   Lex's reply both render in the Lex-tab transcript.
+4. Re-inject the dropship-01 research brief.
+
+### Config change outside this repo
+
+- `~/.claude/CLAUDE.md` gained a "Starting a New Project" section (canonical
+  template = `github.com/Omnib0mb3r/dev-template`; 5-step scaffold). Mirrored
+  in auto-memory `reference_devneural_project_template`.
+
+### 2026-07-19 batch commits (still undeployed; deploy with the SAME restart)
 
 - `63641c0` fix(notifications): keep telemetry sources off the
   input-needed bell. The bell surfaced background telemetry as if it were
