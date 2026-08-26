@@ -6,23 +6,53 @@ const DAEMON = process.env.DEVNEURAL_DAEMON_URL ?? 'http://localhost:3747';
 // dev we keep the rewrite-proxy pattern.
 const PROD = process.env.NODE_ENV === 'production';
 
+// Every top-level daemon route prefix the browser can hit in dev. The dev
+// server owns port 3000 and only proxies what is listed here; anything the
+// daemon serves but this array omits 404s in dev while working fine on the
+// daemon's own port. That gap is what broke the Add-project folder picker
+// ('fs' was missing, so GET /fs/list 404'd). Keep in sync with the daemon:
+//   grep -rhoE "app\.(get|post|put|patch|delete)\(\s*'/[a-zA-Z0-9_-]+" \
+//     07-daemon/src --include=*.ts | sed -E "s/.*'\///" | sort -u
+// Prefixes that also have an app-router page live in COLLIDING_PATHS below.
 const DAEMON_PATHS = [
+  'admin',
+  'audit-findings',
   'auth',
+  'curate',
+  'curator',
   'dashboard',
-  'sessions',
-  'services',
+  'decay',
+  'flush',
+  'fs',
+  'glossary',
+  'graph',
+  'health',
+  'ingest',
+  'lex',
+  'lint',
+  'notifications',
+  'page',
+  'panic',
   'projects',
+  'pty',
+  'push',
   'reference',
   'reminders',
-  'notifications',
-  'push',
+  'reseed',
+  'runtime-config',
   'search',
-  'upload',
-  'graph',
+  'services',
+  'session',
+  'sessions',
   'stats',
-  'lex',
-  'admin',
-  'pty',
+  'summarize',
+  'sync',
+  'task',
+  'upload',
+  'uploads',
+  'voice',
+  'whats-new',
+  'worker',
 ];
 
 // Prefixes that also carry an app-router page route (app/sessions/page.tsx,
