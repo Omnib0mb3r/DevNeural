@@ -686,6 +686,24 @@ function streamMaxMs(): number {
  * working, it just has not produced an assistant record yet; this is
  * what a slow HEARTBEAT ask looks like), or silent - the liveness
  * watchdog treats those very differently. */
+/* BUG-022 (2026-09-21; the root cause behind the old BUG-008 chars=0).
+ * Claude Code writes one assistant turn as TWO jsonl records sharing a
+ * message id: a thinking-block record ALREADY stamped stop_reason
+ * 'end_turn' and carrying no text, then the text record. Returning on
+ * the first end_turn handed back the empty thinking record on every
+ * ask (48/48 on 2026-07-20, still 100% on 2026-09-21) while the real
+ * reply sat unread one record later. An end_turn that carries no text
+ * now opens a short grace window for the sibling text record; a
+ * genuinely empty turn still resolves (empty) once the window lapses. */
+const DEFAULT_EMPTY_END_TURN_GRACE_MS = 2_500;
+
+function emptyEndTurnGraceMs(): number {
+  const raw = Number(
+    process.env.DEVNEURAL_VOICE_BRAIN_EMPTY_END_TURN_GRACE_MS ?? '',
+  );
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_EMPTY_END_TURN_GRACE_MS;
+}
+
 async function waitForVoiceReply(
   jsonlPath: string,
   startOffset: number,
@@ -702,6 +720,10 @@ async function waitForVoiceReply(
   let sawBytes = false;
   const wall = deps.now() + streamMaxMs();
   let effectiveDeadline = deadline;
+  /* Set when an end_turn record arrived with no text block (the
+   * thinking-only sibling); the loop then waits up to the grace window
+   * for the text record before resolving. */
+  let emptyEndTurnAt: number | null = null;
   for (;;) {
     let stat: { size: number } | null;
     try {
@@ -737,6 +759,7 @@ async function waitForVoiceReply(
           if (text) return { timedOut: false, text };
           continue;
         }
+        const endTurn = assistantStopReason(rec) === 'end_turn';
         if (text) {
           recordsSeen += 1;
           parts.push(text);
@@ -754,11 +777,37 @@ async function waitForVoiceReply(
             wall,
             Math.max(effectiveDeadline, deps.now() + streamIdleMs()),
           );
+          /* The text record closes the ask when it carries end_turn
+           * itself OR when its thinking-only sibling already did. */
+          if (endTurn || emptyEndTurnAt !== null) {
+            return { timedOut: false, text: parts.join('\n') };
+          }
+          continue;
         }
-        if (assistantStopReason(rec) === 'end_turn') {
-          return { timedOut: false, text: parts.join('\n') };
+        if (endTurn) {
+          if (parts.length > 0) {
+            return { timedOut: false, text: parts.join('\n') };
+          }
+          /* Thinking-only end_turn (BUG-022): hold for the sibling text
+           * record instead of resolving empty. */
+          if (emptyEndTurnAt === null) {
+            emptyEndTurnAt = deps.now();
+            effectiveDeadline = Math.min(
+              wall,
+              Math.max(effectiveDeadline, emptyEndTurnAt + emptyEndTurnGraceMs()),
+            );
+          }
         }
       }
+    }
+    if (
+      emptyEndTurnAt !== null &&
+      deps.now() - emptyEndTurnAt >= emptyEndTurnGraceMs()
+    ) {
+      deps.log(
+        `[voice-brain] end_turn carried no text and no sibling text record arrived within ${emptyEndTurnGraceMs()}ms; resolving empty`,
+      );
+      return { timedOut: false, text: parts.join('\n') };
     }
     const remaining = effectiveDeadline - deps.now();
     if (remaining <= 0) return { timedOut: true, recordsSeen, sawBytes };

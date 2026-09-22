@@ -1051,3 +1051,66 @@ describe('signal-based liveness (2026-07-17)', () => {
     }
   });
 });
+
+/* BUG-022 (2026-09-21): Claude Code writes one assistant turn as TWO
+ * jsonl records sharing a message id: a thinking-block record already
+ * stamped stop_reason 'end_turn' with no text, then the text record.
+ * The streaming tail used to return on the first end_turn, i.e. the
+ * empty one, so every L1 ask logged chars=0 while the reply sat unread
+ * one record later (48/48 asks on 2026-07-20, still 100% on 09-21). */
+describe('BUG-022: a thinking-only end_turn record must not close the ask', () => {
+  it('streams the text from the sibling record and resolves with it', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
+    const partials: string[] = [];
+    io.scheduleAssistantRecord(pathForSession(1), 50, null, 'end_turn');
+    io.scheduleAssistantRecord(
+      pathForSession(1),
+      400,
+      'Checked. Nine AM tomorrow.',
+      'end_turn',
+    );
+    const reply = await askVoice({
+      prompt: 'Deliver this.',
+      timeoutMs: 6000,
+      onPartial: (t) => partials.push(t),
+    });
+    expect(reply).toBe('Checked. Nine AM tomorrow.');
+    expect(partials).toEqual(['Checked. Nine AM tomorrow.']);
+  });
+
+  it('a genuinely empty turn still resolves null after the grace window', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
+    io.scheduleAssistantRecord(pathForSession(1), 50, null, 'end_turn');
+    const reply = await askVoice({
+      prompt: 'x',
+      timeoutMs: 6000,
+      onPartial: () => undefined,
+    });
+    expect(reply).toBeNull();
+    /* Resolved by the grace window, not the ask deadline: no liveness
+     * strike, the session stays warm. */
+    expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(0);
+    expect(_voiceBrainSessionSnapshotForTests().warm).toBe(true);
+  });
+
+  it('text record first then a bare end_turn closes with the text', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
+    io.scheduleAssistantRecord(pathForSession(1), 50, 'First sentence.');
+    io.scheduleAssistantRecord(pathForSession(1), 200, null, 'end_turn');
+    const reply = await askVoice({
+      prompt: 'x',
+      timeoutMs: 6000,
+      onPartial: () => undefined,
+    });
+    expect(reply).toBe('First sentence.');
+  });
+});
