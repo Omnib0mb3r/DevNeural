@@ -362,7 +362,7 @@ export function derivePhaseFromTail(file: string): 'thinking' | 'tool' | 'idle' 
  * Skips tool_use turns (those are mechanical, not pertinent for the
  * user). Returns null if nothing useful is found. Cheap tail scan
  * (~16KB) so it's safe to call on every Stop hook. */
-function readLastAssistantText(file: string): string | null {
+export function readLastAssistantText(file: string): string | null {
   try {
     const stat = fs.statSync(file);
     if (stat.size === 0) return null;

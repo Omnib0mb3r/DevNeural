@@ -79,7 +79,11 @@ import {
   type CompactionSupervisorState,
   type UsageLike,
 } from '../lex/compaction-supervisor.js';
-import { spawnLexSession } from '../lex/spawn-lex-session.js';
+import { spawnLexSession, transcriptPathFor } from '../lex/spawn-lex-session.js';
+/* BUG-029: the worker's phase for the [live] block, the same merge the
+ * deck tiles use (hook phase overridden by the transcript tail). */
+import { getPhase, type SessionPhase } from '../dashboard/session-phase.js';
+import { derivePhaseFromTail, readLastAssistantText } from '../dashboard/sessions.js';
 import { buildLexSpawnPrompt } from '../lex/spawn-prompt.js';
 import { buildLexSystemPromptVersioned } from '../lex/system-prompt.js';
 import {
@@ -2096,6 +2100,48 @@ export function _l2ComposerUpImpl(i: {
   return i.nowMs - i.lastActivity >= L2_WARM_QUIET_MS;
 }
 
+function agoLabel(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m`;
+  return `${Math.round(m / 60)}h`;
+}
+
+/* BUG-029 (2026-09-22): what the [live] block says about the supervised
+ * worker. It used to be "live (<slug>)" and nothing else, so Layer 1
+ * answered "what's the worker doing" from imagination ("idle, no active
+ * brainstorm" while /sessions said thinking). Now: the phase the deck
+ * tiles already compute, how long since the transcript last moved, and
+ * the worker's last words when it is idle. Pure so the wording is pinned. */
+export function _workerLineImpl(i: {
+  status: string;
+  slug: string;
+  phase: SessionPhase;
+  lastActivityMs: number | null;
+  nowMs: number;
+  lastText: string | null;
+}): string {
+  if (i.status !== 'live') return `bound, offline (${i.slug})`;
+  const phaseWord: Record<SessionPhase, string | null> = {
+    thinking: 'thinking',
+    tool: 'running a tool',
+    permission: 'waiting on a permission prompt',
+    idle: 'idle',
+    unknown: null,
+  };
+  const word = phaseWord[i.phase];
+  let line = word ? `live, ${word} (${i.slug})` : `live (${i.slug})`;
+  if (i.lastActivityMs !== null && i.phase !== 'permission' && i.phase !== 'unknown') {
+    const ago = agoLabel(i.nowMs - i.lastActivityMs);
+    line += i.phase === 'idle' ? `, quiet for ${ago}` : `, last activity ${ago} ago`;
+  }
+  if (i.phase === 'idle' && i.lastText) {
+    line += `, last said: ${JSON.stringify(i.lastText.replace(/\s+/g, ' ').trim().slice(0, 120))}`;
+  }
+  return line;
+}
+
 export function attachLexVoiceWs(socket: FastifyWS): void {
   logFn(`[voice-ws] client connected (attach)`);
   /* 2026-07-16 smoke-test fix 3: boot the voice brain the moment a
@@ -3285,9 +3331,30 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       if (!scope.projectAnchorId) return null;
       const proj = getStore().db.getProjectSession(scope.projectAnchorId);
       if (!proj) return null;
-      return proj.status === 'live'
-        ? `live (${proj.project_slug})`
-        : `bound, offline (${proj.project_slug})`;
+      const sid = proj.current_session_id;
+      let phase: SessionPhase = 'unknown';
+      let lastActivityMs: number | null = null;
+      let lastText: string | null = null;
+      if (proj.status === 'live' && sid) {
+        phase = getPhase(sid);
+        const file = transcriptPathFor({ cwd: proj.cwd, ccSessionId: sid });
+        const tail = derivePhaseFromTail(file);
+        if (tail !== 'unknown') phase = tail;
+        try {
+          lastActivityMs = fs.statSync(file).mtimeMs;
+        } catch {
+          lastActivityMs = null;
+        }
+        if (phase === 'idle') lastText = readLastAssistantText(file);
+      }
+      return _workerLineImpl({
+        status: proj.status,
+        slug: proj.project_slug,
+        phase,
+        lastActivityMs,
+        nowMs: Date.now(),
+        lastText,
+      });
     } catch {
       return null;
     }
