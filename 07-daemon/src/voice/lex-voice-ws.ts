@@ -96,9 +96,18 @@ import {
   type VoiceCommandKind,
 } from './lex-voice-commands.js';
 import {
+  renderLiveBlock,
+  topLayerEventTurn,
+  topLayerTurn,
   voiceLexReply,
   type LexReplyOutcome,
+  type LiveBlock,
+  type MidState,
+  type TopLayerControl,
+  type TopLayerEvent,
+  type TopLayerResult,
 } from './voice-top-layer.js';
+import { rememberSpokenLine, wasLastSpoken } from './voice-haiku-glue.js';
 import {
   isSmartTurnEnabled,
   analyzeTurn,
@@ -347,6 +356,17 @@ interface ConnState {
    * the MID-layer (Lex inject) boundary queue. */
   topTurnInFlight: boolean;
   pendingTopUtterances: string[];
+  /* Voice layers (2026-09-21): forwards parked while L2 is still
+   * booting; flushed as one merged turn when it warms (or after the
+   * fail-open cap). */
+  pendingForwardsUntilWarm: string[];
+  warmQueueTimer: ReturnType<typeof setInterval> | null;
+  /* What the [live] block knows about L2: any assistant record seen on
+   * the bound jsonl (= warm), and the tool L2 is currently in. */
+  midSeenAssistant: boolean;
+  midLastToolName: string | null;
+  /* brain-progress throttle (one L1 event per window). */
+  lastBrainProgressMs: number;
   /* P1 top-owned ack (2026-07-18): true from the moment the TOP layer
    * speaks its own handoff on an escalated forward until the deep
    * turn's end_turn. While true, deep pre-tool acks are suppressed (the
@@ -1882,6 +1902,172 @@ export function _shouldCoalesceMidReplyImpl(args: {
   return args.replyInFlight;
 }
 
+/* ------------------------------------------------------------------ */
+/* Layer 1 wiring seams (LAYER-1-CONTROL.md v2, 2026-09-21). Pure and  */
+/* module-level so they pin without a socket.                          */
+/* ------------------------------------------------------------------ */
+
+export interface MidStateInput {
+  hasBind: boolean;
+  ptyAlive: boolean;
+  awaitingSystemPrompt: boolean;
+  seenAssistant: boolean;
+  ttsActive: boolean;
+  awaitingResponseSince: number;
+  lastToolName: string | null;
+  directLlm: boolean;
+  directLlmInFlight: boolean;
+}
+
+/* What the [live] block says the brain (L2) is doing. warming = the
+ * PTY is up but Claude Code has not produced an assistant record yet
+ * (boot banner / cold-start preload still running). */
+export function _midStateImpl(i: MidStateInput): {
+  mid: MidState;
+  sinceMs: number | null;
+  tool: string | null;
+} {
+  if (i.directLlm) {
+    return { mid: i.directLlmInFlight ? 'thinking' : 'idle', sinceMs: null, tool: null };
+  }
+  if (!i.hasBind || !i.ptyAlive) return { mid: 'down', sinceMs: null, tool: null };
+  if (i.awaitingSystemPrompt || !i.seenAssistant) {
+    return { mid: 'warming', sinceMs: null, tool: null };
+  }
+  if (i.ttsActive) return { mid: 'replying', sinceMs: null, tool: null };
+  if (i.awaitingResponseSince > 0) {
+    return i.lastToolName
+      ? { mid: 'tool', sinceMs: i.awaitingResponseSince, tool: i.lastToolName }
+      : { mid: 'thinking', sinceMs: i.awaitingResponseSince, tool: null };
+  }
+  return { mid: 'idle', sinceMs: null, tool: null };
+}
+
+export type TopLayerAction =
+  | { kind: 'ignore'; reason: string }
+  | { kind: 'speak'; text: string }
+  | { kind: 'control'; control: TopLayerControl; arg: string | null }
+  | { kind: 'forward'; text: string }
+  | { kind: 'queue-until-warm'; text: string };
+
+/* How a parsed L1 turn becomes daemon actions. Order matters: speech
+ * first (already streamed in practice), then the control, then the
+ * forward. `combine` owns its own forward (the merged text), so no
+ * separate forward action is planned for it. IGNORE alone is the
+ * silent drop; IGNORE plus speech just speaks (the model chose to ask). */
+export function _planTopLayerActionsImpl(
+  r: TopLayerResult,
+  midWarming: boolean,
+): TopLayerAction[] {
+  const out: TopLayerAction[] = [];
+  if (r.speech) out.push({ kind: 'speak', text: r.speech });
+  if (r.control) out.push({ kind: 'control', control: r.control, arg: r.controlArg });
+  if (r.forward && r.control !== 'combine') {
+    out.push(
+      midWarming
+        ? { kind: 'queue-until-warm', text: r.forward }
+        : { kind: 'forward', text: r.forward },
+    );
+  }
+  if (out.length === 0 && r.ignore !== null) out.push({ kind: 'ignore', reason: r.ignore });
+  return out;
+}
+
+/* Single-mouth invariant 6: a delivery cut mid-stream is FINAL. It is
+ * never re-delivered from the top (that would re-speak the heard
+ * prefix) and never spoken raw; the full text stays in the transcript. */
+export function _shouldRecordCutAsFinalImpl(outcome: LexReplyOutcome): boolean {
+  return outcome === 'cut';
+}
+
+/* Phase B handlers (plan approval, dispatch gate) are registered by the
+ * routes at boot. Each returns a short factual status the voice then
+ * phrases in its own words (never a hardcoded spoken line). */
+export interface TopLayerControlHandlers {
+  approvePlan?: (anchorId: string, arg: string | null) => Promise<string | null>;
+  rejectPlan?: (anchorId: string, arg: string | null) => Promise<string | null>;
+  confirmDispatch?: (anchorId: string, arg: string | null) => Promise<string | null>;
+  rejectDispatch?: (anchorId: string, arg: string | null) => Promise<string | null>;
+  pendingPlan?: (anchorId: string) => string | null;
+  pendingDispatch?: (anchorId: string) => { id: string; summary: string } | null;
+}
+
+let topLayerControlHandlers: TopLayerControlHandlers = {};
+
+export function setTopLayerControlHandlers(h: TopLayerControlHandlers): void {
+  topLayerControlHandlers = h;
+}
+
+/* Every live voice connection registers an event sink so daemon-side
+ * events (a plan awaiting approval, a parked dispatch, brain progress)
+ * reach the Layer 1 of the right brainstorm. */
+interface TopLayerEventSink {
+  anchorId: () => string | null;
+  closed: () => boolean;
+  run: (event: TopLayerEvent) => Promise<void>;
+}
+
+const topLayerEventSinks = new Set<TopLayerEventSink>();
+
+/** Hand an event to the L1 of every live connection on `anchorId`.
+ * Resolves true when at least one connection took it; false means no
+ * voice client is bound to that brainstorm right now (callers fall
+ * back to a bell notification). */
+export async function notifyTopLayerEvent(
+  anchorId: string,
+  event: TopLayerEvent,
+): Promise<boolean> {
+  let delivered = false;
+  for (const sink of topLayerEventSinks) {
+    if (sink.closed()) continue;
+    if (sink.anchorId() !== anchorId) continue;
+    try {
+      await sink.run(event);
+      delivered = true;
+    } catch (err) {
+      logFn(`[voice-ws] top-layer event sink threw: ${(err as Error).message}`);
+    }
+  }
+  return delivered;
+}
+
+/* The tool L2 is entering, from the pre-tool-ack record (a text block
+ * plus a tool_use block in the same assistant turn). */
+function firstToolUseName(rec: Record<string, unknown>): string | null {
+  const content = (rec.message as { content?: Array<{ type?: string; name?: string }> } | undefined)
+    ?.content;
+  const t = Array.isArray(content) ? content.find((c) => c?.type === 'tool_use') : undefined;
+  return typeof t?.name === 'string' ? t.name : null;
+}
+
+/* L2 warming: has the bound jsonl produced any assistant record? Read
+ * once from the tail; the live watch flips the flag afterwards. */
+function jsonlHasAssistantRecord(p: string): boolean {
+  try {
+    const size = fs.statSync(p).size;
+    if (size === 0) return false;
+    const len = Math.min(size, 64 * 1024);
+    const fd = fs.openSync(p, 'r');
+    try {
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, size - len);
+      return buf.toString('utf-8').includes('"type":"assistant"');
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
+/* brain-progress cadence: while L2 is mid-turn and the operator is
+ * quiet, L1 gets one event per window and decides whether a word is
+ * worth it. Never a daemon-generated spoken line (BUG-013 rule). */
+const BRAIN_PROGRESS_MS = 45_000;
+/* Fail-open cap for forwards parked while L2 warms: past this, the
+ * merged text goes down anyway (the CC composer buffers a paste). */
+const WARM_QUEUE_CAP_MS = 5 * 60_000;
+
 export function attachLexVoiceWs(socket: FastifyWS): void {
   logFn(`[voice-ws] client connected (attach)`);
   /* 2026-07-16 smoke-test fix 3: boot the voice brain the moment a
@@ -1927,6 +2113,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     pendingUserUtterances: [],
     topTurnInFlight: false,
     pendingTopUtterances: [],
+    pendingForwardsUntilWarm: [],
+    warmQueueTimer: null,
+    midSeenAssistant: false,
+    midLastToolName: null,
+    lastBrainProgressMs: 0,
     topOwnsAck: false,
     directLlmAbort: null,
     brainstormId: null,
@@ -2317,7 +2508,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
 
   function startJsonlWatch(): void {
     if (state.watchTimer) return;
-    state.watchTimer = setInterval(() => pollJsonl(), 250);
+    state.watchTimer = setInterval(() => {
+      pollJsonl();
+      maybeBrainProgress();
+    }, 250);
   }
 
   function stopJsonlWatch(): void {
@@ -2492,6 +2686,8 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
 
   function handleJsonlLine(rec: Record<string, unknown>): void {
     if (rec.type !== 'assistant') return;
+    /* Voice layers (2026-09-21): any assistant record means L2 is warm. */
+    state.midSeenAssistant = true;
     /* Read-only watch mode: when the client supplied a watchSessionId
      * but we have no PTY to inject into, the WS can't drive the request
      * side, so awaitingResponseSince never gets set. Speak every fresh
@@ -2521,6 +2717,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     const decision = selectTtsContent(rec as unknown as Parameters<typeof selectTtsContent>[0], spokenSegmentHashes);
     if (decision.drop) return;
     const isPreToolAck = decision.is_pre_tool_ack;
+    /* Voice layers (2026-09-21): the [live] block names the tool L2 is
+     * in while its turn runs; cleared on the end_turn. */
+    state.midLastToolName = isPreToolAck ? firstToolUseName(rec) : null;
     const text = decision.new_text;
     const fullText = decision.full_text;
     const uuid = String(rec.uuid ?? '');
@@ -3007,6 +3206,265 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     return bs?.id ?? null;
   }
 
+  /* Voice layers (2026-09-21): what the [live] block says about L2. */
+  function midState(): { mid: MidState; sinceMs: number | null; tool: string | null } {
+    const handle = state.bindKey
+      ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
+      : null;
+    if (!state.midSeenAssistant && state.jsonlPath && jsonlHasAssistantRecord(state.jsonlPath)) {
+      state.midSeenAssistant = true;
+    }
+    return _midStateImpl({
+      hasBind: Boolean(state.bindKey),
+      ptyAlive: Boolean(handle && !handle.exited),
+      awaitingSystemPrompt: state.bindKey ? isAwaitingSystemPrompt(state.bindKey) : false,
+      seenAssistant: state.midSeenAssistant,
+      ttsActive: Boolean(state.ttsActive),
+      awaitingResponseSince: state.awaitingResponseSince,
+      lastToolName: state.midLastToolName,
+      directLlm: state.runtimeMode === 'direct-llm',
+      directLlmInFlight: state.inFlightDirectLlmReply,
+    });
+  }
+
+  /* One line about the supervised worker for the [live] block; null when
+   * the brainstorm supervises nothing (scope rule: L1 sees only its own
+   * brainstorm's worker). */
+  function workerLine(anchorId: string | null): string | null {
+    if (!anchorId) return null;
+    try {
+      const scope = resolveLexScopeDetailed(anchorId);
+      if (!scope.projectAnchorId) return null;
+      const proj = getStore().db.getProjectSession(scope.projectAnchorId);
+      if (!proj) return null;
+      return proj.status === 'live'
+        ? `live (${proj.project_slug})`
+        : `bound, offline (${proj.project_slug})`;
+    } catch {
+      return null;
+    }
+  }
+
+  function buildLive(anchorId: string | null): LiveBlock {
+    const ms = midState();
+    const h = topLayerControlHandlers;
+    return {
+      mid: ms.mid,
+      midSinceMs: ms.sinceMs,
+      midTool: ms.tool,
+      worker: workerLine(anchorId),
+      lastSaid: lastSpokenText,
+      digest: getDigest()?.digest ?? null,
+      pendingPlan: anchorId && h.pendingPlan ? h.pendingPlan(anchorId) : null,
+      pendingDispatch: anchorId && h.pendingDispatch ? h.pendingDispatch(anchorId) : null,
+      nowMs: Date.now(),
+    };
+  }
+
+  /* One speaker per turn: every L1 line goes through here, sentence by
+   * sentence, chaining gaplessly after the first. Never-twice ring
+   * (single-mouth invariant 4) applied per line. */
+  function makeLineSpeaker(): { speakLine: (line: string) => void; streamed: () => boolean } {
+    let streamed = false;
+    return {
+      streamed: () => streamed,
+      speakLine: (line: string): void => {
+        const text = line.trim();
+        if (!text) return;
+        if (wasLastSpoken(text)) return;
+        rememberSpokenLine(text);
+        send({ t: 'layer-hop', layer: 'top', text });
+        for (const seg of splitForSpeech(text)) speak(seg, { continuation: streamed });
+        streamed = true;
+      },
+    };
+  }
+
+  function clearWarmQueue(): void {
+    if (state.warmQueueTimer) {
+      clearInterval(state.warmQueueTimer);
+      state.warmQueueTimer = null;
+    }
+  }
+
+  /* Forwards parked while L2 warms: flush as ONE merged turn the moment
+   * it is warm, or after the fail-open cap. */
+  function armWarmQueueFlush(): void {
+    if (state.warmQueueTimer) return;
+    const armedAt = Date.now();
+    const timer = setInterval(() => {
+      if (state.closed) {
+        clearWarmQueue();
+        return;
+      }
+      if (state.pendingForwardsUntilWarm.length === 0) {
+        clearWarmQueue();
+        return;
+      }
+      const warming = midState().mid === 'warming';
+      const overdue = Date.now() - armedAt > WARM_QUEUE_CAP_MS;
+      if (warming && !overdue) return;
+      const merged = mergeOperatorUtterances(state.pendingForwardsUntilWarm.splice(0));
+      clearWarmQueue();
+      logFn(
+        `[voice-ws] L2 ${overdue ? 'still warming past the cap (fail-open)' : 'warm'}; flushing queued forward(s)`,
+      );
+      void forwardToL2(merged, 0);
+    }, 1000);
+    if (typeof (timer as { unref?: () => void }).unref === 'function') {
+      (timer as { unref: () => void }).unref();
+    }
+    state.warmQueueTimer = timer;
+  }
+
+  /* CONTROL: verbs -> daemon effects. */
+  async function applyTopLayerControl(
+    control: TopLayerControl,
+    arg: string | null,
+    turn: TopLayerResult,
+    utterance: string,
+  ): Promise<void> {
+    switch (control) {
+      case 'mute':
+      case 'unmute':
+      case 'standby':
+      case 'listen':
+      case 'disable':
+      case 'end_session':
+        dispatchVoiceCommand(control, 'transcript');
+        return;
+      case 'stop_speaking': {
+        const cancelled = speakCtrl.killActive();
+        if (cancelled) send({ t: 'tts-cancel', reason: 'quiet' });
+        return;
+      }
+      case 'interrupt_work':
+        dispatchVoiceCommand('hold_up', 'transcript');
+        return;
+      case 'cancel_redirect': {
+        /* Double-ESC to the L2 PTY: drop its in-flight work; the new
+         * direction follows as the FORWARD action. Never touches L3
+         * (only the emergency stop reaches the worker). */
+        const h = state.bindKey ? getPty(state.bindKey) || getPtyBySession(state.bindKey) : null;
+        if (h && !h.exited) {
+          try {
+            h.pty.write('\x1b\x1b');
+          } catch {
+            /* best-effort */
+          }
+        }
+        state.awaitingResponseSince = 0;
+        state.pendingUserUtterances = [];
+        logFn('[voice-ws] L1 cancel_redirect: double-ESC sent to L2');
+        return;
+      }
+      case 'drop_reply': {
+        /* The brain's current reply is moot: stop speaking it and make
+         * sure its raw body never comes back as a fallback (the delivery
+         * in flight sees the seq mismatch and records a miss). */
+        deliverySeq += 1;
+        const cancelled = speakCtrl.killActive();
+        if (cancelled) send({ t: 'tts-cancel', reason: 'drop-reply' });
+        logFn('[voice-ws] L1 drop_reply: current delivery discarded');
+        return;
+      }
+      case 'combine': {
+        const queued = state.pendingTopUtterances.splice(0);
+        const merged = mergeOperatorUtterances([...queued, turn.forward ?? utterance]);
+        if (midState().mid === 'warming') {
+          state.pendingForwardsUntilWarm.push(merged);
+          armWarmQueueFlush();
+        } else {
+          await forwardToL2(merged, 0);
+        }
+        return;
+      }
+      case 'repeat': {
+        if (lastSpokenText) {
+          for (const seg of splitForSpeech(lastSpokenText)) speak(seg, { continuation: true });
+        }
+        return;
+      }
+      case 'approve_plan':
+      case 'reject_plan':
+      case 'confirm_dispatch':
+      case 'reject_dispatch': {
+        const anchorId = currentAnchorId();
+        const h = topLayerControlHandlers;
+        const fn =
+          control === 'approve_plan'
+            ? h.approvePlan
+            : control === 'reject_plan'
+              ? h.rejectPlan
+              : control === 'confirm_dispatch'
+                ? h.confirmDispatch
+                : h.rejectDispatch;
+        if (!anchorId || !fn) {
+          logFn(`[voice-ws] L1 control ${control} not wired (anchor=${anchorId ?? 'none'})`);
+          return;
+        }
+        try {
+          const status = await fn(anchorId, arg);
+          if (status) {
+            /* The handler's factual status is phrased by the voice, never
+             * spoken as a hardcoded line. */
+            await runTopLayerEventTurn({
+              kind: control.endsWith('_plan') ? 'plan-result' : 'dispatch-result',
+              text: status,
+            });
+          }
+        } catch (err) {
+          logFn(`[voice-ws] L1 control ${control} failed: ${(err as Error).message}`);
+        }
+        return;
+      }
+    }
+  }
+
+  /* A daemon-originated event handed to L1 (plan ready, dispatch pending,
+   * brain progress, a handler's result). Same speaker, same queue; never
+   * fail-safe-forwards. */
+  async function runTopLayerEventTurn(event: TopLayerEvent): Promise<void> {
+    if (state.closed) return;
+    const anchorId = currentAnchorId();
+    const speaker = makeLineSpeaker();
+    const turn = await topLayerEventTurn(event, {
+      live: buildLive(anchorId),
+      duringTts: false,
+      anchorId,
+      deps: { onSpeech: speaker.speakLine },
+    });
+    if (turn.speech) speaker.speakLine(turn.speech);
+    if (turn.control) await applyTopLayerControl(turn.control, turn.controlArg, turn, event.text);
+    if (turn.forward && turn.control !== 'combine') {
+      if (midState().mid === 'warming') {
+        state.pendingForwardsUntilWarm.push(turn.forward);
+        armWarmQueueFlush();
+      } else {
+        await forwardToL2(turn.forward, 0);
+      }
+    }
+  }
+
+  /* While L2 is mid-turn and the operator is quiet, hand L1 one
+   * brain-progress event per window; silence is a valid answer. */
+  function maybeBrainProgress(): void {
+    if (state.closed || state.mode === 'notes') return;
+    if (state.awaitingResponseSince <= 0 || state.ttsActive) return;
+    const now = Date.now();
+    if (now - state.awaitingResponseSince < BRAIN_PROGRESS_MS) return;
+    if (now - state.lastUserSpeechEndMs < BRAIN_PROGRESS_MS) return;
+    if (now - state.lastBrainProgressMs < BRAIN_PROGRESS_MS) return;
+    state.lastBrainProgressMs = now;
+    const anchorId = currentAnchorId();
+    void runTopLayerEventTurn({
+      kind: 'brain-progress',
+      text: renderLiveBlock(buildLive(anchorId)),
+    }).catch((err) => {
+      logFn(`[voice-ws] brain-progress event failed: ${(err as Error).message}`);
+    });
+  }
+
   function speak(text: string, opts?: { continuation?: boolean }): void {
     /* No-live-sink guard (2026-07-17 item 3): a speakable reply
      * heading into a closed connection is dead air the operator can
@@ -3057,8 +3515,6 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * a pending redelivery, and the operator is never re-read an old
    * reply after the conversation moved on. */
   let deliverySeq = 0;
-  const REDELIVERY_WAIT_MS = 90_000;
-  const REDELIVERY_POLL_MS = 3_000;
 
   function speakViaBrain(text: string, fallbackRaw: boolean): void {
     deliverySeq += 1;
@@ -3082,56 +3538,25 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         },
         log: logFn,
       });
-    const redeliverAfterRespawn = async (): Promise<void> => {
-      const deadline = Date.now() + REDELIVERY_WAIT_MS;
-      while (Date.now() < deadline) {
-        if (state.closed || deliverySeq !== seq) {
-          logFn(
-            '[voice-ws] redelivery abandoned: superseded by a newer delivery or socket closed',
-          );
-          return;
-        }
-        if (isVoiceBrainSessionWarm()) {
-          logFn(
-            `[voice-ws] re-delivering cut reply via respawned brain (body=${text.length} chars)`,
-          );
-          const second = await deliver();
-          if (second !== 'delivered' && fallbackRaw && deliverySeq === seq) {
-            logFn(
-              `[voice-ws] redelivery ${second}; speaking raw body as final fallback`,
-            );
-            raw();
-            record('delivered');
-          } else if (second === 'delivered') {
-            record('delivered');
-          } else {
-            record(second);
-          }
-          return;
-        }
-        await new Promise<void>((r) => {
-          const t = setTimeout(r, REDELIVERY_POLL_MS);
-          if (typeof (t as { unref?: () => void }).unref === 'function') {
-            (t as { unref: () => void }).unref();
-          }
-        });
-      }
-      if (fallbackRaw && deliverySeq === seq && !state.closed) {
-        logFn(
-          '[voice-ws] redelivery gave up waiting for warm brain; speaking raw body',
-        );
-        raw();
-        record('delivered');
-      }
-    };
     void deliver()
       .then((outcome) => {
+        if (deliverySeq !== seq) {
+          /* drop_reply or a newer delivery superseded this one while it
+           * streamed: never speak its raw body after the fact. */
+          record('miss');
+          return;
+        }
         if (outcome === 'miss' && fallbackRaw) {
           raw();
           record('delivered');
-        } else if (outcome === 'cut') {
+        } else if (_shouldRecordCutAsFinalImpl(outcome)) {
+          /* Single-mouth invariant 6: a cut delivery is final. Re-delivering
+           * from the top would re-speak the heard prefix; the full text
+           * stays readable in the transcript. */
+          logFn(
+            `[voice-ws] LEX REPLY DELIVERY CUT: not re-delivered (would re-speak the heard prefix); full text in transcript (body=${text.length} chars)`,
+          );
           record('cut');
-          void redeliverAfterRespawn();
         } else if (outcome === 'miss') {
           record('miss');
         } else {
@@ -3139,7 +3564,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         }
       })
       .catch(() => {
-        if (fallbackRaw) {
+        if (fallbackRaw && deliverySeq === seq) {
           raw();
           record('delivered');
         } else {
@@ -4532,57 +4957,100 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
   }
 
-  /* Voice top layer (spec v2, 2026-07-15): the one conversational
-   * brain the operator talks to. Every utterance that survived the
-   * panic check and the notes gate gets ONE speech-first turn from
-   * the dedicated persistent session: whatever it says is spoken;
-   * a trailing FORWARD: line hands substance to Lex through the
-   * normal inject path below; a trailing CONTROL: line fires the
-   * existing dispatch effects. No lanes, no whitelist, no canned
-   * lines. Fail-safe: session down/timeout/unparseable means the
-   * turn forwards untouched - the top layer can never eat the
+  /* Voice top layer, Layer 1 (LAYER-1-CONTROL.md v2, 2026-09-21): the
+   * one conversational layer the operator talks to. Every utterance that
+   * survived the panic check and the notes gate gets ONE turn from the
+   * anchor's persistent haiku session: whatever it says is spoken as it
+   * streams; a trailing FORWARD: hands substance to L2 through
+   * forwardToL2 below; CONTROL: fires the dispatch effects; IGNORE: drops
+   * background. Fail-safe: session down / timeout / unparseable means
+   * the turn forwards untouched - the top layer can never eat the
    * operator's words.
    *
-   * SM-25: extracted from handleUtteranceEnd's tail so the coalesce
-   * loop above can re-enter it with a combined utterance. Returns a
-   * string when the resolved reply was superseded (the caller
-   * re-asks with that combined text); returns void when the turn
-   * completed (spoken, forwarded, controlled, or absorbed). */
+   * SM-25: the coalesce loop above re-enters this with a combined
+   * utterance. Returns a string when newer utterances stacked up (the
+   * caller re-asks with the merged text); void when the turn completed. */
   async function runTopLayerVoiceTurnOnce(
     trimmed: string,
     sttMs: number,
   ): Promise<string | void> {
-    let result: { text: string; ms: number } = { text: trimmed, ms: sttMs };
+    const duringTts = state.utteranceStartedDuringTts;
     state.utteranceStartedDuringTts = false;
-    /* Layer 1 is UNWIRED (LAYER-1-CONTROL.md, 2026-07-20). The smart
-     * haiku talk-layer ask is gone: it returned an empty (chars=0) turn
-     * every time and fail-safe-forwarded the operator's words to L2
-     * anyway. The operator utterance now forwards straight to L2 - no
-     * classify, no rethink/finish, no top-layer speech, no ack round
-     * trip, no chars=0. The L1 intelligence is rebuilt on top of this
-     * later; see the doc. */
-    logFn(`[voice-ws] forward to L2: ${JSON.stringify(trimmed.slice(0, 80))}`);
     /* Coalesce (COALESCE-UTTERANCE-QUEUE point 5): utterances that
-     * stacked up while this turn was resolving combine into ONE forward,
-     * so L2 gets one cohesive turn instead of stacked replies. */
+     * stacked up while this turn was resolving combine into ONE turn, so
+     * L1 and L2 get one cohesive ask instead of stacked replies. */
     if (state.pendingTopUtterances.length > 0) {
       const extras = state.pendingTopUtterances.splice(0);
       logFn(
-        `[voice-ws] coalesce: combining ${extras.length} newer utterance(s) into one forward`,
+        `[voice-ws] coalesce: combining ${extras.length} newer utterance(s) into one turn`,
       );
       return mergeOperatorUtterances([trimmed, ...extras]);
     }
     /* Barge (baseline): drop the stash and STAY stopped - a barge never
      * resumes. No deferred Ctrl+C, so L2 finishes its reply and the full
      * statement stays readable as text; only the TTS audio was cut.
-     * Truncating L2 is reserved for the deterministic emergency stop. */
+     * Truncating L2 is reserved for the deterministic emergency stop and
+     * for L1's own cancel_redirect. */
     confirmRealBarge(false);
-    /* L1 no longer speaks its own ack; the single ack is the deep (L2)
-     * pre-tool ack. */
-    state.topOwnsAck = false;
+    const anchorId = currentAnchorId();
+    const speaker = makeLineSpeaker();
+    const turn = await topLayerTurn(trimmed, {
+      live: buildLive(anchorId),
+      duringTts,
+      anchorId,
+      deps: { onSpeech: speaker.speakLine },
+    });
+    /* One ack per escalated utterance (single-mouth invariant 3): when
+     * L1 spoke the handoff, L2's pre-tool ack for this turn stays silent;
+     * when L1 said nothing (fail-safe forward) the deep ack is the net. */
+    state.topOwnsAck = speaker.streamed() || turn.speech !== null;
+    const warming = midState().mid === 'warming';
+    const actions = _planTopLayerActionsImpl(turn, warming);
+    logFn(
+      `[voice-ws] L1 turn: speech=${state.topOwnsAck} forward=${turn.forward !== null} control=${turn.control ?? 'none'} ignore=${turn.ignore ?? 'no'} warming=${warming}`,
+    );
+    for (const action of actions) {
+      switch (action.kind) {
+        case 'speak':
+          speaker.speakLine(action.text);
+          break;
+        case 'ignore':
+          logFn(
+            `[voice-ws] L1 ignored (${action.reason}): ${JSON.stringify(trimmed.slice(0, 80))}`,
+          );
+          send({ t: 'ignored', text: trimmed, reason: action.reason });
+          break;
+        case 'control':
+          await applyTopLayerControl(action.control, action.arg, turn, trimmed);
+          break;
+        case 'queue-until-warm':
+          state.pendingForwardsUntilWarm.push(action.text);
+          logFn(
+            `[voice-ws] L2 warming; queued forward depth=${state.pendingForwardsUntilWarm.length}`,
+          );
+          send({
+            t: 'queued-mid-turn',
+            text: action.text,
+            queue_depth: state.pendingForwardsUntilWarm.length,
+          });
+          armWarmQueueFlush();
+          break;
+        case 'forward':
+          await forwardToL2(action.text, sttMs);
+          break;
+      }
+    }
+  }
+
+  /* The forward path: hand an utterance (or L1's sharpened version of
+   * it) to L2 through the existing inject machinery. Extracted verbatim
+   * from the old runTopLayerVoiceTurnOnce tail (2026-09-21) so the L1
+   * turn, the warm-queue flush and cancel_redirect share one path. */
+  async function forwardToL2(text: string, sttMs: number): Promise<void> {
+    let result: { text: string; ms: number } = { text, ms: sttMs };
     /* Three-way transcript: surface the you -> voice -> deep hop; the L2
      * reply comes back later as an assistant-text (layer 'mid'). */
-    send({ t: 'layer-hop', layer: 'top', text: `to Lex (brain): ${trimmed}` });
+    send({ t: 'layer-hop', layer: 'top', text: `to Lex (brain): ${text}` });
     /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
      * Direct-llm branch: no PTY, no jsonl watch. Build the system
      * prompt + brainstorm chunks history, call ollama, stream the
@@ -4864,6 +5332,15 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
     startJsonlWatch();
   }
+
+  /* Voice layers (2026-09-21): daemon-side events (plan ready, dispatch
+   * pending, brain progress) reach this connection's Layer 1 here. */
+  const topLayerSink: TopLayerEventSink = {
+    anchorId: () => currentAnchorId(),
+    closed: () => state.closed,
+    run: (event) => runTopLayerEventTurn(event),
+  };
+  topLayerEventSinks.add(topLayerSink);
 
   socket.on('message', (raw: unknown, isBinary?: boolean) => {
     /* fastify-websocket gives us either a string-ish JSON message or
@@ -5350,6 +5827,8 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * left entries under earlier keys pinning this whole ConnState
      * after socket close. */
     releaseBindKeys(state);
+    topLayerEventSinks.delete(topLayerSink);
+    clearWarmQueue();
     /* Fix 53 (2026-06-18): drop this connection from the watch-target
      * registry. Value-scan rather than key lookup because the watched
      * target (watchSessionId / jsonlPath) can be late-resolved or
