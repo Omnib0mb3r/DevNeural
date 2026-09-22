@@ -19,6 +19,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   askVoice,
+  defaultVoiceBrainCwd,
   isVoiceBrainSessionEnabled,
   isVoiceBrainSessionWarm,
   prewarmVoiceBrainSession,
@@ -33,6 +34,26 @@ import { transcriptPathFor } from '../src/lex/spawn-lex-session.js';
 
 const CWD = 'C:/fake/voice-brain-cwd';
 const HOME_DIR = 'C:/fake/home';
+
+/* BUG-028 (2026-09-22): Claude Code loads the git root's auto-memory for
+ * any cwd inside a repo. The L1 that ran from 07-daemon recited the
+ * operator's MEMORY.md as Lex's state. The voice runs from a bare
+ * directory under the data root, outside every repo. */
+describe('defaultVoiceBrainCwd (BUG-028)', () => {
+  it('lives under the data root, outside every repo, unless overridden', () => {
+    const prev = process.env.DEVNEURAL_VOICE_BRAIN_SESSION_CWD;
+    delete process.env.DEVNEURAL_VOICE_BRAIN_SESSION_CWD;
+    try {
+      expect(defaultVoiceBrainCwd()).toMatch(/\/voice-l1$/);
+      expect(defaultVoiceBrainCwd()).not.toMatch(/Projects\/DevNeural/);
+      process.env.DEVNEURAL_VOICE_BRAIN_SESSION_CWD = 'C:/elsewhere';
+      expect(defaultVoiceBrainCwd()).toBe('C:/elsewhere');
+    } finally {
+      if (prev === undefined) delete process.env.DEVNEURAL_VOICE_BRAIN_SESSION_CWD;
+      else process.env.DEVNEURAL_VOICE_BRAIN_SESSION_CWD = prev;
+    }
+  });
+});
 
 /* Virtual filesystem + clock. statSync/readRange only ever see content
  * that has "arrived" as of the current virtual time, so a scheduled

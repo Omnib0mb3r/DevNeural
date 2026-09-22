@@ -81,6 +81,7 @@ import {
   getPty as ptyHostGetPty,
 } from '../dashboard/pty-host.js';
 import { transcriptPathFor } from './spawn-lex-session.js';
+import { DATA_ROOT } from '../paths.js';
 /* Static import is acyclic at module-eval time: voice-top-layer only
  * reaches back into this module through a lazy dynamic import inside
  * its default ask. */
@@ -226,6 +227,10 @@ export interface VoiceBrainSessionDeps {
    * 054) after every spawn / rotation / kill. Called with the registry
    * key; production skips the shared 'default' key. Best-effort. */
   persistBinding: (anchorKey: string, binding: VoiceBrainBinding) => void;
+  /** BUG-028: make the spawn cwd exist (it is a bare directory under
+   * the data root, created on first use). Optional so test rigs that
+   * never touch the disk need not provide it. */
+  ensureDir?: (dir: string) => void;
 }
 
 function defaultReadRange(path: string, start: number, length: number): string {
@@ -252,6 +257,16 @@ function defaultSleep(ms: number): Promise<void> {
  * lex_session row behind it). */
 export const DEFAULT_VOICE_BRAIN_ANCHOR = 'default';
 
+/* BUG-028 (2026-09-22): Claude Code loads the git root's auto-memory for
+ * any cwd inside a repo; the L1 that ran from 07-daemon recited the
+ * operator's MEMORY.md ("voice wave built and restart pending") as Lex's
+ * own state instead of forwarding. The voice runs from a bare directory
+ * under the data root, outside every repo, so it owns no memory and has
+ * nothing to recite. Env override kept for tests and experiments. */
+export function defaultVoiceBrainCwd(): string {
+  return process.env.DEVNEURAL_VOICE_BRAIN_SESSION_CWD ?? `${DATA_ROOT}/voice-l1`;
+}
+
 function defaultDeps(): VoiceBrainSessionDeps {
   return {
     spawnLex: ptySpawnLex,
@@ -264,7 +279,8 @@ function defaultDeps(): VoiceBrainSessionDeps {
     randomUUID: () => nodeRandomUUID(),
     sleep: defaultSleep,
     log: () => undefined,
-    cwd: process.env.DEVNEURAL_VOICE_BRAIN_SESSION_CWD ?? process.cwd(),
+    cwd: defaultVoiceBrainCwd(),
+    ensureDir: (dir) => fs.mkdirSync(dir, { recursive: true }),
     homeDir: os.homedir(),
     pollIntervalMs: 200,
     /* 2026-07-16 smoke-test fix 2/3: default was 5 minutes, which
@@ -462,6 +478,11 @@ function spawnInto(
   });
   try {
     const cfg = deps.runtimeConfig();
+    try {
+      deps.ensureDir?.(deps.cwd);
+    } catch {
+      /* the spawn reports a missing cwd itself */
+    }
     const spawned = deps.spawnLex({
       cwd: deps.cwd,
       systemPrompt: VOICE_BRAIN_SESSION_SYSTEM_PROMPT,

@@ -131,6 +131,12 @@ describe('buildTopLayerSystemPrompt', () => {
     /* Seamless: the layer vocabulary is for the contract, never spoken. */
     expect(p).toContain('Out loud there is only one of you');
   });
+
+  it('tells the voice it holds no project facts (BUG-028)', () => {
+    const p = buildTopLayerSystemPrompt();
+    expect(p).toMatch(/you do not know it/);
+    expect(p).toMatch(/hold no project facts/);
+  });
 });
 
 describe('topLayerTurn', () => {
