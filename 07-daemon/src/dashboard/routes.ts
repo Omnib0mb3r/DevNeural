@@ -78,8 +78,12 @@ import {
 import { buildLexSpawnPrompt } from '../lex/spawn-prompt.js';
 import { spawnLexSession } from '../lex/spawn-lex-session.js';
 import {
+  effortArgs,
+  effortFlag,
+  midEffort,
   midModel,
   midPermissionMode,
+  workerEffort,
   workerModel,
 } from '../lex/layer-model.js';
 import { listAnchorTiles } from '../lex/anchor-tiles.js';
@@ -1810,6 +1814,8 @@ export async function registerDashboardRoutes(
           midModel(store.db),
           '--permission-mode',
           midPermissionMode(store.db),
+          /* Voice layers (2026-09-21): mid_effort knob, only when set. */
+          ...effortArgs(midEffort(store.db)),
         ],
         buildSystemPrompt: (prep) => {
           built = buildLexSpawnPrompt({
@@ -1961,6 +1967,8 @@ export async function registerDashboardRoutes(
           midModel(store.db),
           '--permission-mode',
           midPermissionMode(store.db),
+          /* Voice layers (2026-09-21): mid_effort knob, only when set. */
+          ...effortArgs(midEffort(store.db)),
         ],
           systemPrompt: built.prompt,
         });
@@ -3993,7 +4001,9 @@ export async function registerDashboardRoutes(
      * whitelisted (layer-model.ts) so it is safe to interpolate into
      * this command string the bridge types into a terminal. Read
      * per-request so the live switch takes effect on the next start. */
-    const command = `claude --model ${workerModel(store.db)} --dangerously-skip-permissions`;
+    /* Voice layers (2026-09-21): worker_effort knob rides the same
+     * whitelisted resolver (effortFlag only ever sees a resolved level). */
+    const command = `claude --model ${workerModel(store.db)}${effortFlag(workerEffort(store.db))} --dangerously-skip-permissions`;
     const warnings: string[] = [];
     /* WP-H: coarse bridge-liveness precheck. If NOT ONE bridge window
      * anywhere has posted a fresh presence heartbeat, no VS Code

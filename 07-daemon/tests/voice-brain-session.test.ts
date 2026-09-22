@@ -213,6 +213,7 @@ function baseDeps(
     homeDir: HOME_DIR,
     pollIntervalMs: 50,
     respawnCooldownMs: 5 * 60 * 1000,
+    runtimeConfig: () => ({ getRuntimeConfig: () => null }),
     ...extra,
   };
 }
@@ -455,8 +456,11 @@ describe('top layer is context-thin (Phase 2 R6)', () => {
 
     const args = pty.spawnCalls[0]!.args ?? [];
     /* The exact thin set: deterministic binding, headless perms, fast
-     * model, tools off, no MCP load. Nothing else - no context preload
-     * flags, no cold-start report path, no investigator seed. */
+     * model, tools off, no MCP load, no user settings source (2026-09-21:
+     * skips the operator's SessionStart hooks + plugin sync, 30-57s ->
+     * 4s boot). Nothing else - no context preload flags, no cold-start
+     * report path, no investigator seed, no --effort unless the knob is
+     * set. */
     expect(args).toEqual([
       '--session-id',
       'cc-session-1',
@@ -466,6 +470,8 @@ describe('top layer is context-thin (Phase 2 R6)', () => {
       '--tools',
       '',
       '--strict-mcp-config',
+      '--setting-sources',
+      'project,local',
     ]);
   });
 });
@@ -1112,5 +1118,47 @@ describe('BUG-022: a thinking-only end_turn record must not close the ask', () =
       onPartial: () => undefined,
     });
     expect(reply).toBe('First sentence.');
+  });
+});
+
+/* Voice layers (2026-09-21): the L1 spawn argv. Fast boot (no user
+ * settings source), no tools, zero MCP, model/effort from the knobs. */
+describe('L1 spawn argv (voice layers)', () => {
+  it('spawns with the fast-boot and no-tools flags, effort only when set', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(
+      baseDeps(io, pty, {
+        runtimeConfig: () => ({ getRuntimeConfig: () => null }),
+      }),
+    );
+    await warmSession(io, pty, 1);
+    const args = pty.spawnCalls[0]!.args ?? [];
+    expect(args).toContain('--strict-mcp-config');
+    const tools = args.indexOf('--tools');
+    expect(args.slice(tools, tools + 2)).toEqual(['--tools', '']);
+    const sources = args.indexOf('--setting-sources');
+    expect(args.slice(sources, sources + 2)).toEqual([
+      '--setting-sources',
+      'project,local',
+    ]);
+    expect(args).not.toContain('--effort');
+    expect(args[args.indexOf('--model') + 1]).toBe('haiku');
+  });
+
+  it('honors top_model and top_effort from runtime config', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    const map: Record<string, string> = { top_model: 'sonnet', top_effort: 'low' };
+    _setVoiceBrainSessionDepsForTests(
+      baseDeps(io, pty, {
+        runtimeConfig: () => ({ getRuntimeConfig: (k) => map[k] ?? null }),
+      }),
+    );
+    await warmSession(io, pty, 1);
+    const args = pty.spawnCalls[0]!.args ?? [];
+    expect(args[args.indexOf('--model') + 1]).toBe('sonnet');
+    const effort = args.indexOf('--effort');
+    expect(args.slice(effort, effort + 2)).toEqual(['--effort', 'low']);
   });
 });

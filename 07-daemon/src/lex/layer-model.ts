@@ -127,3 +127,84 @@ export function workerModel(cfg: RuntimeConfigReader): string {
     'opus',
   );
 }
+
+/* ------------------------------------------------------------------ *
+ * Voice layers (2026-09-21, LAYER-1-CONTROL.md "Knobs"): the L1 model,
+ * per-layer effort, and the Phase B dispatch gate. Same read order as
+ * the model knobs: runtime_config -> env -> default.
+ * ------------------------------------------------------------------ */
+
+export const TOP_MODEL_KEY = 'top_model';
+export const TOP_EFFORT_KEY = 'top_effort';
+export const MID_EFFORT_KEY = 'mid_effort';
+export const WORKER_EFFORT_KEY = 'worker_effort';
+export const DISPATCH_CONFIRM_GATE_KEY = 'dispatch_confirm_gate';
+
+/* `claude --effort <level>` levels (from `claude --help`). Haiku 4.5 has
+ * no effort parameter: the CLI accepts the flag on haiku and nothing
+ * changes (measured 2026-09-21), so the knob only bites on Sonnet, Opus
+ * and Fable. Whitelisted for the same command-injection reason as the
+ * model ids: the worker value lands in a typed command string. */
+const KNOWN_EFFORT_LEVELS: ReadonlySet<string> = new Set([
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+]);
+
+/** Resolve an effort level; anything off the whitelist is null (unset). */
+export function resolveEffort(raw: string | null | undefined): string | null {
+  const lower = (raw ?? '').trim().toLowerCase();
+  return KNOWN_EFFORT_LEVELS.has(lower) ? lower : null;
+}
+
+/** argv fragment for a spawn: `['--effort', level]` or nothing. */
+export function effortArgs(level: string | null): string[] {
+  return level ? ['--effort', level] : [];
+}
+
+/** Command-string fragment for the bridge-typed worker command
+ * (queueProjectBootstrap): ` --effort <level>` or ''. Only ever fed a
+ * value that came through resolveEffort. */
+export function effortFlag(level: string | null): string {
+  return level ? ` --effort ${level}` : '';
+}
+
+/** Resolve the TOP (L1) model: runtime_config.top_model ->
+ * DEVNEURAL_VOICE_BRAIN_MODEL -> 'haiku'. */
+export function topModel(cfg: RuntimeConfigReader): string {
+  return resolveLayerModel(
+    cfg.getRuntimeConfig(TOP_MODEL_KEY) ?? process.env.DEVNEURAL_VOICE_BRAIN_MODEL,
+    'haiku',
+  );
+}
+
+export function topEffort(cfg: RuntimeConfigReader): string | null {
+  return resolveEffort(
+    cfg.getRuntimeConfig(TOP_EFFORT_KEY) ?? process.env.DEVNEURAL_TOP_EFFORT,
+  );
+}
+
+export function midEffort(cfg: RuntimeConfigReader): string | null {
+  return resolveEffort(
+    cfg.getRuntimeConfig(MID_EFFORT_KEY) ?? process.env.DEVNEURAL_MID_EFFORT,
+  );
+}
+
+export function workerEffort(cfg: RuntimeConfigReader): string | null {
+  return resolveEffort(
+    cfg.getRuntimeConfig(WORKER_EFFORT_KEY) ?? process.env.DEVNEURAL_WORKER_EFFORT,
+  );
+}
+
+/** Phase B mechanical confirm gate on worker dispatch. 'on' arms it;
+ * anything else (including unset) leaves the prompt-enforced rule as
+ * the only gate. */
+export function dispatchConfirmGateOn(cfg: RuntimeConfigReader): boolean {
+  const raw =
+    cfg.getRuntimeConfig(DISPATCH_CONFIRM_GATE_KEY) ??
+    process.env.DEVNEURAL_DISPATCH_CONFIRM_GATE ??
+    '';
+  return raw.trim().toLowerCase() === 'on';
+}

@@ -5,6 +5,14 @@ import {
   midModel,
   midPermissionMode,
   workerModel,
+  resolveEffort,
+  effortArgs,
+  effortFlag,
+  topModel,
+  topEffort,
+  midEffort,
+  workerEffort,
+  dispatchConfirmGateOn,
   type RuntimeConfigReader,
 } from '../src/lex/layer-model.js';
 
@@ -123,5 +131,56 @@ describe('layer resolvers: runtime_config wins, then env, then default', () => {
     setEnv('DEVNEURAL_MID_PERMISSION_MODE', undefined);
     expect(midPermissionMode(cfg({}))).toBe('bypassPermissions');
     expect(midPermissionMode(cfg({ mid_permission_mode: 'plan' }))).toBe('plan');
+  });
+});
+
+/* Voice layers (2026-09-21): per-layer effort knobs, the L1 model knob and
+ * the Phase B dispatch gate switch. Effort is whitelisted because the
+ * worker value is interpolated into a bridge-typed command string. */
+describe('effort + top-model knobs', () => {
+  it('whitelists effort levels and rejects junk', () => {
+    expect(resolveEffort('low')).toBe('low');
+    expect(resolveEffort(' XHIGH ')).toBe('xhigh');
+    expect(resolveEffort('turbo; rm -rf /')).toBeNull();
+    expect(resolveEffort('')).toBeNull();
+    expect(resolveEffort(null)).toBeNull();
+  });
+
+  it('effortArgs is empty when unset, a flag pair when set', () => {
+    expect(effortArgs(null)).toEqual([]);
+    expect(effortArgs('low')).toEqual(['--effort', 'low']);
+    expect(effortFlag(null)).toBe('');
+    expect(effortFlag('max')).toBe(' --effort max');
+  });
+
+  it('top model reads runtime_config, then env, then haiku', () => {
+    setEnv('DEVNEURAL_VOICE_BRAIN_MODEL', undefined);
+    expect(topModel(cfg({}))).toBe('haiku');
+    expect(topModel(cfg({ top_model: 'sonnet' }))).toBe('sonnet');
+    expect(topModel(cfg({ top_model: 'bad value' }))).toBe('haiku');
+    setEnv('DEVNEURAL_VOICE_BRAIN_MODEL', 'claude-sonnet-5');
+    expect(topModel(cfg({}))).toBe('claude-sonnet-5');
+  });
+
+  it('per-layer effort knobs read runtime_config then env', () => {
+    setEnv('DEVNEURAL_TOP_EFFORT', undefined);
+    setEnv('DEVNEURAL_MID_EFFORT', undefined);
+    setEnv('DEVNEURAL_WORKER_EFFORT', undefined);
+    expect(topEffort(cfg({ top_effort: 'low' }))).toBe('low');
+    expect(midEffort(cfg({ mid_effort: 'xhigh' }))).toBe('xhigh');
+    expect(workerEffort(cfg({}))).toBeNull();
+    setEnv('DEVNEURAL_WORKER_EFFORT', 'high');
+    expect(workerEffort(cfg({}))).toBe('high');
+    expect(workerEffort(cfg({ worker_effort: 'low' }))).toBe('low');
+  });
+
+  it('dispatch gate is off unless on', () => {
+    setEnv('DEVNEURAL_DISPATCH_CONFIRM_GATE', undefined);
+    expect(dispatchConfirmGateOn(cfg({}))).toBe(false);
+    expect(dispatchConfirmGateOn(cfg({ dispatch_confirm_gate: 'on' }))).toBe(true);
+    expect(dispatchConfirmGateOn(cfg({ dispatch_confirm_gate: 'ON ' }))).toBe(true);
+    expect(dispatchConfirmGateOn(cfg({ dispatch_confirm_gate: 'off' }))).toBe(false);
+    setEnv('DEVNEURAL_DISPATCH_CONFIRM_GATE', 'on');
+    expect(dispatchConfirmGateOn(cfg({}))).toBe(true);
   });
 });

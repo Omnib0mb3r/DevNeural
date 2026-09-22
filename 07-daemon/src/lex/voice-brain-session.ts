@@ -56,6 +56,13 @@
  * (same shape judge-session's askText takes).
  */
 import { randomUUID as nodeRandomUUID } from 'node:crypto';
+import { getStore } from './brainstorm-store.js';
+import {
+  effortArgs,
+  topEffort,
+  topModel,
+  type RuntimeConfigReader,
+} from './layer-model.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import {
@@ -114,16 +121,10 @@ function defaultAskTimeoutMs(): number {
  * a fast model is the ENTIRE point of the layer. The pre-fix 33s cold
  * boot (`voice-brain warm: first reply after 33653ms`) was caused by
  * spawning with NO --model, so the "fast voice layer" booted the
- * account default (Opus-class), neither always-live nor haiku-class as
- * drawn-conclusion 1 requires. Read per spawn so a runtime_config
- * reload takes effect without a restart. Default alias 'haiku' (the
- * exact alias Claude Code's own voice call uses). */
-const DEFAULT_VOICE_BRAIN_MODEL = 'haiku';
-
-function voiceBrainModel(): string {
-  const raw = (process.env.DEVNEURAL_VOICE_BRAIN_MODEL ?? '').trim();
-  return raw || DEFAULT_VOICE_BRAIN_MODEL;
-}
+ * account default (Opus-class). Since 2026-09-21 the model and effort
+ * come from layer-model.ts (runtime_config top_model / top_effort ->
+ * DEVNEURAL_VOICE_BRAIN_MODEL env -> 'haiku'), read per spawn through
+ * deps.runtimeConfig so a live flip lands on the next session. */
 
 /* Session-level contract, injected once at spawn via
  * --append-system-prompt. Deliberately thin: the top layer restates
@@ -185,6 +186,10 @@ export interface VoiceBrainSessionDeps {
   homeDir: string;
   pollIntervalMs: number;
   respawnCooldownMs: number;
+  /** Live knobs (layer-model.ts): top_model / top_effort are read per
+   * spawn so a runtime_config flip lands on the next L1 session with no
+   * rebuild. Production: the store's db; tests: a fake reader. */
+  runtimeConfig: () => RuntimeConfigReader;
 }
 
 function defaultReadRange(path: string, start: number, length: number): string {
@@ -231,6 +236,7 @@ function defaultDeps(): VoiceBrainSessionDeps {
     respawnCooldownMs: Number(
       process.env.DEVNEURAL_VOICE_BRAIN_SESSION_RESPAWN_COOLDOWN_MS ?? 60_000,
     ),
+    runtimeConfig: () => getStore().db,
   };
 }
 
@@ -339,6 +345,7 @@ function ensureSpawned(): boolean {
     homeDir: deps.homeDir,
   });
   try {
+    const cfg = deps.runtimeConfig();
     const spawned = deps.spawnLex({
       cwd: deps.cwd,
       systemPrompt: VOICE_BRAIN_SESSION_SYSTEM_PROMPT,
@@ -349,18 +356,32 @@ function ensureSpawned(): boolean {
         /* Phase 2 R1 - haiku-class, context-thin, fast warm:
          *   --model <alias>   fast model (default 'haiku'); the fix for
          *                     the heavy-default 33s cold boot.
+         *   --effort <level>  only when the top_effort knob is set
+         *                     (haiku has no effort dial; the flag is a
+         *                     no-op there, it bites on sonnet/opus).
          *   --tools ""        disable every built-in tool. The session
          *                     prompt already forbids tool use; this
          *                     enforces it mechanically and trims warm.
          *   --strict-mcp-config  with no --mcp-config, load ZERO MCP
          *                     servers at boot (a large warm-time save).
+         *   --setting-sources project,local  skip the operator's user
+         *                     settings: a headless haiku spawn with the
+         *                     user source loaded took 30-57s (SessionStart
+         *                     hooks + plugin sync); without it, 4s
+         *                     (measured 2026-09-21). L1 needs no hooks,
+         *                     plugins or CLAUDE.md. L2 keeps the user
+         *                     source (the daemon's capture hooks live
+         *                     there).
          * quoteWindowsArg('') -> "" so the empty --tools value survives
          * cmd.exe quoting on Windows. */
         '--model',
-        voiceBrainModel(),
+        topModel(cfg),
+        ...effortArgs(topEffort(cfg)),
         '--tools',
         '',
         '--strict-mcp-config',
+        '--setting-sources',
+        'project,local',
       ],
       sessionId: ccSessionId,
     });
