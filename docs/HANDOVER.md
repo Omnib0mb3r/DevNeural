@@ -6,7 +6,104 @@ Update this file IN PLACE every time the cursor moves; never add a new
 dated file. Ground every claim against git before asserting; this doc
 reflects what was true at the last update.
 
-## Cursor (2026-07-26, worker-linking + trust-gate + Stream Deck batch; daemon NOT restarted - PENDING operator restart)
+## Cursor (2026-09-22, voice layers wave on branch `voice-layers`; daemon NOT restarted - PENDING operator restart + morning test)
+
+Built overnight 2026-09-21/22 on operator direction ("just build it, I'll
+test in the AM"). Everything is committed on branch **`voice-layers`**
+(master untouched past `6b12951`); `07-daemon/dist` and
+`08-dashboard/out/` are rebuilt from the branch. ONE operator daemon
+restart deploys it. Merge to master after the live verify (`git merge
+voice-layers` from master, or keep testing on the branch).
+
+Design of record: `docs/spec/LAYER-1-CONTROL.md` (v2, canonical). Plan:
+`docs/superpowers/plans/2026-09-21-voice-layers.md`. Trackers: BUG-022
+(chars=0 root cause, SMOKE-TESTING), BUG-023 (pre-existing dashboard test
+red), FIXES.md rows VL-1..VL-9.
+
+### What shipped (branch commits, oldest first)
+
+- `0d056e1` carry-over of the 2026-08-26 session's uncommitted fixes (as found).
+- `6b12951` docs: LAYER-1-CONTROL v2 + the plan.
+- `670c7cd` BUG-022 root cause: Claude Code writes a thinking-only record
+  already stamped `end_turn` BEFORE the text record; `waitForVoiceReply`
+  closed the ask on it, so every L1 ask was `chars=0`. Grace window for the
+  sibling text record.
+- `b12fa91` shared persona module (one Lex, two mouths).
+- `9b33f1d` knobs `top_model`, `top_effort`, `mid_effort`, `worker_effort`,
+  `dispatch_confirm_gate`; L1 spawns with `--setting-sources project,local`
+  (headless haiku spawn 30-57s -> 4s, measured).
+- `720a1e7` one L1 per brainstorm anchor, spawned on Open BEFORE L2,
+  binding persisted (migration 054), killed with the anchor.
+- `cadb7cb` Layer 1 prompt (sparring partner contract), live block,
+  FORWARD / CONTROL / IGNORE parser, streaming turn, fail-safe forward.
+- `3f279c8` Layer 1 wired into the turn pipeline (speak / forward /
+  control / ignore, warm queue, brain-progress, single-mouth guards).
+- `b7e9e23` blue/green L1 respawn past the jsonl cap.
+- `17ea3a5` Phase B: dispatch confirm gate + plan approval by voice.
+- `e296252` trackers + SMART-COMPACT.md rewritten as the context-lifecycle doc.
+- dashboard: greyed "(not for Lex)" rows for dropped utterances.
+
+### Verified running state at handover
+
+- Daemon PID 32924 (booted 2026-09-21 ~22:11 local) still runs the OLD
+  dist; it has none of the above. `dist/` rebuilt 2026-09-22 00:26 local
+  from the branch; `out/` rebuilt right after (see the last commit).
+- Full daemon suite on the branch: 2156 passed, 2 failed, both pre-existing
+  (`grooming-routes` = BUG-014; `sessions-anchor-liveness` red also with
+  the pre-wave `sessions.ts`, verified by swapping the file in).
+- Dashboard suite: 299 passed; 3 failing files are the 2 Playwright
+  collection errors + `voice-mic-init.test.tsx` (BUG-023, pre-existing).
+- Ports / Tailscale / Salem road trip: untouched (no command bound a port
+  or restarted anything).
+
+### Restart-verify (morning checklist, in order)
+
+1. Restart the daemon (dashboard restart button or the scheduled task).
+   `daemon.log` should show `[voice-brain] anchor=<id8> spawned ptyId=...`
+   on the next brainstorm Open, BEFORE the `[lex-anchor] new anchor` /
+   `reopen` line, and `warm: first reply after <N>ms` with N in the
+   single-digit seconds.
+2. Open a brainstorm, press Start voice, talk immediately: the voice pill
+   goes live on L1 warm; if L2 is still booting, Lex says the deeper part
+   is still waking up and the forward lands once it warms
+   (`[voice-ws] L2 warming; queued forward` then `L2 warm; flushing`).
+3. Say something to the TV / another person: transcript shows it greyed
+   "(not for Lex)", `daemon.log` has `[voice-ws] L1 ignored (<reason>)`,
+   nothing reaches L2.
+4. Ask "what's she doing" while L2 is mid-turn: L1 answers with the live
+   state; L2 keeps working. After ~45s of silence during a long turn L1
+   may say a word (`brain-progress`), or nothing.
+5. L2 reply is spoken in L1's voice: `[voice-brain] ... ask replied ...
+   chars=<n>0` (NOT 0) and no `speaking raw body` fallback line. That is
+   BUG-022 -> RESOLVED.
+6. Barge over a reply: audio stops, never resumes, text intact. Say a
+   correction: `[voice-ws] L1 drop_reply` or `cancel_redirect: double-ESC
+   sent to L2`.
+7. Arm the gate: `POST /runtime-config/dispatch_confirm_gate {"value":"on"}`.
+   Ask Lex to send the worker something: `[dispatch-gate] parked <id>`,
+   L1 asks you; "go" -> `[dispatch-gate] released <id>: status=200
+   decision=accepted`; "no, X" -> the brain gets `[dispatch-rejected]`.
+8. Only after 1-7 pass: `POST /runtime-config/mid_permission_mode
+   {"value":"plan"}`, reopen the brainstorm, ask for a plan: L1 reads it
+   out (`[plan-approval] pending on anchor`), "go" presses Enter on L2,
+   "no, X" presses Escape + types the reason. If plan mode misbehaves,
+   flip back to `bypassPermissions` (live, no rebuild).
+9. `lex emergency stop` still fires with no model in the loop.
+10. Then merge `voice-layers` into master.
+
+Every log line above is pre-wired; grep `daemon.log` first on any failure.
+Knob reference: LAYER-1-CONTROL.md "Knobs".
+
+### Next after the live verify
+
+- Phase C (worker-authored handover + Lex review, T3): recipe in
+  `docs/spec/SMART-COMPACT.md` section 5; plan it as its own file.
+- Two follow-ups noted during the build: the `ignored` frame's `reason` is
+  not surfaced client-side (a tooltip would do); L2 could also boot faster
+  with a trimmed `--settings` carrying only the daemon's hooks (not done:
+  the capture hooks live in the user settings file).
+
+## Previous cursor (2026-07-26, worker-linking + trust-gate + Stream Deck batch; daemon NOT restarted - PENDING operator restart)
 
 CRITICAL: a backlog of committed-but-undeployed daemon fixes has stacked
 up. The RUNNING daemon predates BOTH the 2026-07-19 batch (4 commits,

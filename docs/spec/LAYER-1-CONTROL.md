@@ -516,6 +516,10 @@ above on a found root cause, not resurrected from the broken shape).
   echo filter, Smart Turn endpointing), `killActiveTts`, `dropBargeStash`, `confirmRealBarge`
 - L2 spawn: `07-daemon/src/lex/spawn-lex-session.ts`; anchor open/start routes in `routes.ts`
 - Engine buckets (pure, wired as the pre-model echo filter): `07-daemon/src/voice/engine/barge-classifier.ts`
-- Dispatch gate + plan approval: `07-daemon/src/lex/cross-session-inject.ts`, `07-daemon/src/dashboard/pending-prompt*.ts`
+- Dispatch gate + plan approval: `07-daemon/src/lex/dispatch-gate.ts` (pure registry),
+  `07-daemon/src/lex/plan-approval.ts` (pure detector / extractor / PTY actions),
+  `07-daemon/src/dashboard/voice-layers-wire.ts` (deps-injected wiring: `maybePark` in the
+  inject route, `onPendingPrompt` in the pending-prompt route, the L1 control handlers,
+  the 10-minute expiry sweep); registered in `routes.ts` next to the smart-clear routes
 - Client: `08-dashboard/components/VoiceClient.tsx` (frames), transcript grouping `08-dashboard/lib/transcript-grouping.ts`
 - Emergency stop: `07-daemon/src/voice/lex-voice-commands.ts` `matchPanicCommand`, `panic-routes.ts`
