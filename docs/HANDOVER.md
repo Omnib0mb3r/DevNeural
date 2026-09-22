@@ -6,7 +6,7 @@ Update this file IN PLACE every time the cursor moves; never add a new
 dated file. Ground every claim against git before asserting; this doc
 reflects what was true at the last update.
 
-## Cursor (2026-09-22 12:20 local, voice layers wave on branch `voice-layers`; daemon on the branch dist; first voice test done: L1 works, BRAIN UNREACHABLE (BUG-026); items 5-8 blocked)
+## Cursor (2026-09-22 18:05 local, voice fix wave BUILT on `voice-layers` (BUG-026/027/028/029/030), dist rebuilt 18:01; restart + retest next)
 
 Built overnight 2026-09-21/22 on operator direction ("just build it, I'll
 test in the AM"). Everything is committed on branch **`voice-layers`**
@@ -22,6 +22,37 @@ Design of record: `docs/spec/LAYER-1-CONTROL.md` (v2, canonical). Plan:
 `docs/superpowers/plans/2026-09-21-voice-layers.md`. Trackers: BUG-022
 (chars=0 root cause, SMOKE-TESTING), BUG-023 (pre-existing dashboard test
 red), FIXES.md rows VL-1..VL-9.
+
+### 2026-09-22 afternoon: fix wave built (operator said "complete all")
+
+Plan: `docs/superpowers/plans/2026-09-22-voice-layers-fixes.md`. Six
+commits, TDD, additive: `81e7958` L2 warm from the PTY (BUG-026),
+`d382d16` word gate + parser guards (BUG-030), `da38850` worker phase in
+the live block (BUG-029), `280a265` memory-free L1 cwd + "you do not know
+it" rule (BUG-028), `d643a46` contract examples + warming/waking banned,
+`eb4253e` no default L1 on attach (BUG-027). FIXES.md rows VL-10..VL-15.
+Suite 2174/2176; the two reds are the known pair (BUG-014,
+sessions-anchor-liveness). `07-daemon/dist` rebuilt 18:01; `out/`
+untouched (no client change).
+
+Daemon note: PID 24256 died at 12:40 local (V8 stack in
+`daemon.stderr.prev.log`: BUG-017 heap death) and the relauncher revived
+it as PID 55836 on the 00:38 dist. BUG-018's sidecar rotation did its job.
+
+Restart-verify for this wave (after restart + Open):
+
+1. `[voice-brain] anchor=<id8> spawned ... cwd=C:/dev/data/skill-connections/voice-l1`.
+2. No `[voice-brain] anchor=default` line after `client connected (attach)`.
+3. First utterance: `[voice-ws] L2 composer up after <N>s; brain idle`,
+   then `L1 turn: ... warming=false`. A substantive ask logs
+   `forward=true` and `forward to L2:`; the reply comes back through
+   `ask replied ... chars=<n>` (item 5, never yet seen live).
+4. "Lex mute." -> `control by word gate: mute`; the next sentence is not
+   transcribed at all (mic off). "Lex unmute" brings it back.
+5. "What's the worker doing?" while a worker is mid-turn -> the answer
+   says thinking (the block now carries `worker: live, thinking (<slug>),
+   last activity <N>s ago`).
+6. Then items 6-9 of the morning list.
 
 ### 2026-09-22 morning: restart done, item 1 verified (operator said "do it")
 

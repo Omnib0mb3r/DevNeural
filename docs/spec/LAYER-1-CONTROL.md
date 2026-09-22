@@ -87,10 +87,17 @@ brainstorm she is in and the worker she controls at that moment
 2. Voice goes live the moment L1 is warm (the existing `voice-brain
    {ready}` frame). Nothing waits for L2.
 3. Every L1 turn carries L2's live state. While L2 is still warming, L1 says
-   so once, in the first person ("the deeper part of me is still waking up,
-   go on"), keeps the conversation going, and still emits `FORWARD:` for
-   anything meant for L2. The daemon queues those forwards and flushes them
-   the moment L2 is warm. No utterance is dropped because L2 was late.
+   so once, in the first person ("give me a second, go on"; the words
+   warming and waking are banned out loud, 2026-09-22), keeps the
+   conversation going, and still emits `FORWARD:` for anything meant for
+   L2. The daemon queues those forwards and flushes them the moment L2 is
+   warm. No utterance is dropped because L2 was late. **L2 is warm**
+   (2026-09-22, BUG-026) when its PTY has been up 15s and its output quiet
+   for 3s with no native prompt open (the composer is up), or when its
+   jsonl carries an assistant record. The first is what a fresh Open
+   produces: a fresh L2 writes no jsonl before its first turn, so a
+   jsonl-only test made warming circular. Latched per connection; logged
+   `[voice-ws] L2 composer up after <N>s; brain idle`.
 4. Pressing Start voice on a brainstorm whose L1 is not alive spawns it
    (today's trigger stays as the fallback).
 
@@ -191,7 +198,11 @@ Input message (one per utterance, self-contained):
 
 ```
 [live] brain: warming 12s | idle | thinking 34s | tool Read 8s | replying
-       worker: idle | running 3m (dropship-01)
+       worker: live, thinking (dropship-01), last activity 12s ago
+             | live, running a tool (dropship-01), last activity 1s ago
+             | live, idle (dropship-01), quiet for 3m, last said: "..."
+             | live, waiting on a permission prompt (dropship-01)
+             | bound, offline (dropship-01)
        last said: "<L1's last spoken line>"
        digest: <current task / last decision / open question / next steps>
 [heard] "<transcript>"  (during_tts: yes|no, words: 7)
@@ -243,6 +254,18 @@ IGNORE: <reason>
 - Emergency stop stays deterministic and hard-wired: "lex emergency stop"
   is matched by regex before anything else and fires double-ESC. No model in
   the loop.
+- The fixed spoken controls are mechanical too (2026-09-22, BUG-030): "lex
+  mute / unmute / stand by / listen / end session / stop talking / be
+  quiet", prefix required, whole utterance, matched right after the panic
+  check and before L1 (`matchSpokenControl`), logged `control by word gate:
+  <verb>`. L1 still hears the utterance and speaks the ack; its own
+  `CONTROL:` line, if any, lands on the voice-command dedupe. A narrated
+  verb with no directive ("Muted.", under 40 chars) is mapped by the parser
+  and logged `inferred=yes`; a parenthetical-only line is never spoken.
+- L1 runs from `<DATA_ROOT>/voice-l1` (2026-09-22, BUG-028), a bare
+  directory outside every repo, so Claude Code attaches no auto-memory to
+  it. The voice holds no project facts of its own; every project question
+  is substance and forwards.
 
 Latency budget: the ask timeout is the bound on time-to-first-signal
 (default 6s, `DEVNEURAL_VOICE_BRAIN_TIMEOUT_MS`), then silence-bounded. A
