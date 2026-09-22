@@ -86,6 +86,10 @@ import {
   workerEffort,
   workerModel,
 } from '../lex/layer-model.js';
+import {
+  killVoiceBrainSession,
+  prewarmVoiceBrainSession,
+} from '../lex/voice-brain-session.js';
 import { listAnchorTiles } from '../lex/anchor-tiles.js';
 import {
   getLexSession,
@@ -1802,6 +1806,9 @@ export async function registerDashboardRoutes(
         cwd,
         title: body.title,
         kind,
+        /* Voice layers (2026-09-21): Layer 1 spawns FIRST, keyed to
+         * this anchor, so the voice is warm while L2 is still booting. */
+        onPrepared: (prep) => prewarmVoiceBrainSession(prep.lexSession.id),
         /* L2 MID (2026-07-18): opus (live-switchable to fable via
          * runtime_config mid_model) + --permission-mode (default 'plan',
          * live-switchable to 'bypassPermissions' via mid_permission_mode
@@ -1902,6 +1909,9 @@ export async function registerDashboardRoutes(
     }
     const liveSet = getLivePtyIds();
     if (row.current_pty_id && liveSet.has(row.current_pty_id)) {
+      /* Voice layers (2026-09-21): a live L2 with no live L1 (daemon
+       * restarted under it, or an older open) gets its voice brain now. */
+      prewarmVoiceBrainSession(id);
       return {
         ok: true,
         mode: 'bind',
@@ -1913,6 +1923,9 @@ export async function registerDashboardRoutes(
     if (existing) return existing;
     const inflight = (async () => {
       try {
+        /* Voice layers (2026-09-21): Layer 1 spawns FIRST, keyed to this
+         * anchor, so the voice is warm while L2 is still booting. */
+        prewarmVoiceBrainSession(id);
         const refs = listTranscriptRefs(id);
         /* Worker scope (2026-07-08): reopen rebuilds the prompt with
          * the anchor's current supervises binding so a rebound anchor
@@ -2058,6 +2071,9 @@ export async function registerDashboardRoutes(
       reply.code(404);
       return { ok: false, error: 'anchor not found' };
     }
+    /* Voice layers (2026-09-21): the anchor's Layer 1 voice brain dies
+     * with its L2. Idempotent; a no-op when none was spawned. */
+    killVoiceBrainSession(id, 'anchor-end');
     /* Dashboard "End" button must behave identically to the spoken
      * "Lex end session" voice command: both fire the full session-end
      * pipeline (distillation, ref_summary write, last_summary refresh,

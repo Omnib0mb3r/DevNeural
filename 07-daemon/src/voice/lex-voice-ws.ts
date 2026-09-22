@@ -62,6 +62,7 @@ import {
   prewarmVoiceBrainSession,
   isVoiceBrainSessionWarm,
   isVoiceBrainSessionEnabled,
+  killVoiceBrainSession,
 } from '../lex/voice-brain-session.js';
 import {
   getBrainstormByClaudeSessionId,
@@ -1890,7 +1891,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * fail-safe null path (speech=null, forward-only) that made the
    * whole 2026-07-16 session mute. No-op when already warm/disabled. */
   try {
-    prewarmVoiceBrainSession();
+    /* Voice layers (2026-09-21): one L1 per brainstorm anchor. The
+     * anchor Open routes already spawned it; this is the fallback for
+     * a bind whose anchor has no live voice brain yet. At attach time
+     * no bind exists, so this warms the shared default session; the
+     * bind handlers below re-prewarm for the resolved anchor. */
+    prewarmVoiceBrainSession(null);
   } catch {
     /* prewarm is best-effort; the ask path retains its own spawn */
   }
@@ -2984,6 +2990,23 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * contract. Same-turn segments (pre-tool ack + end_turn body)
    * queue and play back-to-back; barge / hold-up clears the queue
    * and cancels the in-flight ctx as one atomic boundary. */
+  /* Voice layers (2026-09-21): the brainstorm anchor this connection
+   * serves. Standalone (direct-llm) binds carry state.brainstormId;
+   * cc-pty binds resolve through the bound PTY's session / pty id, the
+   * same chain the snapshot builder uses. Null = no brainstorm (the
+   * voice brain falls back to its shared default session). */
+  function currentAnchorId(): string | null {
+    if (state.brainstormId) return state.brainstormId;
+    const handle = state.bindKey
+      ? getPty(state.bindKey) || getPtyBySession(state.bindKey)
+      : null;
+    const bs =
+      (handle?.sessionId && getBrainstormByClaudeSessionId(handle.sessionId)) ||
+      (handle?.ptyId && getBrainstormByPty(handle.ptyId)) ||
+      null;
+    return bs?.id ?? null;
+  }
+
   function speak(text: string, opts?: { continuation?: boolean }): void {
     /* No-live-sink guard (2026-07-17 item 3): a speakable reply
      * heading into a closed connection is dead air the operator can
@@ -3765,6 +3788,17 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
             logFn(
               `[voice-ws] end_session: pipeline threw ${(err as Error).message}`,
             );
+          }
+          /* Voice layers (2026-09-21): the anchor's Layer 1 voice brain
+           * dies with its L2 (resolved through the bind, not only the
+           * standalone brainstormId). */
+          const voiceAnchor = currentAnchorId();
+          if (voiceAnchor) {
+            try {
+              killVoiceBrainSession(voiceAnchor, 'voice-end-session');
+            } catch {
+              /* best-effort */
+            }
           }
           const anchorId = state.brainstormId;
           if (!anchorId) return;
@@ -5338,7 +5372,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * in teardown so a closed socket leaves no live poll timer. */
   cancelBrainReadyWatch = _startVoiceBrainReadyWatch<ReturnType<typeof setTimeout>>({
     enabled: isVoiceBrainSessionEnabled(),
-    isWarm: isVoiceBrainSessionWarm,
+    isWarm: () => isVoiceBrainSessionWarm(currentAnchorId()),
     send,
     schedule: (fn, ms) => {
       const t = setTimeout(fn, ms);

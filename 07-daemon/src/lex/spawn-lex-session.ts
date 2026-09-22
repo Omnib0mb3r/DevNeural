@@ -182,6 +182,12 @@ export interface SpawnLexSessionOptions extends PrepareLexSpawnOptions {
    * present, it runs after prepare and receives the full prep result
    * (anchor id, cc session id, transcript path). */
   buildSystemPrompt?: (prep: PrepareLexSpawnResult) => string;
+  /** Voice layers (2026-09-21): runs right after prepare and BEFORE
+   * the L2 PTY spawns, with the prepared anchor. The anchor routes use
+   * it to start Layer 1 (the voice brain) first, so the voice is warm
+   * while L2 is still booting. Best-effort: a throw is logged and never
+   * blocks the L2 spawn. */
+  onPrepared?: (prep: PrepareLexSpawnResult) => void;
   cols?: number;
   rows?: number;
   env?: Record<string, string>;
@@ -275,6 +281,18 @@ export function spawnLexSession(
   opts: SpawnLexSessionOptions,
 ): SpawnLexSessionResult {
   const prep = prepareLexSpawn(opts);
+  /* Voice layers (2026-09-21): let the caller start Layer 1 for this
+   * anchor BEFORE the L2 PTY spawns, so the voice is warm while L2 is
+   * still booting. Best-effort; a throw here must never block L2. */
+  if (opts.onPrepared) {
+    try {
+      opts.onPrepared(prep);
+    } catch (err) {
+      console.error(
+        `[spawn-lex-session] onPrepared threw for anchor=${prep.lexSession.id.slice(0, 8)} (ignored): ${(err as Error).message}`,
+      );
+    }
+  }
   const args = [...prep.args, ...(opts.extraArgs ?? [])];
   let ptyResult: SpawnLexResult;
   try {

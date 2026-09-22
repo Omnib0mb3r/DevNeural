@@ -365,6 +365,13 @@ export interface LexSessionRow {
    * target_session as before). Non-null references project_session.id
    * so the inject path can resolve a target without judgment. */
   supervises_project_anchor_id?: string | null;
+  /* Migration 054 (voice layers, 2026-09-21): the Layer 1 voice-brain
+   * binding for this anchor. NULL = no voice session spawned. Written
+   * by voice-brain-session.ts on spawn / rotation / kill so a restart,
+   * the dashboard and the Stream Deck can find the L1 session. */
+  voice_session_id?: string | null;
+  voice_pty_id?: string | null;
+  voice_spawned_ms?: number | null;
   /* Migration 053: reversible hide bit for the Past Sessions list.
    * 0 = visible (default; every pre-migration row), 1 = archived
    * (hidden from GET /lex/anchors). Lets the operator clear stale/test
@@ -2078,6 +2085,47 @@ export class IndexDb {
       )
       .run(projectAnchorId, lexAnchorId);
     return this.getLexSession(lexAnchorId);
+  }
+
+  /* Voice layers (migration 054, 2026-09-21): persist the Layer 1
+   * voice-brain binding on the anchor. voice-brain-session.ts writes
+   * it on spawn / rotation / kill; nulls clear it. */
+  setLexSessionVoiceBinding(
+    lexAnchorId: string,
+    binding: {
+      voice_session_id: string | null;
+      voice_pty_id: string | null;
+      voice_spawned_ms: number | null;
+    },
+  ): LexSessionRow | null {
+    this.db
+      .prepare(
+        `UPDATE lex_session
+           SET voice_session_id = ?, voice_pty_id = ?, voice_spawned_ms = ?
+         WHERE id = ?`,
+      )
+      .run(
+        binding.voice_session_id,
+        binding.voice_pty_id,
+        binding.voice_spawned_ms,
+        lexAnchorId,
+      );
+    return this.getLexSession(lexAnchorId);
+  }
+
+  /* The anchor behind a Claude Code session id, via lex_transcript_ref
+   * (newest ref wins). The plan-approval detector uses this to map a
+   * pending-prompt on the L2 session back to its brainstorm. */
+  getLexSessionByCcSessionId(ccSessionId: string): LexSessionRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT lex_session_id FROM lex_transcript_ref
+          WHERE cc_session_id = ?
+          ORDER BY ordering DESC
+          LIMIT 1`,
+      )
+      .get(ccSessionId) as { lex_session_id: string } | undefined;
+    return row ? this.getLexSession(row.lex_session_id) : null;
   }
 
   updateLexSession(

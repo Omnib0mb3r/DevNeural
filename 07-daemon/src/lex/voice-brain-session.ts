@@ -1,21 +1,30 @@
 /**
- * Dedicated persistent voice-brain session.
+ * Dedicated persistent voice-brain sessions (Layer 1), one per brainstorm.
  *
- * Sibling of judge-session.ts (spec:
- * docs/superpowers/specs/2026-07-15-voice-top-layer-design.md, layer 1
- * "TOP"). The voice top layer needs fast turnaround on every spoken
- * exchange, and judge-session serializes ALL of its callers onto one
- * shared in-flight-ask queue: routing voice turns through it would
- * park an operator utterance behind however many classification asks
- * the supervisors have queued. So the voice brain gets its OWN
- * kept-open headless `claude` PTY session with its own session id,
- * its own ask queue, and its own liveness state, built on the same
- * machinery judge-session uses:
+ * Sibling of judge-session.ts (spec: docs/spec/LAYER-1-CONTROL.md, the
+ * canonical voice-layers doc; history in
+ * docs/superpowers/specs/2026-07-15-voice-top-layer-design.md). The
+ * voice top layer needs fast turnaround on every spoken exchange, and
+ * judge-session serializes ALL of its callers onto one shared
+ * in-flight-ask queue: routing voice turns through it would park an
+ * operator utterance behind however many classification asks the
+ * supervisors have queued. So each voice brain gets its OWN kept-open
+ * headless `claude` PTY session with its own session id, its own ask
+ * queue, and its own liveness state, built on the same machinery
+ * judge-session uses:
  *
- *   - lazy spawn on first ask via pty-host's spawnLex with a
- *     daemon-minted --session-id, so the transcript jsonl path is
- *     predictable up front (spawn-lex-session's transcriptPathFor,
- *     the 2026-07-08 deterministic-binding approach)
+ *   - ONE SESSION PER BRAINSTORM ANCHOR (2026-09-21). Brainstorms are
+ *     pinned to workers so contexts never cross; the voice brain
+ *     inherits that rule. The registry below keys every session,
+ *     warmup, queue and persisted binding by anchor id. A null anchor
+ *     (standalone binds with no brainstorm) uses the shared 'default'
+ *     key, which is never persisted.
+ *   - spawn via pty-host's spawnLex with a daemon-minted --session-id,
+ *     so the transcript jsonl path is predictable up front
+ *     (spawn-lex-session's transcriptPathFor, the 2026-07-08
+ *     deterministic-binding approach). Spawned on brainstorm Open
+ *     (before L2) by the anchor routes, and lazily by the voice WS
+ *     bind / first ask as the fallback.
  *   - asks pasted through ptyInject with commit=true: body plus CR,
  *     and pty-host's own 1s bare-CR nudge (PTY_INJECT_COMMIT_NUDGE_MS)
  *     fires after every inject, so no extra nudge is needed here
@@ -49,11 +58,11 @@
  * Without onPartial, the first text-bearing assistant record resolves
  * the ask, mirroring judge-session's single-record behavior.
  *
- * The speech-first contract, FORWARD/CONTROL trailing-line parsing,
- * persona and digest grounding all live in voice-top-layer.ts. This
- * module owns only the session lifecycle and the ask primitive; the
- * per-ask `system` field is a plain framing line the caller prepends
- * (same shape judge-session's askText takes).
+ * The speech-first contract, FORWARD/CONTROL/IGNORE trailing-line
+ * parsing and the persona live in voice-top-layer.ts. This module owns
+ * only the session lifecycle and the ask primitive; the per-ask
+ * `system` field is a plain framing line the caller prepends (same
+ * shape judge-session's askText takes).
  */
 import { randomUUID as nodeRandomUUID } from 'node:crypto';
 import { getStore } from './brainstorm-store.js';
@@ -74,6 +83,9 @@ import {
 import { transcriptPathFor } from './spawn-lex-session.js';
 
 export interface AskVoiceInput {
+  /** Brainstorm anchor whose voice brain answers this ask. Null or
+   * absent = the shared default session (standalone binds). */
+  anchorId?: string | null;
   /** Optional framing line prepended before the prompt (the top
    * layer's speech-first contract). Plain text; askVoice never parses
    * the reply. */
@@ -95,11 +107,11 @@ export interface AskVoiceInput {
    * timeout is a soft bound, never an error path. When true, a timed-out
    * ask nulls (the caller's fail-safe forward-to-Lex fires) but scores
    * NO liveness strike and can never contribute to the two-consecutive-
-   * timeouts session kill. The top layer's turn, delivery, and heartbeat
-   * asks all set this: a slow or long turn is not evidence of a dead
-   * session, and on this box claude turn latency regularly exceeds the
-   * bound. Session death is still detected by an exited PTY (ensureSpawned)
-   * and by the boot warmup probe - both independent of this flag. */
+   * timeouts session kill. The top layer's turn and delivery asks set
+   * this: a slow or long turn is not evidence of a dead session, and on
+   * this box claude turn latency regularly exceeds the bound. Session
+   * death is still detected by an exited PTY (ensureSpawned) and by the
+   * boot warmup probe - both independent of this flag. */
   noLivenessStrike?: boolean;
 }
 
@@ -162,6 +174,12 @@ export function isVoiceBrainSessionEnabled(): boolean {
  * grow a compile-time coupling that tempts them to.
  * ---------------------------------------------------------------- */
 
+export interface VoiceBrainBinding {
+  voice_session_id: string | null;
+  voice_pty_id: string | null;
+  voice_spawned_ms: number | null;
+}
+
 export interface VoiceBrainSessionDeps {
   spawnLex: (opts: {
     cwd: string;
@@ -190,6 +208,10 @@ export interface VoiceBrainSessionDeps {
    * spawn so a runtime_config flip lands on the next L1 session with no
    * rebuild. Production: the store's db; tests: a fake reader. */
   runtimeConfig: () => RuntimeConfigReader;
+  /** Persist the L1 binding on the anchor's lex_session row (migration
+   * 054) after every spawn / rotation / kill. Called with the registry
+   * key; production skips the shared 'default' key. Best-effort. */
+  persistBinding: (anchorKey: string, binding: VoiceBrainBinding) => void;
 }
 
 function defaultReadRange(path: string, start: number, length: number): string {
@@ -211,6 +233,10 @@ function defaultSleep(ms: number): Promise<void> {
     }
   });
 }
+
+/* Registry key for "no brainstorm" binds. Never persisted (there is no
+ * lex_session row behind it). */
+export const DEFAULT_VOICE_BRAIN_ANCHOR = 'default';
 
 function defaultDeps(): VoiceBrainSessionDeps {
   return {
@@ -237,6 +263,16 @@ function defaultDeps(): VoiceBrainSessionDeps {
       process.env.DEVNEURAL_VOICE_BRAIN_SESSION_RESPAWN_COOLDOWN_MS ?? 60_000,
     ),
     runtimeConfig: () => getStore().db,
+    persistBinding: (anchorKey, binding) => {
+      if (anchorKey === DEFAULT_VOICE_BRAIN_ANCHOR) return;
+      try {
+        getStore().db.setLexSessionVoiceBinding(anchorKey, binding);
+      } catch (err) {
+        deps.log(
+          `[voice-brain] anchor=${anchorKey.slice(0, 8)} persistBinding failed (ignored): ${(err as Error).message}`,
+        );
+      }
+    },
   };
 }
 
@@ -250,10 +286,12 @@ export function setVoiceBrainSessionLogger(log: (msg: string) => void): void {
 }
 
 /* ---------------------------------------------------------------- *
- * Session state.
+ * Session state: one record per brainstorm anchor.
  * ---------------------------------------------------------------- */
 
 interface VoiceBrainSessionState {
+  /** Registry key (anchor id or DEFAULT_VOICE_BRAIN_ANCHOR). */
+  anchorKey: string;
   ptyId: string | null;
   ccSessionId: string | null;
   jsonlPath: string | null;
@@ -275,10 +313,18 @@ interface VoiceBrainSessionState {
   warm: boolean;
   warmupRunning: boolean;
   spawnedAt: number;
+  /** In-flight warmup, exposed to tests so the background boot can be
+   * driven to completion deterministically on the virtual clock. */
+  warmupPromise: Promise<void> | null;
+  /** Serialization: one in-flight ask at a time per session, since all
+   * asks share the one PTY's stdin/stdout. Private per anchor; a
+   * backed-up brainstorm never delays another's voice turn. */
+  queueTail: Promise<void>;
 }
 
-function initialState(): VoiceBrainSessionState {
+function initialState(anchorKey: string): VoiceBrainSessionState {
   return {
+    anchorKey,
     ptyId: null,
     ccSessionId: null,
     jsonlPath: null,
@@ -293,50 +339,87 @@ function initialState(): VoiceBrainSessionState {
     warm: false,
     warmupRunning: false,
     spawnedAt: 0,
+    warmupPromise: null,
+    queueTail: Promise.resolve(),
   };
 }
 
-let state: VoiceBrainSessionState = initialState();
+const sessions = new Map<string, VoiceBrainSessionState>();
+
+function keyFor(anchorId: string | null | undefined): string {
+  const trimmed = (anchorId ?? '').trim();
+  return trimmed ? trimmed : DEFAULT_VOICE_BRAIN_ANCHOR;
+}
+
+function stateFor(anchorId: string | null | undefined): VoiceBrainSessionState {
+  const key = keyFor(anchorId);
+  let s = sessions.get(key);
+  if (!s) {
+    s = initialState(key);
+    sessions.set(key, s);
+  }
+  return s;
+}
+
+function tag(s: VoiceBrainSessionState): string {
+  return `anchor=${s.anchorKey.slice(0, 8)}`;
+}
+
+function persist(s: VoiceBrainSessionState): void {
+  try {
+    deps.persistBinding(s.anchorKey, {
+      voice_session_id: s.ccSessionId,
+      voice_pty_id: s.ptyId,
+      voice_spawned_ms: s.ptyId ? s.spawnedAt : null,
+    });
+  } catch (err) {
+    deps.log(
+      `[voice-brain] ${tag(s)} persistBinding threw (ignored): ${(err as Error).message}`,
+    );
+  }
+}
 
 /* Kill the current PTY (best-effort) and clear all session identity so
  * the next ask attempts a fresh spawn, subject to the respawn cooldown
  * gate in ensureSpawned. Used both for the "PTY died externally" path
  * and the "two consecutive timeouts" liveness trigger. */
-function killCurrent(reason: string): void {
-  if (state.ptyId) {
-    deps.log(`[voice-brain] killing session ptyId=${state.ptyId} reason=${reason}`);
+function killCurrent(s: VoiceBrainSessionState, reason: string): void {
+  if (s.ptyId) {
+    deps.log(`[voice-brain] ${tag(s)} killing session ptyId=${s.ptyId} reason=${reason}`);
     try {
-      deps.ptyKill(state.ptyId);
+      deps.ptyKill(s.ptyId);
     } catch (err) {
       deps.log(`[voice-brain] ptyKill threw (ignored): ${(err as Error).message}`);
     }
   }
-  state.ptyId = null;
-  state.ccSessionId = null;
-  state.jsonlPath = null;
-  state.consecutiveTimeouts = 0;
-  state.warm = false;
+  s.ptyId = null;
+  s.ccSessionId = null;
+  s.jsonlPath = null;
+  s.consecutiveTimeouts = 0;
+  s.warm = false;
+  persist(s);
 }
 
-/* Ensure a live voice-brain session exists, spawning (or respawning)
- * one if needed. Returns false when no session is available right now;
- * the caller resolves its ask to null in that case. */
-function ensureSpawned(): boolean {
-  if (state.ptyId) {
-    const handle = deps.getPty(state.ptyId);
+/* Ensure a live voice-brain session exists for the anchor, spawning
+ * (or respawning) one if needed. Returns false when no session is
+ * available right now; the caller resolves its ask to null in that
+ * case. */
+function ensureSpawned(s: VoiceBrainSessionState): boolean {
+  if (s.ptyId) {
+    const handle = deps.getPty(s.ptyId);
     if (handle && !handle.exited) return true;
-    deps.log(`[voice-brain] pty died externally ptyId=${state.ptyId}`);
-    killCurrent('exited');
+    deps.log(`[voice-brain] ${tag(s)} pty died externally ptyId=${s.ptyId}`);
+    killCurrent(s, 'exited');
   }
 
   const now = deps.now();
-  if (now - state.lastSpawnAttemptAt < deps.respawnCooldownMs) {
+  if (now - s.lastSpawnAttemptAt < deps.respawnCooldownMs) {
     deps.log(
-      `[voice-brain] spawn suppressed: cooldown active (${deps.respawnCooldownMs}ms window, last attempt ${now - state.lastSpawnAttemptAt}ms ago)`,
+      `[voice-brain] ${tag(s)} spawn suppressed: cooldown active (${deps.respawnCooldownMs}ms window, last attempt ${now - s.lastSpawnAttemptAt}ms ago)`,
     );
     return false;
   }
-  state.lastSpawnAttemptAt = now;
+  s.lastSpawnAttemptAt = now;
 
   const ccSessionId = deps.randomUUID();
   const jsonlPath = transcriptPathFor({
@@ -385,24 +468,25 @@ function ensureSpawned(): boolean {
       ],
       sessionId: ccSessionId,
     });
-    state.ptyId = spawned.ptyId;
-    state.ccSessionId = ccSessionId;
-    state.jsonlPath = jsonlPath;
-    state.consecutiveTimeouts = 0;
-    state.warm = false;
-    state.spawnedAt = deps.now();
+    s.ptyId = spawned.ptyId;
+    s.ccSessionId = ccSessionId;
+    s.jsonlPath = jsonlPath;
+    s.consecutiveTimeouts = 0;
+    s.warm = false;
+    s.spawnedAt = deps.now();
+    persist(s);
     deps.log(
-      `[voice-brain] spawned ptyId=${spawned.ptyId} pid=${spawned.pid} ccSessionId=${ccSessionId.slice(0, 8)} cwd=${deps.cwd}; warmup starting`,
+      `[voice-brain] ${tag(s)} spawned ptyId=${spawned.ptyId} pid=${spawned.pid} ccSessionId=${ccSessionId.slice(0, 8)} cwd=${deps.cwd}; warmup starting`,
     );
-    warmupPromise = runWarmup(spawned.ptyId).catch((err) => {
+    s.warmupPromise = runWarmup(s, spawned.ptyId).catch((err) => {
       deps.log(
-        `[voice-brain] WARMUP FAILED: warmup threw: ${(err as Error).message}`,
+        `[voice-brain] ${tag(s)} WARMUP FAILED: warmup threw: ${(err as Error).message}`,
       );
-      killCurrent('warmup-threw');
+      killCurrent(s, 'warmup-threw');
     });
     return true;
   } catch (err) {
-    deps.log(`[voice-brain] spawn FAILED: ${(err as Error).message}`);
+    deps.log(`[voice-brain] ${tag(s)} spawn FAILED: ${(err as Error).message}`);
     return false;
   }
 }
@@ -438,10 +522,6 @@ const WARMUP_PROBE_TEXT = 'Warmup check. Reply with exactly: OK';
  * cheap; a genuinely dead spawn still dies, just 45s later. */
 const DEFAULT_WARMUP_TIMEOUT_MS = 90_000;
 
-/* In-flight warmup, exposed to tests so the background boot can be
- * driven to completion deterministically on the virtual clock. */
-let warmupPromise: Promise<void> | null = null;
-
 function warmupTimeoutMs(): number {
   const raw = Number(process.env.DEVNEURAL_VOICE_BRAIN_WARMUP_TIMEOUT_MS ?? '');
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_WARMUP_TIMEOUT_MS;
@@ -454,22 +534,22 @@ function warmupTimeoutMs(): number {
  * jsonl. Only then does the session accept real asks. Every outcome
  * is logged loudly; a failed warmup kills the session so the cooldown
  * gate meters retry attempts. */
-async function runWarmup(ptyId: string): Promise<void> {
-  if (state.warmupRunning) return;
-  state.warmupRunning = true;
+async function runWarmup(s: VoiceBrainSessionState, ptyId: string): Promise<void> {
+  if (s.warmupRunning) return;
+  s.warmupRunning = true;
   const startedAt = deps.now();
   try {
     /* Banner pre-dismiss, same shape as pty-host's seedFirstTurn. */
     await deps.sleep(1_500);
-    if (state.ptyId !== ptyId) return;
+    if (s.ptyId !== ptyId) return;
     try { deps.ptyInject(ptyId, '\r', false); } catch { /* best-effort */ }
     await deps.sleep(600);
-    if (state.ptyId !== ptyId) return;
+    if (s.ptyId !== ptyId) return;
     try { deps.ptyInject(ptyId, '\r', false); } catch { /* best-effort */ }
     await deps.sleep(Math.max(0, WARMUP_BOOT_DELAY_MS - 2_100));
-    if (state.ptyId !== ptyId) return;
+    if (s.ptyId !== ptyId) return;
 
-    const jsonlPath = state.jsonlPath;
+    const jsonlPath = s.jsonlPath;
     if (!jsonlPath) return;
     let sinceOffset = 0;
     try {
@@ -479,8 +559,8 @@ async function runWarmup(ptyId: string): Promise<void> {
     }
     const probe = deps.ptyInject(ptyId, WARMUP_PROBE_TEXT, true);
     if (!probe.ok) {
-      deps.log(`[voice-brain] WARMUP FAILED: probe inject error: ${probe.error}`);
-      killCurrent('warmup-inject-failed');
+      deps.log(`[voice-brain] ${tag(s)} WARMUP FAILED: probe inject error: ${probe.error}`);
+      killCurrent(s, 'warmup-inject-failed');
       return;
     }
     /* Signal-based warmup (2026-07-17): the base timeout bounds
@@ -493,11 +573,11 @@ async function runWarmup(ptyId: string): Promise<void> {
     let lastProbeAt = deps.now();
     let jsonlEverGrew = false;
     for (;;) {
-      if (state.ptyId !== ptyId) return; /* killed/replaced mid-warmup */
+      if (s.ptyId !== ptyId) return; /* killed/replaced mid-warmup */
       const handle = deps.getPty(ptyId);
       if (!handle || handle.exited) {
-        deps.log('[voice-brain] WARMUP FAILED: pty died during boot');
-        killCurrent('warmup-pty-died');
+        deps.log(`[voice-brain] ${tag(s)} WARMUP FAILED: pty died during boot`);
+        killCurrent(s, 'warmup-pty-died');
         return;
       }
       const ptyAt = ptyOutputAtMs(ptyId);
@@ -531,10 +611,10 @@ async function runWarmup(ptyId: string): Promise<void> {
             continue;
           }
           if (extractAssistantText(rec)) {
-            state.warm = true;
-            state.consecutiveTimeouts = 0;
+            s.warm = true;
+            s.consecutiveTimeouts = 0;
             deps.log(
-              `[voice-brain] warm: first reply after ${deps.now() - startedAt}ms; session ready for asks`,
+              `[voice-brain] ${tag(s)} warm: first reply after ${deps.now() - startedAt}ms; session ready for asks`,
             );
             return;
           }
@@ -543,9 +623,9 @@ async function runWarmup(ptyId: string): Promise<void> {
       const now = deps.now();
       if (now >= effectiveDeadline) {
         deps.log(
-          `[voice-brain] WARMUP FAILED: no assistant reply and all liveness signals quiet for ${signalQuietMs()}ms (base ${warmupTimeoutMs()}ms); killing session (respawn gated by cooldown)`,
+          `[voice-brain] ${tag(s)} WARMUP FAILED: no assistant reply and all liveness signals quiet for ${signalQuietMs()}ms (base ${warmupTimeoutMs()}ms); killing session (respawn gated by cooldown)`,
         );
-        killCurrent('warmup-timeout');
+        killCurrent(s, 'warmup-timeout');
         return;
       }
       if (!jsonlEverGrew && now - lastProbeAt >= WARMUP_REPROBE_MS) {
@@ -564,39 +644,69 @@ async function runWarmup(ptyId: string): Promise<void> {
       await deps.sleep(deps.pollIntervalMs);
     }
   } finally {
-    state.warmupRunning = false;
+    s.warmupRunning = false;
   }
 }
 
 /* Fire-and-forget prewarm so the FIRST operator utterance of a voice
  * session already has a warm brain instead of paying the boot cost
  * (and pre-fix, the boot death spiral) on the first real turn. Called
- * by the voice WS on bind. Safe to call repeatedly. */
-export function prewarmVoiceBrainSession(): void {
+ * by the anchor Open routes (before L2 spawns) and by the voice WS on
+ * bind. Safe to call repeatedly. */
+export function prewarmVoiceBrainSession(anchorId?: string | null): void {
   if (!isVoiceBrainSessionEnabled()) return;
-  if (state.ptyId && state.warm) return;
-  ensureSpawned();
+  const s = stateFor(anchorId);
+  if (s.ptyId && s.warm) return;
+  if (s.ptyId && s.warmupRunning) return;
+  ensureSpawned(s);
 }
 
-/* True when a live, boot-probed session is accepting asks. The
- * redelivery path (a spoken delivery cut by a session death waits for
- * the respawn, then re-delivers) polls this instead of poking the ask
- * queue with probe asks. */
-export function isVoiceBrainSessionWarm(): boolean {
+/* True when a live, boot-probed session is accepting asks for the
+ * anchor. The voice WS gates the client's connecting -> live transition
+ * on this. */
+export function isVoiceBrainSessionWarm(anchorId?: string | null): boolean {
   if (!isVoiceBrainSessionEnabled()) return false;
-  if (!state.ptyId || !state.warm) return false;
-  const handle = deps.getPty(state.ptyId);
+  const s = sessions.get(keyFor(anchorId));
+  if (!s || !s.ptyId || !s.warm) return false;
+  const handle = deps.getPty(s.ptyId);
   return Boolean(handle && !handle.exited);
 }
 
-function handleTimeout(): void {
-  state.consecutiveTimeouts += 1;
+/* Kill an anchor's voice brain and forget it (brainstorm ended, anchor
+ * switched away, daemon shutdown). Idempotent. */
+export function killVoiceBrainSession(anchorId: string, reason: string): void {
+  const key = keyFor(anchorId);
+  const s = sessions.get(key);
+  if (!s) return;
+  killCurrent(s, reason);
+  sessions.delete(key);
+}
+
+/** Diagnostics: every anchor with a voice-brain record. */
+export function listVoiceBrainSessions(): Array<{
+  anchorId: string;
+  ptyId: string | null;
+  ccSessionId: string | null;
+  warm: boolean;
+  spawnedAt: number;
+}> {
+  return [...sessions.values()].map((s) => ({
+    anchorId: s.anchorKey,
+    ptyId: s.ptyId,
+    ccSessionId: s.ccSessionId,
+    warm: s.warm,
+    spawnedAt: s.spawnedAt,
+  }));
+}
+
+function handleTimeout(s: VoiceBrainSessionState): void {
+  s.consecutiveTimeouts += 1;
   deps.log(
-    `[voice-brain] ask timed out; session marked suspect (consecutive_timeouts=${state.consecutiveTimeouts})`,
+    `[voice-brain] ${tag(s)} ask timed out; session marked suspect (consecutive_timeouts=${s.consecutiveTimeouts})`,
   );
-  if (state.consecutiveTimeouts >= 2) {
-    deps.log('[voice-brain] two consecutive timeouts; killing session for respawn');
-    killCurrent('two-consecutive-timeouts');
+  if (s.consecutiveTimeouts >= 2) {
+    deps.log(`[voice-brain] ${tag(s)} two consecutive timeouts; killing session for respawn`);
+    killCurrent(s, 'two-consecutive-timeouts');
   }
 }
 
@@ -704,9 +814,8 @@ function streamMaxMs(): number {
  * On timeout, recordsSeen + sawBytes tell the caller whether the
  * session was mid-generation (records flowed, then stalled), alive
  * but slow (the jsonl grew - claude accepted the inject and is
- * working, it just has not produced an assistant record yet; this is
- * what a slow HEARTBEAT ask looks like), or silent - the liveness
- * watchdog treats those very differently. */
+ * working, it just has not produced an assistant record yet), or
+ * silent - the liveness watchdog treats those very differently. */
 /* BUG-022 (2026-09-21; the root cause behind the old BUG-008 chars=0).
  * Claude Code writes one assistant turn as TWO jsonl records sharing a
  * message id: a thinking-block record ALREADY stamped stop_reason
@@ -837,16 +946,11 @@ async function waitForVoiceReply(
 }
 
 /* Liveness strike policy, isolated on purpose (2026-07-16 addendum).
- * A candidate redesign is under operator review: drop fixed deadlines
- * entirely and treat transcript-jsonl growth OR pty byte output within
- * the last N seconds as the liveness signal at EVERY phase, killing
- * only when all signals are quiet. Until that lands, this function is
- * the single place the interim policy lives: a timed-out ask counts
- * as a strike ONLY when the session showed zero life for the whole
- * wait - no assistant records (streaming) and no jsonl growth at all
- * (covers non-streaming HEARTBEAT asks on a slow-but-alive session;
- * the 04:46Z incident killed the brain mid-heartbeat exactly because
- * record-less progress was invisible to the old policy). */
+ * A timed-out ask counts as a strike ONLY when the session showed zero
+ * life for the whole wait - no assistant records (streaming) and no
+ * jsonl growth at all (covers non-streaming asks on a slow-but-alive
+ * session; the 04:46Z incident killed the brain mid-pulse exactly
+ * because record-less progress was invisible to the old policy). */
 export function _shouldCountLivenessStrikeImpl(result: {
   recordsSeen: number;
   sawBytes: boolean;
@@ -856,28 +960,30 @@ export function _shouldCountLivenessStrikeImpl(result: {
 
 /* The ask primitive: enable-flag check, lazy spawn, inject,
  * tail-and-wait, liveness bookkeeping. Returns the trimmed reply text
- * or null on any failure. Callers reach it through the queue in
- * askVoice, never directly. */
-async function askVoiceInner(input: AskVoiceInput): Promise<string | null> {
+ * or null on any failure. Callers reach it through the anchor's queue
+ * in askVoice, never directly. */
+async function askVoiceInner(
+  s: VoiceBrainSessionState,
+  input: AskVoiceInput,
+): Promise<string | null> {
   if (!isVoiceBrainSessionEnabled()) return null;
   const timeoutMs = input.timeoutMs ?? defaultAskTimeoutMs();
   const question = buildVoiceQuestion(input.system, input.prompt);
   const deadline = deps.now() + timeoutMs;
 
-  if (!ensureSpawned()) return null;
+  if (!ensureSpawned(s)) return null;
   /* Warmup gate: never inject into a booting session. The ask nulls
-   * fast (caller fail-safe fires: forward-to-Lex, skipped pulse), the
-   * composer stays clean for the warmup probe, and nothing here can
-   * count as a liveness timeout against a session that is still
-   * booting. */
-  if (!state.warm) {
+   * fast (caller fail-safe fires: forward-to-Lex), the composer stays
+   * clean for the warmup probe, and nothing here can count as a
+   * liveness timeout against a session that is still booting. */
+  if (!s.warm) {
     deps.log(
-      `[voice-brain] ask skipped: session warming (${deps.now() - state.spawnedAt}ms since spawn)`,
+      `[voice-brain] ${tag(s)} ask skipped: session warming (${deps.now() - s.spawnedAt}ms since spawn)`,
     );
     return null;
   }
-  const ptyId = state.ptyId!;
-  const jsonlPath = state.jsonlPath!;
+  const ptyId = s.ptyId!;
+  const jsonlPath = s.jsonlPath!;
 
   let sinceOffset = 0;
   try {
@@ -888,8 +994,8 @@ async function askVoiceInner(input: AskVoiceInput): Promise<string | null> {
 
   const inject = deps.ptyInject(ptyId, question, true);
   if (!inject.ok) {
-    deps.log(`[voice-brain] inject failed ptyId=${ptyId}: ${inject.error}`);
-    killCurrent('inject-failed');
+    deps.log(`[voice-brain] ${tag(s)} inject failed ptyId=${ptyId}: ${inject.error}`);
+    killCurrent(s, 'inject-failed');
     return null;
   }
 
@@ -908,7 +1014,7 @@ async function askVoiceInner(input: AskVoiceInput): Promise<string | null> {
        * Lex) fires - but a slow/long turn scores NO strike and can
        * never contribute to the two-consecutive-timeouts kill. */
       deps.log(
-        `[voice-brain] conversational ask timed out (records=${result.recordsSeen} bytes_grew=${result.sawBytes}); no liveness strike by contract (streak stays ${state.consecutiveTimeouts})`,
+        `[voice-brain] ${tag(s)} conversational ask timed out (records=${result.recordsSeen} bytes_grew=${result.sawBytes}); no liveness strike by contract (streak stays ${s.consecutiveTimeouts})`,
       );
       return null;
     }
@@ -916,23 +1022,21 @@ async function askVoiceInner(input: AskVoiceInput): Promise<string | null> {
       /* The session showed life during the wait (assistant records
        * streamed, or the jsonl grew at all - claude accepted the
        * inject and is working): this is a slow/stalled TURN, not a
-       * dead session. No liveness strike. The 04:30Z (delivery) and
-       * 04:46Z (heartbeat) incidents were exactly this shape scoring
-       * strike 2 and getting killed mid-speech / mid-pulse. */
+       * dead session. No liveness strike. */
       deps.log(
-        `[voice-brain] ask timed out but session showed life (records=${result.recordsSeen} bytes_grew=${result.sawBytes}); no liveness strike (streak stays ${state.consecutiveTimeouts})`,
+        `[voice-brain] ${tag(s)} ask timed out but session showed life (records=${result.recordsSeen} bytes_grew=${result.sawBytes}); no liveness strike (streak stays ${s.consecutiveTimeouts})`,
       );
       return null;
     }
-    handleTimeout();
+    handleTimeout(s);
     return null;
   }
   /* A reply landed: the session is alive and responsive. Reset the
    * failure streak. */
   deps.log(
-    `[voice-brain] ask replied in ${deps.now() - askStartedAt}ms chars=${result.text.length}`,
+    `[voice-brain] ${tag(s)} ask replied in ${deps.now() - askStartedAt}ms chars=${result.text.length}`,
   );
-  state.consecutiveTimeouts = 0;
+  s.consecutiveTimeouts = 0;
   /* A degenerate end_turn with zero text blocks concatenates to the
    * empty string; the top layer treats that the same as no answer, so
    * normalize it to null here (the null path is what triggers the
@@ -942,18 +1046,16 @@ async function askVoiceInner(input: AskVoiceInput): Promise<string | null> {
 }
 
 /* ---------------------------------------------------------------- *
- * Serialization: one in-flight voice ask at a time, since all asks
- * share the one PTY's stdin/stdout. This queue is PRIVATE to the
- * voice-brain session; judge-session asks run on their own queue and
- * their own PTY, so a backed-up judge never delays a voice turn.
+ * Serialization: one in-flight voice ask at a time PER ANCHOR, since
+ * all of an anchor's asks share its one PTY's stdin/stdout. Private to
+ * the voice-brain sessions; judge-session asks run on their own queue
+ * and their own PTY, so a backed-up judge never delays a voice turn.
  * ---------------------------------------------------------------- */
 
-let queueTail: Promise<void> = Promise.resolve();
-
-function enqueue<T>(fn: () => Promise<T>): Promise<T> {
+function enqueue<T>(s: VoiceBrainSessionState, fn: () => Promise<T>): Promise<T> {
   const run = (): Promise<T> => fn();
-  const resultPromise = queueTail.then(run, run);
-  queueTail = resultPromise.then(
+  const resultPromise = s.queueTail.then(run, run);
+  s.queueTail = resultPromise.then(
     () => undefined,
     () => undefined,
   );
@@ -961,15 +1063,16 @@ function enqueue<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Single-turn ask against the dedicated voice-brain session. Returns
+ * Single-turn ask against the anchor's voice-brain session. Returns
  * the trimmed assistant reply text, or null on disabled, unavailable,
  * or timeout. Never throws; on null the caller's fail-safe (forward
  * the utterance to Lex) fires unchanged.
  */
 export function askVoice(input: AskVoiceInput): Promise<string | null> {
-  return enqueue(() => askVoiceInner(input)).catch((err) => {
+  const s = stateFor(input.anchorId);
+  return enqueue(s, () => askVoiceInner(s, input)).catch((err) => {
     deps.log(
-      `[voice-brain] askVoice threw (treated as unavailable): ${(err as Error).message}`,
+      `[voice-brain] ${tag(s)} askVoice threw (treated as unavailable): ${(err as Error).message}`,
     );
     return null;
   });
@@ -987,17 +1090,19 @@ export function _setVoiceBrainSessionDepsForTests(
 }
 
 export function _resetVoiceBrainSessionStateForTests(): void {
-  state = initialState();
-  queueTail = Promise.resolve();
-  warmupPromise = null;
+  sessions.clear();
 }
 
-/** Await the in-flight warmup (resolved immediately when none). Tests
- * only: production callers never wait on boot. */
-export function _voiceBrainWarmupForTests(): Promise<void> {
-  return warmupPromise ?? Promise.resolve();
+/** Await the anchor's in-flight warmup (resolved immediately when
+ * none). Tests only: production callers never wait on boot. */
+export function _voiceBrainWarmupForTests(anchorId?: string | null): Promise<void> {
+  return sessions.get(keyFor(anchorId))?.warmupPromise ?? Promise.resolve();
 }
 
-export function _voiceBrainSessionSnapshotForTests(): Readonly<VoiceBrainSessionState> {
-  return { ...state };
+export function _voiceBrainSessionSnapshotForTests(
+  anchorId?: string | null,
+): Readonly<Omit<VoiceBrainSessionState, 'warmupPromise' | 'queueTail'>> {
+  const s = stateFor(anchorId);
+  const { warmupPromise: _w, queueTail: _q, ...rest } = s;
+  return { ...rest };
 }
