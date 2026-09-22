@@ -34,5 +34,6 @@ is FOR (purpose), not a line-by-line summary.
 - [archive/](archive/) - historical handovers, postmortems, superseded waves and phase plans, the pre-FUNCTIONAL-SPEC architecture drafts; read only for provenance
 - [bugs/](bugs/) - active bug log; appended-to, never multiplied. Open bugs in `bugs/README.md`; per-bug docs are dated files with root-cause sections
 - [install/](install/) - installation, prerequisites, file/path layout, troubleshooting, recovery, audio/video/heartbeat/notifications/tailscale subnotes
-- [spec/](spec/) - current architecture and design specs (FUNCTIONAL-SPEC, LEX-AUTONOMY-PAYLOAD-SPEC, LEX-STANDALONE-SUPERVISION, COALESCE-UTTERANCE-QUEUE, PROJECT-ANCHORS, SMART-COMPACT, EVENT-DRIVEN-SUPERVISION, PANIC-BUTTON, PHASE-8-RELIABILITY-PLAN, STREAMDECK-DEVNEURAL-ALIGNMENT, FUTURE-DAEMON-SPLIT, codex reviews)
+- [spec/LAYER-1-CONTROL](spec/LAYER-1-CONTROL.md) - canonical voice-layers design: L1 voice (haiku headless terminal, personality, noise gate, sees L2), L2 brain, L3 workers; boot order, knobs, plan approval and dispatch gate through L1
+- [spec/](spec/) - current architecture and design specs (FUNCTIONAL-SPEC, LAYER-1-CONTROL, LEX-AUTONOMY-PAYLOAD-SPEC, LEX-STANDALONE-SUPERVISION, COALESCE-UTTERANCE-QUEUE, PROJECT-ANCHORS, SMART-COMPACT, EVENT-DRIVEN-SUPERVISION, PANIC-BUTTON, PHASE-8-RELIABILITY-PLAN, STREAMDECK-DEVNEURAL-ALIGNMENT, FUTURE-DAEMON-SPLIT, codex reviews)
 - [superpowers/](superpowers/) - shared "superpower" skill reference docs consumed by plugin-side hooks
