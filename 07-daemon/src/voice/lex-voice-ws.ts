@@ -364,6 +364,8 @@ interface ConnState {
   /* What the [live] block knows about L2: any assistant record seen on
    * the bound jsonl (= warm), and the tool L2 is currently in. */
   midSeenAssistant: boolean;
+  /* BUG-026: L2's PTY reached its composer (latched by midState()). */
+  midComposerSeen: boolean;
   midLastToolName: string | null;
   /* brain-progress throttle (one L1 event per window). */
   lastBrainProgressMs: number;
@@ -1912,6 +1914,9 @@ export interface MidStateInput {
   ptyAlive: boolean;
   awaitingSystemPrompt: boolean;
   seenAssistant: boolean;
+  /** BUG-026: the L2 PTY has booted to its composer (banner scrolled,
+   * output quiet). Warm without waiting for a first assistant record. */
+  composerUp: boolean;
   ttsActive: boolean;
   awaitingResponseSince: number;
   lastToolName: string | null;
@@ -1931,7 +1936,7 @@ export function _midStateImpl(i: MidStateInput): {
     return { mid: i.directLlmInFlight ? 'thinking' : 'idle', sinceMs: null, tool: null };
   }
   if (!i.hasBind || !i.ptyAlive) return { mid: 'down', sinceMs: null, tool: null };
-  if (i.awaitingSystemPrompt || !i.seenAssistant) {
+  if (i.awaitingSystemPrompt || !(i.seenAssistant || i.composerUp)) {
     return { mid: 'warming', sinceMs: null, tool: null };
   }
   if (i.ttsActive) return { mid: 'replying', sinceMs: null, tool: null };
@@ -2068,6 +2073,28 @@ const BRAIN_PROGRESS_MS = 45_000;
  * merged text goes down anyway (the CC composer buffers a paste). */
 const WARM_QUEUE_CAP_MS = 5 * 60_000;
 
+/* L2 "composer up" (BUG-026, 2026-09-22): a freshly opened L2 writes no
+ * jsonl until its first turn, and that turn could not arrive while the
+ * daemon called it warming and parked every forward (circular; the live
+ * test saw warming=true for 110 minutes). The PTY says the same thing the
+ * operator's eyes do: the banner has scrolled and output has gone quiet.
+ * Latched once seen, so L2's first turn (spinner output) cannot flip it
+ * back. The jsonl assistant record stays a second sufficient signal. */
+export const L2_WARM_MIN_UPTIME_MS = 15_000;
+export const L2_WARM_QUIET_MS = 3_000;
+
+export function _l2ComposerUpImpl(i: {
+  exited: boolean;
+  awaitingSystemPrompt: boolean;
+  startedAt: number;
+  lastActivity: number;
+  nowMs: number;
+}): boolean {
+  if (i.exited || i.awaitingSystemPrompt) return false;
+  if (i.nowMs - i.startedAt < L2_WARM_MIN_UPTIME_MS) return false;
+  return i.nowMs - i.lastActivity >= L2_WARM_QUIET_MS;
+}
+
 export function attachLexVoiceWs(socket: FastifyWS): void {
   logFn(`[voice-ws] client connected (attach)`);
   /* 2026-07-16 smoke-test fix 3: boot the voice brain the moment a
@@ -2116,6 +2143,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     pendingForwardsUntilWarm: [],
     warmQueueTimer: null,
     midSeenAssistant: false,
+    midComposerSeen: false,
     midLastToolName: null,
     lastBrainProgressMs: 0,
     topOwnsAck: false,
@@ -3214,11 +3242,30 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     if (!state.midSeenAssistant && state.jsonlPath && jsonlHasAssistantRecord(state.jsonlPath)) {
       state.midSeenAssistant = true;
     }
+    const awaitingSystemPrompt = state.bindKey ? isAwaitingSystemPrompt(state.bindKey) : false;
+    if (!state.midComposerSeen && handle && state.bindKey) {
+      const nowMs = Date.now();
+      if (
+        _l2ComposerUpImpl({
+          exited: handle.exited,
+          awaitingSystemPrompt,
+          startedAt: handle.startedAt,
+          lastActivity: handle.lastActivity,
+          nowMs,
+        })
+      ) {
+        state.midComposerSeen = true;
+        logFn(
+          `[voice-ws] L2 composer up after ${Math.round((nowMs - handle.startedAt) / 1000)}s; brain idle`,
+        );
+      }
+    }
     return _midStateImpl({
       hasBind: Boolean(state.bindKey),
       ptyAlive: Boolean(handle && !handle.exited),
-      awaitingSystemPrompt: state.bindKey ? isAwaitingSystemPrompt(state.bindKey) : false,
+      awaitingSystemPrompt,
       seenAssistant: state.midSeenAssistant,
+      composerUp: state.midComposerSeen,
       ttsActive: Boolean(state.ttsActive),
       awaitingResponseSince: state.awaitingResponseSince,
       lastToolName: state.midLastToolName,

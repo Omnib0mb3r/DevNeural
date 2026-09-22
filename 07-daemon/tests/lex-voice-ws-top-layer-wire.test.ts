@@ -10,9 +10,12 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  _l2ComposerUpImpl,
   _midStateImpl,
   _planTopLayerActionsImpl,
   _shouldRecordCutAsFinalImpl,
+  L2_WARM_MIN_UPTIME_MS,
+  L2_WARM_QUIET_MS,
 } from '../src/voice/lex-voice-ws.js';
 import type { TopLayerResult } from '../src/voice/voice-top-layer.js';
 
@@ -22,12 +25,25 @@ describe('_midStateImpl', () => {
     ptyAlive: true,
     awaitingSystemPrompt: false,
     seenAssistant: true,
+    composerUp: false,
     ttsActive: false,
     awaitingResponseSince: 0,
     lastToolName: null as string | null,
     directLlm: false,
     directLlmInFlight: false,
   };
+
+  it('composer up counts as warm even before the first assistant record (BUG-026)', () => {
+    expect(_midStateImpl({ ...base, seenAssistant: false, composerUp: true }).mid).toBe('idle');
+    expect(
+      _midStateImpl({ ...base, seenAssistant: false, composerUp: true, awaitingResponseSince: 10 })
+        .mid,
+    ).toBe('thinking');
+    expect(
+      _midStateImpl({ ...base, seenAssistant: false, composerUp: true, awaitingSystemPrompt: true })
+        .mid,
+    ).toBe('warming');
+  });
 
   it('down / warming / idle / thinking / tool / replying', () => {
     expect(_midStateImpl({ ...base, hasBind: false }).mid).toBe('down');
@@ -51,6 +67,27 @@ describe('_midStateImpl', () => {
       _midStateImpl({ ...base, hasBind: false, directLlm: true, directLlmInFlight: true }).mid,
     ).toBe('thinking');
     expect(_midStateImpl({ ...base, hasBind: false, directLlm: true }).mid).toBe('idle');
+  });
+});
+
+describe('_l2ComposerUpImpl (BUG-026)', () => {
+  const up = {
+    exited: false,
+    awaitingSystemPrompt: false,
+    startedAt: 0,
+    lastActivity: 20_000,
+    nowMs: 40_000,
+  };
+  it('is up once the PTY is old enough and its output has been quiet', () => {
+    expect(_l2ComposerUpImpl(up)).toBe(true);
+  });
+  it('is not up during boot, while output still flows, on a native prompt, or after exit', () => {
+    expect(_l2ComposerUpImpl({ ...up, nowMs: L2_WARM_MIN_UPTIME_MS - 1, lastActivity: 0 })).toBe(
+      false,
+    );
+    expect(_l2ComposerUpImpl({ ...up, lastActivity: up.nowMs - L2_WARM_QUIET_MS + 1 })).toBe(false);
+    expect(_l2ComposerUpImpl({ ...up, awaitingSystemPrompt: true })).toBe(false);
+    expect(_l2ComposerUpImpl({ ...up, exited: true })).toBe(false);
   });
 });
 
