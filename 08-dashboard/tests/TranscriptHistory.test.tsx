@@ -272,3 +272,51 @@ describe("TranscriptHistory - collapse toggle persistence", () => {
     expect(calls).toEqual([true, false]);
   });
 });
+
+describe("TranscriptHistory - Layer 1 ignored utterances", () => {
+  it("renders an ignored operator line greyed with a '(not for Lex)' marker", () => {
+    /* LAYER-1-CONTROL.md "Transcript and client": a dropped utterance
+     * still shows so the operator can see what Layer 1 threw away. */
+    render(
+      <TranscriptHistory
+        turns={[
+          { id: "o1", role: "user", layer: "operator", text: "start the build" },
+          {
+            id: "i1",
+            role: "user",
+            layer: "operator",
+            text: "pass the remote",
+            ignored: true,
+          },
+        ]}
+      />,
+    );
+    const rows = screen.getAllByTestId("lex-turn");
+    expect(rows).toHaveLength(2);
+    /* The normal operator line is untouched. */
+    expect(rows[0]).not.toHaveAttribute("data-ignored");
+    expect(rows[0]!.style.opacity).toBe("");
+    expect(rows[0]).not.toHaveTextContent(/not for Lex/);
+    /* The dropped line keeps its operator label and text, greyed, with
+     * the marker appended as plain text (no control). */
+    expect(rows[1]).toHaveAttribute("data-ignored", "1");
+    expect(rows[1]).toHaveAttribute("data-layer", "operator");
+    expect(rows[1]).toHaveTextContent(/you:/);
+    expect(rows[1]).toHaveTextContent(/pass the remote/);
+    expect(rows[1]).toHaveTextContent(/\(not for Lex\)/);
+    expect(rows[1]!.style.opacity).toBe("0.45");
+    expect(rows[1]!.querySelectorAll("button")).toHaveLength(0);
+  });
+
+  it("an ignored line never spawns a deep (brain) node of its own", () => {
+    render(
+      <TranscriptHistory
+        turns={[
+          { id: "i1", role: "user", layer: "operator", text: "tv chatter", ignored: true },
+        ]}
+      />,
+    );
+    expect(screen.getAllByTestId("lex-turn")).toHaveLength(1);
+    expect(screen.queryByTestId("lex-deep-toggle")).not.toBeInTheDocument();
+  });
+});

@@ -26,6 +26,9 @@ export interface TranscriptTurn {
   role: "user" | "assistant";
   text: string;
   layer?: TranscriptLayer;
+  /** Layer 1 dropped the utterance (daemon `t:'ignored'` frame): nothing
+   * was forwarded, no reply follows. The panel renders it greyed. */
+  ignored?: boolean;
 }
 
 export type TranscriptStatus =

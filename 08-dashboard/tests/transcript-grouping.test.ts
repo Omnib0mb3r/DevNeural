@@ -108,4 +108,26 @@ describe("groupTranscriptTurns (P4 two-party + collapsed deep)", () => {
     expect(groups[1]!.deep[0]!.text).toBe("deep1");
     expect(groups[3]!.deep[0]!.text).toBe("deep2");
   });
+
+  it("an ignored operator turn (Layer 1 dropped it) survives grouping with the flag intact", () => {
+    /* LAYER-1-CONTROL.md "Transcript and client": a dropped utterance
+     * arrives as an operator turn tagged ignored=true. It is a normal
+     * top-level row (never folded, never a deep child) and the flag is
+     * passed through untouched so the panel can grey it out. */
+    const groups = groupTranscriptTurns([
+      op("start the build", "o1"),
+      { ...op("pass the remote", "i1"), ignored: true },
+      top("on it", "t1"),
+    ]);
+    expect(groups).toHaveLength(3);
+    expect(groups[1]!.row).toMatchObject({
+      layer: "operator",
+      text: "pass the remote",
+      ignored: true,
+    });
+    expect(groups[1]!.deep).toHaveLength(0);
+    /* Neighbouring rows do not pick up the flag. */
+    expect(groups[0]!.row?.ignored).toBeUndefined();
+    expect(groups[2]!.row?.ignored).toBeUndefined();
+  });
 });

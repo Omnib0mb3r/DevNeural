@@ -114,6 +114,9 @@ interface VoiceCtxValue {
     text: string;
     silent?: boolean;
     layer?: "operator" | "top" | "mid";
+    /* Layer 1 dropped this operator utterance (daemon 'ignored' frame);
+     * nothing was forwarded. Rendered greyed by TranscriptHistory. */
+    ignored?: boolean;
   }>;
   hasLex: boolean;
   /* Soft mute set by the "Lex mute / shut up / be quiet / stop talking"
@@ -485,6 +488,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       text: string;
       silent?: boolean;
       layer?: "operator" | "top" | "mid";
+      ignored?: boolean;
     }>
   >([]);
   const TURNS_BUFFER_CAP = 50;
@@ -2378,6 +2382,48 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                 layer: "operator",
               });
             } else setStatus("ready");
+            break;
+          }
+          case "ignored": {
+            /* Layer 1 heard the utterance and dropped it: background
+             * noise, or not addressed to Lex (LAYER-1-CONTROL.md,
+             * "Transcript and client"). Nothing was forwarded, so no
+             * reply is coming: no status flip, no TTS, no thinking
+             * placeholder. The line still lands in the transcript,
+             * flagged ignored, so the operator can see what was dropped
+             * (rendered greyed with a "(not for Lex)" marker). */
+            const ignoredText = String(msg.text ?? "").trim();
+            if (ignoredText) {
+              const turnId = `i-${Date.now()}-${Math.random()
+                .toString(36)
+                .slice(2, 8)}`;
+              setTurns((prev) => {
+                const next = [
+                  ...prev,
+                  {
+                    id: turnId,
+                    role: "user" as const,
+                    text: ignoredText,
+                    layer: "operator" as const,
+                    ignored: true,
+                  },
+                ];
+                return next.length > TURNS_BUFFER_CAP
+                  ? next.slice(next.length - TURNS_BUFFER_CAP)
+                  : next;
+              });
+              /* Same pure render bus the 'transcript' case feeds: its
+               * only subscriber is LexTranscriptHistoryPanel, which
+               * appends the line to its own list. No audio or reply
+               * hangs off it, so the dropped line shows on /lex too. */
+              emitTranscriptTurn({
+                id: turnId,
+                role: "user",
+                text: ignoredText,
+                layer: "operator",
+                ignored: true,
+              });
+            }
             break;
           }
           case "layer-hop": {

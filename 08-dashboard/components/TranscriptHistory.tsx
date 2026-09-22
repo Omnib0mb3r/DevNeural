@@ -34,6 +34,10 @@ export interface TranscriptTurn {
   role: "user" | "assistant";
   text: string;
   layer?: TranscriptLayer;
+  /** Layer 1 dropped this operator utterance (background noise or not
+   * addressed to Lex). Rendered greyed with a "(not for Lex)" marker so
+   * the operator can see what was dropped. */
+  ignored?: boolean;
 }
 
 /* Speaker label per turn. Layer wins when present (three-way); role is
@@ -154,11 +158,17 @@ export function TranscriptHistory({
             return (
               <div key={g.id} className="space-y-1">
                 {g.row && (
+                  /* An operator line Layer 1 dropped (background noise or
+                   * not addressed to Lex) still shows, greyed, with a
+                   * trailing "(not for Lex)" marker. Nothing was
+                   * forwarded, so no voice or brain line follows it. */
                   <div
                     data-testid="lex-turn"
                     data-role={g.row.role}
                     data-layer={g.row.layer}
+                    data-ignored={g.row.ignored ? "1" : undefined}
                     className="flex items-start gap-2"
+                    style={g.row.ignored ? { opacity: 0.45 } : undefined}
                   >
                     <span
                       className={`text-nano font-mono mr-2 shrink-0 ${turnLabelClass(g.row)}`}
@@ -167,6 +177,9 @@ export function TranscriptHistory({
                     </span>
                     <span className="text-txt1 flex-1 min-w-0 whitespace-pre-wrap">
                       {g.row.text}
+                      {g.row.ignored && (
+                        <span className="text-txt3 italic"> (not for Lex)</span>
+                      )}
                     </span>
                   </div>
                 )}

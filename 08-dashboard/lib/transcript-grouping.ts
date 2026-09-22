@@ -21,6 +21,12 @@ export interface TranscriptTurn {
   text: string;
   layer?: "operator" | "top" | "mid";
   silent?: boolean;
+  /** Layer 1 dropped this operator utterance (background noise or not
+   * addressed to Lex; LAYER-1-CONTROL.md "Transcript and client").
+   * Nothing was forwarded. The row still renders, greyed, so the
+   * operator can see what was dropped. Grouping passes it through
+   * untouched. */
+  ignored?: boolean;
 }
 
 export interface TranscriptGroup {
