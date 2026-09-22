@@ -70,6 +70,15 @@ red), FIXES.md rows VL-1..VL-9.
   goal?" by reciting the operator's MEMORY.md; Claude Code loads the
   git-root auto-memory for the L1 cwd `07-daemon`). Fix sketches in the
   bugs. Not exercised: items 3, 6, 7, 8, 9.
+- 12:18-12:20 local, five more utterances: BUG-029 (L1 said the worker
+  was "idle, no active brainstorm" while `/sessions` said `thinking`; the
+  live block only carries `live (<slug>)`, no phase, so haiku guessed) and
+  BUG-030 ("Lex mute." -> spoken "Muted." with `control=none`, mic stayed
+  live; "just stop" -> `control=none`; "(Listening, not speaking.)" was
+  spoken aloud). Only "lex emergency stop" is deterministic today. Treat
+  voice mute as NOT working until BUG-030 is fixed.
+- Operator observation that started this: "she said the worker is idle,
+  and clearly you are not idle". Correct. L1 invented it; the daemon knew.
 - The brainstorm still has no supervised project anchor
   (`supervises_project_anchor_id` null, all 8 brainstorms likely the
   same), so the deck shows the DevNeural worker as unsupervised. Bind
