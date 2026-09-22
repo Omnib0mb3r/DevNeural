@@ -40,6 +40,9 @@ describe('persona: one Lex, two mouths', () => {
     const voice = composeVoiceIdentity();
     expect(voice).toContain(LEX_SPOKEN_RULES);
     expect(voice).not.toContain(LEX_TEXT_STYLE);
+    /* The brain's daemon-API pointer never reaches the tool-less voice. */
+    expect(voice).not.toContain('GET /lex/snapshot');
+    expect(composeBrainIdentity()).toContain('GET /lex/snapshot');
     expect(LEX_SPOKEN_RULES).toMatch(/no markdown/i);
     expect(LEX_SPOKEN_RULES).toMatch(/UUID/);
     expect(LEX_SPOKEN_RULES).not.toMatch(/—|–/);

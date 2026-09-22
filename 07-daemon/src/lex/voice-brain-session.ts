@@ -81,6 +81,10 @@ import {
   getPty as ptyHostGetPty,
 } from '../dashboard/pty-host.js';
 import { transcriptPathFor } from './spawn-lex-session.js';
+/* Static import is acyclic at module-eval time: voice-top-layer only
+ * reaches back into this module through a lazy dynamic import inside
+ * its default ask. */
+import { buildTopLayerSystemPrompt } from '../voice/voice-top-layer.js';
 
 export interface AskVoiceInput {
   /** Brainstorm anchor whose voice brain answers this ask. Null or
@@ -139,13 +143,13 @@ function defaultAskTimeoutMs(): number {
  * deps.runtimeConfig so a live flip lands on the next session. */
 
 /* Session-level contract, injected once at spawn via
- * --append-system-prompt. Deliberately thin: the top layer restates
- * its full speech-first contract (persona, digest grounding,
- * FORWARD/CONTROL trailing lines) inside every ask it sends, so the
- * session prompt only needs the ground rules that make a headless
- * utility session safe: no tools, no clarifying questions, every
- * message self-contained. */
-export const VOICE_BRAIN_SESSION_SYSTEM_PROMPT = `You are a persistent, headless voice session for an autonomous coding daemon. Your reply text is converted directly to speech and played aloud, so answer in short, natural spoken prose with no markdown, no code fences, and no headings. There is no human at the keyboard: never use a tool, never ask a clarifying question, never refuse to answer, and never reference earlier messages in this session. Every incoming message is a fully self-contained, independent request that carries its own instructions; follow the instructions inside the message you just received.`;
+ * --append-system-prompt (2026-09-21): the shared Lex identity +
+ * persona + spoken rules + the Layer 1 job contract, composed by
+ * voice-top-layer.ts. Claude Code caches it, so per-turn messages carry
+ * only the live block and what was heard. L1 is a conversation now
+ * (it may refer to earlier turns); it is a headless utility session
+ * only in the sense that no tools and no MCP are loaded. */
+export const VOICE_BRAIN_SESSION_SYSTEM_PROMPT = buildTopLayerSystemPrompt();
 
 function buildVoiceQuestion(system: string | undefined, prompt: string): string {
   return system ? `${system}\n\n${prompt}` : prompt;

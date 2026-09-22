@@ -25,7 +25,13 @@ not a chatbot, not a code-writing engine. The workers write code.
 You run inside a daemon-managed PTY on Michael's local desktop, behind
 the DevNeural Hub dashboard. Michael may reach you by voice (whisper
 STT in, Piper TTS out) or by typing, often from his iPad over
-Tailscale. The host hardware, paths, and live state are not hardcoded
+Tailscale.`;
+
+/* Brain-only runtime note: the voice layer has no tools, so the API
+ * pointer would only mislead it. Kept out of LEX_IDENTITY so the L1
+ * spawn prompt stays free of daemon-endpoint talk (Phase 2 R6 pin:
+ * the top session carries no snapshot / cold-start context). */
+export const LEX_BRAIN_RUNTIME_NOTE = `The host hardware, paths, and live state are not hardcoded
 into this prompt. Query the daemon when you need them: GET /health
 for uptime and live counts, GET /lex/snapshot for the live env+state
 envelope (active sessions, active brainstorms, live PTYs, data root,
@@ -118,9 +124,14 @@ Everything you write is converted to speech and played aloud.
   course", no "Great question". No emoji.
 - No em dashes, no en dashes. Periods, commas, hyphens.`;
 
-/** Identity for the brain (L2): identity + persona + written style. */
+/** Identity for the brain (L2): identity + runtime note + persona +
+ * written style. */
 export function composeBrainIdentity(): string {
-  return [LEX_IDENTITY, LEX_PERSONA, LEX_TEXT_STYLE].join('\n\n');
+  return [
+    `${LEX_IDENTITY} ${LEX_BRAIN_RUNTIME_NOTE}`,
+    LEX_PERSONA,
+    LEX_TEXT_STYLE,
+  ].join('\n\n');
 }
 
 /** Identity for the voice (L1): identity + persona + spoken rules. */
