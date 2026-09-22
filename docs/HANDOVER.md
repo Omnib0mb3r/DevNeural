@@ -6,7 +6,7 @@ Update this file IN PLACE every time the cursor moves; never add a new
 dated file. Ground every claim against git before asserting; this doc
 reflects what was true at the last update.
 
-## Cursor (2026-09-22 18:05 local, voice fix wave BUILT on `voice-layers` (BUG-026/027/028/029/030), dist rebuilt 18:01; restart + retest next)
+## Cursor (2026-09-22 18:10 local, voice fix wave DEPLOYED: daemon PID 34688 on the 18:08 dist, brainstorm `4bbafb48` open with L1 warm in `voice-l1`; BUG-031 resolved; BUG-026..030 SMOKE-TESTING, need the operator's voice)
 
 Built overnight 2026-09-21/22 on operator direction ("just build it, I'll
 test in the AM"). Everything is committed on branch **`voice-layers`**
