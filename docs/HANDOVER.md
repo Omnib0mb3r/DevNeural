@@ -43,9 +43,14 @@ red), FIXES.md rows VL-1..VL-9.
   Trap: an `npm run build` while on master would replace the branch dist.
 - BUG-024 logged (project anchor seed pass aborts every boot on the
   `Resume` slug collision; two months old, unrelated to the wave).
-- Noise seen at boot, not chased: `[wiki-push] push failed: git push
-  --quiet ... remote: error: See https://gh.io/lfs` (wiki repo push
-  rejected on LFS).
+- BUG-025 logged: `[wiki-push] push failed` every 300s since 2026-08-02
+  because a wiki page grew to 134 MB by frontmatter single-quote doubling
+  (`escapeScalar` doubles, `parseScalar` never undoubles); the four
+  unpushed wiki commits carry it and GitHub rejects files over 100 MB.
+  Fix recipe in the entry; the local history rewrite is the operator's call.
+- L2 after Open sits with an empty composer and no jsonl until the first
+  voice forward; that is normal (last night's first user record came 11s
+  after the first forward, not at reopen). Do not "kick" it.
 
 ### What shipped (branch commits, oldest first)
 
