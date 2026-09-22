@@ -126,9 +126,17 @@ claude --session-id <pre-minted uuid>
 ```
 
 Effort note: `--effort` levels are low / medium / high / xhigh / max. Haiku
-4.5 has no effort parameter (it runs thinking-off and is already the floor;
-the CLI accepts the flag on haiku and it changes nothing). The knob exists so
-Sonnet 5 or Opus can be flipped in at `low` for an A/B without a rebuild.
+4.5 has no effort parameter (the CLI accepts the flag on haiku and it changes
+nothing). The knob exists so Sonnet 5 or Opus can be flipped in at `low` for
+an A/B without a rebuild.
+
+Thinking off (the speed lever, measured 2026-09-22 with `claude -p --model
+haiku`): Claude Code spends 100-300 thinking tokens per haiku reply by
+default, 3.0s API time and 2.2s to first token for one spoken sentence.
+With `MAX_THINKING_TOKENS=0` in the session env: 0 thinking tokens, 0.64s
+API time, 0.66s to first token, the identical sentence. L1 spawns with that
+env (override `DEVNEURAL_VOICE_BRAIN_THINKING_TOKENS`). The voice never
+needs to think; the brain does.
 
 L1 gets NO cold-start preload: no sibling index, no distillation reseed, no
 investigator. It carries only the live block described below. Less context
@@ -163,6 +171,10 @@ module (see "Personality"):
    canned pulse). When the brain replies, say so in your own words and
    deliver it. Facts from the brain are delivered verbatim; the
    conversation around them is yours.
+   Seamless (operator's goal, 2026-09-22): out loud there is only one Lex.
+   The words brain, layer, top, mid, session, model and deeper reasoning
+   are for the contract, never for Michael ("still on it", "right, got
+   it"). He must never be able to tell there are two of you.
 5. Seeing L2: the live block tells you what the deeper brain is doing and
    for how long. Say so when asked or when it matters ("still reading the
    schema, about forty seconds in"). Never wait for it before replying.
@@ -432,7 +444,12 @@ the gate makes it mechanical.
 
 ## Transcript and client
 
-- Transcript labels by layer stay as shipped (you / lex voice / lex deep).
+- One Lex in the transcript (2026-09-22): every assistant line, whether it
+  came from L1 (spoken lines, sent as `layer-hop` frames) or L2 (the reply,
+  `assistant-text`), is labelled `lex:` and rendered flat, in order. The old
+  collapsed "brain replied" step-down and the "to Lex (brain): ..." hop line
+  are gone; the routing lives in `daemon.log` (`[voice-ws] forward to L2:
+  ...`). `data-layer` stays on the rows for debugging.
 - A dropped utterance emits `{t:'ignored', text, reason}` so the transcript
   can grey it out. Unknown frames are ignored by older clients.
 - Dashboard control surface: unchanged. No new buttons, sliders or knobs on

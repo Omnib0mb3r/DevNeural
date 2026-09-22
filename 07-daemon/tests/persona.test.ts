@@ -45,6 +45,7 @@ describe('persona: one Lex, two mouths', () => {
     expect(composeBrainIdentity()).toContain('GET /lex/snapshot');
     expect(LEX_SPOKEN_RULES).toMatch(/no markdown/i);
     expect(LEX_SPOKEN_RULES).toMatch(/UUID/);
+    expect(LEX_SPOKEN_RULES).toMatch(/only one of you/);
     expect(LEX_SPOKEN_RULES).not.toMatch(/—|–/);
   });
 

@@ -5048,9 +5048,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * turn, the warm-queue flush and cancel_redirect share one path. */
   async function forwardToL2(text: string, sttMs: number): Promise<void> {
     let result: { text: string; ms: number } = { text, ms: sttMs };
-    /* Three-way transcript: surface the you -> voice -> deep hop; the L2
-     * reply comes back later as an assistant-text (layer 'mid'). */
-    send({ t: 'layer-hop', layer: 'top', text: `to Lex (brain): ${text}` });
+    /* Seamless (2026-09-22): no "to Lex (brain): ..." hop line in the
+     * transcript any more. The operator hears / reads Layer 1's own
+     * handoff line and then the reply; the routing is plumbing and lives
+     * in the daemon log only. */
+    logFn(`[voice-ws] forward to L2: ${JSON.stringify(text.slice(0, 120))}`);
     /* Brainstorm-as-durable-primary-entity (2026-05-22, Path B).
      * Direct-llm branch: no PTY, no jsonl watch. Build the system
      * prompt + brainstorm chunks history, call ollama, stream the

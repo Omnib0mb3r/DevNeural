@@ -3,15 +3,10 @@ import { groupTranscriptTurns } from "../lib/transcript-grouping";
 import type { TranscriptTurn } from "../lib/transcript-grouping";
 
 /**
- * P4 (2026-07-18 VOICE-TOP-LAYER-SMARTS-SPEC): the three-way transcript
- * must read as a TWO-PARTY conversation between the operator and VOICE.
- * The deep (MID) layer is NOT a bubble that addresses the operator; it
- * renders as a thin COLLAPSED step-down node UNDER the voice line.
- *
- * groupTranscriptTurns is the pure grouping the panel renders: operator
- * and voice turns become top-level rows; each mid (deep) turn is folded
- * into the `deep` list of the most recent row (the voice line it
- * answered), never a row of its own.
+ * One Lex (2026-09-22, LAYER-1-CONTROL.md "Transcript and client"): the
+ * transcript never reveals that two layers answer the operator. Every
+ * assistant turn, voice (`top`) or brain (`mid`), is its own flat row in
+ * order; nothing folds, nothing collapses.
  */
 const op = (text: string, id = "o"): TranscriptTurn => ({
   id,
@@ -32,52 +27,37 @@ const mid = (text: string, id = "m"): TranscriptTurn => ({
   layer: "mid",
 });
 
-describe("groupTranscriptTurns (P4 two-party + collapsed deep)", () => {
-  it("folds a mid turn under the preceding voice line", () => {
+describe("groupTranscriptTurns (one Lex, flat rows)", () => {
+  it("renders voice and brain turns as their own rows, in order", () => {
     const groups = groupTranscriptTurns([
       op("start the build"),
-      top("on it, handing to Lex"),
+      top("on it"),
       mid("build kicked off"),
     ]);
-    expect(groups).toHaveLength(2);
-    expect(groups[0]!.row).toMatchObject({ layer: "operator" });
-    expect(groups[0]!.deep).toHaveLength(0);
-    expect(groups[1]!.row).toMatchObject({ layer: "top" });
-    expect(groups[1]!.deep).toHaveLength(1);
-    expect(groups[1]!.deep[0]!.text).toBe("build kicked off");
+    expect(groups).toHaveLength(3);
+    expect(groups.map((g) => g.row?.layer)).toEqual(["operator", "top", "mid"]);
+    expect(groups[2]!.row?.text).toBe("build kicked off");
+    for (const g of groups) expect(g.deep).toHaveLength(0);
   });
 
-  it("never emits a mid turn as its own top-level row", () => {
-    const groups = groupTranscriptTurns([
-      op("q"),
-      top("ack"),
-      mid("deep answer"),
-    ]);
-    for (const g of groups) {
-      expect(g.row?.layer).not.toBe("mid");
-    }
-  });
-
-  it("attaches multiple consecutive mids to the same voice line", () => {
+  it("consecutive brain turns stay separate rows", () => {
     const groups = groupTranscriptTurns([
       op("q"),
       top("ack"),
       mid("part one", "m1"),
       mid("part two", "m2"),
     ]);
-    expect(groups).toHaveLength(2);
-    expect(groups[1]!.deep.map((d) => d.text)).toEqual(["part one", "part two"]);
+    expect(groups.map((g) => g.row?.text)).toEqual(["q", "ack", "part one", "part two"]);
   });
 
-  it("a conversational (top-only) turn has no deep child", () => {
-    /* P2 case: the top fielded a greeting itself, nothing went deep. */
-    const groups = groupTranscriptTurns([op("good morning"), top("morning boss")]);
-    expect(groups).toHaveLength(2);
-    expect(groups[1]!.row).toMatchObject({ layer: "top" });
-    expect(groups[1]!.deep).toHaveLength(0);
+  it("a brain reply with no preceding voice line is still a row, never hidden", () => {
+    const groups = groupTranscriptTurns([mid("straight answer")]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.row).toMatchObject({ layer: "mid", text: "straight answer" });
+    expect(groups[0]!.deep).toHaveLength(0);
   });
 
-  it("keeps back-compat: legacy assistant turns (no layer) are voice rows", () => {
+  it("keeps back-compat: legacy assistant turns (no layer) are rows", () => {
     const groups = groupTranscriptTurns([
       { id: "u", role: "user", text: "hi" },
       { id: "a", role: "assistant", text: "hello" },
@@ -85,35 +65,14 @@ describe("groupTranscriptTurns (P4 two-party + collapsed deep)", () => {
     expect(groups).toHaveLength(2);
     expect(groups[0]!.row?.role).toBe("user");
     expect(groups[1]!.row?.role).toBe("assistant");
-    expect(groups[1]!.deep).toHaveLength(0);
   });
 
-  it("an orphan mid (no preceding row) folds into a row-less deep group, never a bubble", () => {
-    const groups = groupTranscriptTurns([mid("orphan deep")]);
-    expect(groups).toHaveLength(1);
-    expect(groups[0]!.row).toBeNull();
-    expect(groups[0]!.deep).toHaveLength(1);
-  });
-
-  it("two full exchanges each keep their own deep child", () => {
-    const groups = groupTranscriptTurns([
-      op("first", "o1"),
-      top("ack1", "t1"),
-      mid("deep1", "m1"),
-      op("second", "o2"),
-      top("ack2", "t2"),
-      mid("deep2", "m2"),
-    ]);
-    expect(groups).toHaveLength(4);
-    expect(groups[1]!.deep[0]!.text).toBe("deep1");
-    expect(groups[3]!.deep[0]!.text).toBe("deep2");
+  it("group ids are stable on the turn id, index as the fallback", () => {
+    const groups = groupTranscriptTurns([op("a", "x1"), { role: "user", text: "b" }]);
+    expect(groups.map((g) => g.id)).toEqual(["g-x1", "g-1"]);
   });
 
   it("an ignored operator turn (Layer 1 dropped it) survives grouping with the flag intact", () => {
-    /* LAYER-1-CONTROL.md "Transcript and client": a dropped utterance
-     * arrives as an operator turn tagged ignored=true. It is a normal
-     * top-level row (never folded, never a deep child) and the flag is
-     * passed through untouched so the panel can grey it out. */
     const groups = groupTranscriptTurns([
       op("start the build", "o1"),
       { ...op("pass the remote", "i1"), ignored: true },
@@ -125,8 +84,6 @@ describe("groupTranscriptTurns (P4 two-party + collapsed deep)", () => {
       text: "pass the remote",
       ignored: true,
     });
-    expect(groups[1]!.deep).toHaveLength(0);
-    /* Neighbouring rows do not pick up the flag. */
     expect(groups[0]!.row?.ignored).toBeUndefined();
     expect(groups[2]!.row?.ignored).toBeUndefined();
   });

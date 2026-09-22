@@ -128,6 +128,8 @@ describe('buildTopLayerSystemPrompt', () => {
     }
     expect(p).not.toContain('never reference earlier messages');
     expect(p).not.toMatch(/—|–/);
+    /* Seamless: the layer vocabulary is for the contract, never spoken. */
+    expect(p).toContain('Out loud there is only one of you');
   });
 });
 

@@ -43,6 +43,25 @@ red), FIXES.md rows VL-1..VL-9.
 - `e296252` trackers + SMART-COMPACT.md rewritten as the context-lifecycle doc.
 - dashboard: greyed "(not for Lex)" rows for dropped utterances.
 
+### Late addendum (2026-09-22 ~01:00, /goal "native-fast, one seamless Lex")
+
+- **Fast:** the L1 session now spawns with `MAX_THINKING_TOKENS=0`.
+  Measured with `claude -p --model haiku`: default 154 thinking tokens,
+  3.0s API time, 2.2s to first token for one spoken sentence; thinking off:
+  0 tokens, 0.64s, 0.66s, identical sentence. Override
+  `DEVNEURAL_VOICE_BRAIN_THINKING_TOKENS`.
+- **Seamless:** out loud there is one Lex. The L1 contract and the spoken
+  rules now forbid the words brain / layer / top / mid / session / model /
+  deeper reasoning; the delivery cue is "right, got it", never "the brain
+  is back". The transcript labels every assistant line `lex:` (was
+  "lex (voice):" / "lex (brain):"), renders the brain's reply as a normal
+  row (the collapsed "brain replied" toggle is gone), and the internal
+  "to Lex (brain): ..." hop line is no longer sent; the routing is in
+  `daemon.log` as `[voice-ws] forward to L2: ...`. `data-layer` stays on
+  the rows for debugging.
+- Verify items 3 and 5 below read accordingly: no "brain replied" toggle,
+  the answer text is simply the next `lex:` row.
+
 ### Verified running state at handover
 
 - Daemon PID 32924 (booted 2026-09-21 ~22:11 local) still runs the OLD

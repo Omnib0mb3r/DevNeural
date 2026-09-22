@@ -1,17 +1,22 @@
 /**
- * Transcript grouping (P4, 2026-07-18 VOICE-TOP-LAYER-SMARTS-SPEC).
+ * Transcript grouping.
  *
- * The three-way voice transcript (operator -> TOP fast voice -> MID
- * deep reasoning) must READ as a two-party conversation between the
- * operator and VOICE. The deep (MID) layer is never a bubble that
- * addresses the operator; it renders as a thin COLLAPSED step-down node
- * under the voice line it answered.
+ * One Lex (2026-09-22, LAYER-1-CONTROL.md "Transcript and client"): the
+ * operator should never be able to tell that a fast voice layer and a
+ * deeper reasoning layer answer him. Every assistant line, whether it
+ * came from the voice (`top`: the spoken lines) or the brain (`mid`: the
+ * reply text), is a top-level `lex:` row, rendered flat in order.
  *
- * This pure helper turns the flat turn list into that shape: operator
- * and voice turns become top-level rows; each `mid` turn folds into the
- * `deep` list of the most recent row (the voice line it belongs under),
- * never a row of its own. Kept separate from the React component so the
- * grouping contract pins without mounting a tree.
+ * History: the P4 shape (2026-07-18) folded every `mid` turn into a
+ * collapsed "brain replied" step-down node under the voice line, back
+ * when the voice re-spoke the brain's reply as its own visible bubble
+ * and the two would otherwise have read as a duplicate. The voice no
+ * longer emits its delivery as transcript lines, so the brain's text IS
+ * the visible answer and must not hide behind a toggle.
+ *
+ * The group shape is kept (row + deep) so the panel API stays stable;
+ * `deep` is always empty now. Kept separate from the React component so
+ * the contract pins without mounting a tree.
  */
 
 /** Structural turn shape shared with the transcript bus / panel. */
@@ -30,34 +35,17 @@ export interface TranscriptTurn {
 }
 
 export interface TranscriptGroup {
-  /** Stable key for the group (row id, else first deep id, else index). */
+  /** Stable key for the group (row id, else index). */
   id: string;
-  /** The top-level conversation line (operator / voice / legacy). Null
-   * for an orphan deep-only group (a mid with no preceding row) so the
-   * deep still renders collapsed, never as an operator-addressed
-   * bubble. */
+  /** The conversation line. Never null since 2026-09-22 (every turn is
+   * a row); the type stays nullable for the panel's back-compat. */
   row: TranscriptTurn | null;
-  /** Deep (MID) turns folded under this row, rendered collapsed. */
+  /** Always empty since 2026-09-22 (no collapsed step-down nodes). */
   deep: TranscriptTurn[];
 }
 
 export function groupTranscriptTurns(
   turns: readonly TranscriptTurn[],
 ): TranscriptGroup[] {
-  const groups: TranscriptGroup[] = [];
-  turns.forEach((t, i) => {
-    if (t.layer === "mid") {
-      let last = groups[groups.length - 1];
-      if (!last) {
-        /* Orphan deep (no voice line yet): a row-less group so it still
-         * renders as a collapsed node, never a top-level bubble. */
-        last = { id: `g-${t.id ?? `deep-${i}`}`, row: null, deep: [] };
-        groups.push(last);
-      }
-      last.deep.push(t);
-      return;
-    }
-    groups.push({ id: `g-${t.id ?? String(i)}`, row: t, deep: [] });
-  });
-  return groups;
+  return turns.map((t, i) => ({ id: `g-${t.id ?? String(i)}`, row: t, deep: [] }));
 }

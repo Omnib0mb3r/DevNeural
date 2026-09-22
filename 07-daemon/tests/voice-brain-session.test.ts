@@ -1162,3 +1162,18 @@ describe('L1 spawn argv (voice layers)', () => {
     expect(args.slice(effort, effort + 2)).toEqual(['--effort', 'low']);
   });
 });
+
+/* Fast turns (2026-09-22): Claude Code spends 100-300 thinking tokens per
+ * haiku reply by default (3.0s API, 2.2s to first token for one spoken
+ * sentence; 0.64s / 0.66s with thinking off, same sentence). The voice
+ * session is spawned with MAX_THINKING_TOKENS=0. */
+describe('L1 spawn env (voice layers)', () => {
+  it('turns thinking off for the voice session', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
+    const env = (pty.spawnCalls[0] as { env?: Record<string, string> }).env ?? {};
+    expect(env.MAX_THINKING_TOKENS).toBe('0');
+  });
+});

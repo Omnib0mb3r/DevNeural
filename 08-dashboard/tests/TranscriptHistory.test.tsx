@@ -73,47 +73,56 @@ describe("TranscriptHistory - N turns rendering", () => {
   });
 });
 
-describe("TranscriptHistory - three-way layer labels", () => {
-  it("labels operator and voice (top) as the two-party conversation", () => {
-    render(
-      <TranscriptHistory
-        turns={[
-          { id: "o", role: "user", layer: "operator", text: "start the build" },
-          { id: "t", role: "assistant", layer: "top", text: "on it, handing to Lex" },
-          { id: "m", role: "assistant", layer: "mid", text: "build kicked off" },
-        ]}
-      />,
-    );
+describe("TranscriptHistory - one Lex (2026-09-22, LAYER-1-CONTROL.md)", () => {
+  const exchange = [
+    { id: "o", role: "user" as const, layer: "operator" as const, text: "start the build" },
+    { id: "t", role: "assistant" as const, layer: "top" as const, text: "on it" },
+    { id: "m", role: "assistant" as const, layer: "mid" as const, text: "build kicked off, running now" },
+  ];
+
+  it("labels every assistant line lex:, whether it came from the voice or the brain", () => {
+    render(<TranscriptHistory turns={exchange} />);
     const turns = screen.getAllByTestId("lex-turn");
-    /* P4: only operator + voice are conversation rows; the deep (mid)
-     * turn is NOT a top-level bubble. */
-    expect(turns).toHaveLength(2);
+    expect(turns).toHaveLength(3);
     expect(turns[0]).toHaveAttribute("data-layer", "operator");
     expect(turns[0]).toHaveTextContent(/you:/);
     expect(turns[1]).toHaveAttribute("data-layer", "top");
-    expect(turns[1]).toHaveTextContent(/voice/i);
+    expect(turns[2]).toHaveAttribute("data-layer", "mid");
+    for (const t of [turns[1]!, turns[2]!]) {
+      expect(t).toHaveTextContent(/lex:/);
+      expect(t).not.toHaveTextContent(/voice|brain|layer/i);
+    }
   });
 
-  it("brain (mid) replies do not consume conversation slots in the last-N window", () => {
+  it("renders the brain reply as a visible row, never behind a toggle", () => {
+    render(<TranscriptHistory turns={exchange} />);
+    expect(screen.getByText(/build kicked off, running now/)).toBeInTheDocument();
+    expect(screen.queryByTestId("lex-deep-toggle")).not.toBeInTheDocument();
+    expect(screen.queryByText(/brain replied/i)).not.toBeInTheDocument();
+  });
+
+  it("uses one tint for every lex line", () => {
+    render(<TranscriptHistory turns={exchange} />);
+    const [, t, m] = screen.getAllByTestId("lex-turn");
+    const labelClass = (el: HTMLElement): string => el.querySelector("span")!.className;
+    expect(labelClass(t!)).toBe(labelClass(m!));
+  });
+
+  it("brain lines count toward the last-N window like any other line", () => {
     const turns = [
       { id: "o", role: "user" as const, layer: "operator" as const, text: "the real question" },
       { id: "t", role: "assistant" as const, layer: "top" as const, text: "voice answer" },
-      /* A burst of brain replies (like a long investigation). These fold
-       * under the voice line and must NOT evict the you <-> voice pair from
-       * the last-N window. Regression for the "brain replies eat the slots"
-       * bug: slicing raw turns before grouping dropped the conversation. */
       ...Array.from({ length: 12 }, (_, i) => ({
-        id: `m${i}`,
+        id: "m" + i,
         role: "assistant" as const,
         layer: "mid" as const,
-        text: `brain step ${i}`,
+        text: "step " + i,
       })),
     ];
     render(<TranscriptHistory turns={turns} maxTurns={5} />);
     const rows = screen.getAllByTestId("lex-turn");
-    expect(rows).toHaveLength(2);
-    expect(rows[0]).toHaveTextContent(/you:/);
-    expect(rows[1]).toHaveTextContent(/voice/i);
+    expect(rows).toHaveLength(5);
+    expect(rows[4]).toHaveTextContent(/step 11/);
   });
 
   it("falls back to role labels when no layer is set (back-compat)", () => {
@@ -129,59 +138,6 @@ describe("TranscriptHistory - three-way layer labels", () => {
     expect(u).toHaveTextContent(/you:/);
     expect(u).not.toHaveAttribute("data-layer");
     expect(a).toHaveTextContent(/lex:/);
-  });
-});
-
-describe("TranscriptHistory - P4 deep collapse", () => {
-  const exchange = [
-    { id: "o", role: "user" as const, layer: "operator" as const, text: "start the build" },
-    { id: "t", role: "assistant" as const, layer: "top" as const, text: "on it, handing to Lex" },
-    { id: "m", role: "assistant" as const, layer: "mid" as const, text: "build kicked off, running now" },
-  ];
-
-  it("collapses the deep reply under the voice line by default (no content shown)", () => {
-    render(<TranscriptHistory turns={exchange} />);
-    /* Deep is a thin collapsed step-down node, not a bubble. */
-    const toggle = screen.getByTestId("lex-deep-toggle");
-    expect(toggle).toHaveTextContent(/brain replied/i);
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    /* The deep TEXT is not rendered anywhere until expanded. */
-    expect(screen.queryByText(/build kicked off/)).not.toBeInTheDocument();
-  });
-
-  it("never renders the deep reply as an operator-addressed bubble", () => {
-    render(<TranscriptHistory turns={exchange} />);
-    const turns = screen.getAllByTestId("lex-turn");
-    expect(turns).toHaveLength(2);
-    for (const t of turns) {
-      expect(t).not.toHaveAttribute("data-layer", "mid");
-      expect(t).not.toHaveTextContent(/build kicked off/);
-    }
-  });
-
-  it("reveals the deep text on expand and hides it again on collapse", () => {
-    render(<TranscriptHistory turns={exchange} />);
-    const toggle = screen.getByTestId("lex-deep-toggle");
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByTestId("lex-deep-body")).toHaveTextContent(
-      /build kicked off, running now/,
-    );
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByTestId("lex-deep-body")).not.toBeInTheDocument();
-  });
-
-  it("shows no deep node for a conversational (top-only) turn", () => {
-    render(
-      <TranscriptHistory
-        turns={[
-          { id: "o", role: "user", layer: "operator", text: "good morning" },
-          { id: "t", role: "assistant", layer: "top", text: "morning boss" },
-        ]}
-      />,
-    );
-    expect(screen.queryByTestId("lex-deep-toggle")).not.toBeInTheDocument();
   });
 });
 

@@ -20,11 +20,11 @@ import {
 } from "@/lib/transcript-collapse";
 import { groupTranscriptTurns } from "@/lib/transcript-grouping";
 
-/** Three-layer voice topology (2026-07-18): the operator talks to the
- * TOP (fast voice) layer, which routes to the MID (deep reasoning /
- * brainstorm Lex) layer and back. The transcript labels each turn by
- * the layer it came from so the round trip (you -> voice -> deep -> and
- * back) is legible, not flattened to a two-party you/lex log. Absent =
+/** Three-layer voice topology: the operator talks to the TOP (fast
+ * voice) layer, which routes to the MID (deep reasoning / brainstorm
+ * Lex) layer and back. Since 2026-09-22 (LAYER-1-CONTROL.md, one Lex)
+ * the layer is kept on the row as data-layer for debugging only; every
+ * assistant line reads "lex:" and renders flat. Absent =
  * legacy turn, labelled by role. */
 export type TranscriptLayer = "operator" | "top" | "mid";
 
@@ -44,8 +44,10 @@ export interface TranscriptTurn {
  * the back-compat fallback for turns emitted before the layer wiring. */
 function turnLabel(t: TranscriptTurn): string {
   if (t.layer === "operator") return "you:";
-  if (t.layer === "top") return "lex (voice):";
-  if (t.layer === "mid") return "lex (brain):";
+  /* One Lex: the voice's spoken lines and the brain's reply text carry
+   * the same label. The operator must never be able to tell there are
+   * two layers behind the voice. */
+  if (t.layer === "top" || t.layer === "mid") return "lex:";
   return t.role === "assistant" ? "lex:" : "you:";
 }
 
@@ -53,9 +55,6 @@ function turnLabelClass(t: TranscriptTurn): string {
   if (t.layer === "operator" || (!t.layer && t.role === "user")) {
     return "text-txt3";
   }
-  /* top = fast voice throat, mid = deep reasoning. Both are Lex; tint
-   * the fast layer lighter so the two are distinguishable at a glance. */
-  if (t.layer === "top") return "text-txt2";
   return "text-brandSoft";
 }
 
@@ -83,22 +82,6 @@ export function TranscriptHistory({
   const [collapsed, setCollapsed] = useState<boolean>(
     initialCollapsed ?? false,
   );
-  /* P4: which deep (MID) step-down nodes are expanded, keyed by group
-   * id. Collapsed by default - the deep reply is troubleshooting detail
-   * under the voice line, revealed on demand. */
-  const [expandedDeep, setExpandedDeep] = useState<Set<string>>(
-    () => new Set<string>(),
-  );
-
-  function toggleDeep(id: string): void {
-    setExpandedDeep((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
-
   /* Read persisted state on mount when the caller did not pre-seed
    * via initialCollapsed. SSR-safe: readCollapsedState bails when
    * window is undefined. */
@@ -116,12 +99,7 @@ export function TranscriptHistory({
     });
   }
 
-  /* P4 + slot-fix (2026-07-19): group the FULL turn list FIRST, then keep
-   * the last maxTurns GROUPS. Deep (MID) brain replies fold under their
-   * voice line and must NOT consume a conversation slot. Slicing raw turns
-   * before grouping let a burst of brain replies evict the you <-> voice
-   * lines from the last-N window (the "brain replies eat the slots" bug);
-   * windowing over groups counts only top-level conversation turns. */
+  /* One row per turn (2026-09-22): the last maxTurns lines in order. */
   const groups = groupTranscriptTurns(turns).slice(-maxTurns);
   const showPlaceholder = status === "thinking";
 
@@ -153,8 +131,7 @@ export function TranscriptHistory({
           {groups.length === 0 && !showPlaceholder && (
             <div className="text-txt3">No transcript yet.</div>
           )}
-          {groups.map((g, gi) => {
-            const deepOpen = expandedDeep.has(g.id);
+          {groups.map((g) => {
             return (
               <div key={g.id} className="space-y-1">
                 {g.row && (
@@ -181,44 +158,6 @@ export function TranscriptHistory({
                         <span className="text-txt3 italic"> (not for Lex)</span>
                       )}
                     </span>
-                  </div>
-                )}
-                {g.deep.length > 0 && (
-                  /* Thin COLLAPSED deep step-down node under the voice
-                   * line. Never a bubble that addresses the operator;
-                   * the deep text is hidden until expanded. */
-                  <div className="pl-[3.25rem]">
-                    <button
-                      type="button"
-                      data-testid="lex-deep-toggle"
-                      onClick={() => toggleDeep(g.id)}
-                      aria-expanded={deepOpen}
-                      aria-controls={`lex-deep-body-${gi}`}
-                      className="flex items-center gap-1 text-nano text-txt3 hover:text-txt2 font-mono"
-                    >
-                      <span aria-hidden="true">{deepOpen ? "▾" : "▸"}</span>
-                      <span>
-                        brain replied
-                        {g.deep.length > 1 ? ` (${g.deep.length})` : ""}
-                      </span>
-                    </button>
-                    {deepOpen && (
-                      <div
-                        id={`lex-deep-body-${gi}`}
-                        data-testid="lex-deep-body"
-                        className="mt-1 pl-3 border-l border-border1 space-y-1 text-txt2"
-                      >
-                        {g.deep.map((d, di) => (
-                          <div
-                            key={d.id ?? `deep-${di}`}
-                            data-testid="lex-deep-line"
-                            className="whitespace-pre-wrap"
-                          >
-                            {d.text}
-                          </div>
-                        ))}
-                      </div>
-                    )}
                   </div>
                 )}
               </div>

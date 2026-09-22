@@ -126,6 +126,14 @@ export interface AskVoiceInput {
  * returns chars=0 and produces a silent turn. */
 const DEFAULT_ASK_TIMEOUT_MS = 6_000;
 
+/* MAX_THINKING_TOKENS for the L1 session. '0' turns thinking off: the
+ * voice never needs to think (the brain does), and thinking cost 2-3s per
+ * haiku reply (measured 2026-09-22). Override for experiments only. */
+function voiceBrainThinkingTokens(): string {
+  const raw = (process.env.DEVNEURAL_VOICE_BRAIN_THINKING_TOKENS ?? '').trim();
+  return /^\d+$/.test(raw) ? raw : '0';
+}
+
 /* Read per ask, not cached at module load, so a daemon that mutates
  * process.env (runtime_config reload) takes effect without a restart. */
 function defaultAskTimeoutMs(): number {
@@ -190,6 +198,8 @@ export interface VoiceBrainSessionDeps {
     systemPrompt?: string;
     args?: string[];
     sessionId?: string;
+    /** Extra env merged onto the spawn (pty-host spawnLex opts.env). */
+    env?: Record<string, string>;
   }) => { ptyId: string; pid: number };
   ptyInject: (
     ptyId: string,
@@ -455,6 +465,16 @@ function spawnInto(
     const spawned = deps.spawnLex({
       cwd: deps.cwd,
       systemPrompt: VOICE_BRAIN_SESSION_SYSTEM_PROMPT,
+      /* Fast turns (2026-09-22, measured with `claude -p --model haiku`):
+       * Claude Code spends 100-300 thinking tokens per haiku reply by
+       * default (3.0s API time, 2.2s to first token for one spoken
+       * sentence). MAX_THINKING_TOKENS=0 turns thinking off for this
+       * session: 0.64s API time, 0.66s to first token, same sentence.
+       * The voice never needs to think; the brain (L2) does. Override
+       * with DEVNEURAL_VOICE_BRAIN_THINKING_TOKENS. */
+      env: {
+        MAX_THINKING_TOKENS: voiceBrainThinkingTokens(),
+      },
       args: [
         '--session-id',
         ccSessionId,
