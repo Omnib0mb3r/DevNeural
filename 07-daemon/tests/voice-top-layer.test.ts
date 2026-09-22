@@ -137,6 +137,19 @@ describe('buildTopLayerSystemPrompt', () => {
     expect(p).toMatch(/you do not know it/);
     expect(p).toMatch(/hold no project facts/);
   });
+
+  it('carries worked examples for every directive shape (2026-09-22)', () => {
+    const p = buildTopLayerSystemPrompt();
+    expect(p).toMatch(/Examples \(heard/);
+    expect(p).toMatch(/CONTROL: drop_reply/);
+    expect(p).toMatch(/CONTROL: combine/);
+    expect(p).toMatch(/CONTROL: repeat/);
+    expect(p).toMatch(/CONTROL: mute/);
+    expect(p).toMatch(/IGNORE: background/);
+    /* The spoken warming line is gone; "give me a second" replaces it. */
+    expect(p).not.toMatch(/still waking up/);
+    expect(p).toMatch(/give me a second, go on/);
+  });
 });
 
 describe('topLayerTurn', () => {

@@ -49,6 +49,14 @@ describe('persona: one Lex, two mouths', () => {
     expect(LEX_SPOKEN_RULES).not.toMatch(/—|–/);
   });
 
+  it('bans the boot words out loud (2026-09-22)', () => {
+    /* "I'm here. Warming up now." leaked the two-layer boot through the
+     * seamless rule; the honest line is "give me a second". */
+    expect(LEX_SPOKEN_RULES).toMatch(/warming/);
+    expect(LEX_SPOKEN_RULES).toMatch(/waking/);
+    expect(LEX_SPOKEN_RULES).toMatch(/give me a second/);
+  });
+
   it('the L2 system prompt is built from the shared blocks', () => {
     const prompt = buildLexSystemPromptStable('conversation');
     expect(prompt).toContain(LEX_IDENTITY);
