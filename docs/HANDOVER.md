@@ -39,6 +39,12 @@ Daemon note: PID 24256 died at 12:40 local (V8 stack in
 `daemon.stderr.prev.log`: BUG-017 heap death) and the relauncher revived
 it as PID 55836 on the 00:38 dist. BUG-018's sidecar rotation did its job.
 
+First restart on the wave dist (PID 58740, 22:03:59Z) found BUG-031: the
+L1 spawned in the new `voice-l1` folder died at boot (untrusted folder,
+trust dialog, exit 1). Fixed the same evening (VL-16: `seedProjectTrust`
+before every L1 spawn) and restarted again; see the cursor for the state
+after that second restart.
+
 Restart-verify for this wave (after restart + Open):
 
 1. `[voice-brain] anchor=<id8> spawned ... cwd=C:/dev/data/skill-connections/voice-l1`.

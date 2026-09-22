@@ -273,6 +273,47 @@ async function warmSession(
   expect(_voiceBrainSessionSnapshotForTests().warm).toBe(true);
 }
 
+/* BUG-031 (2026-09-22): the first spawn in the bare voice-l1 folder died
+ * at boot with exit 1 and no transcript: the folder was untrusted, so
+ * Claude Code parked on its trust dialog and the warmup probe's
+ * keystrokes ended it. Trust is seeded before every spawn. */
+describe('trust seed before spawn (BUG-031)', () => {
+  it('calls ensureTrusted with the cwd before spawnLex on a cold spawn', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    const order: string[] = [];
+    const realSpawn = pty.spawnLex;
+    _setVoiceBrainSessionDepsForTests(
+      baseDeps(io, pty, {
+        ensureTrusted: (dir) => {
+          order.push(`trust:${dir}`);
+        },
+        spawnLex: (opts) => {
+          order.push(`spawn:${opts.cwd}`);
+          return realSpawn(opts);
+        },
+      }),
+    );
+    const r = await askVoice({ prompt: 'cold ask', timeoutMs: 100 });
+    expect(r).toBeNull();
+    expect(order).toEqual([`trust:${CWD}`, `spawn:${CWD}`]);
+  });
+
+  it('a throwing trust seed never blocks the spawn', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(
+      baseDeps(io, pty, {
+        ensureTrusted: () => {
+          throw new Error('config locked');
+        },
+      }),
+    );
+    await askVoice({ prompt: 'cold ask', timeoutMs: 100 });
+    expect(pty.spawnCalls.length).toBe(1);
+  });
+});
+
 describe('warmup gate (2026-07-16 smoke-test fix 2/3)', () => {
   it('asks made while the session is warming resolve null, inject nothing, and count no timeouts', async () => {
     const io = makeVirtualIo();

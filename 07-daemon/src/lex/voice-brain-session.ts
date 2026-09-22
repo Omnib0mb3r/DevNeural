@@ -82,6 +82,7 @@ import {
 } from '../dashboard/pty-host.js';
 import { transcriptPathFor } from './spawn-lex-session.js';
 import { DATA_ROOT } from '../paths.js';
+import { seedProjectTrust } from '../dashboard/projects-new.js';
 /* Static import is acyclic at module-eval time: voice-top-layer only
  * reaches back into this module through a lazy dynamic import inside
  * its default ask. */
@@ -231,6 +232,12 @@ export interface VoiceBrainSessionDeps {
    * the data root, created on first use). Optional so test rigs that
    * never touch the disk need not provide it. */
   ensureDir?: (dir: string) => void;
+  /** BUG-031: pre-accept Claude Code's folder trust gate for the spawn
+   * cwd. An untrusted folder parks the interactive TUI on the trust
+   * dialog before any session exists; the warmup probe's keystrokes
+   * then ended the process with exit 1 (2026-09-22, first spawn in the
+   * bare voice-l1 folder). Optional for test rigs. */
+  ensureTrusted?: (dir: string) => void;
 }
 
 function defaultReadRange(path: string, start: number, length: number): string {
@@ -281,6 +288,9 @@ function defaultDeps(): VoiceBrainSessionDeps {
     log: () => undefined,
     cwd: defaultVoiceBrainCwd(),
     ensureDir: (dir) => fs.mkdirSync(dir, { recursive: true }),
+    ensureTrusted: (dir) => {
+      seedProjectTrust(dir);
+    },
     homeDir: os.homedir(),
     pollIntervalMs: 200,
     /* 2026-07-16 smoke-test fix 2/3: default was 5 minutes, which
@@ -482,6 +492,13 @@ function spawnInto(
       deps.ensureDir?.(deps.cwd);
     } catch {
       /* the spawn reports a missing cwd itself */
+    }
+    try {
+      deps.ensureTrusted?.(deps.cwd);
+    } catch (err) {
+      deps.log(
+        `[voice-brain] ${tag(owner)} trust seed failed (ignored): ${(err as Error).message}`,
+      );
     }
     const spawned = deps.spawnLex({
       cwd: deps.cwd,
