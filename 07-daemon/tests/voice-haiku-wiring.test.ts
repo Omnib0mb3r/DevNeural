@@ -7,6 +7,7 @@
  * this file pins is the surviving trio: the safe spoken-output strip,
  * the heartbeat line, and the absorbed-aside ring helpers.
  */
+import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   renderForSpeech,
@@ -24,6 +25,17 @@ beforeEach(() => {
 afterEach(() => {
   if (priorFlag === undefined) delete process.env.DEVNEURAL_VOICE_HAIKU;
   else process.env.DEVNEURAL_VOICE_HAIKU = priorFlag;
+});
+
+/* BUG-027 (2026-09-22): the attach handler warmed a shared "default"
+ * Layer 1 next to the per-anchor one the Open route already spawned; a
+ * third claude.exe that took no asks. Source pin: the null prewarm is
+ * gone; the Open routes (onPrepared) and askVoice's own spawn own it. */
+describe('attach does not spawn a default Layer 1 (BUG-027)', () => {
+  it('the null prewarm is gone from the voice WS', () => {
+    const src = readFileSync(new URL('../src/voice/lex-voice-ws.ts', import.meta.url), 'utf-8');
+    expect(src).not.toMatch(/prewarmVoiceBrainSession\(null\)/);
+  });
 });
 
 describe('renderForSpeech', () => {

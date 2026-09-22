@@ -59,7 +59,6 @@ import {
 } from '../dashboard/pty-host.js';
 import { getLexSession, setLexSessionStatus } from '../lex/lex-session-store.js';
 import {
-  prewarmVoiceBrainSession,
   isVoiceBrainSessionWarm,
   isVoiceBrainSessionEnabled,
   killVoiceBrainSession,
@@ -2144,22 +2143,12 @@ export function _workerLineImpl(i: {
 
 export function attachLexVoiceWs(socket: FastifyWS): void {
   logFn(`[voice-ws] client connected (attach)`);
-  /* 2026-07-16 smoke-test fix 3: boot the voice brain the moment a
-   * voice client connects, not lazily on the first ask. Claude takes
-   * 4-20s to boot; prewarming here means the first operator utterance
-   * meets a WARM brain (real speech + handoff acks) instead of the
-   * fail-safe null path (speech=null, forward-only) that made the
-   * whole 2026-07-16 session mute. No-op when already warm/disabled. */
-  try {
-    /* Voice layers (2026-09-21): one L1 per brainstorm anchor. The
-     * anchor Open routes already spawned it; this is the fallback for
-     * a bind whose anchor has no live voice brain yet. At attach time
-     * no bind exists, so this warms the shared default session; the
-     * bind handlers below re-prewarm for the resolved anchor. */
-    prewarmVoiceBrainSession(null);
-  } catch {
-    /* prewarm is best-effort; the ask path retains its own spawn */
-  }
+  /* 2026-07-16 smoke-test fix 3 used to prewarm a voice brain here so the
+   * first utterance met a warm session. BUG-027 (2026-09-22): with one
+   * Layer 1 per brainstorm anchor (spawned by the Open routes' onPrepared
+   * before Layer 2) that prewarm only ever warmed a shared "default"
+   * session no ask used: a third claude.exe per attach. Gone. A bind
+   * whose Layer 1 died is respawned by askVoice's own spawn path. */
   const state: ConnState = {
     ws: socket,
     bindKey: null,
