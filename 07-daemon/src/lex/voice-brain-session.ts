@@ -324,6 +324,13 @@ interface VoiceBrainSessionState {
    * asks share the one PTY's stdin/stdout. Private per anchor; a
    * backed-up brainstorm never delays another's voice turn. */
   queueTail: Promise<void>;
+  /** Blue/green rotation (context hygiene): the fresh session warming
+   * in the background, swapped in between turns once warm. */
+  standby: VoiceBrainSessionState | null;
+  rotating: boolean;
+  /** Fired once when this session's warmup succeeds (a standby uses it
+   * to schedule the swap on the owner's ask queue). */
+  onWarm: (() => void) | null;
 }
 
 function initialState(anchorKey: string): VoiceBrainSessionState {
@@ -345,6 +352,9 @@ function initialState(anchorKey: string): VoiceBrainSessionState {
     spawnedAt: 0,
     warmupPromise: null,
     queueTail: Promise.resolve(),
+    standby: null,
+    rotating: false,
+    onWarm: null,
   };
 }
 
@@ -415,15 +425,24 @@ function ensureSpawned(s: VoiceBrainSessionState): boolean {
     deps.log(`[voice-brain] ${tag(s)} pty died externally ptyId=${s.ptyId}`);
     killCurrent(s, 'exited');
   }
+  return spawnInto(s, s);
+}
 
+/* Spawn a `claude` PTY into `target`. `target === owner` is the live
+ * session (binding persisted); a distinct target is the blue/green
+ * standby (kept private until the swap). */
+function spawnInto(
+  owner: VoiceBrainSessionState,
+  target: VoiceBrainSessionState,
+): boolean {
   const now = deps.now();
-  if (now - s.lastSpawnAttemptAt < deps.respawnCooldownMs) {
+  if (now - target.lastSpawnAttemptAt < deps.respawnCooldownMs) {
     deps.log(
-      `[voice-brain] ${tag(s)} spawn suppressed: cooldown active (${deps.respawnCooldownMs}ms window, last attempt ${now - s.lastSpawnAttemptAt}ms ago)`,
+      `[voice-brain] ${tag(owner)} spawn suppressed: cooldown active (${deps.respawnCooldownMs}ms window, last attempt ${now - target.lastSpawnAttemptAt}ms ago)`,
     );
     return false;
   }
-  s.lastSpawnAttemptAt = now;
+  target.lastSpawnAttemptAt = now;
 
   const ccSessionId = deps.randomUUID();
   const jsonlPath = transcriptPathFor({
@@ -472,25 +491,25 @@ function ensureSpawned(s: VoiceBrainSessionState): boolean {
       ],
       sessionId: ccSessionId,
     });
-    s.ptyId = spawned.ptyId;
-    s.ccSessionId = ccSessionId;
-    s.jsonlPath = jsonlPath;
-    s.consecutiveTimeouts = 0;
-    s.warm = false;
-    s.spawnedAt = deps.now();
-    persist(s);
+    target.ptyId = spawned.ptyId;
+    target.ccSessionId = ccSessionId;
+    target.jsonlPath = jsonlPath;
+    target.consecutiveTimeouts = 0;
+    target.warm = false;
+    target.spawnedAt = deps.now();
+    if (target === owner) persist(owner);
     deps.log(
-      `[voice-brain] ${tag(s)} spawned ptyId=${spawned.ptyId} pid=${spawned.pid} ccSessionId=${ccSessionId.slice(0, 8)} cwd=${deps.cwd}; warmup starting`,
+      `[voice-brain] ${tag(owner)} spawned${target === owner ? '' : ' STANDBY'} ptyId=${spawned.ptyId} pid=${spawned.pid} ccSessionId=${ccSessionId.slice(0, 8)} cwd=${deps.cwd}; warmup starting`,
     );
-    s.warmupPromise = runWarmup(s, spawned.ptyId).catch((err) => {
+    target.warmupPromise = runWarmup(target, spawned.ptyId).catch((err) => {
       deps.log(
-        `[voice-brain] ${tag(s)} WARMUP FAILED: warmup threw: ${(err as Error).message}`,
+        `[voice-brain] ${tag(owner)} WARMUP FAILED: warmup threw: ${(err as Error).message}`,
       );
-      killCurrent(s, 'warmup-threw');
+      killCurrent(target, 'warmup-threw');
     });
     return true;
   } catch (err) {
-    deps.log(`[voice-brain] ${tag(s)} spawn FAILED: ${(err as Error).message}`);
+    deps.log(`[voice-brain] ${tag(owner)} spawn FAILED: ${(err as Error).message}`);
     return false;
   }
 }
@@ -617,6 +636,9 @@ async function runWarmup(s: VoiceBrainSessionState, ptyId: string): Promise<void
           if (extractAssistantText(rec)) {
             s.warm = true;
             s.consecutiveTimeouts = 0;
+            const onWarm = s.onWarm;
+            s.onWarm = null;
+            if (onWarm) onWarm();
             deps.log(
               `[voice-brain] ${tag(s)} warm: first reply after ${deps.now() - startedAt}ms; session ready for asks`,
             );
@@ -682,6 +704,9 @@ export function killVoiceBrainSession(anchorId: string, reason: string): void {
   const key = keyFor(anchorId);
   const s = sessions.get(key);
   if (!s) return;
+  if (s.standby?.ptyId) killCurrent(s.standby, reason);
+  s.standby = null;
+  s.rotating = false;
   killCurrent(s, reason);
   sessions.delete(key);
 }
@@ -1046,7 +1071,81 @@ async function askVoiceInner(
    * normalize it to null here (the null path is what triggers the
    * fail-safe forward). */
   const text = result.text.trim();
+  maybeStartRotation(s);
   return text || null;
+}
+
+/* ---------------------------------------------------------------- *
+ * Context hygiene (LAYER-1-CONTROL.md, "L1 is disposable"). L1 carries
+ * no durable state (every turn re-hydrates from the live block), so
+ * past a jsonl size cap a fresh session is warmed in the background
+ * while the old one keeps answering; the swap runs on the anchor's ask
+ * queue (never mid-turn) and only then is the old pty killed. A clear
+ * never drops an utterance and never leaves the operator waiting on a
+ * boot.
+ * ---------------------------------------------------------------- */
+
+const DEFAULT_MAX_JSONL_BYTES = 400_000;
+
+function maxJsonlBytes(): number {
+  const raw = Number(process.env.DEVNEURAL_VOICE_BRAIN_MAX_JSONL_BYTES ?? '');
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_JSONL_BYTES;
+}
+
+/* Called after every successful ask. Starts a standby when the live
+ * session's transcript passed the cap and no rotation is in flight. */
+function maybeStartRotation(s: VoiceBrainSessionState): void {
+  if (s.rotating || !s.jsonlPath) return;
+  let size = 0;
+  try {
+    size = deps.statSync(s.jsonlPath).size;
+  } catch {
+    return;
+  }
+  if (size < maxJsonlBytes()) return;
+  const standby = initialState(s.anchorKey);
+  standby.onWarm = () => {
+    void enqueue(s, async () => swapToStandby(s));
+  };
+  if (!spawnInto(s, standby)) return;
+  s.rotating = true;
+  s.standby = standby;
+  deps.log(
+    `[voice-brain] ${tag(s)} jsonl ${size}B over the ${maxJsonlBytes()}B cap; fresh session warming in the background`,
+  );
+}
+
+/* The swap: runs on the ask queue, so no ask is in flight. Only a WARM
+ * standby replaces the live session; otherwise the rotation is dropped
+ * and retried after a later ask. */
+async function swapToStandby(s: VoiceBrainSessionState): Promise<void> {
+  const nb = s.standby;
+  s.standby = null;
+  s.rotating = false;
+  if (!nb || !nb.warm || !nb.ptyId) {
+    if (nb?.ptyId) killCurrent(nb, 'standby-not-warm');
+    return;
+  }
+  const oldPty = s.ptyId;
+  s.ptyId = nb.ptyId;
+  s.ccSessionId = nb.ccSessionId;
+  s.jsonlPath = nb.jsonlPath;
+  s.warm = true;
+  s.consecutiveTimeouts = 0;
+  s.spawnedAt = nb.spawnedAt;
+  s.lastSpawnAttemptAt = nb.lastSpawnAttemptAt;
+  s.warmupPromise = null;
+  if (oldPty) {
+    try {
+      deps.ptyKill(oldPty);
+    } catch (err) {
+      deps.log(`[voice-brain] ptyKill threw (ignored): ${(err as Error).message}`);
+    }
+  }
+  persist(s);
+  deps.log(
+    `[voice-brain] ${tag(s)} rotated: old pty ${oldPty ?? 'none'} killed, new pty ${s.ptyId} live`,
+  );
 }
 
 /* ---------------------------------------------------------------- *
@@ -1099,14 +1198,26 @@ export function _resetVoiceBrainSessionStateForTests(): void {
 
 /** Await the anchor's in-flight warmup (resolved immediately when
  * none). Tests only: production callers never wait on boot. */
-export function _voiceBrainWarmupForTests(anchorId?: string | null): Promise<void> {
-  return sessions.get(keyFor(anchorId))?.warmupPromise ?? Promise.resolve();
+export function _voiceBrainWarmupForTests(
+  anchorId?: string | null,
+  opts: { standby?: boolean } = {},
+): Promise<void> {
+  const s = sessions.get(keyFor(anchorId));
+  const target = opts.standby ? s?.standby : s;
+  return target?.warmupPromise ?? Promise.resolve();
+}
+
+/** Run the blue/green swap on the anchor's ask queue (tests only; in
+ * production the standby's onWarm schedules it). */
+export function _rotateForTests(anchorId?: string | null): Promise<void> {
+  const s = stateFor(anchorId);
+  return enqueue(s, () => swapToStandby(s));
 }
 
 export function _voiceBrainSessionSnapshotForTests(
   anchorId?: string | null,
-): Readonly<Omit<VoiceBrainSessionState, 'warmupPromise' | 'queueTail'>> {
+): Readonly<Omit<VoiceBrainSessionState, 'warmupPromise' | 'queueTail' | 'standby' | 'onWarm'>> {
   const s = stateFor(anchorId);
-  const { warmupPromise: _w, queueTail: _q, ...rest } = s;
+  const { warmupPromise: _w, queueTail: _q, standby: _s, onWarm: _o, ...rest } = s;
   return { ...rest };
 }

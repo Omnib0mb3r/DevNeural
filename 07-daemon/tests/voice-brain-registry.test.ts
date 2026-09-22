@@ -16,6 +16,7 @@ import {
   listVoiceBrainSessions,
   prewarmVoiceBrainSession,
   _resetVoiceBrainSessionStateForTests,
+  _rotateForTests,
   _setVoiceBrainSessionDepsForTests,
   _voiceBrainWarmupForTests,
   type VoiceBrainSessionDeps,
@@ -246,6 +247,64 @@ describe('one L1 per brainstorm anchor', () => {
     await warmSession(io, pty, 'anchor-a');
     prewarmVoiceBrainSession('anchor-a');
     prewarmVoiceBrainSession('anchor-a');
+    expect(pty.spawnCalls).toHaveLength(1);
+  });
+});
+
+/* Context hygiene (LAYER-1-CONTROL.md, "L1 is disposable"): past a jsonl
+ * size cap a fresh session warms in the background while the old one
+ * keeps answering; the swap happens between turns on the ask queue and
+ * only then is the old pty killed. */
+describe('blue/green rotation past the jsonl cap', () => {
+  it('warms a standby, serves from the old pty until the swap, then kills the old', async () => {
+    process.env.DEVNEURAL_VOICE_BRAIN_MAX_JSONL_BYTES = '200';
+    try {
+      const io = makeVirtualIo();
+      const pty = makeFakePtyLayer();
+      const bindings: string[] = [];
+      _setVoiceBrainSessionDepsForTests(
+        baseDeps(io, pty, {
+          persistBinding: (a, b) => bindings.push(`${a}:${b.voice_pty_id}`),
+        }),
+      );
+      const pathA = await warmSession(io, pty, 'a');
+      io.scheduleAssistantRecord(pathA, 50, 'x'.repeat(300), 'end_turn');
+      expect(await askVoice({ anchorId: 'a', prompt: 'p1', timeoutMs: 5000 })).toHaveLength(300);
+      /* Rotation started: a second spawn exists; the old pty is still
+       * the ask target and no binding changed yet. */
+      expect(pty.spawnCalls).toHaveLength(2);
+      expect(pty.killCalls).toEqual([]);
+      expect(bindings).toEqual(['a:pty-1']);
+      const pathB = pathForSession(2);
+      /* +3000ms, not +50: the standby's boot sleeps advance the shared
+       * virtual clock before this ask's baseline read; a record scheduled
+       * earlier than that would be folded into the baseline (test rig
+       * artifact, real time never jumps). Still inside the 5s deadline. */
+      io.scheduleAssistantRecord(pathA, 3_000, 'still old', 'end_turn');
+      expect(await askVoice({ anchorId: 'a', prompt: 'p2', timeoutMs: 5000 })).toBe('still old');
+      expect(pty.injectCalls.filter((c) => c.text === 'p2')[0]!.ptyId).toBe('pty-1');
+      /* The standby's boot probe answers; the swap job runs on the queue. */
+      io.scheduleAssistantRecord(pathB, 10, 'OK');
+      await _voiceBrainWarmupForTests('a', { standby: true });
+      await _rotateForTests('a');
+      expect(pty.killCalls).toEqual(['pty-1']);
+      expect(bindings.at(-1)).toBe('a:pty-2');
+      io.scheduleAssistantRecord(pathB, 50, 'from new', 'end_turn');
+      expect(await askVoice({ anchorId: 'a', prompt: 'p3', timeoutMs: 5000 })).toBe('from new');
+      expect(pty.injectCalls.filter((c) => c.text === 'p3')[0]!.ptyId).toBe('pty-2');
+      expect(listVoiceBrainSessions().map((s) => s.ptyId)).toEqual(['pty-2']);
+    } finally {
+      delete process.env.DEVNEURAL_VOICE_BRAIN_MAX_JSONL_BYTES;
+    }
+  });
+
+  it('never rotates below the cap', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    const pathA = await warmSession(io, pty, 'a');
+    io.scheduleAssistantRecord(pathA, 50, 'short', 'end_turn');
+    expect(await askVoice({ anchorId: 'a', prompt: 'p1', timeoutMs: 5000 })).toBe('short');
     expect(pty.spawnCalls).toHaveLength(1);
   });
 });
