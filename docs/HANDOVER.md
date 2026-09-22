@@ -6,7 +6,7 @@ Update this file IN PLACE every time the cursor moves; never add a new
 dated file. Ground every claim against git before asserting; this doc
 reflects what was true at the last update.
 
-## Cursor (2026-09-22 10:25 local, voice layers wave on branch `voice-layers`; daemon RESTARTED on the branch dist, checklist item 1 PASSED, items 2-9 need the operator's voice)
+## Cursor (2026-09-22 12:20 local, voice layers wave on branch `voice-layers`; daemon on the branch dist; first voice test done: L1 works, BRAIN UNREACHABLE (BUG-026); items 5-8 blocked)
 
 Built overnight 2026-09-21/22 on operator direction ("just build it, I'll
 test in the AM"). Everything is committed on branch **`voice-layers`**
@@ -49,8 +49,35 @@ red), FIXES.md rows VL-1..VL-9.
   unpushed wiki commits carry it and GitHub rejects files over 100 MB.
   Fix recipe in the entry; the local history rewrite is the operator's call.
 - L2 after Open sits with an empty composer and no jsonl until the first
-  voice forward; that is normal (last night's first user record came 11s
-  after the first forward, not at reopen). Do not "kick" it.
+  voice forward. Claude Code is fine with that; the daemon is not (see
+  BUG-026 below: it calls that state "warming" forever).
+
+### 2026-09-22 12:13-12:16 local: first operator voice test (five utterances)
+
+- PASSED: item 2 (L1 answered within 2-3s of each utterance), item 4
+  ("Can you see what the worker's doing?" answered from the live block:
+  worker live on DevNeural), BUG-022 -> RESOLVED (5/5 asks chars 44-369,
+  no chars=0, no raw fallback).
+- FAILED: nothing reached L2. Every turn logged `[voice-ws] L1 turn:
+  speech=true forward=false control=none ignore=no warming=true`. L2 had
+  been up 110 min. Root cause BUG-026: `_midStateImpl` says warming until
+  the L2 jsonl has an assistant record, the jsonl only appears after L2's
+  first turn, and forwards are parked while warming. Circular. Items 5-8
+  cannot pass until that is fixed. Fix sketch in the bug (warm from the
+  PTY, or the daemon sends the greeting turn on Open).
+- Also found: BUG-027 (a second `anchor=default` L1 spawns on every voice
+  attach; three claude.exe now) and BUG-028 (L1 answered "What is your
+  goal?" by reciting the operator's MEMORY.md; Claude Code loads the
+  git-root auto-memory for the L1 cwd `07-daemon`). Fix sketches in the
+  bugs. Not exercised: items 3, 6, 7, 8, 9.
+- The brainstorm still has no supervised project anchor
+  (`supervises_project_anchor_id` null, all 8 brainstorms likely the
+  same), so the deck shows the DevNeural worker as unsupervised. Bind
+  with `PATCH /lex/anchors/:id {"supervises_project_anchor_id":
+  "6c7d6691-8e72-427a-9e95-8a70161e4d34"}` or the dashboard picker, then
+  reopen so the scope reaches L2's prompt.
+- Next: fix BUG-026 first (it gates everything downstream), then BUG-028,
+  then BUG-027; rebuild; restart; rerun items 2-9.
 
 ### What shipped (branch commits, oldest first)
 
