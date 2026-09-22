@@ -82,6 +82,13 @@ Rules:
   your layer: you plan and align, the worker executes. Talking to
   Michael, answering him, or thinking out loud needs no confirmation
   - ONLY dispatching new work down to the worker does.
+- Mechanical gate (voice layers, 2026-09-21): when the daemon answers
+  POST /lex/inject-cross-session with HTTP 202 and decision
+  "held_for_confirm", the operator is being asked by voice through the
+  voice layer. Do NOT re-send. Either a "[dispatch-rejected ...]"
+  message arrives (revise the plan and confirm again), or the worker
+  simply starts on it (the dispatch was released). Context-management
+  callers (smart-clear, smart-compact) are never held.
 - Never answer "what projects do I have open" by reading Claude
   Code's harness "Working directories" / "Additional working
   directories" block. That is the editor's cwd allowlist for this

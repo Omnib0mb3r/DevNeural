@@ -69,6 +69,8 @@ import {
   startSessionDiscoveryProbe,
   seedFirstTurn,
   getLivePtyIds,
+  getPty,
+  getPtyBySession,
 } from './pty-host.js';
 import {
   buildLexSystemPrompt,
@@ -136,8 +138,12 @@ import {
 import {
   attachLexVoiceWs,
   broadcastVoiceControl,
+  notifyTopLayerEvent,
+  setTopLayerControlHandlers,
   type VoiceControlKind,
 } from '../voice/lex-voice-ws.js';
+import { createVoiceLayersWire, readFileTail } from './voice-layers-wire.js';
+import { issueToken } from '../lex/cross-session-inject.js';
 import { lintQueueStatus } from '../wiki/lint-queue.js';
 import { providerStatus } from '../llm/index.js';
 import { embedderStats } from '../embedder/index.js';
@@ -486,6 +492,91 @@ export async function registerDashboardRoutes(
   registerSmartClearRoutes(app, store.db, log, {
     ctxProvider: smartCompactCtxProvider,
   });
+
+  /* Voice layers Phase B (2026-09-21, LAYER-1-CONTROL.md): the dispatch
+   * confirm gate and plan approval, answered by voice through Layer 1.
+   * Registered before any route handler can run; the inject and
+   * pending-prompt routes call into it, and the Layer 1 control verbs
+   * (approve_plan / reject_plan / confirm_dispatch / reject_dispatch)
+   * resolve through the handlers installed here. */
+  const voiceLayers = createVoiceLayersWire({
+    cfg: store.db,
+    now: () => Date.now(),
+    log,
+    notify: notifyTopLayerEvent,
+    bell: (i) => {
+      emitNotification({
+        severity: 'warn',
+        source: 'voice-layers',
+        notify_class: 'followup',
+        title: i.title,
+        body: i.body,
+        dedup_key: i.dedup_key,
+        ...(i.anchor_id ? { push_data: { anchor_id: i.anchor_id } } : {}),
+      });
+    },
+    /* A confirmed dispatch re-enters the same route (fresh token, same
+     * body) so every transport rule, audit row and delivery check runs
+     * unchanged. */
+    reinject: async (body) => {
+      const r = await app.inject({
+        method: 'POST',
+        url: '/lex/inject-cross-session',
+        payload: body,
+      });
+      let ok = false;
+      let decision: string | null = null;
+      try {
+        const j = r.json() as { ok?: boolean; decision?: string };
+        ok = Boolean(j.ok);
+        decision = typeof j.decision === 'string' ? j.decision : null;
+      } catch {
+        /* non-JSON body: treat as a failed dispatch */
+      }
+      return { status: r.statusCode, ok, decision };
+    },
+    freshToken: (subject) => issueToken(subject),
+    resolveSupervisedTarget: (brainstormId) => {
+      const r = resolveSupervisedTargetSession(store.db, brainstormId);
+      return r.reason === 'bound-live' && r.target_session ? r.target_session : null;
+    },
+    lexPtyFor: (anchorId) => getLexSession(anchorId)?.current_pty_id ?? null,
+    ptyInject: (ptyId, text, commit) => ptyInject(ptyId, text, commit),
+    ptyWriteRaw: (ptyId, bytes) => {
+      const h = getPty(ptyId) || getPtyBySession(ptyId);
+      if (!h || h.exited) return false;
+      try {
+        h.pty.write(bytes);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    anchorForCcSession: (cc) => {
+      const row = store.db.getLexSessionByCcSessionId(cc);
+      return row ? { id: row.id, current_pty_id: row.current_pty_id } : null;
+    },
+    ptyIdForCcSession: (cc) => getPtyBySession(cc)?.ptyId ?? null,
+    transcriptPathFor: (anchorId, cc) =>
+      listTranscriptRefs(anchorId).find((r) => r.cc_session_id === cc)?.transcript_path ?? null,
+    readTail: readFileTail,
+    clearPendingPrompt: (cc) => clearPending(cc),
+    delay: (fn, ms) => {
+      const t = setTimeout(fn, ms);
+      if (typeof (t as { unref?: () => void }).unref === 'function') {
+        (t as { unref: () => void }).unref();
+      }
+    },
+    schedule: (fn, ms) => {
+      const t = setInterval(fn, ms);
+      if (typeof (t as { unref?: () => void }).unref === 'function') {
+        (t as { unref: () => void }).unref();
+      }
+      return t;
+    },
+    clearSchedule: (h) => clearInterval(h as ReturnType<typeof setInterval>),
+  });
+  setTopLayerControlHandlers(voiceLayers.handlers());
 
   /* Background poll that binds a daemon-owned PTY to its claude
    * session_id once the .jsonl file appears. Single global timer; no
@@ -1416,6 +1507,10 @@ export async function registerDashboardRoutes(
     }
     const promptKind = body.kind ?? 'notification';
     setPending(id, body.message, promptKind);
+    /* Voice layers Phase B (2026-09-21): an ExitPlanMode prompt on a
+     * brainstorm's L2 session is a plan awaiting the operator; Layer 1
+     * reads it out and takes the yes / no by voice. */
+    void voiceLayers.onPendingPrompt(id, promptKind, body.message);
     // Also surface in the live activity feed so the user sees CC waiting
     // even when not on /sessions. warn-level because it blocks Claude
     // until the user answers; this severity also triggers web push.
@@ -5916,6 +6011,19 @@ export async function registerDashboardRoutes(
     if (body.text.length > 4096) {
       reply.code(400);
       return { ok: false, error: 'text too long (max 4096 chars)' };
+    }
+    /* Voice layers Phase B (2026-09-21): mechanical confirm gate. A Lex
+     * dispatch is parked and the operator is asked by voice through
+     * Layer 1; the confirmed re-entry (confirmed_dispatch_id) passes
+     * exactly once. Context-management callers are never held. */
+    {
+      const parked = await voiceLayers.maybePark(
+        body as unknown as Record<string, unknown>,
+      );
+      if (parked) {
+        reply.code(parked.status);
+        return parked.payload;
+      }
     }
     /* Fix 15 — anchor-resolved dispatch.
      *
