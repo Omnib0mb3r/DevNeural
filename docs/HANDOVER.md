@@ -6,7 +6,7 @@ Update this file IN PLACE every time the cursor moves; never add a new
 dated file. Ground every claim against git before asserting; this doc
 reflects what was true at the last update.
 
-## Cursor (2026-09-22, voice layers wave on branch `voice-layers`; daemon NOT restarted - PENDING operator restart + morning test)
+## Cursor (2026-09-22 10:25 local, voice layers wave on branch `voice-layers`; daemon RESTARTED on the branch dist, checklist item 1 PASSED, items 2-9 need the operator's voice)
 
 Built overnight 2026-09-21/22 on operator direction ("just build it, I'll
 test in the AM"). Everything is committed on branch **`voice-layers`**
@@ -22,6 +22,30 @@ Design of record: `docs/spec/LAYER-1-CONTROL.md` (v2, canonical). Plan:
 `docs/superpowers/plans/2026-09-21-voice-layers.md`. Trackers: BUG-022
 (chars=0 root cause, SMOKE-TESTING), BUG-023 (pre-existing dashboard test
 red), FIXES.md rows VL-1..VL-9.
+
+### 2026-09-22 morning: restart done, item 1 verified (operator said "do it")
+
+- Restart fired `POST /admin/daemon/restart` at 14:23:40Z. Graceful
+  shutdown 3.3s (`[shutdown] complete`), new PID 24256 listening at
+  14:23:46Z, `migrations: applied 1 (054-lex-session-voice-binding.sql);
+  total=55`. The running daemon is now the branch dist (00:38).
+- Item 1 PASSED on `POST /lex/anchors/4bbafb48.../open` (DevNeural
+  Testing): `[voice-brain] anchor=4bbafb48 spawned ptyId=524b8e5f...` at
+  14:24:47.851Z, `[lex-anchor] reopen` at 14:24:47.989Z (L1 first), `warm:
+  first reply after 6942ms`. L2 cc=42fb8c7f pty=a03c7122 is up for the
+  operator. Items 2-9 need a human voice; nothing else was verified.
+- Branch event to know about: at 10:14:35 local an untracked `AGENTS.md`
+  (Codex-flavored copy of CLAUDE.md) appeared and at 10:14:43 something
+  ran `git checkout master` in this tree (reflog). Not this session; a
+  codex sandbox service was running. The tree was switched back to
+  `voice-layers` at ~10:22 with the guard "no tracked changes, last reflog
+  entry is that checkout". `AGENTS.md` is left untracked and untouched.
+  Trap: an `npm run build` while on master would replace the branch dist.
+- BUG-024 logged (project anchor seed pass aborts every boot on the
+  `Resume` slug collision; two months old, unrelated to the wave).
+- Noise seen at boot, not chased: `[wiki-push] push failed: git push
+  --quiet ... remote: error: See https://gh.io/lfs` (wiki repo push
+  rejected on LFS).
 
 ### What shipped (branch commits, oldest first)
 
