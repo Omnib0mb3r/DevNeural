@@ -9,6 +9,7 @@
  * Exits cleanly on SIGTERM/SIGINT, releases PID file.
  */
 import * as fs from 'node:fs';
+import * as v8 from 'node:v8';
 import Fastify from 'fastify';
 import { ensureDataRoot, daemonLogFile, daemonPidFile } from './paths.js';
 import { writePid, readPid, removeStalePid, isAlive } from './lifecycle/pid.js';
@@ -810,6 +811,48 @@ async function main(): Promise<void> {
   if (typeof stallTimer.unref === 'function') {
     stallTimer.unref();
   }
+
+  /* Heap telemetry (BUG-017). The daemon has been dying of Node heap
+   * OOM (~4GB) roughly every 24h of uptime; the crash trace lands in
+   * stderr, which the relauncher truncates (BUG-018), so daemon.log
+   * itself must carry the memory curve. One line per minute keeps the
+   * leak's growth rate and its correlation with load (voice, vector
+   * flush, brainstorm ingest) reconstructable after any death. The
+   * warn line gives the operator a visible early signal before the
+   * hard limit. Interval override: DEVNEURAL_MEMLOG_INTERVAL_MS. */
+  const memLogIntervalMs = Number(
+    process.env.DEVNEURAL_MEMLOG_INTERVAL_MS ?? 60_000,
+  );
+  const heapLimitBytes = (() => {
+    try {
+      return v8.getHeapStatistics().heap_size_limit;
+    } catch {
+      return 0;
+    }
+  })();
+  function logMemory(): void {
+    try {
+      const m = process.memoryUsage();
+      const mb = (n: number): number => Math.round(n / (1024 * 1024));
+      const pct = heapLimitBytes
+        ? Math.round((m.heapUsed / heapLimitBytes) * 100)
+        : 0;
+      const line =
+        `[memory] rss=${mb(m.rss)}MB heapUsed=${mb(m.heapUsed)}MB ` +
+        `heapTotal=${mb(m.heapTotal)}MB external=${mb(m.external)}MB ` +
+        `arrayBuffers=${mb(m.arrayBuffers)}MB heapLimit=${mb(heapLimitBytes)}MB used=${pct}%`;
+      if (heapLimitBytes && pct >= 80) {
+        logger(`${line} WARN heap above 80% of limit; OOM death approaching (BUG-017)`);
+      } else {
+        logger(line);
+      }
+    } catch {
+      /* telemetry must never take the daemon down */
+    }
+  }
+  logMemory();
+  const memLogTimer = setInterval(logMemory, memLogIntervalMs);
+  if (typeof memLogTimer.unref === 'function') memLogTimer.unref();
 
   /* Memory janitor (Wave 3 Lane B step 37 / LX-14). Runs weekly at
    * +20min after boot; staggered so it does not compete with the

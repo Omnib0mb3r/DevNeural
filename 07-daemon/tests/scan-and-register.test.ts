@@ -43,7 +43,16 @@ beforeEach(() => {
   tmpDir = fs
     .mkdtempSync(path.join(os.tmpdir(), 'devneural-scan-register-'))
     .replace(/\\/g, '/');
-  projectsRoot = path.posix.join(tmpDir, 'Projects');
+  /* The scan tree must live OUTSIDE DATA_ROOT. paths.ts puts the
+   * registry's own per-project dirs at DATA_ROOT/projects, and NTFS is
+   * case-insensitive, so a scan root of tmpDir/Projects IS
+   * DATA_ROOT/projects: recordIdentity's ensureProjectDir then drops an
+   * id-named folder straight into the tree under scan. That went
+   * unnoticed while non-git dirs were skipped as no_identity; once
+   * scanAndRegisterProjects learned to claim plain folders (BUG-021)
+   * the registry's internals started registering themselves as
+   * projects. Nesting the tree under tmpDir/tree keeps them apart. */
+  projectsRoot = path.posix.join(tmpDir, 'tree', 'Projects');
   fs.mkdirSync(projectsRoot, { recursive: true });
   priorDataRoot = process.env.DEVNEURAL_DATA_ROOT;
   process.env.DEVNEURAL_DATA_ROOT = tmpDir;
@@ -57,7 +66,7 @@ afterEach(() => {
 });
 
 describe('scanAndRegisterProjects', () => {
-  it('registers a fresh git repo, skips excluded/dot dirs and non-git dirs, and reports an already-registered repo as skipped', async () => {
+  it('registers a fresh git repo and a plain non-git folder, skips excluded/dot dirs, and reports an already-registered repo as skipped', async () => {
     const pathsMod = await import('../src/paths.js');
     expect(pathsMod.DATA_ROOT).toBe(tmpDir);
 
@@ -70,7 +79,11 @@ describe('scanAndRegisterProjects', () => {
     fs.mkdirSync(path.posix.join(projectsRoot, 'tmp'));
     fs.mkdirSync(path.posix.join(projectsRoot, '.hidden'));
 
-    // Plain folder, not a git repo at all -> no_identity.
+    /* Plain folder, not a git repo at all. BUG-021: this used to be
+     * dropped as no_identity, which is why every non-git folder under
+     * C:/dev/Projects was invisible to the dashboard. It now earns a
+     * path-scoped identity, same as the operator pointing
+     * /projects/register-path at it. */
     fs.mkdirSync(path.posix.join(projectsRoot, 'not-a-repo'));
 
     // Fresh git repo, no remote -> path-scoped identity, not yet known
@@ -88,7 +101,14 @@ describe('scanAndRegisterProjects', () => {
     const result = await routesMod.scanAndRegisterProjects(projectsRoot);
 
     expect(result.ok).toBe(true);
-    expect(result.registered.map((r) => r.name)).toEqual(['fresh-repo']);
+    expect(result.registered.map((r) => r.name).sort()).toEqual([
+      'fresh-repo',
+      'not-a-repo',
+    ]);
+
+    // The plain folder registered path-scoped, with no remote.
+    const plain = result.registered.find((r) => r.name === 'not-a-repo')!;
+    expect(registryMod.getProject(plain.id)?.remote).toBeNull();
 
     const skippedByDir = Object.fromEntries(
       result.skipped.map((s) => [s.dir, s.reason]),
@@ -97,13 +117,12 @@ describe('scanAndRegisterProjects', () => {
     expect(skippedByDir['Holding']).toBe('excluded');
     expect(skippedByDir['tmp']).toBe('excluded');
     expect(skippedByDir['.hidden']).toBe('excluded');
-    expect(skippedByDir['not-a-repo']).toBe('no_identity');
+    expect(skippedByDir['not-a-repo']).toBeUndefined();
     expect(skippedByDir['pre-registered']).toBe('already_registered');
 
     // The freshly-registered repo is now actually in the registry.
-    expect(registryMod.getProject(result.registered[0]!.id)?.name).toBe(
-      'fresh-repo',
-    );
+    const fresh = result.registered.find((r) => r.name === 'fresh-repo')!;
+    expect(registryMod.getProject(fresh.id)?.name).toBe('fresh-repo');
   });
 
   it('reports a shared-remote clone as already_registered (KNOWN COLLISION: undetached template clones)', async () => {

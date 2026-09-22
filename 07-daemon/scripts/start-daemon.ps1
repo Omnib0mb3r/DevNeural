@@ -255,6 +255,25 @@ $logFile = Join-Path $dataRoot 'daemon.log'
 $stdoutLog = Join-Path $dataRoot 'daemon.stdout.log'
 $stderrLog = Join-Path $dataRoot 'daemon.stderr.log'
 
+# BUG-018: Start-Process file redirection TRUNCATES these sidecars on
+# every spawn. The relauncher fires within 5 minutes of any crash, so
+# each OOM stack trace (BUG-017) was erased by the very relaunch that
+# followed it; the only trace ever recovered came from the append-mode
+# hook-spawn sidecar. Rotate one generation before spawning so the
+# previous process's dying words always survive its successor.
+foreach ($sidecar in @($stdoutLog, $stderrLog)) {
+    if (Test-Path -LiteralPath $sidecar) {
+        try {
+            if ((Get-Item -LiteralPath $sidecar).Length -gt 0) {
+                $prev = [System.IO.Path]::ChangeExtension($sidecar, $null).TrimEnd('.') + '.prev.log'
+                Move-Item -LiteralPath $sidecar -Destination $prev -Force
+            }
+        } catch {
+            # Rotation is best-effort; never block the daemon launch on it.
+        }
+    }
+}
+
 # Route distillation (scheduled backfill + staleness re-distill + the
 # critical end-of-session path) through the headless Opus engine instead
 # of ollama. Set here so it inherits to the spawned node on BOTH the

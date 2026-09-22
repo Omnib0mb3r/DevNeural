@@ -42,6 +42,12 @@
 import type { Readable } from 'node:stream';
 import { acquireMouth } from './voice-mouth.js';
 
+/* BUG-020: partialChain is drained only by a successful cc-pty inject,
+ * so branches that never inject (direct-llm, top-layer) grow it one
+ * full spoken-segment string per barge for the socket's life. The
+ * [voice-context] weave only uses recent interruptions; keep newest N. */
+const PARTIAL_CHAIN_CAP = 20;
+
 export interface SynthLikeHandle {
   pcm: Readable;
   cancel: () => void;
@@ -293,6 +299,14 @@ export function createSpeakController(
         started_at_ms: state.currentTtsStartedAtMs,
         cancelled_at_ms: Date.now(),
       });
+      /* BUG-020: the chain is only drained on a successful cc-pty
+       * inject; the direct-llm and top-layer branches never drain it,
+       * so hours of barges accumulated full spoken-segment strings
+       * without bound. The [voice-context] weave only ever cares
+       * about recent interruptions - keep the newest N. */
+      if (state.partialChain.length > PARTIAL_CHAIN_CAP) {
+        state.partialChain.splice(0, state.partialChain.length - PARTIAL_CHAIN_CAP);
+      }
     }
     state.currentTtsText = null;
     state.currentTtsStartedAtMs = 0;

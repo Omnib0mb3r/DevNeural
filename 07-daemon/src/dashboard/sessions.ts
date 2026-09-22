@@ -276,6 +276,43 @@ export function deriveContextFromTail(
   return null;
 }
 
+/* A busy verdict ('thinking'/'tool') derived from a static file tail
+ * is only trustworthy while the file is still moving. Claude Code
+ * writes the jsonl continuously during a real turn (thinking blocks,
+ * tool_use, tool_results all append as they happen), so a transcript
+ * untouched for minutes with a trailing user record is a DEAD turn --
+ * a /clear that never gets a reply, an inject absorbed at kill time,
+ * or a worker whose daemon died mid-turn (BUG-017/BUG-019). Without
+ * this gate those sessions report "thinking" forever. Any fresh write
+ * re-derives on the next poll and instantly restores the busy phase. */
+const TAIL_BUSY_MAX_AGE_MS = 180_000;
+
+/* User-role records that never trigger a model turn and therefore must
+ * not derive 'thinking': local slash-command records (/clear et al.,
+ * content starts with <command-name> or <local-command-...>) and
+ * isMeta records (the local-command caveat). BUG-019: a dashboard
+ * worker whose transcript ends with /clear showed "thinking" while
+ * plainly idle. */
+function isNonTurnUserRecord(rec: {
+  isMeta?: boolean;
+  message?: { content?: unknown };
+}): boolean {
+  if (rec.isMeta === true) return true;
+  const content = rec.message?.content;
+  const texts: string[] = [];
+  if (typeof content === 'string') texts.push(content);
+  else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === 'object' && typeof (block as { text?: unknown }).text === 'string') {
+        texts.push((block as { text: string }).text);
+      }
+    }
+  }
+  return texts.some(
+    (t) => t.startsWith('<command-name>') || t.startsWith('<local-command-'),
+  );
+}
+
 export function derivePhaseFromTail(file: string): 'thinking' | 'tool' | 'idle' | 'unknown' {
   try {
     const stat = fs.statSync(file);
@@ -291,6 +328,7 @@ export function derivePhaseFromTail(file: string): 'thinking' | 'tool' | 'idle' 
     } finally {
       fs.closeSync(fd);
     }
+    const stale = Date.now() - stat.mtimeMs > TAIL_BUSY_MAX_AGE_MS;
     const lines = text.split('\n').filter((l) => l.trim().length > 0);
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i]!;
@@ -298,12 +336,16 @@ export function derivePhaseFromTail(file: string): 'thinking' | 'tool' | 'idle' 
         const rec = JSON.parse(line) as {
           type?: string;
           role?: string;
+          isMeta?: boolean;
           message?: { role?: string; content?: unknown };
         };
         const role = rec.type ?? rec.role ?? rec.message?.role;
-        if (role === 'user') return 'thinking';
+        if (role === 'user') {
+          if (isNonTurnUserRecord(rec)) continue;
+          return stale ? 'idle' : 'thinking';
+        }
         if (role === 'assistant') {
-          if (/"type"\s*:\s*"tool_use"/.test(line)) return 'tool';
+          if (/"type"\s*:\s*"tool_use"/.test(line)) return stale ? 'idle' : 'tool';
           return 'idle';
         }
       } catch {

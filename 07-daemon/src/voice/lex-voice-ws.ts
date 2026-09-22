@@ -744,6 +744,22 @@ export function _seedDigestFromLastTurnImpl(
  * whenever a fresh hello binds. */
 const activeByBindKey = new Map<string, ConnState>();
 
+/* BUG-020: a connection's bindKey is REASSIGNED across its life
+ * (brainstorm:<id> -> sessionId -> ptyId as resolution improves), and
+ * both bind paths registered the new key without dropping the entry
+ * under the previous key. teardown() then only deleted the CURRENT
+ * key, so every stale entry pinned the whole dead connection's
+ * ConnState + closure graph in this module-lifetime map forever. Under
+ * reconnect churn (exactly what a daemon crash causes) that stranded
+ * one full voice-connection graph per reconnect and compounded the
+ * BUG-017 heap OOM. Value-scan mirror of the activeByWatchTarget
+ * cleanup: drop EVERY key mapping to this state. */
+function releaseBindKeys(state: ConnState): void {
+  for (const [k, v] of activeByBindKey) {
+    if (v === state) activeByBindKey.delete(k);
+  }
+}
+
 /* Fix 53 (2026-06-18): one voice TALKBACK per watched session.
  * activeByBindKey only dedupes PTY-bound + direct-llm clients. A
  * read-only TTS watcher (watchSessionId set, no PTY -> no bindKey)
@@ -2123,6 +2139,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       maybeReplayLastTurnOnBind();
       return;
     }
+    releaseBindKeys(state); /* BUG-020: drop any entry under a prior bindKey */
     state.bindKey = handle.sessionId ?? handle.ptyId;
     /* Evict any earlier socket bound to the same PTY. Multiple tabs
      * with the voice panel open would otherwise each hear the user's
@@ -2255,6 +2272,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       /* Standalone brainstorm: no PTY, no jsonl. The voice WS is the
        * sole runtime for this brainstorm; chunks land directly into
        * the DB and TTS streams from the LLM reply. */
+      releaseBindKeys(state); /* BUG-020: drop any entry under a prior bindKey */
       state.bindKey = `brainstorm:${brainstormId}`;
       const prior = activeByBindKey.get(state.bindKey);
       if (prior && prior !== state) {
@@ -2367,6 +2385,19 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * reason paths (end_turn and tool_use) without re-speaking text
    * the client has already heard. */
   const spokenSegmentHashes: Set<string> = new Set();
+  /* BUG-020: this set grew one hash per spoken assistant text block for
+   * the LIFE of the socket (cleared only on smart-compact rebind or
+   * "lex hold up"), so an hours-long voice conversation accumulated it
+   * monotonically. Dedupe only ever needs to span nearby records (an
+   * end_turn echoing its own turn's pre-tool blocks), so evict oldest
+   * (Set iterates in insertion order) past a generous cap. */
+  const SPOKEN_SEGMENT_HASH_CAP = 4096;
+  function capSpokenSegmentHashes(): void {
+    for (const h of spokenSegmentHashes) {
+      if (spokenSegmentHashes.size <= SPOKEN_SEGMENT_HASH_CAP) break;
+      spokenSegmentHashes.delete(h);
+    }
+  }
 
   function pollJsonl(): void {
     if (!state.jsonlPath && state.watchSessionId) {
@@ -2490,6 +2521,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     /* Stamp the dedupe set BEFORE speak() so a re-read of the same
      * jsonl line cannot double-speak. */
     for (const h of decision.new_hashes) spokenSegmentHashes.add(h);
+    capSpokenSegmentHashes();
     if (!isPreToolAck) state.awaitingResponseSince = 0;
     /* Fix 20 (2026-05-23): flush any utterances queued during
      * Lex's mid-turn-no-tts window the instant the end_turn lands.
@@ -5279,9 +5311,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       state.ttsActive.cancel();
       state.ttsActive = null;
     }
-    if (state.bindKey && activeByBindKey.get(state.bindKey) === state) {
-      activeByBindKey.delete(state.bindKey);
-    }
+    /* BUG-020: value-scan, not current-key lookup. The bindKey is
+     * reassigned across the connection's life, and a key-only delete
+     * left entries under earlier keys pinning this whole ConnState
+     * after socket close. */
+    releaseBindKeys(state);
     /* Fix 53 (2026-06-18): drop this connection from the watch-target
      * registry. Value-scan rather than key lookup because the watched
      * target (watchSessionId / jsonlPath) can be late-resolved or

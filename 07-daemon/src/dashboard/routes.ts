@@ -363,7 +363,13 @@ export async function scanAndRegisterProjects(
     };
   }
 
-  const { resolveProjectIdentity } = await import('../identity/project-id.js');
+  /* Registration resolver, not the plain one: this route is an explicit
+   * operator action, so a folder that is not a git repo still earns a
+   * path-scoped identity instead of being dropped as `no_identity`.
+   * SCAN_EXCLUDED_DIRS above still filters Archive/Holding/tmp. */
+  const { resolveProjectIdentityForRegistration } = await import(
+    '../identity/project-id.js'
+  );
   const { recordIdentity, getProject } = await import('../identity/registry.js');
 
   const registered: { id: string; name: string }[] = [];
@@ -377,7 +383,7 @@ export async function scanAndRegisterProjects(
       continue;
     }
     const full = path.posix.join(root, name);
-    const identity = resolveProjectIdentity(full);
+    const identity = resolveProjectIdentityForRegistration(full);
     if (identity.id === 'global') {
       skipped.push({ dir: name, reason: 'no_identity' });
       continue;
@@ -3879,17 +3885,26 @@ export async function registerDashboardRoutes(
       reply.code(400);
       return { ok: false, error: `path not found: ${target}` };
     }
-    const { resolveProjectIdentity } = await import('../identity/project-id.js');
+    const { resolveProjectIdentityForRegistration } = await import(
+      '../identity/project-id.js'
+    );
     const { recordIdentity, getProject } = await import(
       '../identity/registry.js'
     );
-    const identity = resolveProjectIdentity(target);
+    /* Registration resolver: git remote -> git toplevel -> plain
+     * filesystem path. The operator picked this folder on purpose, so a
+     * non-git folder gets a path-scoped identity rather than the 422
+     * this route used to return for every folder without a .git. */
+    const identity = resolveProjectIdentityForRegistration(target);
     if (identity.id === 'global') {
+      /* Unreachable in practice: the existsSync guard above already
+       * ran, and the path fallback claims anything that exists. Kept as
+       * a floor so a future resolver change cannot silently register a
+       * `global` identity. */
       reply.code(422);
       return {
         ok: false,
-        error:
-          'could not resolve a project identity for that folder (not a git repo and no usable path)',
+        error: `could not resolve a project identity for ${target}`,
       };
     }
     const already = Boolean(getProject(identity.id));
