@@ -15,6 +15,9 @@ test in the AM"). Everything is committed on branch **`voice-layers`**
 restart deploys it. Merge to master after the live verify (`git merge
 voice-layers` from master, or keep testing on the branch).
 
+Fresh-context resume seed (what landed, the reset, the checklist, the file
+map, in one file): `C:\dev\data\skill-connections\brainstorm\HANDOVER-2026-09-22-voice-layers.md`.
+
 Design of record: `docs/spec/LAYER-1-CONTROL.md` (v2, canonical). Plan:
 `docs/superpowers/plans/2026-09-21-voice-layers.md`. Trackers: BUG-022
 (chars=0 root cause, SMOKE-TESTING), BUG-023 (pre-existing dashboard test
