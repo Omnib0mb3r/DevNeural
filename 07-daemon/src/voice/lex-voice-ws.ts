@@ -95,6 +95,7 @@ import {
   ALL_VOICE_COMMAND_KINDS,
   type VoiceCommandKind,
 } from './lex-voice-commands.js';
+import { matchSpokenControl } from './lex-voice-commands.js';
 import {
   renderLiveBlock,
   topLayerEventTurn,
@@ -4750,6 +4751,24 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       state.utteranceStartedDuringTts = false;
       return;
     }
+    /* BUG-030 (2026-09-22): the fixed controls (mute, unmute, standby,
+     * listen, end session, quiet) are mechanical again, prefix required,
+     * before Layer 1. The utterance still goes on to Layer 1 so the ack
+     * is spoken in its voice; its own CONTROL line, if it remembers one,
+     * lands on the voice-command dedupe window and is a no-op. The
+     * effect no longer depends on a model remembering a directive. */
+    const spokenControl = matchSpokenControl(result.text);
+    if (spokenControl) {
+      logFn(
+        `[voice-ws] control by word gate: ${spokenControl} text=${JSON.stringify(result.text.slice(0, 60))}`,
+      );
+      void applyTopLayerControl(
+        spokenControl,
+        null,
+        { speech: null, forward: null, control: null, controlArg: null, ignore: null },
+        result.text,
+      );
+    }
     /* Engine classification (2026-07-17, VOICE-TOP-LAYER-SPEC).
      * Order is the safety property: deterministic stop-class BEFORE
      * the echo filter (a spoken "hold on" interrupts even when Lex's
@@ -5054,7 +5073,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     const warming = midState().mid === 'warming';
     const actions = _planTopLayerActionsImpl(turn, warming);
     logFn(
-      `[voice-ws] L1 turn: speech=${state.topOwnsAck} forward=${turn.forward !== null} control=${turn.control ?? 'none'} ignore=${turn.ignore ?? 'no'} warming=${warming}`,
+      `[voice-ws] L1 turn: speech=${state.topOwnsAck} forward=${turn.forward !== null} control=${turn.control ?? 'none'} inferred=${turn.inferredControl ? 'yes' : 'no'} ignore=${turn.ignore ?? 'no'} warming=${warming}`,
     );
     for (const action of actions) {
       switch (action.kind) {

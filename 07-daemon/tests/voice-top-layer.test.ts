@@ -308,3 +308,33 @@ describe('voiceLexReply (TTS hooked only to the top layer)', () => {
     expect(spoken).toEqual([]);
   });
 });
+
+/* BUG-030 (2026-09-22): haiku narrated verbs instead of emitting the
+ * directive ("Muted." with no CONTROL line, mic stayed live) and spoke a
+ * stage direction aloud. The parser closes both gaps. */
+describe('parser guards (BUG-030)', () => {
+  it('a narrated verb with no directive becomes the control, flagged inferred', () => {
+    const r = parseTopLayerReply('Muted.');
+    expect(r.control).toBe('mute');
+    expect(r.inferredControl).toBe(true);
+    expect(parseTopLayerReply('Unmuted, go on.').control).toBe('unmute');
+    expect(parseTopLayerReply('Standing by.').control).toBe('standby');
+    expect(parseTopLayerReply('Listening.').control).toBe('listen');
+    expect(parseTopLayerReply('Stopping. Over.').control).toBe('stop_speaking');
+  });
+  it('a real directive is never overridden and long speech is never inferred', () => {
+    const r = parseTopLayerReply('Muted.\nCONTROL: standby');
+    expect(r.control).toBe('standby');
+    expect(r.inferredControl).toBeUndefined();
+    expect(
+      parseTopLayerReply(
+        'Muted the notifications for the worker as you asked, and the rest stays live.',
+      ).control,
+    ).toBeNull();
+  });
+  it('parenthetical stage directions are never spoken', () => {
+    expect(parseTopLayerReply('(Listening, not speaking.)').speech).toBeNull();
+    expect(speechOnly('(pauses)\nRight, got it.')).toBe('Right, got it.');
+    expect(parseTopLayerReply('Right (I think) so.').speech).toBe('Right (I think) so.');
+  });
+});

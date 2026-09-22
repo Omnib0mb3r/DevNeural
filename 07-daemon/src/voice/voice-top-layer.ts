@@ -104,6 +104,10 @@ export interface TopLayerResult {
   controlArg: string | null;
   /** Non-null = the model decided this was not for Lex; the reason. */
   ignore: string | null;
+  /** BUG-030: set when the control came from a narrated verb ("Muted.")
+   * rather than a CONTROL line. Logged so directive discipline is
+   * measurable. */
+  inferredControl?: boolean;
 }
 
 export type TopLayerEventKind =
@@ -324,6 +328,24 @@ const IGNORE_LINE = /^\s*ignore:(.*)$/i;
  * off-contract, and speaking all of it would be worse than trimming. */
 const MAX_SPEECH_CHARS = 600;
 
+/* A whole line in parentheses is a stage direction ("(Listening, not
+ * speaking.)"), never speech (BUG-030). Parentheses inside a sentence
+ * are ordinary text. */
+export const STAGE_DIRECTION_LINE = /^\s*\(.*\)\s*$/;
+
+/* Narrated verbs (BUG-030): short speech that IS the control. Haiku with
+ * thinking off said "Muted." and omitted the CONTROL line three times in
+ * one minute; the mic stayed live. Only a short reply qualifies, so a
+ * sentence that merely starts with the word is never mistaken. */
+const NARRATED_CONTROL: ReadonlyArray<[RegExp, TopLayerControl]> = [
+  [/^unmuted\b/i, 'unmute'],
+  [/^muted\b/i, 'mute'],
+  [/^standing by\b/i, 'standby'],
+  [/^listening\b/i, 'listen'],
+  [/^(stopping|stopped)\b/i, 'stop_speaking'],
+];
+const NARRATED_CONTROL_MAX_CHARS = 40;
+
 function isControlLine(line: string): boolean {
   const m = line.match(CONTROL_LINE);
   return Boolean(m && CONTROLS.has(m[1]!.toLowerCase() as TopLayerControl));
@@ -346,7 +368,10 @@ export function speechOnly(text: string): string {
     .split(/\r?\n/)
     .filter(
       (line) =>
-        !FORWARD_LINE.test(line) && !isControlLine(line) && !IGNORE_LINE.test(line),
+        !FORWARD_LINE.test(line) &&
+        !isControlLine(line) &&
+        !IGNORE_LINE.test(line) &&
+        !STAGE_DIRECTION_LINE.test(line),
     )
     .join('\n')
     .trim();
@@ -425,16 +450,27 @@ export function parseTopLayerReply(raw: string | null | undefined): TopLayerResu
       continue;
     }
     if (collectingForward) forwardLines.push(line);
-    else speechLines.push(line);
+    else if (!STAGE_DIRECTION_LINE.test(line)) speechLines.push(line);
   }
 
   const speechJoined = speechLines.join('\n').trim();
+  let inferredControl: boolean | undefined;
+  if (control === null && speechJoined && speechJoined.length <= NARRATED_CONTROL_MAX_CHARS) {
+    for (const [re, verb] of NARRATED_CONTROL) {
+      if (re.test(speechJoined)) {
+        control = verb;
+        inferredControl = true;
+        break;
+      }
+    }
+  }
   return {
     speech: speechJoined ? speechJoined.slice(0, MAX_SPEECH_CHARS) : null,
     forward: forwardLines.join('\n').trim() || null,
     control,
     controlArg,
     ignore,
+    ...(inferredControl ? { inferredControl } : {}),
   };
 }
 

@@ -67,3 +67,42 @@ export function matchPanicCommand(text: string): boolean {
   if (!norm) return false;
   return PANIC_RE.test(norm);
 }
+
+/* BUG-030 (2026-09-22): the fixed operator controls were riding Layer 1's
+ * directive discipline and it narrated them instead ("Muted." with no
+ * CONTROL line; the mic stayed live). These few verbs are matched
+ * mechanically, prefix required, whole utterance, BEFORE Layer 1, same
+ * shape as the panic phrase. Layer 1 still hears the utterance and speaks
+ * the ack; the effect no longer depends on it. Anything with more words
+ * after the verb ("lex, can you mute the worker notifications") is
+ * substance and stays with Layer 1. */
+export type SpokenControl =
+  | 'mute'
+  | 'unmute'
+  | 'standby'
+  | 'listen'
+  | 'end_session'
+  | 'stop_speaking';
+
+const SPOKEN_CONTROL_RES: ReadonlyArray<[RegExp, SpokenControl]> = [
+  [new RegExp(LEX_PREFIX + String.raw`unmute\s*$`), 'unmute'],
+  [new RegExp(LEX_PREFIX + String.raw`mute\s*$`), 'mute'],
+  [new RegExp(LEX_PREFIX + String.raw`stand\s*by\s*$`), 'standby'],
+  [new RegExp(LEX_PREFIX + String.raw`listen\s*$`), 'listen'],
+  [new RegExp(LEX_PREFIX + String.raw`end\s+(the\s+)?session\s*$`), 'end_session'],
+  [
+    new RegExp(LEX_PREFIX + String.raw`(stop\s+(talking|speaking)|be\s+quiet|quiet)\s*$`),
+    'stop_speaking',
+  ],
+];
+
+/** The fixed spoken controls, prefix required, whole utterance. */
+export function matchSpokenControl(text: string): SpokenControl | null {
+  if (!text) return null;
+  const norm = normalize(text);
+  if (!norm) return null;
+  for (const [re, kind] of SPOKEN_CONTROL_RES) {
+    if (re.test(norm)) return kind;
+  }
+  return null;
+}
