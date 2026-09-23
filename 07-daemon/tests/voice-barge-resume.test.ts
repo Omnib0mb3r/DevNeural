@@ -174,6 +174,28 @@ describe('_resumeBargedSpeechImpl (full-body remainder resume)', () => {
     expect(spoken).toEqual(['Four five six. Seven eight nine.']);
   });
 
+  it('v3: a cut mid-sentence resumes from the start of that sentence, never mid-word', () => {
+    const spoken: string[] = [];
+    /* 20 chars at 10ms/char lands inside "Four five six." */
+    const resumed = _resumeBargedSpeechImpl({
+      stash: stash({
+        interruptedSegment: 'Four five six.',
+        queuedSegments: [],
+        fullRunText: FULL,
+        playedMs: 200,
+      }),
+      nowMs: 2_000,
+      ttsBusy: false,
+      partialChain: [],
+      speak: (t) => spoken.push(t),
+      reason: 'l1-finish',
+      log: () => undefined,
+      msPerChar: 10,
+    });
+    expect(resumed).toBe(true);
+    expect(spoken).toEqual(['Four five six. Seven eight nine.']);
+  });
+
   it('appends still-queued segments that never shipped to the run text', () => {
     const spoken: string[] = [];
     /* fullRunText only covers what got a tts-start (sentences 1-2);

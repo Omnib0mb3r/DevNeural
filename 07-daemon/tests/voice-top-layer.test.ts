@@ -33,6 +33,8 @@ const LIVE: LiveBlock = {
   digest: null,
   pendingPlan: null,
   pendingDispatch: null,
+  cut: null,
+  pendingHandover: null,
   nowMs: 0,
 };
 

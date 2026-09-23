@@ -10,8 +10,10 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  _bargeDecisionImpl,
   _l2ComposerUpImpl,
   _midStateImpl,
+  sliceRemainderAtSentence,
   _planTopLayerActionsImpl,
   _shouldRecordCutAsFinalImpl,
   L2_WARM_MIN_UPTIME_MS,
@@ -88,6 +90,42 @@ describe('_l2ComposerUpImpl (BUG-026)', () => {
     expect(_l2ComposerUpImpl({ ...up, lastActivity: up.nowMs - L2_WARM_QUIET_MS + 1 })).toBe(false);
     expect(_l2ComposerUpImpl({ ...up, awaitingSystemPrompt: true })).toBe(false);
     expect(_l2ComposerUpImpl({ ...up, exited: true })).toBe(false);
+  });
+});
+
+describe('_bargeDecisionImpl (v3, VOICE-BARGE-CLASSIFIER-SPEC sections 3 and 4)', () => {
+  const b = (o: Partial<Parameters<typeof _bargeDecisionImpl>[0]>) =>
+    _bargeDecisionImpl({ stashAlive: true, bucket: 'real', control: null, ...o });
+  it('engine buckets resume without the model', () => {
+    for (const bucket of ['echo', 'noise', 'backchannel'] as const) {
+      expect(b({ bucket })).toBe('resume');
+    }
+  });
+  it('stop class and unsigned real words rethink; finish resumes; answer_then_finish resumes after the reply', () => {
+    expect(b({ bucket: 'stop' })).toBe('rethink');
+    expect(b({})).toBe('rethink');
+    expect(b({ control: 'drop_reply' })).toBe('rethink');
+    expect(b({ control: 'combine' })).toBe('rethink');
+    expect(b({ control: 'finish' })).toBe('resume');
+    expect(b({ control: 'answer_then_finish' })).toBe('resume_after_reply');
+  });
+  it('no stash means nothing to decide', () => {
+    expect(b({ stashAlive: false, control: 'finish' })).toBe('none');
+  });
+});
+
+describe('sliceRemainderAtSentence (v3: resume from the cut sentence, never mid-word)', () => {
+  const run = 'One two three. Four five six. Seven eight.';
+  it('backs up to the start of the sentence containing the cut', () => {
+    expect(sliceRemainderAtSentence(run, 20)).toBe('Four five six. Seven eight.');
+    expect(sliceRemainderAtSentence(run, 15)).toBe('Four five six. Seven eight.');
+    expect(sliceRemainderAtSentence(run, 14)).toBe('Four five six. Seven eight.');
+    expect(sliceRemainderAtSentence(run, 5)).toBe(run);
+  });
+  it('nothing heard means everything; everything heard means nothing', () => {
+    expect(sliceRemainderAtSentence(run, 0)).toBe(run);
+    expect(sliceRemainderAtSentence(run, run.length)).toBe('');
+    expect(sliceRemainderAtSentence(run, 999)).toBe('');
   });
 });
 

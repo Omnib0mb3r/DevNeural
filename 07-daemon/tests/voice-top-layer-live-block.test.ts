@@ -21,10 +21,23 @@ const BASE: LiveBlock = {
   digest: null,
   pendingPlan: null,
   pendingDispatch: null,
+  cut: null,
+  pendingHandover: null,
   nowMs: 0,
 };
 
 describe('renderLiveBlock', () => {
+  it('v3: shows the cut point after a barge and a pending handover', () => {
+    const s = renderLiveBlock({
+      ...BASE,
+      cut: { heard: 'we shipped the fix', remainder: 'and the tests are green' },
+      pendingHandover: 'worker at end of step 3, Lex added steps 4 and 5',
+    });
+    expect(s).toMatch(/cut: heard "we shipped the fix" \| remainder "and the tests are green"/);
+    expect(s).toMatch(/handover pending: worker at end of step 3/);
+    expect(renderLiveBlock(BASE)).not.toMatch(/cut:|handover pending/);
+  });
+
   it('renders every mid state with elapsed seconds where it matters', () => {
     expect(renderLiveBlock(BASE)).toBe('[live] brain: idle');
     expect(renderLiveBlock({ ...BASE, mid: 'down' })).toBe('[live] brain: down');

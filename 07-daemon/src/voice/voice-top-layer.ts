@@ -110,6 +110,12 @@ export interface LiveBlock {
   pendingPlan: string | null;
   /** A worker dispatch parked by the confirm gate (Phase B). */
   pendingDispatch: { id: string; summary: string } | null;
+  /** v3 barge: the tail of what the operator heard before the stop and
+   * the head of what he did not; null when nothing is cut. */
+  cut: { heard: string; remainder: string } | null;
+  /** A handover awaiting the operator's spoken approval (Phase C): the
+   * gist of the worker's draft and the brain's review. */
+  pendingHandover: string | null;
   /** Clock now, same base as midSinceMs. */
   nowMs: number;
 }
@@ -369,6 +375,14 @@ export function renderLiveBlock(live: LiveBlock): string {
     lines.push(
       `       dispatch pending (${live.pendingDispatch.id}): ${oneLine(live.pendingDispatch.summary, 200)}`,
     );
+  }
+  if (live.cut) {
+    lines.push(
+      `       cut: heard "${oneLine(live.cut.heard, 160)}" | remainder "${oneLine(live.cut.remainder, 160)}"`,
+    );
+  }
+  if (live.pendingHandover) {
+    lines.push(`       handover pending: ${oneLine(live.pendingHandover, 400)}`);
   }
   return lines.join('\n');
 }

@@ -79,6 +79,9 @@ import {
   type UsageLike,
 } from '../lex/compaction-supervisor.js';
 import { spawnLexSession, transcriptPathFor } from '../lex/spawn-lex-session.js';
+/* v3 barge: a bare agreement during TTS resumes the cut sentence with no
+ * model in the loop (VOICE-BARGE-CLASSIFIER-SPEC section 3.4). */
+import { isBackchannelUtterance } from './engine/barge-classifier.js';
 /* BUG-029: the worker's phase for the [live] block, the same merge the
  * deck tiles use (hook phase overridden by the transcript tail). */
 import { getPhase, type SessionPhase } from '../dashboard/session-phase.js';
@@ -1765,7 +1768,8 @@ export function _resumeBargedSpeechImpl(deps: _ResumeBargedSpeechDeps): boolean 
       deps.stash.playedMs,
       deps.msPerChar != null ? { msPerChar: deps.msPerChar } : {},
     );
-    const remainder = fullRun.slice(heard.length).trimStart();
+    /* v3: resume from the sentence that was cut, never mid-word. */
+    const remainder = sliceRemainderAtSentence(fullRun, heard.length);
     const tail = [remainder, ...deps.stash.queuedSegments]
       .map((s) => s.trim())
       .filter((s) => s.length > 0)
@@ -1963,6 +1967,46 @@ export type TopLayerAction =
  * forward. `combine` owns its own forward (the merged text), so no
  * separate forward action is planned for it. IGNORE alone is the
  * silent drop; IGNORE plus speech just speaks (the model chose to ask). */
+/* v3 barge (2026-09-22, VOICE-BARGE-CLASSIFIER-SPEC sections 3 and 4):
+ * what happens to the cut remainder once the words are in. The stop
+ * itself already happened, deterministically. Engine buckets (echo,
+ * noise, backchannel) resume without the model; the stop class stays
+ * stopped; real words resume only on an explicit FINISH (or after the
+ * reply on ANSWER_THEN_FINISH); anything unsigned is a rethink, the
+ * operator floor. */
+export type BargeBucketForDecision = 'echo' | 'noise' | 'backchannel' | 'stop' | 'real';
+export type BargeDecision = 'resume' | 'resume_after_reply' | 'rethink' | 'none';
+
+export function _bargeDecisionImpl(i: {
+  stashAlive: boolean;
+  bucket: BargeBucketForDecision;
+  control: TopLayerControl | null;
+}): BargeDecision {
+  if (!i.stashAlive) return 'none';
+  if (i.bucket === 'echo' || i.bucket === 'noise' || i.bucket === 'backchannel') return 'resume';
+  if (i.bucket === 'stop') return 'rethink';
+  if (i.control === 'finish') return 'resume';
+  if (i.control === 'answer_then_finish') return 'resume_after_reply';
+  return 'rethink';
+}
+
+/* The un-heard remainder of a spoken run, starting at the sentence that
+ * contains the cut so a resume never begins mid-word or mid-clause.
+ * heardChars is the played-ms projection from truncateToHeard. */
+export function sliceRemainderAtSentence(fullRun: string, heardChars: number): string {
+  const run = fullRun.trim();
+  if (heardChars <= 0) return run;
+  if (heardChars >= run.length) return '';
+  let start = 0;
+  const re = /[.!?]["')\]]*\s+/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(run)) !== null) {
+    if (m.index >= heardChars) break;
+    start = m.index + m[0].length;
+  }
+  return start >= run.length ? '' : run.slice(start).trim();
+}
+
 export function _planTopLayerActionsImpl(
   r: TopLayerResult,
   midWarming: boolean,
@@ -3351,7 +3395,18 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   function buildLive(anchorId: string | null): LiveBlock {
     const ms = midState();
     const h = topLayerControlHandlers;
+    /* v3 barge: what he heard and what he did not, so Layer 1 can decide
+     * finish, answer then finish, or rethink on the actual cut. */
+    let cut: LiveBlock['cut'] = null;
+    if (bargeStash && bargeStash.fullRunText && bargeStash.playedMs != null) {
+      const full = bargeStash.fullRunText.trim();
+      const heard = truncateToHeard(full, bargeStash.playedMs);
+      const remainder = sliceRemainderAtSentence(full, heard.length);
+      if (remainder) cut = { heard: heard.slice(-160), remainder: remainder.slice(0, 160) };
+    }
     return {
+      cut,
+      pendingHandover: null,
       mid: ms.mid,
       midSinceMs: ms.sinceMs,
       midTool: ms.tool,
@@ -3482,6 +3537,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         }
         return;
       }
+      case 'finish':
+      case 'answer_then_finish':
+        /* Owned by the barge decision in runTopLayerVoiceTurnOnce. */
+        return;
       case 'repeat': {
         if (lastSpokenText) {
           for (const seg of splitForSpeech(lastSpokenText)) speak(seg, { continuation: true });
@@ -4024,8 +4083,33 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   function dropBargeStash(reason: string): void {
     if (!bargeStash) return;
     bargeStash = null;
-    logFn(`[voice-ws] barge: stopped, no resume (reason=${reason})`);
+    logFn(`[voice-ws] barge: rethink, remainder dropped (reason=${reason})`);
   }
+
+  /* v3 (2026-09-22): the resume caller the 2026-07-20 baseline removed,
+   * back on the same pure impl. Speaks the un-heard remainder of the cut
+   * run from the cut sentence, sliced by the client's played ms. Returns
+   * true when something was spoken; false when there is no stash, the
+   * stash is stale, the mouth is busy, or nothing was left to say. */
+  function resumeBargedSpeech(reason: string): boolean {
+    const stash = bargeStash;
+    if (!stash) return false;
+    const resumed = _resumeBargedSpeechImpl({
+      stash,
+      nowMs: Date.now(),
+      ttsBusy: Boolean(state.ttsActive) || state.ttsQueueRunning || state.ttsQueue.length > 0,
+      partialChain: state.partialChain,
+      speak: (t) => speak(t, { continuation: false }),
+      reason,
+      log: logFn,
+    });
+    bargeStash = null;
+    logFn(`[voice-ws] barge: ${resumed ? 'resumed' : 'nothing to resume'} (${reason})`);
+    return resumed;
+  }
+  /* ANSWER_THEN_FINISH: the remainder resumes once the reply's audio has
+   * drained (playback-drained), not before. */
+  let pendingFinish = false;
 
   /* Words confirmed a real operator turn behind the barge: drop the
    * stash (no resume) and fire the deferred PTY Ctrl+C so the worker
@@ -4737,11 +4821,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         `[voice-ws] dropped whisper utterance: reason=${reason} words=${wordCount} text=${JSON.stringify(trimmed)}`,
       );
       send({ t: 'transcript', text: '', ms: result.ms });
-      /* BASELINE (LAYER-1-CONTROL.md): VAD fired on echo/noise and killed
-       * the spoken body, whisper heard nothing real. Pre-baseline this
-       * resumed the barged speech; now a barge NEVER resumes - drop the
-       * stash and stay stopped. */
-      dropBargeStash(reason);
+      /* v3 barge: VAD fired on noise and stopped the spoken body, whisper
+       * heard nothing real. The stop should never have happened; pick the
+       * cut sentence back up with no model in the loop (spec 3.3). */
+      if (!resumeBargedSpeech(reason)) dropBargeStash(reason);
       return;
     }
     /* layer 'operator': the operator's own utterance, layer 0 of the
@@ -4855,7 +4938,17 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         `[voice-ws] ECHO DROPPED: transcript matches Lex's own recent TTS (score=${(engineVerdict.echoScore ?? 0).toFixed(2)} matched=${JSON.stringify((engineVerdict.echoMatched ?? '').slice(0, 60))}) text=${JSON.stringify(trimmed.slice(0, 80))}`,
       );
       send({ t: 'echo-dropped', text: trimmed });
-      dropBargeStash('echo-filter');
+      /* v3 barge: own echo stopped the body; resume it (spec 3.2). */
+      if (!resumeBargedSpeech('engine-echo')) dropBargeStash('echo-filter');
+      state.utteranceStartedDuringTts = false;
+      return;
+    } else if (bargeStash && isBackchannelUtterance(trimmed)) {
+      /* v3 barge (spec 3.4): "yeah", "right", "mm-hm" while she was
+       * talking is agreement, not a turn. Resume, tell nobody. Outside a
+       * barge the same word is an answer and goes to Layer 1 as usual. */
+      logFn(`[voice-ws] backchannel during TTS: ${JSON.stringify(trimmed)}; resuming`);
+      send({ t: 'ignored', text: trimmed, reason: 'backchannel' });
+      if (!resumeBargedSpeech('engine-backchannel')) dropBargeStash('backchannel');
       state.utteranceStartedDuringTts = false;
       return;
     }
@@ -5093,12 +5186,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       );
       return mergeOperatorUtterances([trimmed, ...extras]);
     }
-    /* Barge (baseline): drop the stash and STAY stopped - a barge never
-     * resumes. No deferred Ctrl+C, so L2 finishes its reply and the full
-     * statement stays readable as text; only the TTS audio was cut.
-     * Truncating L2 is reserved for the deterministic emergency stop and
-     * for L1's own cancel_redirect. */
-    confirmRealBarge(false);
+    /* v3 barge: the stash stays alive through the Layer 1 turn; the
+     * decision below (finish / answer then finish / rethink) owns it. No
+     * deferred Ctrl+C: L2 finishes its reply and the full statement stays
+     * readable as text; truncating L2 is reserved for the emergency stop
+     * and for L1's own cancel_redirect. */
     const anchorId = currentAnchorId();
     const speaker = makeLineSpeaker();
     const turn = await topLayerTurn(trimmed, {
@@ -5145,6 +5237,25 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         case 'forward':
           await forwardToL2(action.text, sttMs);
           break;
+      }
+    }
+    /* v3 barge decision on real words (engine buckets never reach here).
+     * A FINISH with speech in front of it waits for that speech to drain,
+     * so the remainder never talks over the ack. */
+    const decision = _bargeDecisionImpl({
+      stashAlive: Boolean(bargeStash),
+      bucket: 'real',
+      control: turn.control,
+    });
+    if (decision !== 'none') {
+      const spokeFirst = speaker.streamed() || turn.speech !== null;
+      if (decision === 'resume' && !spokeFirst) {
+        resumeBargedSpeech('l1-finish');
+      } else if (decision === 'resume' || decision === 'resume_after_reply') {
+        pendingFinish = true;
+        logFn(`[voice-ws] barge: ${decision === 'resume' ? 'finish' : 'answer then finish'}; remainder resumes after the reply drains`);
+      } else {
+        dropBargeStash(`l1-${turn.control ?? 'unsigned'}`);
       }
     }
   }
@@ -5617,6 +5728,15 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
          * synth-stream end, seconds early). Closes the during-TTS
          * window and the current spoken run. */
         clientPlaybackActive = false;
+        /* v3 barge: ANSWER_THEN_FINISH (or a FINISH that had speech in
+         * front of it) resumes the cut remainder now that the reply has
+         * been heard. Next tick, after this frame's bookkeeping. */
+        if (pendingFinish) {
+          pendingFinish = false;
+          setTimeout(() => {
+            if (!resumeBargedSpeech('l1-after-reply')) dropBargeStash('after-reply-empty');
+          }, 0);
+        }
         if (playbackTailTimer) {
           clearTimeout(playbackTailTimer);
           playbackTailTimer = null;
