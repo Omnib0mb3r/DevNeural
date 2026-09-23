@@ -8,12 +8,53 @@ reflects what was true at the last update. Previous cursors (2026-07-18
 to 2026-09-22) are in `docs/archive/HANDOVER-history-2026-07-to-09.md`;
 this file holds the current cursor only.
 
-## Cursor (2026-09-23, voice v3 + Phase C wave COMPLETE and deployed; overnight closeout: BUG-034/035 fixed, docs reconciled and archived; daytime: docs made the single source of truth, Layer 1 worker effects in progress)
+## Cursor (2026-09-23 afternoon: docs are the single source of truth, Layer 1 worker verbs shipped, the hours-long session hangs root-caused and fixed; everything committed, daemon PID 54996 live)
 
 Read first: `docs/spec/LAYER-1-CONTROL.md` (v3) and `docs/spec/SMART-COMPACT.md`
 section 5 are the design of record; `BUGS.md` index block for what is
-known broken; `FIXES.md` VL-17 to VL-27 for what shipped on 2026-09-22/23.
+known broken; `FIXES.md` VL-17 to VL-29 for what shipped on 2026-09-22/23.
 The executed plan lives at `docs/archive/plans/2026-09-22-voice-and-clear-complete.md`.
+
+### Resume here (written 2026-09-23 for a fresh session)
+
+State: branch `voice-layers`, tree clean, four commits today on top of
+`2e05283`: `7be8ea0` docs reconcile, `c5ce453` Layer 1 worker verbs
+(BUG-038, VL-28), `8f8a64d` tracker rows, `1c20bfd` the hook lazy-spawn
+fix (BUG-039, VL-29). Daemon PID 54996 has run since 13:20:19Z on the
+09:18 dist (it carries the worker verbs); the dist was rebuilt again at
+about 11:50 local for VL-29, which only changes `lifecycle/spawn.ts`, a
+module the hooks execute and the daemon never calls, so no restart is
+owed. Dashboard export current (09:19). Nothing is half done.
+
+What happened, in order: (1) every live doc audited against the code
+and the ten archived voice docs diffed against what shipped; the live
+folder is now the truth and history is under `docs/archive/`. (2) The
+voice gained `start_worker`, `stop_worker`, `panic_worker`,
+`switch_project <name>` (AI-interpreted like every control; handlers in
+`07-daemon/src/dashboard/voice-layers-wire.ts` on the dashboard's own
+functions; spec section "The voice reaches the worker"). (3) The
+operator's "stuck thinking, Escape dead, for hours" was traced to the
+hooks lazy-spawning the daemon as their own child (BUG-039 detail has
+the whole evidence chain and the proof rig); fixed by launching through
+the `DevNeural-Daemon` scheduled task. (4) BUG-040 logged: last night's
+three-minute outage was a relaunch during an `npm install`.
+
+Do not: restart the daemon from inside a Claude session while an
+install is in flight (BUG-040); resume a multi-megabyte session in the
+VS Code extension when a fresh one will do (its resume budget is 60s);
+re-add `docs/superpowers/` (deleted, empty); reintroduce any phrase
+matcher for voice controls (closed verb set, AI-interpreted, only the
+safety floor is mechanical).
+
+Task list at handover:
+- [x] Phase A docs reconcile (12 items, commit `7be8ea0`)
+- [x] Phase B worker verbs (B1 to B6, commits `c5ce453`, restart 13:20Z)
+- [x] BUG-039 root cause, fix, proof, commit `1c20bfd`
+- [ ] Operator: spoken items 1 to 11 (LAYER-1-CONTROL "Testing")
+- [ ] BUG-039 live close: the next daemon death or restart during a live session stays responsive
+- [ ] BUG-040: lazy import of the unused Anthropic provider so a missing SDK never stops boot
+- [ ] Shim hardening (SetHandleInformation on its std handles), noted under BUG-039
+- [ ] Merge `voice-layers` into master once the spoken items pass
 
 ### 2026-09-23 daytime: docs reconcile (operator: "get it done")
 
@@ -152,25 +193,35 @@ worktree agents branched off `voice-layers`; both merged in T12 and the
 worktrees removed on 2026-09-23. Every task's commit body ends
 `Rebuild: yes|no`.
 
-## Next steps (refreshed 2026-09-23)
+## Next steps (refreshed 2026-09-23 afternoon)
 
-1. Operator: the spoken items 1 to 10 in `docs/spec/LAYER-1-CONTROL.md`
-   "Testing" on the live daemon, plus one car run for the stream
+1. Operator: the spoken items 1 to 11 in `docs/spec/LAYER-1-CONTROL.md`
+   "Testing" on the live daemon (11 is the worker by voice: start, stop,
+   kill, switch, in your own words), plus one car run for the stream
    (BUG-032) and one real auto-clear cycle in live mode.
 2. Any failure: grep `daemon.log` first. Voice lines are `[voice-ws]`,
-   `[voice-brain]`, `[voice-l1]`; the lifecycle lines are `[handover]`,
-   `[self-clear]`, `[smart-compact]`, `[supervisor-event]`.
-3. Then arm the gates the wave staged: `POST /runtime-config/dispatch_confirm_gate
+   `[voice-brain]`, `[voice-l1]`, `[voice-worker]`; the lifecycle lines
+   are `[handover]`, `[self-clear]`, `[smart-compact]`,
+   `[supervisor-event]`.
+3. BUG-039 closes on the first daemon death or restart that leaves a
+   live session responsive; `daemon.log` must show the task-launched
+   boot (`already running` from the hook's attempt is fine, a
+   hook-time `daemon starting` right after `[shutdown] complete` is
+   the old bug).
+4. Then arm the gates the wave staged: `POST /runtime-config/dispatch_confirm_gate
    {"value":"on"}` and `mid_permission_mode` `plan`, once items 1 to 5 pass.
-4. Open backlog after that: `<DATA_ROOT>/brainstorm/BACKLOG.md` P1 (the
+5. Small fixes owed: BUG-040 (lazy import in `07-daemon/src/llm/anthropic.ts`
+   so a missing SDK never stops boot), the shim hardening under BUG-039.
+6. Open backlog after that: `<DATA_ROOT>/brainstorm/BACKLOG.md` P1 (the
    curator canary and the injection delivery gap) and P2 (the stale-reply
    guard on the reply-text surface); BUG-017 (daemon heap, the Phase 8
-   headline); BUG-024 (anchor seed aborts every boot); BUG-025 (wiki
-   push dead since 2026-08-02).
-5. The 13 BUGS.md rows from July still at SMOKE-TESTING (001, 003, 004,
+   headline and the usual trigger of BUG-039); BUG-024 (anchor seed
+   aborts every boot); BUG-025 (wiki push dead since 2026-08-02).
+7. The 13 BUGS.md rows from July still at SMOKE-TESTING (001, 003, 004,
    006, 009, 010, 011, 012, 013, 018, 019, 020, 021) have been deployed
    across many restarts and never verified. Walk them or flip them.
-6. Phase Two remains queued behind the P2-0 adversarial review of
+8. Merge `voice-layers` into master after the spoken items pass. Phase
+   Two remains queued behind the P2-0 adversarial review of
    FUNCTIONAL-SPEC (standing project rule).
 
 ## Standing rules (unchanged)
