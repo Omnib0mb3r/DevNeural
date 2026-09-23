@@ -17,10 +17,23 @@ sessions only), scope fail-closed, no added latency in the stream sink,
 human speech (no names, symbols or code aloud; longer when it helps;
 challenge him; say when a deeper look will take a while).
 
-Task state (update this line as tasks land): T1 identity DONE. T2 contract
-v3 + word gate withdrawn: next. T3 barge v3, T4 delivery verbs, T5
-handover frame, T6 Phase C routes, T7 end/crash handovers, T8 voice
-approval + L2 rules, T9 Lex self-clear: pending. T10 (context gauge +
+Task state (update this line as tasks land): T1 identity DONE (`64a8a9a`).
+T2 contract v3 + word gate withdrawn DONE (`58fb3cd`). T3 barge v3 DONE
+(`a62eabb`). T4 delivery verbs IN PROGRESS, decisions taken: piper
+`synthesize(text, opts?)` gains `opts.lengthScaleMultiplier` (applied to
+`getLengthScale()`, clamped to MIN/MAX); the speak controller holds a
+per-connection multiplier (`setLengthScaleMultiplier`, stepped by the
+pure `_deliveryParamStepImpl`: slower x1.25, faster x0.8, clamped 0.5 to
+2.0) and passes it on every `deps.synthesize(text, opts)` call (the
+fake synth in `tests/lex-voice-ws-speak-queue.test.ts` records opts); no
+controller-level reply cache, the WS's `lastSpokenText` already serves
+`repeat`, and `start_over` is the same; `slower` / `faster` step then
+re-speak `lastSpokenText`; `louder` / `softer` step a per-connection
+`ttsGain` (0.2 to 1.0 by 0.2), send `{t:'tts-gain', gain}` (Agent B's
+sink applies it) and re-speak. T5 handover frame, T6 Phase C routes, T7
+end/crash handovers, T8 voice approval + L2 rules + the `turn_summary`
+supervisor event (worker's end-of-turn text read out by Lex), T9 Lex
+self-clear: pending. T10 (context gauge +
 handover list UI) and T11 (continuous stream sink) run in isolated
 worktree agents branched off `voice-layers`; merge their branches in T12.
 T12 merge, suite, build, trackers, restart, verify: pending.

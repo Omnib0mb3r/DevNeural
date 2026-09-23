@@ -59,6 +59,11 @@ you ──speak──▶ L1 (voice, haiku) ──FORWARD──▶ L2 (brain, opu
 
 ## North star
 
+The operator's goal (2026-09-22): use this completely while driving or
+running, no screen, and get real work done by talking. Everything below
+serves that: reliable on a mobile link, nothing that needs eyes, every
+result read out in her words.
+
 The voice layer works, acts and feels like native Claude voice chat: talking
 starts on the first sentence, not after the whole reply; you can interrupt
 with words at any time; pauses do not end your turn; the assistant never
