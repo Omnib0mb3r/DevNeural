@@ -116,9 +116,16 @@ export interface LiveBlock {
   /** A handover awaiting the operator's spoken approval (Phase C): the
    * gist of the worker's draft and the brain's review. */
   pendingHandover: string | null;
+  /** The last few exchanges (oldest first): what he said, what the voice
+   * said back. This is the voice's working memory; it lives in the
+   * daemon, so a Layer 1 clear (a respawn at a quiet moment) loses
+   * nothing the voice needed. */
+  recentTalk?: ReadonlyArray<{ heard: string; said: string }>;
   /** Clock now, same base as midSinceMs. */
   nowMs: number;
 }
+
+export const RECENT_TALK_MAX = 6;
 
 export interface TopLayerResult {
   /** What gets spoken out loud (null = nothing, or already streamed). */
@@ -144,7 +151,9 @@ export type TopLayerEventKind =
   | 'brain-progress'
   /* Phase C: a reviewed handover waits for the operator's yes. */
   | 'handover-ready'
-  | 'handover-result';
+  | 'handover-result'
+  /* T4: the brain is clearing its own context (handover approved). */
+  | 'brain-clear';
 
 export interface TopLayerEvent {
   kind: TopLayerEventKind;
@@ -386,6 +395,12 @@ export function renderLiveBlock(live: LiveBlock): string {
   }
   if (live.pendingHandover) {
     lines.push(`       handover pending: ${oneLine(live.pendingHandover, 400)}`);
+  }
+  if (live.recentTalk && live.recentTalk.length > 0) {
+    lines.push('       recent talk (oldest first):');
+    for (const t of live.recentTalk.slice(-RECENT_TALK_MAX)) {
+      lines.push(`         he: ${JSON.stringify(oneLine(t.heard, 140))} | you: ${JSON.stringify(oneLine(t.said, 140))}`);
+    }
   }
   return lines.join('\n');
 }

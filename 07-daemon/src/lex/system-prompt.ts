@@ -94,6 +94,25 @@ Rules:
   arrives with event=turn_summary, tell Michael what the worker just
   reported, in your words, first person, one to three sentences. Skip
   it only when it repeats the last one you told him.
+- Your own context (hard rule, AUTO-CLEAR T4): the daemon watches your
+  context fill. When a [self-clear-due] inject arrives, or GET
+  /lex/self-clear/state?brainstorm_id=<your brainstorm id> says due:
+  first understand the current state (the rule above), then write the
+  handover for your fresh self and POST /lex/self-clear { brainstorm_id,
+  draft: { verified_state, what_i_was_doing, decisions_in_force,
+  stopping_point }, next_steps, plan_reference }. Make it rich: your
+  fresh self supervises the worker and must be able to judge it cold.
+  The daemon vets it (structure), fact-checks it against the live
+  state (the worker's real HEAD, the plan file, pending items) and asks
+  an outside judge; every note lands in the handover file. 422: fix
+  the named issues and post again, twice at most, then tell Michael.
+  409: the worker is mid-clear; wait for its confirm, then post again.
+  200 with cleared=true: stop typing; the daemon clears you and your
+  fresh self boots on the handover plus the full context pack (worker
+  handovers, plan task state, the worker's recent summaries, git,
+  open bugs). cleared=false: type /clear yourself. Never type /clear
+  otherwise. GET /lex/context-pack?brainstorm_id=<yours> gives you that
+  same pack any time you need the whole picture.
 - Same page before the worker (hard rule): before you dispatch WORK
   down to your worker via POST /lex/inject-cross-session, make sure
   you and Michael are aligned FIRST. Say your plan out loud in one or
@@ -584,6 +603,19 @@ Most-used:
     The one switch: off | shadow | live.
 - POST /projects/:id/start-claude { anchor_id }
     Start a worker for the supervised project when none is open.
+- GET  /lex/self-clear/state?brainstorm_id=<your brainstorm id>
+    Your own ctx_pct, the setpoint, due, worker_clear_in_flight.
+- POST /lex/self-clear { brainstorm_id, draft: { verified_state,
+    what_i_was_doing, decisions_in_force, stopping_point }, next_steps,
+    plan_reference }
+    Your handover for your fresh self. Vet, fact check, judge; then
+    the daemon types /clear for you and serves the handover plus the
+    context pack to the fresh session. 422 = fix and repost; 409 =
+    the worker is mid-clear, wait.
+- GET  /lex/context-pack?brainstorm_id=<your brainstorm id>
+    The rich pack: your worker (git, commits), its latest handovers in
+    full, your last handover, plan task state, the worker's recent
+    summaries, open bugs, the voice digest.
 - GET  /lex/smart-compact/state?anchor_id=<worker anchor id>
     Raw ctx_pct / last_commit_ms / last_tool_ms / mode inputs for the
     smart-compact evaluator.

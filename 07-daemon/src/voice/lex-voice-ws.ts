@@ -62,6 +62,8 @@ import {
   isVoiceBrainSessionWarm,
   isVoiceBrainSessionEnabled,
   killVoiceBrainSession,
+  prewarmVoiceBrainSession,
+  voiceBrainJsonlPath,
 } from '../lex/voice-brain-session.js';
 import {
   getBrainstormByClaudeSessionId,
@@ -85,7 +87,11 @@ import { isBackchannelUtterance } from './engine/barge-classifier.js';
 /* BUG-029: the worker's phase for the [live] block, the same merge the
  * deck tiles use (hook phase overridden by the transcript tail). */
 import { getPhase, type SessionPhase } from '../dashboard/session-phase.js';
-import { derivePhaseFromTail, readLastAssistantText } from '../dashboard/sessions.js';
+import {
+  derivePhaseFromTail,
+  deriveContextFromTail,
+  readLastAssistantText,
+} from '../dashboard/sessions.js';
 import { buildLexSpawnPrompt } from '../lex/spawn-prompt.js';
 import { buildLexSystemPromptVersioned } from '../lex/system-prompt.js';
 import {
@@ -102,6 +108,7 @@ import {
   type VoiceCommandKind,
 } from './lex-voice-commands.js';
 import {
+  RECENT_TALK_MAX,
   renderLiveBlock,
   topLayerEventTurn,
   topLayerTurn,
@@ -2120,6 +2127,22 @@ function jsonlHasAssistantRecord(p: string): boolean {
  * quiet, L1 gets one event per window and decides whether a word is
  * worth it. Never a daemon-generated spoken line (BUG-013 rule). */
 const BRAIN_PROGRESS_MS = 45_000;
+
+/* Layer 1 self-clear: how often the transcript is measured, how long the
+ * room must be quiet before the respawn, and the default setpoint
+ * (runtime config l1_clear_pct overrides; haiku's window is large and L1
+ * turns are short, so this is rare). */
+const L1_CLEAR_CHECK_MS = 30_000;
+const L1_CLEAR_QUIET_MS = 8_000;
+export const L1_CLEAR_DEFAULT_PCT = 50;
+let l1ClearPctOverride: number | null = null;
+/** Installed by routes.ts from runtime config; tests set it directly. */
+export function setL1ClearPct(pct: number | null): void {
+  l1ClearPctOverride = pct;
+}
+function l1ClearPct(): number {
+  return l1ClearPctOverride ?? L1_CLEAR_DEFAULT_PCT;
+}
 /* Fail-open cap for forwards parked while L2 warms: past this, the
  * merged text goes down anyway (the CC composer buffers a paste). */
 const WARM_QUEUE_CAP_MS = 5 * 60_000;
@@ -2622,7 +2645,53 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     state.watchTimer = setInterval(() => {
       pollJsonl();
       maybeBrainProgress();
+      maybeClearL1();
     }, 250);
+  }
+
+  /* Layer 1 self-clear (operator, 2026-09-22): the voice never carried
+   * state in its context; every turn is rebuilt from the [live] block,
+   * which now holds the recent talk. So a clear is a respawn at a quiet
+   * moment once the transcript passes the setpoint, no handover, no
+   * review, and nothing she needed is lost. Checked every 30s. */
+  let lastL1ClearCheckMs = 0;
+  let l1ClearArmedAtMs = 0;
+  function maybeClearL1(): void {
+    if (state.closed) return;
+    const now = Date.now();
+    if (now - lastL1ClearCheckMs < L1_CLEAR_CHECK_MS) return;
+    lastL1ClearCheckMs = now;
+    const anchorId = currentAnchorId();
+    if (!anchorId) return;
+    const jsonl = voiceBrainJsonlPath(anchorId);
+    if (!jsonl) return;
+    const ctx = deriveContextFromTail(jsonl);
+    if (!ctx || ctx.max <= 0) return;
+    const pct = (ctx.tokens / ctx.max) * 100;
+    if (pct < l1ClearPct()) {
+      l1ClearArmedAtMs = 0;
+      return;
+    }
+    if (!l1ClearArmedAtMs) {
+      l1ClearArmedAtMs = now;
+      logFn(`[voice-l1] context at ${pct.toFixed(1)}% (setpoint ${l1ClearPct()}%); clearing at the next quiet moment`);
+    }
+    const quiet =
+      state.ttsActive === null &&
+      !bargeStash &&
+      !pendingFinish &&
+      state.awaitingResponseSince === 0 &&
+      !state.userSpeaking &&
+      now - state.lastUserSpeechEndMs >= L1_CLEAR_QUIET_MS;
+    if (!quiet) return;
+    logFn(`[voice-l1] self-clear at ${pct.toFixed(1)}%: respawning the voice session (recent talk kept in the live block)`);
+    l1ClearArmedAtMs = 0;
+    try {
+      killVoiceBrainSession(anchorId, 'l1-self-clear');
+      prewarmVoiceBrainSession(anchorId);
+    } catch (err) {
+      logFn(`[voice-l1] self-clear respawn failed: ${(err as Error).message}`);
+    }
   }
 
   function stopJsonlWatch(): void {
@@ -3411,6 +3480,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     return {
       cut,
       pendingHandover: anchorId && h.pendingHandover ? h.pendingHandover(anchorId) : null,
+      recentTalk: recentTalk.slice(-RECENT_TALK_MAX),
       mid: ms.mid,
       midSinceMs: ms.sinceMs,
       midTool: ms.tool,
@@ -3426,20 +3496,39 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   /* One speaker per turn: every L1 line goes through here, sentence by
    * sentence, chaining gaplessly after the first. Never-twice ring
    * (single-mouth invariant 4) applied per line. */
-  function makeLineSpeaker(): { speakLine: (line: string) => void; streamed: () => boolean } {
+  function makeLineSpeaker(): {
+    speakLine: (line: string) => void;
+    streamed: () => boolean;
+    lines: () => string[];
+  } {
     let streamed = false;
+    const lines: string[] = [];
     return {
       streamed: () => streamed,
+      lines: () => lines,
       speakLine: (line: string): void => {
         const text = line.trim();
         if (!text) return;
         if (wasLastSpoken(text)) return;
         rememberSpokenLine(text);
+        lines.push(text);
         send({ t: 'layer-hop', layer: 'top', text });
         for (const seg of splitForSpeech(text)) speak(seg, { continuation: streamed });
         streamed = true;
       },
     };
+  }
+
+  /* The voice's working memory: the last few exchanges, kept here in
+   * the daemon and rendered into every [live] block. Survives a Layer 1
+   * respawn by construction. */
+  const recentTalk: Array<{ heard: string; said: string }> = [];
+  function rememberTalk(heard: string, said: string): void {
+    const h = heard.trim();
+    const s = said.trim();
+    if (!h && !s) return;
+    recentTalk.push({ heard: h, said: s });
+    while (recentTalk.length > RECENT_TALK_MAX) recentTalk.shift();
   }
 
   function clearWarmQueue(): void {
@@ -5248,6 +5337,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     state.topOwnsAck = speaker.streamed() || turn.speech !== null;
     const warming = midState().mid === 'warming';
     const actions = _planTopLayerActionsImpl(turn, warming);
+    rememberTalk(
+      trimmed,
+      speaker.lines().join(' ') ||
+        turn.speech ||
+        (turn.forward ? '(passed it to the brain)' : turn.ignore ? '(ignored)' : ''),
+    );
     logFn(
       `[voice-ws] L1 turn: speech=${state.topOwnsAck} forward=${turn.forward !== null} control=${turn.control ?? 'none'} inferred=${turn.inferredControl ? 'yes' : 'no'} ignore=${turn.ignore ?? 'no'} warming=${warming}`,
     );

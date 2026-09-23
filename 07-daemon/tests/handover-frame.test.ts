@@ -8,6 +8,7 @@ import {
   parseHandoverFrame,
   renderHandoverFrame,
   reseedFromFrame,
+  richReseedFromFrame,
   vetHandoverFrame,
   type HandoverFrame,
 } from '../src/lex/handover-frame.js';
@@ -37,6 +38,24 @@ describe('renderHandoverFrame / parseHandoverFrame', () => {
   it('round-trips a reviewed frame exactly', () => {
     const md = renderHandoverFrame(FRAME);
     expect(parseHandoverFrame(md)).toEqual(FRAME);
+  });
+  it('a lex-self-clear frame is labelled Lex draft / Judge review and round-trips', () => {
+    const f: HandoverFrame = {
+      ...FRAME,
+      kind: 'lex-self-clear',
+      worker: { ...FRAME.worker, author: { role: 'lex', sessionId: 'cc-lex', at: FRAME.createdAt } },
+      lex: { ...FRAME.lex!, author: { role: 'judge', sessionId: null, at: FRAME.createdAt }, corrections: ['judge: OK'], verdict: 'approved' },
+    };
+    const md = renderHandoverFrame(f);
+    expect(md).toMatch(/^## Lex draft \(lex session cc-lex, /m);
+    expect(md).toMatch(/^## Judge review \(approved, session none, /m);
+    expect(md).not.toMatch(/Worker draft|Lex review/);
+    expect(parseHandoverFrame(md)).toEqual(f);
+    const rich = richReseedFromFrame(f);
+    expect(rich).toMatch(/^Resume from your lex-self-clear handover of .* \(judge: approved\)\./);
+    expect(rich).toContain('Judge notes:\n- judge: OK');
+    expect(rich).toContain('Next steps: Task 6: Phase C routes. Then Task 7.');
+    expect(rich).toContain('Plan: docs/superpowers/plans/2026-09-22-voice-and-clear-complete.md');
   });
   it('labels both halves with author and time, corrections one per line', () => {
     const md = renderHandoverFrame(FRAME);

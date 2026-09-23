@@ -139,11 +139,23 @@ import {
   attachLexVoiceWs,
   broadcastVoiceControl,
   notifyTopLayerEvent,
+  setL1ClearPct,
   setTopLayerControlHandlers,
   type VoiceControlKind,
 } from '../voice/lex-voice-ws.js';
 import { createVoiceLayersWire, readFileTail } from './voice-layers-wire.js';
 import type { PendingHandover } from '../lex/handover-approval.js';
+import { registerLexSelfClearRoutes } from './lex-self-clear-routes.js';
+import {
+  SELF_CLEAR_DEFAULT_PCT,
+  SELF_CLEAR_PCT_KEY,
+  SelfClearGate,
+  selfClearDuePrompt,
+} from '../lex/lex-self-clear.js';
+import { buildLexContextPack, resolvePlanRef } from '../lex/lex-context-pack.js';
+import { defaultRepoProbe } from '../lex/smart-clear.js';
+import { autoClearMode } from './handover-routes.js';
+import { getDigest } from '../voice/voice-digest.js';
 import { issueToken } from '../lex/cross-session-inject.js';
 import { lintQueueStatus } from '../wiki/lint-queue.js';
 import { providerStatus } from '../llm/index.js';
@@ -492,12 +504,16 @@ export async function registerDashboardRoutes(
   const { registerHandoverRoutes } = await import('./handover-routes.js');
   const { HandoverApprovalRegistry } = await import('../lex/handover-approval.js');
   const handoverRegistry = new HandoverApprovalRegistry();
+  /* T4 stagger: a worker clear in flight blocks a Lex self-clear. */
+  const selfClearGate = new SelfClearGate();
   registerSmartCompactRoutes(app, store.db, smartCompactInjector, log, {
     ctxProvider: smartCompactCtxProvider,
     onHandoverClear: (handoverId) => {
       const p = handoverRegistry.approveById(handoverId);
       if (p) log(`[handover] ${handoverId} approved by clear-and-paste (Lex-driven)`);
     },
+    onClearStart: (anchorId) => selfClearGate.workerClearStart(anchorId),
+    onClearEnd: (anchorId) => selfClearGate.workerClearEnd(anchorId),
   });
   /* DRIVE-QUEUE 4: smart-clear trigger surface. Shares the same ctx
    * derivation so /smart-clear/state and /smart-compact/state report
@@ -650,6 +666,127 @@ export async function registerDashboardRoutes(
   setTopLayerControlHandlers(voiceLayers.handlers());
   /* Phase C: a reviewed handover is read out through Layer 1. */
   handoverReviewedHook.fn = (p) => voiceLayers.announceHandover(p);
+
+  /* Lex self-clear (T4) and the rich context pack (operator, 2026-09-22:
+   * Lex's cold start and handover docs are rich even if they fill her
+   * context; she supervises the layers below). Scope rule: the pack reads
+   * only this brainstorm's directory and its one supervised worker. */
+  const brainstormCwd = path.posix.join(DATA_ROOT.replace(/\\/g, '/'), 'brainstorm');
+  const readTextOrNull = (p: string): string | null => {
+    try {
+      return fs.readFileSync(p, 'utf-8');
+    } catch {
+      return null;
+    }
+  };
+  const newestRef = (brainstormId: string) =>
+    [...listTranscriptRefs(brainstormId)].sort((a, b) => b.started_ms - a.started_ms)[0] ?? null;
+  const supervisedWorker = (brainstormId: string) => {
+    const row = getLexSession(brainstormId);
+    const anchorId = row?.supervises_project_anchor_id ?? null;
+    const project = anchorId ? store.db.getProjectSession(anchorId) : null;
+    return project
+      ? {
+          anchorId: project.id,
+          slug: project.project_slug,
+          cwd: project.cwd ?? null,
+          sessionId: project.current_session_id ?? null,
+        }
+      : null;
+  };
+  const lexContextPackFor = (brainstormId: string): string => {
+    try {
+      return buildLexContextPack({
+        brainstormId,
+        worker: supervisedWorker(brainstormId),
+        digest: getDigest()?.digest ?? null,
+        planRoots: [brainstormCwd],
+      }).text;
+    } catch (err) {
+      log(`[context-pack] failed for ${brainstormId.slice(0, 8)}: ${(err as Error).message}`);
+      return '';
+    }
+  };
+  const selfClearSetpoint = (): number => {
+    const raw = Number(store.db.getRuntimeConfig(SELF_CLEAR_PCT_KEY));
+    return Number.isFinite(raw) && raw >= 20 && raw <= 95 ? raw : SELF_CLEAR_DEFAULT_PCT;
+  };
+  const lexCtxPct = (brainstormId: string): number | null => {
+    const ref = newestRef(brainstormId);
+    if (!ref) return null;
+    const ctx = deriveContextFromTail(ref.transcript_path);
+    return ctx && ctx.max > 0 ? Math.round((ctx.tokens / ctx.max) * 1000) / 10 : null;
+  };
+  registerLexSelfClearRoutes(app, store.db, log, {
+    gate: selfClearGate,
+    brainstormCwd,
+    askText: (i) => import('../lex/judge-session.js').then((m) => m.askText(i)),
+    facts: (brainstormId, anchorId) => {
+      const project = anchorId ? store.db.getProjectSession(anchorId) : null;
+      const sig = project?.cwd ? defaultRepoProbe(project.cwd) : null;
+      const roots = [...(project?.cwd ? [project.cwd] : []), brainstormCwd];
+      return {
+        workerHead: sig?.headSha ?? null,
+        workerBranch: sig?.branch ?? null,
+        workerSessionId: project?.current_session_id ?? null,
+        planExists: (ref) => resolvePlanRef(ref, roots) !== null,
+        pendingHandoverId: handoverRegistry.pendingForBrainstorm(brainstormId)?.handoverId ?? null,
+        pendingDispatch: voiceLayers.handlers().pendingDispatch?.(brainstormId)?.summary ?? null,
+      };
+    },
+    contextPack: lexContextPackFor,
+    ctxPct: lexCtxPct,
+    setpoint: selfClearSetpoint,
+    lexPtyFor: (brainstormId) => getLexSession(brainstormId)?.current_pty_id ?? null,
+    ptyInject: (ptyId, text, commit) => ptyInject(ptyId, text, commit),
+    notifyVoice: (brainstormId, text) => notifyTopLayerEvent(brainstormId, { kind: 'brain-clear', text }),
+    bell: (i) => {
+      emitNotification({
+        severity: 'warn',
+        source: 'lex-self-clear',
+        notify_class: 'followup',
+        title: i.title,
+        body: i.body,
+        dedup_key: i.dedup_key,
+        ...(i.anchor_id ? { push_data: { anchor_id: i.anchor_id } } : {}),
+      });
+    },
+    newestTranscript: (brainstormId) => newestRef(brainstormId)?.transcript_path ?? null,
+    currentSessionId: (brainstormId) => newestRef(brainstormId)?.cc_session_id ?? null,
+    readFile: readTextOrNull,
+  });
+  /* The daemon nudges Lex when her own context passes the setpoint (auto
+   * clear on every layer). One nudge per ten minutes per brainstorm, only
+   * in live mode, never while her previous clear is still booting. */
+  const selfClearNudgedAt = new Map<string, number>();
+  const selfClearWatch = setInterval(() => {
+    try {
+      if (autoClearMode(store.db) !== 'live') return;
+      const setpoint = selfClearSetpoint();
+      const now = Date.now();
+      for (const row of store.db.listLexSessions({ status: 'live' })) {
+        if (!row.current_pty_id) continue;
+        if (selfClearGate.lexClearPending(row.id)) continue;
+        const pct = lexCtxPct(row.id);
+        if (pct === null || pct < setpoint) continue;
+        const last = selfClearNudgedAt.get(row.id) ?? 0;
+        if (now - last < 10 * 60_000) continue;
+        selfClearNudgedAt.set(row.id, now);
+        const r = ptyInject(row.current_pty_id, selfClearDuePrompt(pct, setpoint), true);
+        log(`[self-clear] due nudge brainstorm=${row.id.slice(0, 8)} ctx=${pct}% setpoint=${setpoint}% ok=${r.ok}`);
+      }
+    } catch (err) {
+      log(`[self-clear] watch failed: ${(err as Error).message}`);
+    }
+  }, 60_000);
+  selfClearWatch.unref?.();
+  /* Layer 1's own setpoint, from runtime config (l1_clear_pct). */
+  try {
+    const raw = Number(store.db.getRuntimeConfig('l1_clear_pct'));
+    setL1ClearPct(Number.isFinite(raw) && raw >= 20 && raw <= 95 ? raw : null);
+  } catch {
+    /* default stays */
+  }
 
   /* Background poll that binds a daemon-owned PTY to its claude
    * session_id once the .jsonl file appears. Single global timer; no
@@ -6653,6 +6790,23 @@ export async function registerDashboardRoutes(
       }
     } catch {
       /* investigator serve is additive; never block cold start */
+    }
+    /* Rich cold start (operator, 2026-09-22): the context pack (her
+     * worker, its handovers in full, plan task state, the worker's recent
+     * summaries, open bugs) rides along whenever this brainstorm
+     * supervises a worker or has handovers of its own. Additive. */
+    try {
+      const pack = buildLexContextPack({
+        brainstormId: bs.id,
+        worker: supervisedWorker(bs.id),
+        digest: null,
+        planRoots: [brainstormCwd],
+      });
+      if (pack.sections.length > 1 || supervisedWorker(bs.id)) {
+        block = block ? `${block}\n\n${pack.text}` : pack.text;
+      }
+    } catch (err) {
+      log(`[cold-start-preload] context pack failed: ${(err as Error).message}`);
     }
     if (!block) {
       auditEarlyOut('no-siblings', bs.id);

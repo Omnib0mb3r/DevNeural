@@ -758,6 +758,11 @@ export interface RegisterOptions {
    * in the shared registry so the worker's clear-handoff hook serves
    * the same frame (one seed, never a recomputed legacy block). */
   onHandoverClear?: (handoverId: string, brainstormId: string) => void;
+  /** Stagger rule (T4): a worker clear in flight blocks a Lex self-clear
+   * for the same anchor. Start fires before the /clear, end when the
+   * resume completes (the gate also expires it on its own). */
+  onClearStart?: (anchorId: string) => void;
+  onClearEnd?: (anchorId: string) => void;
 }
 
 export function registerSmartCompactRoutes(
@@ -988,6 +993,12 @@ export function registerSmartCompactRoutes(
         /* registry bookkeeping only; never block the clear */
       }
     }
+    const clearedAnchorId: string = body.anchor_id;
+    try {
+      options.onClearStart?.(clearedAnchorId);
+    } catch {
+      /* bookkeeping only */
+    }
     const r = clearAndPaste(db, body.anchor_id, {
       ...(body.caller !== undefined
         ? { caller: body.caller }
@@ -1007,6 +1018,11 @@ export function registerSmartCompactRoutes(
         log(
           `[smart-compact] clear-and-paste resume ship_ok=${info.ship_ok} wait=${info.wait?.reason ?? 'none'} elapsed=${info.wait?.elapsed_ms ?? 0}ms`,
         );
+        try {
+          options.onClearEnd?.(clearedAnchorId);
+        } catch {
+          /* bookkeeping only */
+        }
       },
     });
     log(

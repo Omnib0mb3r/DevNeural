@@ -272,6 +272,45 @@ export async function postWorkerHandoff(
   }
 }
 
+/* Lex self-clear (AUTO-CLEAR T4, 2026-09-22): after Lex's own /clear the
+ * daemon holds her approved handover plus the rich context pack. Ask
+ * for it and print it as additionalContext so her fresh self boots on
+ * it. The daemon answers an empty block for any cwd that is not the
+ * brainstorm directory, or when no Lex clear is pending, so worker and
+ * unrelated sessions are no-ops. Bounded; daemon-down silently skips. */
+export async function postLexClearHandoff(
+  sessionId: string,
+  cwd: string,
+): Promise<void> {
+  if (!sessionId || !cwd) return;
+  const url = `http://127.0.0.1:${DAEMON_PORT}/lex/clear-handoff`;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 2000);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, cwd }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return;
+    const json = (await res.json()) as { ok?: boolean; block?: string };
+    if (!json.ok || !json.block || json.block.trim().length === 0) return;
+    process.stdout.write(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'SessionStart',
+          additionalContext: json.block,
+        },
+      }),
+    );
+  } catch {
+    /* daemon down / network error / timeout: silent no-op */
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 /* Tell the daemon a SessionStart fired from /clear so it can mark the
  * previous session in this workspace as superseded. Without this the
  * Stream Deck rail keeps the old tile around for ACTIVE_THRESHOLD_MS. */
@@ -551,6 +590,9 @@ async function main(): Promise<void> {
     const source = String(payload.source ?? '').toLowerCase();
     const sessionId = String(payload.session_id ?? '');
     if ((source === 'clear' || source === 'compact') && sessionId) {
+      /* Lex's own clear: her approved handover + context pack first,
+       * so the fresh session's first turn carries it. */
+      await postLexClearHandoff(sessionId, cwd);
       await postClearSupersede(sessionId, cwd);
     } else if (source === 'startup' && sessionId) {
       /* Fresh spawn: ask the daemon to compose a sibling-decision

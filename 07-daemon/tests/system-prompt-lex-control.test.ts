@@ -46,6 +46,21 @@ describe('Lex in control (L2 contract, 2026-09-22)', () => {
     expect(flat).toContain('vet.ok');
   });
 
+  it('owns her own context: self-clear through the daemon, never a bare /clear', () => {
+    for (const r of [
+      buildLexSystemPromptVersioned({ archive: false, scope: SCOPE }),
+      buildLexSystemPromptVersioned({ archive: false }),
+    ]) {
+      const flat = r.prompt.replace(/\s+/g, ' ');
+      expect(flat).toContain('Your own context (hard rule, AUTO-CLEAR T4)');
+      expect(flat).toContain('[self-clear-due]');
+      expect(flat).toContain('POST /lex/self-clear { brainstorm_id, draft: { verified_state, what_i_was_doing, decisions_in_force, stopping_point }, next_steps, plan_reference }');
+      expect(flat).toContain('Never type /clear otherwise');
+      expect(flat).toContain('GET /lex/context-pack?brainstorm_id=');
+      expect(r.prompt).toContain('GET  /lex/self-clear/state?brainstorm_id=');
+    }
+  });
+
   it('documents the handover routes in the runtime route list for every prompt', () => {
     for (const r of [
       buildLexSystemPromptVersioned({ archive: false, scope: SCOPE }),

@@ -776,6 +776,13 @@ export function killVoiceBrainSession(anchorId: string, reason: string): void {
   sessions.delete(key);
 }
 
+/** The live session's transcript path for an anchor (null when none),
+ * so the voice WS can measure Layer 1's own context fill. */
+export function voiceBrainJsonlPath(anchorId?: string | null): string | null {
+  const s = sessions.get(keyFor(anchorId));
+  return s?.jsonlPath ?? null;
+}
+
 /** Diagnostics: every anchor with a voice-brain record. */
 export function listVoiceBrainSessions(): Array<{
   anchorId: string;

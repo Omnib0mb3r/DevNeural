@@ -15,7 +15,9 @@ export type HandoverKind = 'auto-clear' | 'session-end' | 'crash-recovery' | 'le
 export type HandoverVerdict = 'approved' | 'revised' | 'rejected';
 
 export interface HandoverAuthor {
-  role: 'worker' | 'daemon-trail' | 'lex';
+  /** 'judge' is the outside approver of a lex-self-clear frame (the
+   * judge session on the operator's subscription). */
+  role: 'worker' | 'daemon-trail' | 'lex' | 'judge';
   sessionId: string | null;
   /** ISO time. */
   at: string;
@@ -97,8 +99,9 @@ export function renderHandoverFrame(f: HandoverFrame): string {
     lines.push('');
   }
   const w = f.worker;
+  const labels = halfLabels(f.kind);
   lines.push(
-    `## Worker draft (${w.author.role} session ${full(w.author.sessionId)}, ${w.author.at})`,
+    `## ${labels.draft} (${w.author.role} session ${full(w.author.sessionId)}, ${w.author.at})`,
   );
   lines.push('');
   lines.push(`### ${SLOT_HEADINGS.verifiedState}`);
@@ -120,7 +123,7 @@ export function renderHandoverFrame(f: HandoverFrame): string {
   if (f.lex) {
     const l = f.lex;
     lines.push(
-      `## Lex review (${l.verdict}, session ${full(l.author.sessionId)}, ${l.author.at})`,
+      `## ${labels.review} (${l.verdict}, session ${full(l.author.sessionId)}, ${l.author.at})`,
     );
     lines.push('');
     lines.push(`### ${SLOT_HEADINGS.corrections}`);
@@ -140,9 +143,20 @@ export function renderHandoverFrame(f: HandoverFrame): string {
   return lines.join('\n');
 }
 
+/* A lex-self-clear frame is Lex's own draft reviewed by the judge; every
+ * other kind is the worker's draft reviewed by Lex. The labels say who
+ * wrote what, so the operator can read the file cold. */
+function halfLabels(kind: HandoverKind): { draft: string; review: string } {
+  return kind === 'lex-self-clear'
+    ? { draft: 'Lex draft', review: 'Judge review' }
+    : { draft: 'Worker draft', review: 'Lex review' };
+}
+
 /* "## Worker draft (worker session <id>, <at>)" and
- * "## Lex review (approved, session <id>, <at>)". */
-const HALF_RE = /^## (Worker draft|Lex review) \((\S+?),? session (\S+), ([^)]+)\)\s*$/;
+ * "## Lex review (approved, session <id>, <at>)"; for a self-clear
+ * "## Lex draft (lex session <id>, <at>)" and "## Judge review (...)". */
+const HALF_RE =
+  /^## (Worker draft|Lex draft|Lex review|Judge review) \((\S+?),? session (\S+), ([^)]+)\)\s*$/;
 const SLOT_RE = /^### (.+?)\s*$/;
 
 function unblock(text: string): string {
@@ -203,7 +217,7 @@ export function parseHandoverFrame(md: string): HandoverFrame | null {
       for (const k of Object.keys(slots)) delete slots[k];
       slot = null;
       const sessionId = h[3] === 'none' ? null : h[3]!;
-      if (h[1] === 'Worker draft') {
+      if (h[1] === 'Worker draft' || h[1] === 'Lex draft') {
         current = {
           half: 'worker',
           author: { role: h[2] as HandoverAuthor['role'], sessionId, at: h[4]! },
@@ -211,7 +225,7 @@ export function parseHandoverFrame(md: string): HandoverFrame | null {
       } else {
         current = {
           half: 'lex',
-          author: { role: 'lex', sessionId, at: h[4]! },
+          author: { role: h[1] === 'Judge review' ? 'judge' : 'lex', sessionId, at: h[4]! },
           verdict: h[2] as HandoverVerdict,
         };
       }
@@ -296,4 +310,45 @@ export function reseedFromFrame(f: HandoverFrame): string {
   if (text.length > RESEED_MAX_CHARS) text = build(220);
   if (text.length > RESEED_MAX_CHARS) text = `${text.slice(0, RESEED_MAX_CHARS - 3)}...`;
   return text;
+}
+
+/* Lex's own reseed (operator, 2026-09-22 evening): rich, not clipped to
+ * the worker's 2400. She supervises the layers below and needs the
+ * whole picture to judge them; filling her context is the accepted
+ * price. Only a runaway guard applies. */
+export const RICH_RESEED_MAX_CHARS = 12_000;
+
+export function richReseedFromFrame(f: HandoverFrame): string {
+  const lines: string[] = [];
+  const who = f.lex
+    ? `${f.lex.author.role === 'judge' ? 'judge' : 'Lex'}: ${f.lex.verdict}`
+    : 'unvetted';
+  lines.push(`Resume from your ${f.kind} handover of ${f.createdAt} (${who}).`);
+  lines.push('');
+  lines.push(`Verified state: ${f.worker.verifiedState.trim()}`);
+  lines.push('');
+  lines.push(`What I was doing: ${f.worker.whatIWasDoing.trim()}`);
+  if (f.worker.decisionsInForce.trim()) {
+    lines.push('');
+    lines.push(`Decisions in force: ${f.worker.decisionsInForce.trim()}`);
+  }
+  lines.push('');
+  lines.push(`Stopping point: ${f.worker.stoppingPoint.trim()}`);
+  if (f.lex) {
+    if (f.lex.corrections.length > 0) {
+      lines.push('');
+      lines.push(f.lex.author.role === 'judge' ? 'Judge notes:' : 'Corrections:');
+      for (const c of f.lex.corrections) lines.push(`- ${c.replace(/\s+/g, ' ').trim()}`);
+    }
+    lines.push('');
+    lines.push(`Next steps: ${f.lex.nextSteps.trim()}`);
+    if (f.lex.planReference.trim()) {
+      lines.push('');
+      lines.push(`Plan: ${f.lex.planReference.trim()}`);
+    }
+  }
+  const text = lines.join('\n');
+  return text.length > RICH_RESEED_MAX_CHARS
+    ? `${text.slice(0, RICH_RESEED_MAX_CHARS - 3)}...`
+    : text;
 }

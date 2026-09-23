@@ -38,6 +38,27 @@ describe('renderLiveBlock', () => {
     expect(renderLiveBlock(BASE)).not.toMatch(/cut:|handover pending/);
   });
 
+  it('renders the recent talk ring, oldest first, at most six, clipped', () => {
+    const s = renderLiveBlock({
+      ...BASE,
+      recentTalk: [
+        { heard: 'what is the worker on', said: 'Task 9, the self clear.' },
+        { heard: 'ok keep going', said: '(passed it to the brain)' },
+      ],
+    });
+    expect(s).toContain('       recent talk (oldest first):');
+    expect(s).toContain('         he: "what is the worker on" | you: "Task 9, the self clear."');
+    expect(s.indexOf('what is the worker on')).toBeLessThan(s.indexOf('ok keep going'));
+    const many = renderLiveBlock({
+      ...BASE,
+      recentTalk: Array.from({ length: 9 }, (_, i) => ({ heard: `h${i}`, said: 'x'.repeat(300) })),
+    });
+    expect(many).not.toContain('he: "h2"');
+    expect(many).toContain('he: "h3"');
+    expect(many).not.toContain('x'.repeat(200));
+    expect(renderLiveBlock({ ...BASE, recentTalk: [] })).not.toContain('recent talk');
+  });
+
   it('renders every mid state with elapsed seconds where it matters', () => {
     expect(renderLiveBlock(BASE)).toBe('[live] brain: idle');
     expect(renderLiveBlock({ ...BASE, mid: 'down' })).toBe('[live] brain: down');
