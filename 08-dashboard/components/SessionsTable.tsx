@@ -6,15 +6,32 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   sessions as sessionsClient,
+  smartClearConfig,
   startClaude,
   type IdleProject,
   type SessionSummary,
 } from "@/lib/daemon-client";
 import { projectFromSlug, relTime } from "@/lib/session-helpers";
+import { ContextGauge } from "./ContextGauge";
 import { Icon } from "./Icon";
 import { StatusDot } from "./StatusDot";
 
 const STALE_HIDE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/* Trip marks when the config fetch has not landed (or the daemon
+ * predates the route): the smart-clear built-in defaults. */
+const DEFAULT_THRESHOLD_PCT = 40;
+const DEFAULT_CEILING_PCT = 60;
+
+/* Whole-percent context for a row. The daemon rounds it into ctx_pct;
+ * a daemon that predates the field still ships the raw context, so
+ * derive from that as the fallback. Null stays null (unknown). */
+function rowCtxPct(s: SessionSummary): number | null {
+  if (typeof s.ctx_pct === "number") return s.ctx_pct;
+  if (s.ctx_pct === null) return null;
+  if (!s.context || !(s.context.max > 0)) return null;
+  return Math.max(0, Math.min(100, Math.round((s.context.tokens / s.context.max) * 100)));
+}
 
 export function SessionsTable() {
   const qc = useQueryClient();
@@ -24,6 +41,20 @@ export function SessionsTable() {
     queryFn: sessionsClient,
     refetchInterval: 5_000,
   });
+  /* Context gauge (2026-09-22): the rows carry a bare ctx_pct; the trip
+   * marks come from the smart-clear config so this table draws the
+   * same two lines as the Stream Deck tiles. Defaults cover a missing
+   * route (older daemon) or a fetch that has not landed yet. */
+  const cfgQ = useQuery({
+    queryKey: ["smart-clear-config"],
+    queryFn: smartClearConfig,
+    refetchInterval: 30_000,
+    retry: false,
+  });
+  const thresholdPct = cfgQ.data?.ok
+    ? cfgQ.data.thresholdPct
+    : DEFAULT_THRESHOLD_PCT;
+  const ceilingPct = cfgQ.data?.ok ? cfgQ.data.ceilingPct : DEFAULT_CEILING_PCT;
   const [showIdle, setShowIdle] = useState(false);
   const [showStale, setShowStale] = useState(false);
   /* Track in-flight start-claude posts per project so the button
@@ -126,6 +157,7 @@ export function SessionsTable() {
               <th className="px-5 py-2 font-normal">Project</th>
               <th className="px-3 py-2 font-normal">Session ID</th>
               <th className="px-3 py-2 font-normal">Status</th>
+              <th className="px-3 py-2 font-normal">Context</th>
               <th className="px-3 py-2 font-normal">Captured state</th>
               <th className="px-3 py-2 font-normal text-right">Last activity</th>
               <th className="px-5 py-2 font-normal text-right">Action</th>
@@ -154,6 +186,7 @@ export function SessionsTable() {
                       <StatusDot status="idle" /> not running
                     </span>
                   </td>
+                  <td className="px-3 py-3" />
                   <td className="px-3 py-3 text-xs text-txt3">—</td>
                   <td className="px-3 py-3 text-right text-[11px] font-mono text-txt3">
                     —
@@ -209,6 +242,14 @@ export function SessionsTable() {
                       <StatusDot status={s.active ? "live" : "idle"} pulse={s.active} />
                       {s.active ? "active" : "idle"}
                     </span>
+                  </td>
+                  <td className="px-3 py-3 min-w-40">
+                    <ContextGauge
+                      pct={rowCtxPct(s)}
+                      thresholdPct={thresholdPct}
+                      ceilingPct={ceilingPct}
+                      compact
+                    />
                   </td>
                   <td className="px-3 py-3 text-xs text-txt2">
                     <span className="inline-flex items-center gap-2">

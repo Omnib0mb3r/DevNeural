@@ -16,6 +16,7 @@ import { NavGrid } from "./NavGrid";
 import { lexPickStable } from "@/lib/lex";
 import { subscribeDashboardEvents } from "@/lib/dashboard-events";
 import { supervisedGroupFor, isGroupSupervised } from "@/lib/deck-nesting";
+import { ContextGauge } from "./ContextGauge";
 
 /* Stream Deck rail = remote analog of the physical Elgato deck.
  *
@@ -260,6 +261,11 @@ export function StreamDeck() {
                             session={s}
                             onTap={handleTileTap}
                             nested
+                            ctxGauge={{
+                              pct: t.worker_ctx_pct,
+                              thresholdPct: t.ctx_threshold_pct,
+                              ceilingPct: t.ctx_ceiling_pct,
+                            }}
                           />
                         ))}
                       </div>
@@ -368,9 +374,20 @@ interface DeckTileProps {
    * (non-nested) rendering keeps the original size. 2026-07-18
    * operator ask. */
   nested?: boolean;
+  /* Context gauge (2026-09-22): a worker nested under a brainstorm
+   * draws its context usage against the smart-clear trip marks. The
+   * brainstorm tile supplies the three numbers (worker_ctx_pct plus
+   * the marks) so the worker and its brainstorm read the same lines;
+   * orphan workers have no marks to draw and render no gauge. */
+  ctxGauge?: { pct: number | null; thresholdPct: number; ceilingPct: number };
 }
 
-function DeckTile({ session: s, onTap, nested = false }: DeckTileProps) {
+function DeckTile({
+  session: s,
+  onTap,
+  nested = false,
+  ctxGauge,
+}: DeckTileProps) {
   const state = tileState(s);
   const led = ledStatus(state);
   const project = projectFromSlug(s.project_slug);
@@ -424,6 +441,17 @@ function DeckTile({ session: s, onTap, nested = false }: DeckTileProps) {
       >
         {nested ? `worker · ${stateLabel}` : stateLabel}
       </div>
+      {ctxGauge && (
+        <div className="mb-1" data-testid="deck-worker-gauge">
+          <ContextGauge
+            pct={ctxGauge.pct}
+            thresholdPct={ctxGauge.thresholdPct}
+            ceilingPct={ctxGauge.ceilingPct}
+            label="worker"
+            compact
+          />
+        </div>
+      )}
       <div
         className={`flex items-center justify-between font-mono text-txt3 ${
           nested ? "text-[10px]" : "text-[11px]"
@@ -521,6 +549,17 @@ function AnchorDeckTile({ tile: t }: { tile: AnchorTile }) {
         <StatusDot status={led} pulse={pulseOnLed} />
       </div>
       <div className="text-xs text-txt2 font-mono mb-1">{stateLabel}</div>
+      {/* Context gauge (2026-09-22): Lex's own context against the
+        * smart-clear trip marks. The supervised worker's gauge sits on
+        * the nested worker tile below, fed by the same tile. */}
+      <div className="mb-1.5" data-testid="deck-lex-gauge">
+        <ContextGauge
+          pct={t.lex_ctx_pct}
+          thresholdPct={t.ctx_threshold_pct}
+          ceilingPct={t.ctx_ceiling_pct}
+          label="Lex"
+        />
+      </div>
       <div className="flex items-center justify-between text-[11px] font-mono text-txt3">
         <span className="truncate">{t.anchor_id.slice(0, 8)}</span>
         <span className="flex items-center gap-2">

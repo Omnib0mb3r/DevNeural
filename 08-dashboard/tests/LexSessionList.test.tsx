@@ -20,6 +20,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import {
   QueryClient,
@@ -28,6 +29,10 @@ import {
 
 vi.mock("@/lib/daemon-client", () => ({
   lexAnchors: vi.fn().mockResolvedValue({ ok: true, anchors: [] }),
+  /* Context gauge (2026-09-22): live rows read their Lex / worker
+   * context pct off the anchor tile feed. Empty by default; the gauge
+   * pin below overrides it. */
+  lexAnchorTiles: vi.fn().mockResolvedValue({ ok: true, tiles: [] }),
   patchLexAnchor: vi.fn().mockResolvedValue({ ok: true }),
   createLexAnchor: vi.fn().mockResolvedValue({ ok: true }),
   openLexAnchor: vi.fn().mockResolvedValue({ ok: true }),
@@ -64,7 +69,11 @@ import {
   LexSessionList,
   PAST_SESSIONS_COLLAPSE_KEY,
 } from "../components/LexSessionList";
-import { lexAnchors, createLexAnchor } from "@/lib/daemon-client";
+import {
+  lexAnchors,
+  lexAnchorTiles,
+  createLexAnchor,
+} from "@/lib/daemon-client";
 
 function renderWithQuery(ui: React.ReactElement) {
   const qc = new QueryClient({
@@ -224,5 +233,74 @@ describe("LexSessionList - C-3 supervises picker", () => {
       expect(select.querySelector("option[value='proj-A']")).toBeTruthy();
     });
     expect(select.value).toBe("proj-A");
+  });
+});
+
+/* Context gauge (2026-09-22 plan, Task 10): every LIVE row draws Lex's
+ * own gauge off the anchor tile feed, plus the supervised worker's
+ * gauge when one is bound. Dormant rows have no tile and no gauge. */
+describe("LexSessionList - context gauge on live rows", () => {
+  it("renders the Lex and worker gauges from the anchor tile feed", async () => {
+    (lexAnchors as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      anchors: [
+        {
+          id: "lex-live",
+          title: "Live one",
+          derived_title: null,
+          status: "live",
+          current_pty_id: "pty-1",
+          cwd: "C:/p",
+          created_ms: 1,
+          last_activity_ms: 1,
+          transcript_count: 1,
+          supervises_project_anchor_id: "proj-A",
+        },
+        {
+          id: "lex-dormant",
+          title: "Old one",
+          derived_title: null,
+          status: "dormant",
+          current_pty_id: null,
+          cwd: "C:/p",
+          created_ms: 1,
+          last_activity_ms: 1,
+          transcript_count: 0,
+          supervises_project_anchor_id: null,
+        },
+      ],
+    });
+    (lexAnchorTiles as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      tiles: [
+        {
+          anchor_id: "lex-live",
+          title: "Live one",
+          derived_title: null,
+          status: "live",
+          current_pty_id: "pty-1",
+          current_cc_session_id: "cc-lex",
+          transcript_path: null,
+          phase: "idle",
+          pending_prompt: null,
+          last_activity_ms: 1,
+          transcript_count: 1,
+          supervised_project_slug: "devneural",
+          supervised_worker_session_id: "cc-live",
+          worker_ctx_pct: 42,
+          lex_ctx_pct: 25,
+          ctx_threshold_pct: 40,
+          ctx_ceiling_pct: 60,
+        },
+      ],
+    });
+    renderWithQuery(<LexSessionList initialCollapsed={false} />);
+    const gauges = await screen.findByTestId("lex-row-gauge-lex-live");
+    const readings = within(gauges).getAllByTestId("context-gauge-text");
+    expect(readings.map((r) => r.textContent)).toEqual([
+      "Lex: 25% of context, clears at 40%",
+      "worker: 42% of context, clears at 40%",
+    ]);
+    expect(screen.queryByTestId("lex-row-gauge-lex-dormant")).toBeNull();
   });
 });

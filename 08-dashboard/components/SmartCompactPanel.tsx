@@ -1,28 +1,35 @@
 "use client";
 
 /**
- * Smart-compact runtime toggle panel.
+ * Auto-clear switch panel.
  *
- * Three-segment selector (off / shadow / live) for the runtime mode
- * backing /lex/smart-compact/fire. Mirrors LexColdStartPreloadPanel
- * so the /system page lays out consistently.
+ * One three-segment selector (off / shadow / live) for BOTH halves of
+ * auto-clear: smart-compact (the worker /clear + reseed) and
+ * smart-clear (the handover-driven wind-down with the trip marks).
+ * 2026-09-22: the two runtime modes used to be two switches on the
+ * /system page; the operator asked for one. A flip posts the unified
+ * POST /lex/auto-clear/mode. A daemon that predates that route answers
+ * 404, and the panel then falls back to the two older endpoints
+ * (POST /lex/smart-compact/toggle + POST /lex/smart-clear/config) so
+ * the switch keeps working across the deploy.
  *
- *   off    — short-circuit: no audit row, no PTY inject. Smart
- *            compact entirely inert. Use to drop the system without
- *            bouncing the daemon when a runaway evaluator is
- *            spamming /clear.
- *   shadow — shadow rows always; inject never runs. The
- *            ship-it-default per SMART-COMPACT.md so the operator
- *            can observe every intended fire before opting in.
- *   live   — per-anchor isShadow() decides; otherwise inject +
- *            fire/wrap.
+ *   off    : short-circuit. No audit row, no PTY inject, no handover
+ *            request. Use to drop the system without bouncing the
+ *            daemon when a runaway evaluator is spamming /clear.
+ *   shadow : shadow rows always; inject never runs. The
+ *            ship-it-default per SMART-COMPACT.md so the operator can
+ *            observe every intended fire before opting in.
+ *   live   : per-anchor isShadow() decides; otherwise the real
+ *            stop / handover / clear / reseed runs.
  *
- * Backed by runtime_config.smart_compact_mode through GET/POST
- * /lex/smart-compact/toggle. Flip takes effect on the next fire
- * request — no daemon restart.
+ * Read side stays on GET /lex/smart-compact/toggle (the two modes are
+ * written together, so the one value reads for both). Flip takes
+ * effect on the next fire request; no daemon restart.
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  setAutoClearMode,
+  setSmartClearConfig,
   setSmartCompactToggle,
   smartCompactToggle,
   type SmartCompactMode,
@@ -46,11 +53,36 @@ const MODE_BTN: Record<SmartCompactMode, string> = {
 };
 
 const MODE_BLURB: Record<SmartCompactMode, string> = {
-  off: "Off. Lex never auto-resets workers. Stuck workers stay stuck until you reset them yourself.",
+  off: "Off. Lex never auto-clears a session. A full context window stays full until you clear it yourself.",
   shadow:
-    "Shadow. Lex records every worker it would have reset, but takes no action. Use this to watch the picks before turning it on.",
-  live: "Live. When a worker runs out of context, Lex resets it and pastes a summary so it picks up where it left off.",
+    "Shadow. Lex records every session it would have cleared, but takes no action. Use this to watch the picks before turning it on.",
+  live: "Live. When a worker or Lex fills the context window, the session gets a vetted handover, a /clear and a reseed so it picks up where it left off.",
 };
+
+/** True when the daemon answered 404: the unified route is not
+ * deployed on this daemon yet. Structural check (not instanceof) so a
+ * mocked client or a serialised error still routes correctly. */
+function isRouteMissing(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { status?: unknown }).status === 404
+  );
+}
+
+/** Set the auto-clear mode: the unified route first, the two older
+ * endpoints only when the unified route is missing. Any other failure
+ * propagates so the optimistic flip reverts. */
+export async function applyAutoClearMode(mode: SmartCompactMode): Promise<void> {
+  try {
+    await setAutoClearMode(mode);
+    return;
+  } catch (err) {
+    if (!isRouteMissing(err)) throw err;
+  }
+  await setSmartCompactToggle(mode);
+  await setSmartClearConfig({ mode });
+}
 
 export function SmartCompactPanel() {
   const qc = useQueryClient();
@@ -60,7 +92,7 @@ export function SmartCompactPanel() {
     refetchInterval: 15_000,
   });
   const flip = useMutation({
-    mutationFn: (next: SmartCompactMode) => setSmartCompactToggle(next),
+    mutationFn: (next: SmartCompactMode) => applyAutoClearMode(next),
     onMutate: async (next: SmartCompactMode) => {
       await qc.cancelQueries({ queryKey: QKEY });
       const prev = qc.getQueryData<SmartCompactToggle>(QKEY);
@@ -74,6 +106,7 @@ export function SmartCompactPanel() {
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: QKEY });
+      qc.invalidateQueries({ queryKey: ["smart-clear-config"] });
     },
   });
 
@@ -89,11 +122,9 @@ export function SmartCompactPanel() {
     >
       <header className="px-4 py-3 border-b border-border1 flex items-center justify-between">
         <div className="flex flex-col gap-0.5">
-          <h2 className="text-sm font-emphasized text-txt1">
-            Worker auto-clear
-          </h2>
+          <h2 className="text-sm font-emphasized text-txt1">Auto-clear</h2>
           <p className="text-nano text-txt3">
-            When a worker fills its context window, it gets /cleared and re-seeded with a resume summary so work continues. (Internally: smart-compact.)
+            One switch for both halves: when a worker or Lex fills the context window, the session gets a vetted handover, a /clear and a reseed so work continues. (Internally: smart-compact plus smart-clear.)
           </p>
         </div>
         <span
@@ -105,7 +136,7 @@ export function SmartCompactPanel() {
       <div className="px-4 py-4 space-y-4">
         <div
           role="radiogroup"
-          aria-label="Smart compact mode"
+          aria-label="Auto-clear mode"
           className="inline-flex rounded-pill hairline overflow-hidden"
         >
           {MODES.map((m) => {
@@ -147,10 +178,10 @@ export function SmartCompactPanel() {
           {q.isLoading
             ? "…"
             : runtimeValue
-              ? `Effective mode: ${mode} — set from this dashboard toggle.`
+              ? `Effective mode: ${mode}, set from this dashboard switch.`
               : envValue
-                ? `Effective mode: ${mode} — from the environment variable; the toggle above overrides it.`
-                : `Effective mode: ${mode} — built-in default; the toggle above overrides it.`}
+                ? `Effective mode: ${mode}, from the environment variable; the switch above overrides it.`
+                : `Effective mode: ${mode}, the built-in default; the switch above overrides it.`}
         </p>
       </div>
     </section>
