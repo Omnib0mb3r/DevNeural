@@ -450,6 +450,10 @@ describe('haiku-class top session (Phase 2 R1)', () => {
     prewarmVoiceBrainSession();
 
     expect(pty.spawnCalls.length).toBe(1);
+    /* BUG-033 (2026-09-22): the voice REPLACES Claude Code's default
+     * system prompt; appending left "You are Claude Code" in front of
+     * Lex and haiku said so out loud. */
+    expect(pty.spawnCalls[0]!.systemPromptMode).toBe('replace');
     const args = pty.spawnCalls[0]!.args ?? [];
     /* Fast model is the whole point of the top layer (the 33s cold-boot
      * root cause was NO --model, so it booted the account default). The

@@ -198,6 +198,8 @@ export interface VoiceBrainSessionDeps {
   spawnLex: (opts: {
     cwd: string;
     systemPrompt?: string;
+    /** BUG-033: the voice replaces Claude Code's default prompt. */
+    systemPromptMode?: 'append' | 'replace';
     args?: string[];
     sessionId?: string;
     /** Extra env merged onto the spawn (pty-host spawnLex opts.env). */
@@ -503,6 +505,11 @@ function spawnInto(
     const spawned = deps.spawnLex({
       cwd: deps.cwd,
       systemPrompt: VOICE_BRAIN_SESSION_SYSTEM_PROMPT,
+      /* BUG-033 (2026-09-22): replace, never append. With append,
+       * Claude Code's "You are Claude Code" led every turn and the voice
+       * said "I'm Claude Code, I assist you through the chat interface"
+       * when asked whether it was controlling the worker. */
+      systemPromptMode: 'replace',
       /* Fast turns (2026-09-22, measured with `claude -p --model haiku`):
        * Claude Code spends 100-300 thinking tokens per haiku reply by
        * default (3.0s API time, 2.2s to first token for one spoken

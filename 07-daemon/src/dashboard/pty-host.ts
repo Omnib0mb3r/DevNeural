@@ -209,6 +209,15 @@ export function getLivePtyIds(): ReadonlySet<string> {
   return out;
 }
 
+/** The argv pair (or triple) that hands Claude Code a system prompt file.
+ * Pure and exported for the BUG-033 pin. */
+export function systemPromptArgs(mode: 'append' | 'replace', file: string): string[] {
+  if (mode === 'replace') {
+    return ['--system-prompt', `@${file}`, '--exclude-dynamic-system-prompt-sections'];
+  }
+  return ['--append-system-prompt', `@${file}`];
+}
+
 export interface SpawnLexOptions {
   cwd: string;
   /** Full command to run. Defaults to `claude`. We pass through to
@@ -219,6 +228,13 @@ export interface SpawnLexOptions {
    * passes --append-system-prompt @<file> so very long prompts don't
    * blow the Windows command-line length limit. */
   systemPrompt?: string;
+  /** BUG-033 (2026-09-22): 'append' (default) keeps Claude Code's own
+   * system prompt and adds ours; 'replace' passes --system-prompt so
+   * ours is the whole identity. The voice (Layer 1) replaces: it has no
+   * tools and no CLAUDE.md, and with append it introduced itself as
+   * Claude Code. Layer 2 keeps append; it uses the tools the default
+   * prompt describes. */
+  systemPromptMode?: 'append' | 'replace';
   cols?: number;
   rows?: number;
   /** Extra env vars merged onto process.env. */
@@ -435,7 +451,7 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
   const command = opts.command ?? 'claude';
   const args = [...(opts.args ?? [])];
   if (systemPromptFile) {
-    args.push('--append-system-prompt', `@${systemPromptFile}`);
+    args.push(...systemPromptArgs(opts.systemPromptMode ?? 'append', systemPromptFile));
   }
 
   /* On Windows, node-pty needs a real executable path or a name
