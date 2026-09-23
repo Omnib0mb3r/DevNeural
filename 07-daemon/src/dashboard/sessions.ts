@@ -183,6 +183,10 @@ export interface SessionListItem {
    * usage object. Lets the dashboard show a fill bar so the user knows
    * when to /clear or /compact. Null when no usage record yet. */
   context: { tokens: number; max: number } | null;
+  /** The same usage as a whole percent of the window (contextPct), so
+   * every gauge on the dashboard rounds the one way. Null when
+   * `context` is null. */
+  ctx_pct: number | null;
   /** User-set label from the brainstorm sessions table, joined by
    * claude_session_id. Null for non-Lex sessions and Lex sessions with
    * no rename applied. Stream Deck tiles prefer this over the project
@@ -274,6 +278,22 @@ export function deriveContextFromTail(
     /* ignore */
   }
   return null;
+}
+
+/* Whole-percent context usage, the one rounding rule for every gauge
+ * (the /sessions row, the anchor tile's worker and Lex fields). Null
+ * when usage is unknown or the window is unusable, never a fake 0, so
+ * a fresh session reads "unknown" rather than "empty". Clamped to
+ * 0..100: a 1M-window session whose recorded usage overshoots the
+ * configured max still draws as full. */
+export function contextPct(
+  ctx: { tokens: number; max: number } | null | undefined,
+): number | null {
+  if (!ctx) return null;
+  if (!Number.isFinite(ctx.tokens) || !Number.isFinite(ctx.max)) return null;
+  if (ctx.max <= 0) return null;
+  const pct = Math.round((ctx.tokens / ctx.max) * 100);
+  return Math.max(0, Math.min(100, pct));
 }
 
 /* A busy verdict ('thinking'/'tool') derived from a static file tail
@@ -637,6 +657,7 @@ export function listSessions(): SessionListItem[] {
       // rename onto Stream Deck and Nav tiles. Returns null for any
       // Claude session that was never bound to a Lex brainstorm row.
       const brainstorm = getBrainstormByClaudeSessionId(sessionId);
+      const context = deriveContextFromTail(file);
       out.push({
         session_id: sessionId,
         project_slug: slug.name,
@@ -648,7 +669,8 @@ export function listSessions(): SessionListItem[] {
         has_task: Boolean(readCurrentTask(sessionId)),
         phase,
         pending_prompt: pending,
-        context: deriveContextFromTail(file),
+        context,
+        ctx_pct: contextPct(context),
         user_label: brainstorm?.user_label ?? null,
         derived_label: brainstorm?.derived_label ?? null,
         lex_anchor_id: brainstorm?.id ?? null,
