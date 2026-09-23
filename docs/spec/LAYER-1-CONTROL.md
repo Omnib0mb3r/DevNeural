@@ -1,4 +1,16 @@
-# Layer 1 Control: the voice layer (canonical, v2)
+# Layer 1 Control: the voice layer (canonical, v3)
+
+v3 (2026-09-22 evening, operator direction after the first live test):
+the barge policy returns to the approved design (`VOICE-BARGE-CLASSIFIER-SPEC.md`
+sections 2 to 4: stop first, then FINISH, RETHINK, or answer then finish,
+decided by L1 on the words); commands are AI-interpreted onto a closed
+effect set with only the safety stop mechanical (the 2026-09-22 afternoon
+word gate is withdrawn); the L1 identity replaces Claude Code's default
+prompt instead of appending to it; the contract carries manner, not lines;
+Lex is in control (current state first, may start a worker, previews
+handovers by voice); Phase C of the context lifecycle ships in the same
+wave. The 2026-07-20 "never resume" rule was an emergency baseline taken
+while L1 was dead and is superseded here.
 
 Single source of truth for how the operator talks to Lex. Supersedes the
 2026-07-20 version of this file (kept below as "Barge baseline", which
@@ -129,8 +141,18 @@ claude --session-id <pre-minted uuid>
        --tools "" --strict-mcp-config (no built-ins, zero MCP)
        --setting-sources project,local
        --dangerously-skip-permissions
-       --append-system-prompt <L1 prompt>
+       --system-prompt <L1 prompt>       (REPLACES Claude Code's default, v3)
+       --exclude-dynamic-system-prompt-sections
 ```
+
+Identity (v3, BUG-033): the L1 prompt is passed with `--system-prompt`,
+not `--append-system-prompt`. Appending left Claude Code's own "You are
+Claude Code" identity ahead of Lex's on every turn, and under a direct
+question ("are you controlling the worker?") haiku answered as Claude
+Code. L1 has no tools and no CLAUDE.md, so nothing in the default prompt
+is needed. `--exclude-dynamic-system-prompt-sections` keeps the
+per-machine sections out as well. L2 keeps `--append-system-prompt`; it
+uses the tools the default prompt describes.
 
 Effort note: `--effort` levels are low / medium / high / xhigh / max. Haiku
 4.5 has no effort parameter (the CLI accepts the flag on haiku and it changes
@@ -159,7 +181,11 @@ module (see "Personality"):
    person, dry British wit, blunt over polite.
 2. The two-layers truth: a deeper part of you reasons behind you (L2). You
    speak for both. Never refer to "Lex" in the third person. The only
-   third-person actor is the worker.
+   third-person actor is the worker, and only when you are handing him
+   something or reporting that he is stuck: his finished work is yours
+   to report in the first person ("we shipped the fix", never "they've
+   completed work"). Out loud there is one of you and you are never
+   Claude Code.
 3. Spoken-behavior rules (L1 owns these): short spoken sentences; no
    markdown, no bullets, no code fences; no long numbers, UUIDs, SHAs or
    paths read aloud (say "the commit", "that session", "the daemon sessions
@@ -191,6 +217,14 @@ module (see "Personality"):
    no address to you, your own echo), emit `IGNORE:` with a two-word reason
    and say nothing. When unsure whether it was meant for you, ask in five
    words or fewer instead of forwarding.
+8. Manner, not lines (v3, operator): the prompt carries personality and
+   how to talk. It never carries sentences to say. Worked examples in the
+   contract show directive SHAPES (what you heard, which trailing lines
+   follow), never spoken text. Knowledge comes from the live block and
+   from the brain; you hold no project facts of your own. If the block
+   does not say it, you do not know it: say so in one line and FORWARD.
+   Never present a handover, a memory or an old line as current; say how
+   old a fact is when you use one.
 
 ### The per-utterance turn
 
@@ -228,21 +262,35 @@ IGNORE: <reason>
 - `CONTROL` verbs: `mute`, `unmute`, `standby`, `listen`, `disable`,
   `end_session`, `stop_speaking`, `interrupt_work`, `cancel_redirect`
   (double-ESC to L2 then forward the new direction), `repeat` (re-speak the
-  last L2 reply from cache, no brain round trip), `drop_reply` (the reply
-  the brain is giving is no longer wanted: stop speaking it and discard
-  the rest), `combine` (fold this utterance into the one still waiting to
-  go down, one turn), `approve_plan`, `reject_plan`, `confirm_dispatch`,
-  `reject_dispatch` (Phase B).
-- Interrupt policy (the operator speaks while L2's reply is being
-  delivered or is pending). Audio already stopped (baseline). L1 sees
-  `during_tts: yes` plus the reply text so far in the live block and
-  decides one of three: **drop** (`CONTROL: drop_reply`, the reply is moot,
-  the new input goes down as the new direction), **additive** (no control;
-  the new input forwards as a follow-up and the brain answers it after
-  the current reply), or **combine** (`CONTROL: combine`; the new input
-  merges with the utterance still queued so the brain gets one turn).
-  Bias: a correction or a new direction drops; an addition is additive; a
-  clarification of the same ask combines. Never resume cut audio.
+  last reply from cache, no brain round trip), `start_over` (the same from
+  the beginning), `slower`, `faster`, `louder`, `softer` (re-render the
+  last reply with the adjusted delivery parameter; the setting sticks for
+  the session), `drop_reply` (the reply the brain is giving is no longer
+  wanted: stop speaking it and discard the rest), `finish` (v3: what was
+  heard did not change what you were saying; pick the cut sentence back
+  up), `answer_then_finish` (v3: answer this first, then pick the cut
+  sentence back up), `combine` (fold this utterance into the one still
+  waiting to go down, one turn), `approve_plan`, `reject_plan`,
+  `confirm_dispatch`, `reject_dispatch` (Phase B), `approve_handover`,
+  `reject_handover <reason>` (Phase C).
+- Interrupt policy (v3, the approved barge design). Audio has already
+  stopped, deterministically, the instant sound arrived. L1 then sees
+  `during_tts: yes`, the reply text so far and the cut point in the live
+  block, and decides like a person would: **finish** (`CONTROL: finish`;
+  an aside, an agreement, or nothing that changes what was being said:
+  the un-heard remainder is spoken from the cut sentence, then the aside
+  is answered if it deserves it), **answer then finish**
+  (`CONTROL: answer_then_finish`; the reply to what was heard comes
+  first, the remainder after), or **rethink** (no finish directive; what
+  was heard changes the answer: the remainder is dropped, `drop_reply` if
+  a brain reply was in flight, and the new input goes down as the new
+  direction, or `combine` when it is a clarification of the ask still
+  queued). Unsigned means rethink: the operator floor. Resume is always
+  text from the cut sentence, computed from the client's played
+  milliseconds, never a replayed audio buffer, so the 2026-07-20
+  phantom-resume bug cannot return. Echo, noise and backchannel never
+  reach L1 for this decision: the engine buckets them and the remainder
+  resumes on its own.
 - L2 progress narration: while L2 is mid-turn and the operator is quiet,
   the daemon hands L1 a `[event] brain-progress` at most once per 45s
   (state, elapsed, current tool). L1 decides whether a word is worth it;
@@ -254,14 +302,20 @@ IGNORE: <reason>
 - Emergency stop stays deterministic and hard-wired: "lex emergency stop"
   is matched by regex before anything else and fires double-ESC. No model in
   the loop.
-- The fixed spoken controls are mechanical too (2026-09-22, BUG-030): "lex
-  mute / unmute / stand by / listen / end session / stop talking / be
-  quiet", prefix required, whole utterance, matched right after the panic
-  check and before L1 (`matchSpokenControl`), logged `control by word gate:
-  <verb>`. L1 still hears the utterance and speaks the ack; its own
-  `CONTROL:` line, if any, lands on the voice-command dedupe. A narrated
-  verb with no directive ("Muted.", under 40 chars) is mapped by the parser
-  and logged `inferred=yes`; a parenthetical-only line is never spoken.
+- Commands are AI-interpreted, never a phrase list (the approved 2026-07-19
+  principle, restored in v3). Only the safety tier is mechanical:
+  "lex emergency stop" (regex, double-ESC) and the engine's stop class
+  (stop, quiet, hold on) which halts speech or the brain's turn before
+  any model runs. Everything else (mute, unmute, stand by, listen, end
+  session, repeat, slower, louder, start over, worker control) is L1's
+  reading of whatever words were used, mapped onto the closed verb set
+  above. The guardrail is the closed set plus the rule that an unsure
+  read is not a control. Reliability comes from the contract: when what
+  was heard was a control, the reply ENDS with the directive line, in
+  every case, and a short narrated verb with no directive ("Muted.", under
+  40 chars) is mapped by the parser and logged `inferred=yes`. A
+  parenthetical-only line is never spoken. The 2026-09-22 afternoon word
+  gate (`matchSpokenControl`) contradicted the principle and is removed.
 - L1 runs from `<DATA_ROOT>/voice-l1` (2026-09-22, BUG-028), a bare
   directory outside every repo, so Claude Code attaches no auto-memory to
   it. The voice holds no project facts of its own; every project question
@@ -271,22 +325,39 @@ Latency budget: the ask timeout is the bound on time-to-first-signal
 (default 6s, `DEVNEURAL_VOICE_BRAIN_TIMEOUT_MS`), then silence-bounded. A
 timed-out conversational turn forwards and scores no liveness strike.
 
-### Barge: the new-input policy (L1 magic, rebuilt)
+### Barge: stop first, decide second (v3, the approved design)
 
-The baseline below is unchanged: sound stops TTS, it never resumes, the full
-text stays readable. What L1 now decides is what happens to the NEW input:
+`VOICE-TOP-LAYER-SPEC.md` point 6 and `VOICE-BARGE-CLASSIFIER-SPEC.md`
+sections 2 to 4, with the operator's 2026-09-22 addition (answer then
+finish). The 2026-07-20 baseline kept only the first half (stop) because
+L1 was dead at the time; v3 restores the second half on a working L1.
 
-- **Combine / coalesce.** Stacked utterances mid-reply merge into one
-  handling, no double answer.
-- **Queue vs now.** L1 says whether the new input waits for L2's current
-  turn or interrupts it (`CONTROL: interrupt_work` or `cancel_redirect`).
-- **Cancel + redirect.** A countermand drops L2's in-flight work (double-ESC
-  to the L2 PTY) and sends the new direction. Latest wins.
-- **Classify.** Command, real words, noise, backchannel ("mm-hm", "right"),
-  own echo. Precedence: emergency stop (regex) > echo filter (engine) > L1
-  decision.
+1. **Stop first.** Sound stops playback the instant it arrives (VAD onset,
+   deterministic, no model). The client reports the played milliseconds
+   (`playback-stopped`), the daemon keeps the full spoken run and the
+   cut point in the barge stash. Nothing is discarded yet.
+2. **Bucket the words (engine, deterministic).** Emergency stop and the
+   stop class halt for good. Echo, noise and backchannel ("yeah",
+   "right", "mm-hm") mean the stop should never have happened: the
+   remainder resumes from the cut sentence with no model in the loop.
+3. **Real words go to L1 with the cut point.** L1 decides FINISH (resume
+   the remainder, then answer the aside if it deserves it), ANSWER THEN
+   FINISH (answer, then resume), or RETHINK (drop the remainder, answer
+   or forward the new direction; `drop_reply` if a brain reply was in
+   flight, `cancel_redirect` if the brain's work itself is countermanded,
+   `combine` if it clarifies the ask still queued). Unsigned is RETHINK.
+4. **Resume is text.** The remainder is the un-heard tail of the whole
+   spoken run, sliced by played milliseconds at a sentence boundary and
+   spoken through the speak controller; never a replayed buffer. A resume
+   that would speak nothing new is a no-op. The barge stash expires after
+   30s; a later FINISH is a no-op with a log line.
+5. **Latest wins.** Stacked utterances mid-reply merge into one handling;
+   a countermand double-ESCs the brain and sends the new direction.
 
-None of this resumes cut audio. Stop is always final.
+Precedence: emergency stop (regex) > stop class (engine) > echo, noise,
+backchannel (engine) > L1 decision. A cut brain reply is never re-delivered
+from the top (single mouth 6); its remainder resumes only through this
+path.
 
 ---
 
@@ -318,7 +389,9 @@ adds no second speaker. The invariants, with their owners:
 6. A delivery cut mid-stream is NOT re-delivered from the top (that would
    re-speak the heard prefix). It is recorded as `cut`, logged loudly, and
    the full text stays readable in the transcript. Replay-on-switch reads
-   the same record and never replays a delivered reply.
+   the same record and never replays a delivered reply. The only way a
+   cut reply continues is the v3 FINISH path: the un-heard remainder,
+   sliced by played milliseconds, through the speak controller.
 7. Segment dedupe on the L2 jsonl (`spokenSegmentHashes`) keeps an
    end_turn from re-speaking its own pre-tool text.
 8. One voice connection per PTY (`activeByBindKey` eviction); a second tab
@@ -369,10 +442,28 @@ The context-clearing design lives in `C:\dev\data\skill-connections\brainstorm\A
    mechanical confirm gate exempts context-management callers
    (`caller_label` starting `smart-compact:` or `smart-clear`, and the
    wrap-and-commit prompt). New work dispatch still needs the spoken yes.
-4. **L2 self-clear (T4: Lex-authored handover, secondary approval, staggered
-   with the worker) is a separate wave**, not this one. Nothing here blocks
-   it: `writeHandover` / `findLatestHandover` and the `clear`-branch hook
-   wiring remain the recipe.
+4. **Phase C ships in the v3 wave (2026-09-22 evening)**, per
+   `docs/spec/SMART-COMPACT.md` section 5: the worker writes its handover
+   into the T5 frame, L2 reviews it against the plan and appends the next
+   steps, the approved handover is persisted, timestamped and reseeded,
+   the worker and Lex clear on one `auto_clear_mode` switch, a handover is
+   also written at every session end and recovered from the jsonl trail
+   after a crash, and Lex's own clear follows T4 with an outside approver
+   and the stagger rule.
+5. **Lex is in control (operator, 2026-09-22).** The brain acts on current
+   state, never on a static prompt: before it reports, it checks live
+   state (the snapshot, the worker's transcript tail, the latest
+   handover with its age) so nothing stale reaches the operator. It may
+   start a worker for the supervised project when a deeper look needs
+   one (`POST /projects/:id/start-claude`). The dispatch gate stays off
+   unless the operator turns it on; the context-management exemption
+   stays narrow (T10.2).
+6. **Handover preview by voice.** When a handover is ready for review,
+   L1 gets `[handover-ready]` with the worker's draft and the brain's
+   review, reads the gist in two or three sentences, and the operator's
+   yes or no comes back as `CONTROL: approve_handover` (the clear
+   proceeds) or `CONTROL: reject_handover <reason>` (the brain revises).
+   Same shape as plan approval.
 
 ## Context hygiene: L1 is disposable
 
@@ -512,18 +603,29 @@ Live (after daemon restart + dashboard build):
 3. Ask "what's she doing" mid-L2-turn: L1 answers with the live state, L2
    keeps working.
 4. L2 reply is spoken in L1's voice (log shows `chars>0`, no raw fallback).
-5. Barge: audio stops, never resumes, text intact; a countermand cancels
-   and redirects L2.
+5. Barge: audio stops instantly. "yeah" or noise: she picks the sentence
+   back up on her own (`[voice-ws] barge: resumed (engine)`). An aside
+   ("hang on, is it raining?"): she answers, then picks it back up
+   (`L1 turn: ... control=answer_then_finish`, then `resumed (l1)`). A
+   correction: she drops it and takes the new direction
+   (`control=drop_reply` or `cancel_redirect`, `barge: rethink`).
 6. Plan mode: L2 plans, L1 reads it out, "go" executes, "no, X" revises.
 7. Dispatch gate: L2's worker prompt is held until a spoken yes.
 8. "lex emergency stop" fires with no model in the loop.
+9. Commands in your own words: "you can stop listening for a bit" mutes
+   (`L1 turn: ... control=mute`), "say that slower" re-speaks slower, "are
+   you controlling the worker" is answered as Lex, never as Claude Code.
+10. Handover by voice: at the trip point the worker writes its handover,
+    L1 reads the brain's review, "go" clears and reseeds, the file under
+    `brainstorms/<anchor>/HANDOVER-<iso>.md` shows both halves.
 
 ---
 
-## Barge baseline (SHIPPED 2026-07-20, unchanged)
+## Barge baseline (SHIPPED 2026-07-20; the stop half stands, the never-resume half is superseded by v3)
 
-The rule is deterministic and dumb on purpose. No model decides whether to
-stop.
+The stop is deterministic and dumb on purpose. No model decides whether to
+stop. What happens after the stop is the v3 policy above; the "never
+resumes" line below was the emergency rule while L1 was dead.
 
 ```
 L1 is speaking (TTS playing)

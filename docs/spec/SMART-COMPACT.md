@@ -123,9 +123,17 @@ point`); the rework formalizes it and splits authorship.
 
 ---
 
-## 5. Phase C (next wave): what turns section 1 into section 3
+## 5. Phase C (BUILT in the 2026-09-22 evening wave): what turns section 1 into section 3
 
-Not built in the voice layers wave. Recipe, in build order:
+Operator additions folded in on 2026-09-22: every handover is
+timestamped and browsable on the brainstorm page; a handover is also
+written at every session end and recovered from the jsonl trail after a
+crash (marked unvetted); the file shows the worker's draft and Lex's
+review as separate, labelled halves with author and time; Lex previews
+the handover by voice before the clear; the context gauge on every
+session surface shows the trip and force marks the trigger reads; and
+Lex checks current state before speaking any of it. Recipe, in build
+order:
 
 1. `POST /lex/smart-clear/handover-request`: the daemon injects a wrap
    prompt asking the worker to write its handover into the frame and
@@ -149,6 +157,23 @@ Not built in the voice layers wave. Recipe, in build order:
    same instant.
 6. Archive, do not delete: keep the recent N handovers in full, roll
    older ones into a meta-handover.
+7. Session end and crash (T6, operator 2026-09-22): every terminal end
+   path writes a handover next to distillation (T10.1 keeps the roles
+   distinct); the boot crash sweep writes one from the jsonl tail with
+   the worker slots filled and a "recovered from the trail, unvetted"
+   banner.
+8. Visible vetting (T5): the persisted file renders "Worker draft"
+   (author session, time, the slots as submitted) then "Lex review"
+   (corrections one per line, appended Next steps, verdict, time).
+9. Browse: `GET /lex/anchors/:id/handovers` lists them newest first;
+   `GET /lex/anchors/:id/handovers/:file` serves one; the brainstorm
+   page shows the list.
+10. Voice preview: `[handover-ready]` to L1, `approve_handover` /
+    `reject_handover <reason>` (LAYER-1-CONTROL.md v3).
+11. Gauge: `/lex/anchor-tiles` and `/sessions` carry `ctx_pct` for the
+    worker and for Lex with the threshold and ceiling; the dashboard
+    draws the bar with both marks on the deck, the Lex tab and the
+    sessions table.
 
 Scope rule that must hold (AUTO-CLEAR T10.1): the handover replaces
 distillation ONLY as the resume seed. Brainstorm distillation stays as
