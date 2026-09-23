@@ -10,6 +10,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
   CONTROLS,
+  MAX_SPEECH_CHARS,
   buildTopLayerSystemPrompt,
   buildTopLayerTurnMessage,
   parseTopLayerReply,
@@ -97,7 +98,10 @@ describe('parseTopLayerReply', () => {
   it('null / empty parses to the all-null result; speech is capped', () => {
     expect(parseTopLayerReply(null)).toEqual(EMPTY);
     expect(parseTopLayerReply('   ')).toEqual(EMPTY);
-    expect(parseTopLayerReply('x'.repeat(2_000)).speech).toHaveLength(600);
+    /* v3: the cap is a runaway guard (MAX_SPEECH_CHARS), not a style rule. */
+    expect(parseTopLayerReply('x'.repeat(MAX_SPEECH_CHARS + 500)).speech).toHaveLength(
+      MAX_SPEECH_CHARS,
+    );
   });
 
   it('speechOnly strips every directive line', () => {
@@ -138,17 +142,42 @@ describe('buildTopLayerSystemPrompt', () => {
     expect(p).toMatch(/hold no project facts/);
   });
 
-  it('carries worked examples for every directive shape (2026-09-22)', () => {
+  it('v3: directive shapes only, no scripted sentences; first person; no facts; barge policy; AI commands', () => {
     const p = buildTopLayerSystemPrompt();
-    expect(p).toMatch(/Examples \(heard/);
-    expect(p).toMatch(/CONTROL: drop_reply/);
-    expect(p).toMatch(/CONTROL: combine/);
-    expect(p).toMatch(/CONTROL: repeat/);
-    expect(p).toMatch(/CONTROL: mute/);
-    expect(p).toMatch(/IGNORE: background/);
+    expect(p).toMatch(/Shapes \(what you heard -> the trailing lines/);
+    expect(p).not.toMatch(/I can't see that from here/);
+    expect(p).not.toMatch(/One moment, checking/);
+    expect(p).toMatch(/his finished work is yours to report in the first person/);
+    expect(p).toMatch(/never Claude Code/);
+    expect(p).toMatch(/CONTROL: finish/);
+    expect(p).toMatch(/CONTROL: answer_then_finish/);
+    expect(p).toMatch(/Unsigned means rethink/);
+    expect(p).toMatch(/whatever words he used/);
+    expect(p).toMatch(/say how old/);
     /* The spoken warming line is gone; "give me a second" replaces it. */
     expect(p).not.toMatch(/still waking up/);
     expect(p).toMatch(/give me a second, go on/);
+    /* Operator, 2026-09-22 evening: human speech, no names or symbols read
+     * aloud; longer when it helps; challenge him; say when a deeper look
+     * will take a while and keep him company meanwhile. */
+    expect(p).toMatch(/never read a file name, a path, a symbol or code aloud/i);
+    expect(p).toMatch(/longer explanation/);
+    expect(p).toMatch(/better way/);
+    expect(p).toMatch(/take a while/);
+    expect(MAX_SPEECH_CHARS).toBeGreaterThanOrEqual(2400);
+    for (const v of [
+      'finish',
+      'answer_then_finish',
+      'slower',
+      'faster',
+      'louder',
+      'softer',
+      'start_over',
+      'approve_handover',
+      'reject_handover',
+    ]) {
+      expect(CONTROLS.has(v as never)).toBe(true);
+    }
   });
 });
 

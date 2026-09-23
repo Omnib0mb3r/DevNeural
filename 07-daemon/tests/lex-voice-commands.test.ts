@@ -9,7 +9,8 @@
  * suite feeds it punctuation and casing noise directly.
  */
 import { describe, expect, it } from 'vitest';
-import { matchPanicCommand, matchSpokenControl } from '../src/voice/lex-voice-commands.js';
+import * as commands from '../src/voice/lex-voice-commands.js';
+import { matchPanicCommand } from '../src/voice/lex-voice-commands.js';
 
 describe('matchPanicCommand', () => {
   describe('fires on the panic phrase', () => {
@@ -76,24 +77,12 @@ describe('matchPanicCommand', () => {
   });
 });
 
-/* BUG-030 (2026-09-22): the fixed operator controls are mechanical again,
- * prefix required, whole utterance, checked before Layer 1. */
-describe('matchSpokenControl (BUG-030 word gate)', () => {
-  it('matches the fixed verb set only with the lex prefix', () => {
-    expect(matchSpokenControl('Lex mute.')).toBe('mute');
-    expect(matchSpokenControl('lex, unmute')).toBe('unmute');
-    expect(matchSpokenControl('Lex stand by')).toBe('standby');
-    expect(matchSpokenControl('lex standby')).toBe('standby');
-    expect(matchSpokenControl('Lex listen')).toBe('listen');
-    expect(matchSpokenControl('lex end session')).toBe('end_session');
-    expect(matchSpokenControl('Lex end the session')).toBe('end_session');
-    expect(matchSpokenControl('lex stop talking')).toBe('stop_speaking');
-    expect(matchSpokenControl('Lex be quiet')).toBe('stop_speaking');
-  });
-  it('ignores the verbs without the prefix and never eats substance', () => {
-    expect(matchSpokenControl('mute the tv')).toBeNull();
-    expect(matchSpokenControl('lex, can you mute the worker notifications')).toBeNull();
-    expect(matchSpokenControl('lex emergency stop')).toBeNull();
-    expect(matchSpokenControl('')).toBeNull();
+/* v3 (2026-09-22 evening): commands are AI-interpreted, never a phrase
+ * list (VOICE-BARGE-CLASSIFIER-SPEC section 2). The afternoon's word gate
+ * is withdrawn; panic is the one mechanical matcher this module exports. */
+describe('one mechanical phrase only (v3)', () => {
+  it('exports no phrase matcher other than panic', () => {
+    const matchers = Object.keys(commands).filter((k) => /^match/i.test(k));
+    expect(matchers).toEqual(['matchPanicCommand']);
   });
 });
