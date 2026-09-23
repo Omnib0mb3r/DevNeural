@@ -68,8 +68,23 @@ export interface SpeakControllerState {
   ttsQueueRunning: boolean;
 }
 
+/* v3 delivery verbs (VOICE-BARGE-CLASSIFIER-SPEC section 3.1b): slower /
+ * faster step a per-connection multiplier on piper's length_scale and the
+ * last reply is spoken again. Clamped so a run of "slower" cannot crawl. */
+export const LENGTH_SCALE_MULTIPLIER_MIN = 0.5;
+export const LENGTH_SCALE_MULTIPLIER_MAX = 2.0;
+
+export function _deliveryParamStepImpl(current: number, verb: 'slower' | 'faster'): number {
+  const next = verb === 'slower' ? current * 1.25 : current * 0.8;
+  return Math.min(LENGTH_SCALE_MULTIPLIER_MAX, Math.max(LENGTH_SCALE_MULTIPLIER_MIN, next));
+}
+
+export interface SynthOptions {
+  lengthScaleMultiplier?: number;
+}
+
 export interface SpeakControllerDeps {
-  synthesize: (text: string) => SynthLikeHandle;
+  synthesize: (text: string, opts?: SynthOptions) => SynthLikeHandle;
   send: (frame: Record<string, unknown>) => void;
   sendBinary: (buf: Buffer) => void;
   /** Optional hook fired after a natural tts-end. Production uses
@@ -100,6 +115,9 @@ export interface SpeakController {
   killActive(): boolean;
   /** Test-only inspection of the current queue depth. */
   _queueDepth(): number;
+  /** v3 delivery verbs: the per-connection speed multiplier. */
+  setLengthScaleMultiplier(m: number): void;
+  lengthScaleMultiplier(): number;
 }
 
 /* Markdown -> spoken-text strip. Same rules as the pre-fix inline
@@ -123,6 +141,7 @@ export function createSpeakController(
   deps: SpeakControllerDeps,
 ): SpeakController {
   const ownerId = deps.mouthOwnerId ?? `speak-${++mouthOwnerSeq}`;
+  let lengthScaleMultiplier = 1;
   /* Set by killActive so a segment queued right after a barge is never
    * marked continuation off the cancelled chain; cleared the next time
    * a fresh (non-continuation) segment starts a new logical turn. */
@@ -183,7 +202,7 @@ export function createSpeakController(
      * markdown at enqueue time. */
     let handle: SynthLikeHandle;
     try {
-      handle = deps.synthesize(clean);
+      handle = deps.synthesize(clean, { lengthScaleMultiplier });
     } catch (err) {
       grant.release();
       /* 2026-07-17 item 3: an evening of silence traced to failures
@@ -317,6 +336,13 @@ export function createSpeakController(
     speak,
     killActive,
     _queueDepth: () => state.ttsQueue.length,
+    setLengthScaleMultiplier: (m) => {
+      lengthScaleMultiplier = Math.min(
+        LENGTH_SCALE_MULTIPLIER_MAX,
+        Math.max(LENGTH_SCALE_MULTIPLIER_MIN, Number.isFinite(m) && m > 0 ? m : 1),
+      );
+    },
+    lengthScaleMultiplier: () => lengthScaleMultiplier,
   };
 }
 

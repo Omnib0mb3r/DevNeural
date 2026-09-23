@@ -23,6 +23,8 @@ import {
   createSpeakController,
   type SpeakControllerState,
   type SynthLikeHandle,
+  _deliveryParamStepImpl,
+  type SynthOptions,
 } from '../src/voice/lex-voice-speak-controller.js';
 
 interface FakeHandle extends SynthLikeHandle {
@@ -271,6 +273,36 @@ describe('speak-queue controller (Fix 40)', () => {
 /* 2026-07-17 item 3: nothing was spoken all evening and no log said
  * why. A synth failure must scream, not just push a client error
  * frame at a possibly-dead socket. */
+/* v3 delivery verbs (2026-09-22): slower / faster ride a per-connection
+ * multiplier on piper's length_scale, passed on every synth call. */
+describe('length-scale multiplier (v3 slower / faster)', () => {
+  it('steps by a quarter up, a fifth down, clamped 0.5 to 2.0', () => {
+    expect(_deliveryParamStepImpl(1, 'slower')).toBeCloseTo(1.25);
+    expect(_deliveryParamStepImpl(2, 'slower')).toBe(2);
+    expect(_deliveryParamStepImpl(1, 'faster')).toBeCloseTo(0.8);
+    expect(_deliveryParamStepImpl(0.5, 'faster')).toBe(0.5);
+  });
+  it('the controller passes its multiplier to every synth call', async () => {
+    const state = freshState();
+    const opts: Array<SynthOptions | undefined> = [];
+    const ctrl = createSpeakController(state, {
+      synthesize: (_text: string, o?: SynthOptions): SynthLikeHandle => {
+        opts.push(o);
+        return makeHandle();
+      },
+      send: () => undefined,
+      sendBinary: () => undefined,
+    });
+    ctrl.speak('as set');
+    await flush();
+    ctrl.setLengthScaleMultiplier(1.25);
+    expect(ctrl.lengthScaleMultiplier()).toBeCloseTo(1.25);
+    ctrl.setLengthScaleMultiplier(9);
+    expect(ctrl.lengthScaleMultiplier()).toBe(2);
+    expect(opts[0]?.lengthScaleMultiplier).toBe(1);
+  });
+});
+
 describe('loud TTS failure logging (2026-07-17)', () => {
   it('a throwing synthesize logs TTS SYNTH FAILED loudly', async () => {
     const logs: string[] = [];

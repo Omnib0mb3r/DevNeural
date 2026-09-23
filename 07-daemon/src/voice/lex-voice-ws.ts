@@ -165,7 +165,7 @@ import {
   _formatAbsorbedAsideBlockImpl,
   type AbsorbedAsideEntry,
 } from './voice-haiku-wiring.js';
-import { splitForSpeech } from './lex-voice-speak-controller.js';
+import { _deliveryParamStepImpl, splitForSpeech } from './lex-voice-speak-controller.js';
 import { useVoiceHaiku } from './voice-haiku.js';
 import {
   pushDigest,
@@ -3541,7 +3541,33 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       case 'answer_then_finish':
         /* Owned by the barge decision in runTopLayerVoiceTurnOnce. */
         return;
-      case 'repeat': {
+      case 'repeat':
+      case 'start_over': {
+        if (lastSpokenText) {
+          for (const seg of splitForSpeech(lastSpokenText)) speak(seg, { continuation: true });
+        }
+        return;
+      }
+      case 'slower':
+      case 'faster': {
+        /* v3 delivery verbs: re-render the last reply at the new pace; the
+         * pace sticks for the rest of this connection. */
+        speakCtrl.setLengthScaleMultiplier(
+          _deliveryParamStepImpl(speakCtrl.lengthScaleMultiplier(), control),
+        );
+        logFn(
+          `[voice-ws] L1 ${control}: length_scale multiplier now ${speakCtrl.lengthScaleMultiplier().toFixed(2)}`,
+        );
+        if (lastSpokenText) {
+          for (const seg of splitForSpeech(lastSpokenText)) speak(seg, { continuation: true });
+        }
+        return;
+      }
+      case 'louder':
+      case 'softer': {
+        ttsGain = Math.min(1, Math.max(0.2, ttsGain + (control === 'louder' ? 0.2 : -0.2)));
+        send({ t: 'tts-gain', gain: Number(ttsGain.toFixed(2)) });
+        logFn(`[voice-ws] L1 ${control}: tts gain now ${ttsGain.toFixed(2)}`);
         if (lastSpokenText) {
           for (const seg of splitForSpeech(lastSpokenText)) speak(seg, { continuation: true });
         }
@@ -4110,6 +4136,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   /* ANSWER_THEN_FINISH: the remainder resumes once the reply's audio has
    * drained (playback-drained), not before. */
   let pendingFinish = false;
+  /* v3 delivery verbs: louder / softer step the client's playback gain
+   * for this connection (the sink applies the tts-gain frame). */
+  let ttsGain = 1;
 
   /* Words confirmed a real operator turn behind the barge: drop the
    * stash (no resume) and fire the deferred PTY Ctrl+C so the worker

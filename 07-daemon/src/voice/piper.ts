@@ -505,7 +505,20 @@ export interface SynthHandle {
  * with no further chunks. The browser stops playback on its end on
  * receiving a "tts-cancel" WebSocket frame.
  */
-export function synthesize(text: string): SynthHandle {
+export interface SynthesizeOptions {
+  /** v3 delivery verbs (slower / faster): a per-connection multiplier on
+   * the persisted length_scale, clamped to the same bounds. 1 = as set. */
+  lengthScaleMultiplier?: number;
+}
+
+/** The length_scale piper gets for one call: the persisted speed times a
+ * per-connection multiplier, clamped. Pure and exported for the pin. */
+export function effectiveLengthScale(multiplier: number | undefined): number {
+  const m = Number.isFinite(multiplier) && (multiplier as number) > 0 ? (multiplier as number) : 1;
+  return Math.min(MAX_LENGTH_SCALE, Math.max(MIN_LENGTH_SCALE, getLengthScale() * m));
+}
+
+export function synthesize(text: string, opts: SynthesizeOptions = {}): SynthHandle {
   const bin = getBin();
   const voice = getVoice();
   if (!fs.existsSync(bin)) throw new Error(`piper binary not found: ${bin}`);
@@ -520,9 +533,9 @@ export function synthesize(text: string): SynthHandle {
       '--quiet',
       /* User-tuneable via /voice/set-speed; persisted in
        * voice-preferences.json. Lower = faster, higher = slower.
-       * Baseline 0.475 ≈ 2x default (current "1.0x" speed). */
+       * Baseline 0.475 is about 2x default (the "1.0x" speed). */
       '--length_scale',
-      String(getLengthScale()),
+      String(effectiveLengthScale(opts.lengthScaleMultiplier)),
     ],
     {
       windowsHide: true,
