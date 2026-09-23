@@ -39,9 +39,9 @@ import {
 } from "@/lib/audio-output";
 import { buildVadOptionSet, type VadOptionSet } from "@/lib/voice-vad-options";
 import {
-  createBrowserPlaybackSink,
-  type BrowserPlaybackSink,
-} from "@/lib/voice-engine/audio-element-sink";
+  createBrowserStreamSink,
+  type BrowserStreamSink,
+} from "@/lib/voice-engine/audio-stream-sink";
 import {
   migrateLegacyMicGain,
   migrateLegacyVadRedemption,
@@ -1061,15 +1061,17 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   const awaitingFinalizeRef = useRef<boolean>(false);
   const finalizeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  /* Media-element playback sink (2026-07-17 voice engine cut). One
-   * persistent HTMLAudioElement replaces the AudioContext buffer-
-   * source scheduler so the browser echo canceller actually
-   * references what the speakers play (VOICE-TOP-LAYER-SPEC "Echo,
-   * first line"; Chromium bug 40504498). Segment assembly, ordered
-   * chaining, played-ms accounting, and stale-chunk discard live in
-   * lib/voice-engine/playback-queue (unit-pinned); this ref just
-   * holds the browser binding. */
-  const sinkRef = useRef<BrowserPlaybackSink | null>(null);
+  /* Continuous stream sink (BUG-032, 2026-09-22). One persistent
+   * HTMLAudioElement plays a live MediaStream fed by Web Audio, so
+   * the browser echo canceller still references what the speakers
+   * play (VOICE-TOP-LAYER-SPEC "Echo, first line"; Chromium bug
+   * 40504498) while the element never stops between sentences and
+   * every PCM chunk plays as soon as it lands instead of after its
+   * sentence has assembled. Chunk scheduling, adaptive lead,
+   * inter-sentence padding, played-ms accounting, and stale-chunk
+   * discard live in lib/voice-engine/stream-sink (unit-pinned); this
+   * ref just holds the browser binding. */
+  const sinkRef = useRef<BrowserStreamSink | null>(null);
   /* Silent-audio probe (2026-07-18): counts every stage of the TTS
    * playback chain so voice_health "snk:" rows show WHERE audio dies
    * without DevTools. sb/se = segments begun/closed (tts-start /
@@ -1113,9 +1115,9 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     }, 4_000);
   }
 
-  function ensureSink(): BrowserPlaybackSink {
+  function ensureSink(): BrowserStreamSink {
     if (sinkRef.current) return sinkRef.current;
-    const sink = createBrowserPlaybackSink({
+    const sink = createBrowserStreamSink({
       onPlaybackStart: () => {
         sinkProbeRef.current.playStarts += 1;
         speakingRef.current = true;
@@ -1153,6 +1155,12 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           },
         ]);
       },
+    }, {
+      /* One AudioContext for the page: the sink hangs its graph off
+       * the gesture-warmed context in audioCtxRef and rebinds by
+       * itself when voice-off closes it or the watchdog heal replaces
+       * it, so this ref never has to be torn down with the context. */
+      getContext: () => audioCtxRef.current,
     });
     const deviceId = getPersistedAudioOutputDevice();
     if (deviceId) void sink.applySinkId(deviceId);
@@ -1404,11 +1412,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
    * in bursts. `gen` is the ttsGen value captured when the chunk
    * arrived; if a barge-in / new tts-start has bumped it since, drop
    * the chunk so we don't schedule cancelled audio into a fresh reply. */
-  /* Feed one raw PCM chunk into the media-element sink's open segment
-   * (2026-07-17 voice engine cut: the AudioContext buffer-source
-   * scheduler is gone; assembly + ordering + stale-chunk discard live
-   * in lib/voice-engine/playback-queue). Name kept: every caller and
-   * watchdog contract predates the cut. */
+  /* Feed one raw PCM chunk into the stream sink's open segment; it is
+   * decoded and scheduled on arrival (BUG-032: scheduling, adaptive
+   * lead and stale-chunk discard live in lib/voice-engine/stream-sink).
+   * Name kept: every caller and watchdog contract predates the
+   * 2026-07-17 engine cut. */
   function schedulePcmChunk(pcm: ArrayBuffer, gen: number): void {
     if (gen !== ttsGenRef.current) return;
     /* Stamp the frame arrival even before we decide whether to
@@ -2549,12 +2557,12 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             }
             const rate = Number(msg.rate) || 22050;
             ttsRateRef.current = rate;
-            /* Media-element sink (2026-07-17 voice engine cut): open a
-             * new segment; chunks append until this segment's tts-end
-             * closes it into a WAV blob. Ordering/gapless chaining is
-             * the queue's job; continuation needs no special playhead
-             * handling anymore. speakingRef flips when audio actually
-             * starts (sink onPlaybackStart), not here. */
+            /* Stream sink (BUG-032): open a new segment; every chunk
+             * that follows is scheduled the moment it lands, so the
+             * first one plays 60ms after arrival, not after tts-end.
+             * Ordering, gapless chaining and the padding into the next
+             * sentence are the sink's job. speakingRef flips when audio
+             * actually starts (sink onPlaybackStart), not here. */
             ensureSink().beginSegment(rate);
             sinkProbeRef.current.segBegins += 1;
             armSinkProbeReporter();
@@ -2589,12 +2597,23 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           }
           case "tts-end": {
             /* Server flushed the last PCM chunk for this SEGMENT.
-             * Close it into a WAV blob; it plays now (if idle) or
-             * chains after the current one. True end-of-audio is the
-             * sink's onDrained (which reports playback-drained to the
-             * daemon and finalizes). */
+             * Close it: the sink pads 120ms of silence so the stream
+             * carries into the next sentence without the element
+             * stopping. True end-of-audio is the sink's onDrained
+             * (which reports playback-drained to the daemon and
+             * finalizes). */
             sinkRef.current?.endSegment();
             sinkProbeRef.current.segEnds += 1;
+            break;
+          }
+          case "tts-gain": {
+            /* Delivery level from the top layer ("louder" / "softer").
+             * The sink clamps to 0.2 .. 1.0 and applies it through its
+             * GainNode, so a running reply changes level in place. Goes
+             * through ensureSink so a frame that lands before the first
+             * tts-start still sticks. */
+            const gain = Number(msg.gain);
+            if (Number.isFinite(gain)) ensureSink().setGain(gain);
             break;
           }
           case "tts-cancel": {
