@@ -316,6 +316,9 @@ export interface SessionSummary {
   phase: SessionPhase;
   pending_prompt: PendingPrompt | null;
   context: ContextUsage | null;
+  /** The same usage as a whole percent of the window, rounded by the
+   * daemon so every gauge reads the same number. Null when unknown. */
+  ctx_pct: number | null;
   user_label: string | null;
   derived_label: string | null;
   /** Lex anchor uuid for sessions backed by a brainstorm anchor.
@@ -690,9 +693,38 @@ export interface AnchorTile {
    * The deck nests the worker under the brainstorm by matching this
    * against the session tiles, the authoritative binding id. */
   supervised_worker_session_id: string | null;
+  /** Context gauge (2026-09-22): the supervised worker's context usage
+   * as a whole percent (null when unbound or unknown), Lex's own usage
+   * from the anchor's current transcript (null when unknown), and the
+   * smart-clear trip marks the gauge draws as vertical lines. */
+  worker_ctx_pct: number | null;
+  lex_ctx_pct: number | null;
+  ctx_threshold_pct: number;
+  ctx_ceiling_pct: number;
 }
 export const lexAnchorTiles = () =>
   request<{ ok: boolean; tiles: AnchorTile[] }>(`/lex/anchor-tiles`);
+
+/* Phase C handovers (2026-09-22): timestamped handover files the daemon
+ * writes per anchor (the worker's half plus Lex's vetted half). The
+ * list carries one row per file; the body is fetched on demand. */
+export interface HandoverRow {
+  file: string;
+  created_at: string;
+  kind: string;
+  /** True until Lex has reviewed the file (crash and session-end
+   * handovers land unvetted). */
+  unvetted: boolean;
+  verdict: string | null;
+}
+export const lexHandovers = (anchorId: string) =>
+  request<{ ok: boolean; handovers: HandoverRow[] }>(
+    `/lex/anchors/${encodeURIComponent(anchorId)}/handovers`,
+  );
+export const lexHandoverFile = (anchorId: string, file: string) =>
+  request<{ ok: boolean; content: string }>(
+    `/lex/anchors/${encodeURIComponent(anchorId)}/handovers/${encodeURIComponent(file)}`,
+  );
 
 /* Wave 2 day 2 (BF-5 / A1, BF-7 review / A2). The /brainstorms +
  * /drafts route family lives alongside the older /lex/sessions
@@ -1839,6 +1871,43 @@ export const setSmartCompactToggle = (mode: SmartCompactMode) =>
   request<SmartCompactToggle>(`/lex/smart-compact/toggle`, {
     method: "POST",
     body: { mode },
+  });
+
+// ── Auto-clear: one switch over smart-compact + smart-clear ─────
+/* POST /lex/auto-clear/mode sets both runtime modes in one call so the
+ * dashboard shows a single Auto-clear switch. A daemon that predates
+ * the route answers 404; SmartCompactPanel then falls back to the two
+ * older endpoints (smart-compact toggle + smart-clear config). */
+export interface AutoClearMode {
+  ok: boolean;
+  mode: SmartCompactMode;
+}
+export const setAutoClearMode = (mode: SmartCompactMode) =>
+  request<AutoClearMode>(`/lex/auto-clear/mode`, {
+    method: "POST",
+    body: { mode },
+  });
+
+/* Smart-clear trip marks (threshold = early wind-down, ceiling = force
+ * stop) plus the smart-clear mode. The context gauge on surfaces that
+ * only carry a bare pct (the /sessions rows) reads the marks here. */
+export interface SmartClearConfig {
+  ok: boolean;
+  mode: SmartCompactMode;
+  thresholdPct: number;
+  ceilingPct: number;
+  defaults?: { thresholdPct: number; ceilingPct: number };
+}
+export const smartClearConfig = () =>
+  request<SmartClearConfig>(`/lex/smart-clear/config`);
+export const setSmartClearConfig = (patch: {
+  mode?: SmartCompactMode;
+  threshold_pct?: number;
+  ceiling_pct?: number;
+}) =>
+  request<SmartClearConfig>(`/lex/smart-clear/config`, {
+    method: "POST",
+    body: patch,
   });
 
 // ── Lex cold-start preload toggle ───────────────────────────────
