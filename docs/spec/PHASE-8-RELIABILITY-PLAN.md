@@ -6,6 +6,20 @@
 >
 > **Not in Phase Two scope.** This phase opens after Phase Two completes (Wave 4 exit, plus the cross-host data root sync spec).
 
+## Status (2026-09-23)
+
+Parts of this plan shipped piecemeal; the rest is open. Read this block before the scope below, which is the original seed.
+
+| Item | Status | Where |
+|---|---|---|
+| Process supervisor | Partial. The `DevNeural-Daemon-Restart` scheduled task relaunches the daemon after a hard death (BUG-017 records revival within about five minutes); `POST /admin/daemon/restart` arms the same task. No 30s health poll, no boot-on-login check recorded. | `07-daemon/scripts/start-daemon.ps1` |
+| Memory + transcript backup | Manual only | `docs/DISASTER-RECOVERY.md` |
+| PTY survival across daemon restart | Not built. BUG-017 (heap death every ~24h) is the live cost: every restart kills the brainstorms and both voice layers. | `docs/spec/FUTURE-DAEMON-SPLIT.md` |
+| Personality ACL (Layer C) | Built. `applyIcacls` runs at daemon boot. | `07-daemon/src/daemon.ts`, `07-daemon/src/lex/personality-guard.ts` |
+| Graceful shutdown | Built (`4c8498a`): `[shutdown]` step timings in `daemon.log`, restart under 10s. Crash traces rotate to `*.prev.log` (BUG-018). | `07-daemon/src/daemon.ts` |
+
+Headline open item: PTY survival, which is what would make BUG-017 survivable.
+
 ---
 
 ## Headline goal

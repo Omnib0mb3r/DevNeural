@@ -4,7 +4,7 @@
 > UUID pronunciation, and the reminders → web push pipeline with its
 > 5-minute end-to-end smoke test.
 >
-> Last updated: 2026-05-12; pointer block added 2026-09-23.
+> Last updated: 2026-09-23 (sections 2 and 3 rewritten for the three-layer voice; sections 4 to 6 unchanged since 2026-05-12).
 
 > **2026-09 update.** Voice is now three layers and the knobs below are
 > the dashboard client's; the layer model, the Layer 1 contract, barge
@@ -60,31 +60,37 @@ This is a feature, not a bug.
 
 ### Where it lives
 
-- `08-dashboard/app/lex/page.tsx` "Talk to Lex" textarea →
-  `ptyInject(target, text, true)` (`lib/daemon-client.ts`).
-- Voice path: utterance frames → WS `/voice/lex-ws` → daemon whisper
-  → daemon inject → `assistant-text` event → Piper TTS frames
-  back over the same WS.
+- Typed path: the "Talk to Lex" box sends a `text-input` frame over the
+  same voice WS (`07-daemon/src/voice/lex-voice-ws.ts`, `case
+  'text-input'`). The daemon injects it to Layer 2 with
+  `suppressSpeakForTurn`, answers `tts-skipped reason=text-input`, and
+  the reply renders in the transcript with no audio
+  (`planDirectLlmReplyDelivery`, commit `925eecb`). The older
+  `ptyInject` call from `app/lex/page.tsx` is the fallback when no voice
+  socket is open.
+- Voice path: utterance frames → WS `/voice/lex-ws` → whisper → Layer 1
+  turn → forward to Layer 2 → the reply spoken through Layer 1
+  (`docs/spec/LAYER-1-CONTROL.md`).
 
 ### Why it stays
 
-The text path bypasses the WS entirely, which means it bypasses
-Piper. That is intentional: the user is typing because they do not
+The typed turn carries `suppressSpeakForTurn`, so the speak gate skips
+Piper for that turn. That is intentional: the user is typing because they do not
 want audio. Removing the gap (e.g. by reading every assistant turn
 aloud regardless of input modality) would constantly speak over the
-user when they are in a quiet context — laptop in a meeting room,
+user when they are in a quiet context - laptop in a meeting room,
 phone on the desk while someone is talking, etc.
 
-If you ever feel tempted to "fix" this by piping text-input
-assistant-text through the voice WS, search this doc first.
+If you ever feel tempted to "fix" this by speaking typed-turn replies,
+search this doc first.
 
 ---
 
 ## 3. UUID pronunciation rule
 
-Lex's voice contract (see `07-daemon/src/lex/system-prompt.ts`)
-says UUIDs are read character-by-character, not as syllabic
-groups. `abcd1234-...` is "a b c d one two three four dash ...",
+The spoken rules (`LEX_SPOKEN_RULES` in `07-daemon/src/lex/persona.ts`,
+owned by Layer 1) say UUIDs are read character-by-character, not as
+syllabic groups. `abcd1234-...` is "a b c d one two three four dash ...",
 not "abcded one twenty-three four".
 
 This matters because Lex regularly reads session ids out loud
@@ -92,10 +98,11 @@ during a brainstorm ("session a b c d eight, ready when you are").
 Slurring the prefix sounds confident but the user can no longer
 disambiguate against the tile list.
 
-The rule lives in the system prompt only; there is no daemon-side
-TTS preprocessor. If the model drifts (voice replay shows
-syllabic reads), the fix is a few-shot example in the
-`07-daemon/.../few-shot/<mode>.md` files, not a tokenizer rewrite.
+The rule lives in the Layer 1 prompt only; there is no daemon-side
+TTS preprocessor. Layer 1 v3 goes further and never reads long ids
+aloud at all ("that session", "the commit"). If the model drifts, the
+fix is the contract in `07-daemon/src/voice/voice-top-layer.ts`, not a
+tokenizer rewrite.
 
 ---
 
@@ -138,8 +145,8 @@ Two distinct dedupe paths:
 
 | Set | Lifetime | What it protects |
 |---|---|---|
-| `remindedIds` | in-process (sweep loop) | awareness event channel — fires once per reminder per daemon process; resets on restart |
-| `pushedIds` (+ ledger) | cross-restart | web push channel — a restart mid-sweep cannot re-buzz the user's phone |
+| `remindedIds` | in-process (sweep loop) | awareness event channel - fires once per reminder per daemon process; resets on restart |
+| `pushedIds` (+ ledger) | cross-restart | web push channel - a restart mid-sweep cannot re-buzz the user's phone |
 
 Both are necessary: the awareness channel deliberately re-fires on
 restart so Lex's snapshot stays accurate; the push channel must
@@ -200,7 +207,7 @@ If step 5 fails:
 
 | Symptom | First check |
 |---|---|
-| No buzz, ledger updated | `sendPushToAll` log line; `delivered=0` means the iOS endpoint rejected the push — usually a stale subscription. Re-subscribe. |
+| No buzz, ledger updated | `sendPushToAll` log line; `delivered=0` means the iOS endpoint rejected the push - usually a stale subscription. Re-subscribe. |
 | No buzz, no ledger | Sweep loop interval; daemon log for `[reminder sweep] failed`. |
 | Buzz but missing title | `emitNotification` body shape; Piper-side payload encoding. |
 | Buzz twice on restart | `loadPushedReminderIds` not reading the ledger; verify file path against `DEVNEURAL_DATA_ROOT`. |

@@ -1,7 +1,7 @@
 # Spec: Align StreamDeck.App with DevNeural project anchor model
 
 **Created:** 2026-05-12 (brainstorm session "DevNeural Testing")
-**Status:** Ready to plan/implement after PROJECT-ANCHORS lands (it has, commits 708233d through 1ff109a).
+**Status (2026-09-23):** DevNeural side shipped (PROJECT-ANCHORS, commits 708233d through 1ff109a; panic routes and event-driven supervision since). Deck side NOT started: `StreamDeck.App` still renders from identity files, and only its hook scripts know anchor ids. Open cross-repo work; the contract table below is still the audit trail.
 **Repo affected:** stream-deck (C:/dev/Projects/stream-deck). DevNeural side is the contract surface and is already shipped.
 
 ---
@@ -20,16 +20,16 @@ This eliminates the parallel codepath between the web dashboard and the deck, an
 
 ### Identity model
 - **Before:** `%LOCALAPPDATA%\stream-deck\identity\<sessionId>.json` was authoritative for liveness via mtime freshness. Buttons referenced session UUIDs.
-- **After:** Buttons reference `anchor_id` (UUID from `project_session.id`). Tray polls `GET /projects/anchor-tiles` for the current tile list and renders by anchor_id. Identity files retained for editor-detection only (which VS Code window to focus on tile click — see "What MUST NOT change" below).
+- **After:** Buttons reference `anchor_id` (UUID from `project_session.id`). Tray polls `GET /projects/anchor-tiles` for the current tile list and renders by anchor_id. Identity files retained for editor-detection only (which VS Code window to focus on tile click - see "What MUST NOT change" below).
 
 ### Tile rendering data source
 - **Before:** Local state derived from identity dir + ad-hoc heuristics.
-- **After:** `GET /projects/anchor-tiles` returns the canonical tile feed (label, phase, status, badge counts). Deck renders from that response. Refresh interval: 1s default, configurable via env. Future: WebSocket push from daemon when event-driven supervision lands (see EVENT-DRIVEN-SUPERVISION.md).
+- **After:** `GET /projects/anchor-tiles` returns the canonical tile feed (label, phase, status, badge counts). Deck renders from that response. Refresh interval: 1s default, configurable via env. Future: WebSocket push from the daemon (event-driven supervision has shipped; spec archived at `docs/archive/spec/EVENT-DRIVEN-SUPERVISION.md`).
 
 ### Button press actions
 - **Single press:** `POST /projects/:anchor_id/open`. Daemon's spawn-or-bind contract handles whether to focus an existing window or launch a fresh one.
 - **Long press (defer to Phase 2):** `POST /projects/:anchor_id/end` to flip dormant.
-- **Panic gesture (when PANIC-BUTTON.md ships):** `POST /projects/:anchor_id/interrupt` to send double-ESC to the worker.
+- **Panic gesture:** `POST /projects/:anchor_id/interrupt` to send double-ESC to the worker (shipped; spec archived at `docs/archive/spec/PANIC-BUTTON.md`).
 - All button actions go through HTTP. No direct PTY writes from the deck app.
 
 ### Configuration storage
@@ -41,7 +41,7 @@ Read from `anchor.title || anchor.derived_title || anchor.project_slug`, in that
 
 ---
 
-## DevNeural usage map (authoritative — where DevNeural reads/writes deck artifacts)
+## DevNeural usage map (authoritative - where DevNeural reads/writes deck artifacts)
 
 If anything below breaks after a stream-deck change, this is the audit trail to fix it. All paths are concrete as of commit 1ff109a.
 
@@ -62,9 +62,9 @@ If the deck-app refactor breaks something, walk this table from the symptom (e.g
 
 ## Out of scope (do NOT touch)
 
-- **Bottom 5 deck keys.** These are universal computer-control bindings (media, app launch, OS macros — owned by the user, NOT by DevNeural). They do NOT control Claude Code sessions and must remain unaffected by the anchor migration. The anchor model applies only to deck buttons currently bound to CC sessions; the bottom row stays in whatever local config the deck app uses for OS-level bindings.
-- Any deck button currently bound to a non-CC action (Spotify, OBS, custom hotkey, etc) — leave alone.
-- The deck firmware / Elgato HID protocol — DevNeural never touches it.
+- **Bottom 5 deck keys.** These are universal computer-control bindings (media, app launch, OS macros - owned by the user, NOT by DevNeural). They do NOT control Claude Code sessions and must remain unaffected by the anchor migration. The anchor model applies only to deck buttons currently bound to CC sessions; the bottom row stays in whatever local config the deck app uses for OS-level bindings.
+- Any deck button currently bound to a non-CC action (Spotify, OBS, custom hotkey, etc) - leave alone.
+- The deck firmware / Elgato HID protocol - DevNeural never touches it.
 
 ---
 
@@ -73,7 +73,7 @@ If the deck-app refactor breaks something, walk this table from the symptom (e.g
 These are the integration points where the deck app produces filesystem artifacts the DevNeural daemon reads, or consumes filesystem artifacts the daemon writes. Touching any of them without coordinating with DevNeural will break the daemon. Each one must keep its current shape AND its current location.
 
 ### 1. Workspace-inject marker watcher
-- **Path:** `%LOCALAPPDATA%\stream-deck\workspace-inject\` (or whatever PROJECT-ANCHORS.md migration plan step 3 wired up — verify exact path against the daemon source `07-daemon/src/dashboard/projects-routes.ts`).
+- **Path:** `%LOCALAPPDATA%\stream-deck\workspace-inject\` (or whatever PROJECT-ANCHORS.md migration plan step 3 wired up - verify exact path against the daemon source `07-daemon/src/dashboard/projects-routes.ts`).
 - **Producer:** DevNeural daemon, on `POST /projects/:id/open` spawn path.
 - **Consumer:** StreamDeck.App tray watcher.
 - **Contract:** marker file appears, deck app launches `code -n <cwd>` so a fresh VS Code window opens. Keep reading these markers; don't change the watch directory or the marker JSON shape without coordinating a daemon-side change first.
@@ -111,16 +111,16 @@ These are the integration points where the deck app produces filesystem artifact
 
 4. **Phase 3: Press actions.** Single-press wires to `POST /projects/:id/open`. Long-press wires to `POST /projects/:id/end` (gate behind a setting). Remove all direct PTY writes from the deck app.
 
-5. **Phase 4: Panic gesture (when PANIC-BUTTON.md ships).** Bind a deck-wide gesture (chord, dedicated red button, or hold-corner) to `POST /projects/:id/interrupt` resolving to the active anchor.
+5. **Phase 4: Panic gesture (the daemon side shipped).** Bind a deck-wide gesture (chord, dedicated red button, or hold-corner) to `POST /projects/:id/interrupt` resolving to the active anchor.
 
 6. **Phase 5: Verification.** Soak with the daemon for one full week. Run through full button matrix on the physical deck and the virtual deck (dashboard). Confirm the contract surface (sections 1-6 in "What MUST NOT change") is untouched by running DevNeural's existing daemon tests (234+ tests, currently green).
 
 ---
 
-## Already done — do NOT redo
+## Already done - do NOT redo
 
 - DevNeural side: PROJECT-ANCHORS migration shipped end to end (commits 708233d, ec96e23, ffb3e12, d26351f, b97af11, 1ff109a). Anchor model, endpoints, sanity-check feed all live.
-- Cross-session inject pipeline shipped commit `8f68121`. Deck panic gesture should reuse the same auth surface (HMAC token issued via `POST /auth/cross-session-token`) when PANIC-BUTTON.md lands, not a new one.
+- Cross-session inject pipeline shipped commit `8f68121`. Deck panic gesture should reuse the same auth surface (HMAC token issued via `POST /auth/cross-session-token`), not a new one.
 - Tile-tap focus + Nav-mode key inject already routed through the StreamDeck.App tray (commit 3147c41 in stream-deck repo, 59cfd2e in DevNeural). Don't tear that out; just rewire the trigger source from local state to the HTTP press handler.
 
 ---
@@ -128,7 +128,7 @@ These are the integration points where the deck app produces filesystem artifact
 ## Constraints / decisions
 
 - Daemon is single source of truth. Deck app stores no anchor state locally beyond its button-to-anchor-id config.
-- HTTP polling at 1s default. WebSocket push deferred to EVENT-DRIVEN-SUPERVISION.md.
+- HTTP polling at 1s default. WebSocket push deferred (the daemon's event-driven supervision exists; a deck push channel does not).
 - Identity files keep being written (editor-detection); daemon no longer treats them as liveness-authoritative (Step 6 of PROJECT-ANCHORS already removed that).
 - Workspace-inject marker contract is sacred. No changes without a coordinated daemon PR.
 - No direct PTY writes from the deck app. All actions go through daemon HTTP.

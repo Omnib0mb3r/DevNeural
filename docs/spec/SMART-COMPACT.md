@@ -36,11 +36,13 @@ the trigger, the worker is purely reactive.
 | Confirm the reseed landed and an assistant reply followed | daemon | `POST /lex/smart-clear/confirm` (`confirmResumeOnTask`) |
 | Audit row per attempt | daemon | `smart_compact_log` (`caller`, `reason`, `action`, `pre_ctx_pct`, `summary_preview`, `payload_text`) |
 
-Two mode keys still coexist (a known footgun, AUTO-CLEAR section 10):
-`smart_compact_mode` (the real inject gate, dashboard toggle, default
-`shadow`) and `smart_clear_mode` (the advisory trigger, no UI, default
-`off`). Both must be `live` for the loop to run. Verified live on
-2026-07-20: both `live`, threshold 40, ceiling 60.
+One switch since Phase C (section 5 item 4): `auto_clear_mode`
+(`GET|POST /lex/auto-clear/mode`, off / shadow / live, the dashboard
+Auto-clear control). The older pair `smart_compact_mode` (inject gate)
+and `smart_clear_mode` (advisory trigger) is read only when
+`auto_clear_mode` is unset (`07-daemon/src/dashboard/handover-routes.ts`,
+"explicit auto_clear_mode wins; otherwise the pair"). Live since the
+2026-09-23 restart: `auto_clear_mode=live`, threshold 40, ceiling 60.
 
 Nothing periodic: the loop fires off `[supervisor-event]` markers that
 the worker's own jsonl activity produces (chokidar listener). The one
@@ -227,8 +229,8 @@ the knowledge, orb and recall layer.
 
 ## 6. Restart-verify for the restored driver loop
 
-With a worker at `ctx_pct >= 40` under a brainstorm that supervises it,
-`smart_clear_mode=live` and `smart_compact_mode=live`:
+With a worker at `ctx_pct >= 40` under a brainstorm that supervises it
+and `auto_clear_mode=live`:
 
 1. A `[supervisor-event]` lands in L2 (worker commit, idle, test
    failure).

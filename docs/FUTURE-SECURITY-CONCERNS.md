@@ -36,3 +36,33 @@ block in `authMiddleware`. The bridge will need a real auth surface
 (shared-secret header signed at daemon launch, or a separate read-only
 session enumeration route gated by a different secret) before that
 deletion can ship without breaking `open_projects`.
+
+## 2026-09-23: workers and Layer 2 run with permissions bypassed
+
+**Change:** none; this records a standing state. Workers spawned by
+`POST /projects/:id/start-claude` (`07-daemon/src/dashboard/routes.ts`)
+run `claude --dangerously-skip-permissions`, and Layer 2 runs
+`--permission-mode bypassPermissions` by default (`mid_permission_mode`).
+The archived INVESTIGATOR-PIPELINE spec asked for a "danger gate" so
+that no worker ever runs bypassed; that gate was never built and is
+not planned.
+
+**Why:** the operator's goal is hands-free control by voice, with no
+screen. A worker parked on a permission prompt is a stalled worker
+nobody can see. Until Layer 1 can route a worker's permission prompt to
+the operator the way it routes Layer 2's plan approval
+(`docs/spec/LAYER-1-CONTROL.md`, Phase B), bypass is what keeps the
+loop moving. The only guard today is the prompt rule in
+`07-daemon/src/lex/system-prompt.ts` (state the plan, get a go-ahead)
+and the optional mechanical `dispatch_confirm_gate`.
+
+**Residual risk:** a worker can run any tool, including destructive
+shell, on the operator's machine with no human check. Bounded by the
+single-user workstation, git as the undo, and the one-brainstorm-one-
+worker scope rule (a worker only ever touches its own project).
+
+**Recovery path:** flip `mid_permission_mode` to `plan` (live, no
+rebuild) for Layer 2 once plan approval by voice passes its smoke test;
+for workers, build the permission-prompt route through Layer 1 (same
+shape as `plan-approval.ts`) and then drop the bypass flag in the
+worker command string in `routes.ts`.

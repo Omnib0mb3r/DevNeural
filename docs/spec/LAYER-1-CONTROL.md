@@ -15,8 +15,10 @@ while L1 was dead and is superseded here.
 Single source of truth for how the operator talks to Lex. Supersedes the
 2026-07-20 version of this file (kept below as "Barge baseline", which
 shipped and still holds) and consolidates the scattered voice-layer design
-in `VOICE-TOP-LAYER-SPEC.md`, `VOICE-TOP-LAYER-SMARTS-SPEC.md`,
-`VOICE-BARGE-CLASSIFIER-SPEC.md`, `COALESCE-UTTERANCE-QUEUE.md` and
+in `VOICE-TOP-LAYER-SPEC.md`, `VOICE-TOP-LAYER-SMARTS-SPEC.md` and
+`VOICE-BARGE-CLASSIFIER-SPEC.md` (all three now under
+`C:\dev\data\skill-connections\brainstorm\archive\`),
+`docs/archive/spec/COALESCE-UTTERANCE-QUEUE.md` and
 `docs/archive/spec/2026-07-15-voice-top-layer-design.md`. Those stay as
 history. This is the doc to build to.
 
@@ -408,8 +410,9 @@ When L2's end_turn body lands, the daemon asks L1 to deliver it out loud in
 its own voice (`voiceLexReply`), streaming per record. Facts, numbers,
 decisions and negations are preserved verbatim; paths, ids and code are
 referred to in passing. A miss (nothing spoken) falls back to speaking the
-raw L2 body so L2 is never silenced; a cut (partials spoken, ask never
-closed) re-delivers when L1 is back.
+raw L2 body so L2 is never silenced. A cut (partials spoken, ask never
+closed) is recorded as `cut` and is never re-delivered from the top
+(single mouth rule 6); only the FINISH path speaks its remainder.
 
 ### BUG-008 root cause (found 2026-09-21)
 
