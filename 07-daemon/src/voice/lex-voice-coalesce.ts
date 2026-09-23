@@ -2,7 +2,7 @@
  * Coalesce-utterance-queue helpers (Fix 35 Phase A, 2026-05-26).
  *
  * Pure utilities for the sealed coalesce contract (full spec at
- * docs/spec/COALESCE-UTTERANCE-QUEUE.md). This module owns three
+ * docs/archive/spec/COALESCE-UTTERANCE-QUEUE.md). This module owns three
  * concerns deliberately separated from the WS state machine:
  *
  *   1. Format a queued-utterance batch into a single combined

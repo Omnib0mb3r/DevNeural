@@ -1,5 +1,6 @@
 /* Voice top layer, Layer 1 (LAYER-1-CONTROL.md v2, 2026-09-21; history:
- * docs/superpowers/specs/2026-07-15-voice-top-layer-design.md).
+ * docs/archive/spec/2026-07-15-voice-top-layer-design.md; the design of
+ * record is docs/spec/LAYER-1-CONTROL.md v3).
  *
  * The one conversational layer the operator talks to: a haiku headless
  * terminal that holds Lex's personality, does ALL the talking, decides

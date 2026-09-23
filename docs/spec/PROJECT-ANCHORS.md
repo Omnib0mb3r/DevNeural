@@ -1,7 +1,7 @@
 # Spec: Project anchors — durable session model for Claude Code projects
 
 **Created:** 2026-05-11 (brainstorm session "DevNeural Testing")
-**Status:** Ready to plan/implement.
+**Status:** SHIPPED (commits `708233d` through `1ff109a`, 2026-05) and load-bearing: every brainstorm supervises exactly one project anchor (`lex_session.supervises_project_anchor_id`), the voice layers, the supervisor and the context lifecycle all key on it. Kept as the reference for the anchor model.
 **Pattern source:** mirrors the just-shipped `lex_session` anchor model (commit `5af07d0`).
 
 ---

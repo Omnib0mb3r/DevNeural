@@ -5,13 +5,22 @@
 > transcript history panel, the Past Sessions compact pattern, and the
 > shared collapse-toggle helper they all use.
 >
-> Last updated: 2026-05-12.
+> Last updated: 2026-05-12; pointer block added 2026-09-23.
+
+> **2026-09 update.** Three surfaces landed with the Phase C wave and
+> are not described below: the context gauge (`ContextGauge`, fill
+> with the auto-clear point and the ceiling marked) on the deck tiles,
+> the Lex tab and the sessions table; the handover list on the
+> brainstorm page (newest first, worker draft and Lex review visible,
+> `GET /lex/anchors/:id/handovers`); and the one Auto-clear switch
+> (`GET|POST /lex/auto-clear/mode`: off, shadow, live). See
+> `08-dashboard/README.md` and `docs/spec/SMART-COMPACT.md` section 5.
 
 ---
 
 ## 1. Global panic button
 
-Spec: `docs/spec/PANIC-BUTTON.md`. Implementation:
+Spec: `docs/archive/spec/PANIC-BUTTON.md` (built; archived 2026-09-23). Implementation:
 - `08-dashboard/components/PanicButton.tsx`
 - `08-dashboard/components/PanicAuditPanel.tsx`
 - `07-daemon/src/dashboard/panic-routes.ts`

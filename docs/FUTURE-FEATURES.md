@@ -2,11 +2,23 @@
 
 Forward-looking scope. Index of what's planned but not built (or only partly built). Each entry links to its spec doc when one exists, plus a one-line "why" so future-us knows whether the motivation still holds.
 
-Last updated: 2026-07-18.
+Last updated: 2026-09-23.
+
+## Shipped since the last refresh (kept here so the "why" survives)
+
+- **L2 mechanical confirm-gate before worker dispatch**: shipped 2026-09-21 as `dispatch_confirm_gate` (runtime config, default off; `07-daemon/src/lex/layer-model.ts`, FIXES.md VL-8). The daemon parks Lex's dispatch (202 `held_for_confirm`), Layer 1 asks, the operator's yes re-enters the route with a fresh token. The CC-native plan-approval prompt routes through Layer 1 too (`plan-approval.ts`), so `mid_permission_mode` `plan` works headless. Both are staged to be armed after the spoken checklist passes (`docs/HANDOVER.md` next steps).
+- **Handover approval by voice, Lex self-clear, the context pack, Layer 1 respawn**: shipped 2026-09-22 (Phase C, `docs/spec/SMART-COMPACT.md` section 5).
 
 ## Near term (next milestone)
 
-### L2 mechanical confirm-gate before worker dispatch
+### Curator canary and the injection delivery gap (BACKLOG P1)
+- `CuratorHealthCard` still renders "No canary probe is wired up on the daemon yet" and `canary_status` is hardcoded `unknown`; separately, an injection can be announced without the chunk landing in context (`lex_retrieval_log` shows zero rows for an announced chunk). Source: `<DATA_ROOT>/brainstorm/BACKLOG.md` P1.
+- Why: the recommendation engine is the product; an unverified delivery path means the brain may be talking to nobody.
+
+### Stale-reply guard on the reply-text surface (BACKLOG P2)
+- Barge v3 made the newest user state beat in-flight brain audio. The same rule is not enforced for the reply text that lands after the operator has already moved on. Source: `<DATA_ROOT>/brainstorm/coalescence-stale-reply-guard.md`.
+
+### L2 mechanical confirm-gate before worker dispatch (SHIPPED, see above; entry kept for its rationale)
 - Today (`3b8ef37`, 2026-07-18) the "Lex (L2) confirms alignment with the operator before it prompts the worker (L3)" rule is PROMPT-enforced in the core Lex prompt (`system-prompt.ts` worker-inject section): state the plan out loud, get the go-ahead, only then `POST /lex/inject-cross-session`. Reliable (rides the existing voice conversation) but not mechanically guaranteed.
 - Future: gate `/lex/inject-cross-session` itself on an operator voice-confirm. When Lex calls it, the daemon HOLDS the dispatch, speaks the plan/intent to the operator through Layer 1, waits for a voice yes/no, then releases (dispatch) or rejects (tell Lex to revise). Bulletproof: Lex literally cannot prompt the worker until the operator agrees. Mirrors the existing loose-ends gate pattern (`enforceLooseEndsGate` on `/projects/:id/start-claude`, returns 409 + report for a banner).
 - Related: route the CC-native plan-approval prompt to Layer 1 so `--permission-mode plan` works headless on the mid. Blocker: the daemon only has a time-based boot-banner prompt hold (`isAwaitingSystemPrompt`), no ExitPlanMode/plan-approval detector; needs a real detector on the mid PTY output plus an approval inject. Until then `mid_permission_mode` defaults to `bypassPermissions` (headless `plan` mode stalls on the unanswered approval); flip live with `POST /runtime-config/mid_permission_mode {"value":"plan"}` once the routing exists.
@@ -18,7 +30,7 @@ Last updated: 2026-07-18.
 - Why: mode is a VAD concern, not a transport concern; rebuilding the socket on every mode change is fragile (the 1006 was one symptom) and blips voice, the same failure class SV-1..3 fought for brainstorm switches.
 
 ### Event-driven supervision
-- Spec: `docs/spec/EVENT-DRIVEN-SUPERVISION.md`
+- Spec: `docs/archive/spec/EVENT-DRIVEN-SUPERVISION.md` (built; archived 2026-09-23)
 - Replaces the polling supervision cron with daemon-push events. Includes a per-anchor `supervision_mode` column (polling / event / off). `off` is the user's kill-switch for auto-supervision and auto-inject.
 - Why: 2-min polling burns context unnecessarily on idle workers. Event-driven only wakes Lex on actual worker state changes.
 

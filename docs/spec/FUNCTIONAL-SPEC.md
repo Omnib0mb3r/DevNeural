@@ -2,8 +2,8 @@
 
 > **Purpose:** Single source of truth for how every component currently works, what rules govern it, what each layer is responsible for, and where the boundaries are. Read this before changing architecture. Read this before extending Lex. Read this before adding a new layer.
 >
-> **Last updated:** 2026-05-09
-> **Companion docs:** `docs/spec/DEVNEURAL.md` (wiki schema for the ingest LLM), `docs/spec/devneural-v2.md` (legacy architecture, kept for historical context), `docs/HANDOVER-2026-05-09-second-brain-strengthening.md` (in-flight work)
+> **Last updated:** 2026-05-09 for the capture, ingest, wiki, retrieval and dashboard layers; link pass 2026-09-23. The Lex layers built after this date are specified elsewhere and this document does not repeat them: the three voice layers in `docs/spec/LAYER-1-CONTROL.md` (v3), the context lifecycle (handovers, auto-clear, self-clear, context pack) in `docs/spec/SMART-COMPACT.md` section 5, the anchor model in `docs/spec/PROJECT-ANCHORS.md`. Where this document and those disagree about Lex, those win.
+> **Companion docs:** `docs/archive/spec/DEVNEURAL.md` (wiki schema for the ingest LLM; the live copy is `wiki/DEVNEURAL.md` in the data root), `docs/archive/spec/devneural-v2.md` (legacy architecture, kept for historical context), `docs/HANDOVER.md` (the rolling cursor)
 
 ---
 
@@ -84,7 +84,7 @@ DevNeural is built on two complementary retrieval layers. Neither alone is suffi
 
 **Semantic layer (meaning-based).** Vector embeddings (MiniLM-L6-v2, 384 dim), cosine similarity, two-tier retrieval. This is what lets recall happen by intent. "The warehouse layout decision" finds work where those words were never used.
 
-**Logical layer (rule-based).** The `[trigger] → [insight]` page schema, validation gates on every LLM output, promotion criteria, reinforcement rules, hard editorial rules from `docs/spec/DEVNEURAL.md`. This is what keeps the wiki from becoming a junk drawer.
+**Logical layer (rule-based).** The `[trigger] → [insight]` page schema, validation gates on every LLM output, promotion criteria, reinforcement rules, hard editorial rules from `docs/archive/spec/DEVNEURAL.md`. This is what keeps the wiki from becoming a junk drawer.
 
 Without semantics: a junk drawer of insights nobody can find. Without logic: a vector store of noise that scores high but means nothing. The combination is what makes the wiki a brain.
 
@@ -178,7 +178,7 @@ Search is dot-product on normalized vectors. `search(query, {topK, filter, minSc
 - `lint-report.md` — last lint pass output
 - `DEVNEURAL.md` — schema spec (canonical copy in `docs/spec/`)
 
-Every page is a markdown file with YAML frontmatter (id, title, trigger, insight, summary, status, weight, hits, corrections, created, last_touched, projects, human_edited). Sections: `# Title`, `## Pattern`, `## Cross-references`, `## Evidence`, `## Open questions`, `## Log`. Spec at `docs/spec/DEVNEURAL.md`.
+Every page is a markdown file with YAML frontmatter (id, title, trigger, insight, summary, status, weight, hits, corrections, created, last_touched, projects, human_edited). Sections: `# Title`, `## Pattern`, `## Cross-references`, `## Evidence`, `## Open questions`, `## Log`. Spec at `docs/archive/spec/DEVNEURAL.md`.
 
 ---
 
@@ -242,7 +242,7 @@ When `writeNewPendingPage()` detects the source project's cwd matches `isBrainst
 
 ### 5.7 Hard rules from DEVNEURAL.md
 
-The ingest LLM is bound by `docs/spec/DEVNEURAL.md`:
+The ingest LLM is bound by `docs/archive/spec/DEVNEURAL.md`:
 
 - Pages are transferable insights, not records of events. Title format `[trigger] → [insight]`, mandatory `→` separator.
 - Pages are produced exclusively by ingest. Hand-authored pages don't exist.
@@ -711,11 +711,11 @@ Items already known:
 | Dashboard frontend | `08-dashboard/` |
 | VS Code bridge | `09-bridge/` |
 | Archived v1 | `archive/v1/` |
-| Wiki spec | `docs/spec/DEVNEURAL.md` |
-| Architecture spec | `docs/spec/devneural-v2.md` |
+| Wiki spec | `docs/archive/spec/DEVNEURAL.md` |
+| Architecture spec | `docs/archive/spec/devneural-v2.md` (legacy); voice layers `docs/spec/LAYER-1-CONTROL.md`; context lifecycle `docs/spec/SMART-COMPACT.md` |
 | **This document** | `docs/spec/FUNCTIONAL-SPEC.md` |
 | Live state | `docs/SESSION-HANDOVER.md` |
-| In-flight tracking | `docs/HANDOVER-2026-05-09-second-brain-strengthening.md` |
+| In-flight tracking | `docs/HANDOVER.md` (rolling cursor), `BUGS.md`, `FIXES.md` |
 
 ---
 
@@ -725,9 +725,9 @@ Final reference. If a behavior surprises you, this is the source of truth.
 
 | Rule | Lives in |
 |---|---|
-| Page shape (frontmatter, sections, title format) | `docs/spec/DEVNEURAL.md` |
-| What ingest LLM is allowed to do | `docs/spec/DEVNEURAL.md` sections 3, 7 |
-| What lint LLM is allowed to do | `docs/spec/DEVNEURAL.md` section 4 |
+| Page shape (frontmatter, sections, title format) | `docs/archive/spec/DEVNEURAL.md` |
+| What ingest LLM is allowed to do | `docs/archive/spec/DEVNEURAL.md` sections 3, 7 |
+| What lint LLM is allowed to do | `docs/archive/spec/DEVNEURAL.md` section 4 |
 | Source-class multipliers | `07-daemon/src/dashboard/search-all.ts:40-46` |
 | Reinforcement weights (hit gain, correction loss, decay rate) | `07-daemon/src/reinforcement/index.ts` constants |
 | Decay cadence | `DEVNEURAL_DECAY_INTERVAL_MS` env var, default 24h |

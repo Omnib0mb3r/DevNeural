@@ -17,6 +17,25 @@ in the same commit that updates `docs/INDEX.md` to drop the entry.
 ## Layout
 
 - `*.md` at the root - superseded top-level docs (HANDOVERs,
-  postmortems, plan docs, dated session-handover snapshots).
+  postmortems, plan docs, dated session-handover snapshots, the 2026-05
+  voice design review).
 - `spec/` - superseded spec files (early architecture drafts, wave
-  plans, phase plans, way-forward documents).
+  plans, phase plans, way-forward documents, the codex reviews, the
+  specs whose subject shipped: coalesce queue, event-driven
+  supervision, panic button, the lex-autonomy payload and standalone
+  supervision specs, the 2026-07 voice top-layer design and mic tuning,
+  the 2026-07-18 bell and voice-binding fix specs, the never-built
+  investigator pipeline).
+- `plans/` - executed implementation plans (organic edges 2026-04, the
+  voice layers 2026-09-21, the fix wave 2026-09-22, the voice v3 +
+  Phase C wave 2026-09-22). Their checkboxes were never ticked; the
+  commits in FIXES.md are the completion record. The 2026-09-22 fix
+  wave's word gate was later withdrawn by LAYER-1-CONTROL v3.
+- `bugs/` - per-bug investigation write-ups for bugs that reached
+  RESOLVED (2026-05 to 2026-06). BUGS.md and FIXES.md carry the
+  resolution; these hold the long-form reasoning.
+
+Archived 2026-09-23 in the overnight reconciliation after the voice v3
++ Phase C wave. The brainstorm-folder design docs that fed those waves
+(barge classifier, top-layer smarts, the resume seeds) were moved to
+`<DATA_ROOT>/brainstorm/archive/` the same night.

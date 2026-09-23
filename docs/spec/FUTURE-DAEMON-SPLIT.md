@@ -1,10 +1,13 @@
 # Spec (future state): Split `07-daemon` into three planes
 
 **Created:** 2026-05-11 (brainstorm session "DevNeural Testing")
-**Status:** Future state — DEFERRED. Do not implement until:
-- Project anchors (`PROJECT-ANCHORS.md`) shipped and soaked.
-- Smart compact (`SMART-COMPACT.md`) shipped and soaked.
-- Wave 3 Lane A (orb unification) shipped.
+**Status:** Future state, DEFERRED. The original gates have all passed
+(project anchors shipped 2026-05, smart compact and the Phase C context
+lifecycle shipped 2026-09-22, orb unification shipped), so the split is
+now a matter of priority, not readiness. Status refreshed 2026-09-23. The
+case for it has grown: BUG-017 (daemon heap death every ~24h) takes the
+voice layers down with the ingest plane, which is exactly the coupling
+this split removes; see `PHASE-8-RELIABILITY-PLAN.md`.
 
 The single-process daemon is fine for now. This document captures the target
 architecture so when the split happens, the seams are already in mind.

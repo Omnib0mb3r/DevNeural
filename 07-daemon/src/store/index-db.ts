@@ -90,7 +90,7 @@ export interface BrainstormSessionRow {
   lifecycle_state?: 'idle' | 'attached' | 'speaking' | 'ended';
   attached_worker_session_id?: string | null;
   /* Lex standalone supervision (2026-05-24, migration 035).
-   * See docs/spec/LEX-STANDALONE-SUPERVISION.md.
+   * See docs/archive/spec/LEX-STANDALONE-SUPERVISION.md.
    *
    * last_user_utterance_at  ISO timestamp of the most recent user
    *                         turn in this brainstorm. Voice WS updates

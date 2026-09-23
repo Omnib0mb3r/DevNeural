@@ -3,7 +3,8 @@
  *
  * Sibling of judge-session.ts (spec: docs/spec/LAYER-1-CONTROL.md, the
  * canonical voice-layers doc; history in
- * docs/superpowers/specs/2026-07-15-voice-top-layer-design.md). The
+ * docs/archive/spec/2026-07-15-voice-top-layer-design.md; the design of
+ * record is now docs/spec/LAYER-1-CONTROL.md v3). The
  * voice top layer needs fast turnaround on every spoken exchange, and
  * judge-session serializes ALL of its callers onto one shared
  * in-flight-ask queue: routing voice turns through it would park an

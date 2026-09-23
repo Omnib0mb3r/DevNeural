@@ -4,9 +4,11 @@
 
 DevNeural is a personal second brain for software work. It captures everything you do in Claude Code, builds a semantic search layer (RAG) over the raw record, compiles transferable insights into a maintained wiki, recommends relevant prior thinking to Claude in real time, learns from what actually works, and surfaces it all through a dashboard you can hit from anywhere via Tailscale.
 
-It runs entirely on your own hardware. By default no data leaves your machine. Two opt-in flags allow Anthropic API for Pass 2 schema fallback and cross-project pattern verification on non-voice content only. Voice brainstorm and meeting content stays host-only in the direct-llm (ollama) runtime; the default cc-pty runtime instead sends it to Anthropic as part of the normal Claude Code conversation, outside that outbound_log tracking. Every off-host call the outbound guard covers is logged in `outbound_log` and shown on the dashboard's Outbound card; see `outbound.md` at the repo root for the canonical list.
+It runs entirely on your own hardware. By default no data leaves your machine. Two opt-in flags allow the Anthropic API for Pass 2 schema fallback and cross-project pattern verification on non-voice wiki content only; both are off by default. Every off-host call the outbound guard covers is logged in `outbound_log` and shown on the dashboard's Outbound card; see `outbound.md` at the repo root for the canonical list.
 
-DevNeural is **brainstormer-first**. Voice brainstorm conversations are the substrate of the system, not derivative artifacts of project work. Retrieval ranks brainstorms above the wiki, brainstorms never decay, and brainstorm content is the highest-sensitivity privacy class. The wiki is downstream of brainstorming. See `voice-review.md` and `docs/spec/PHASE-TWO-IMPLEMENTATION.md` for the full reframe.
+Lex, the voice layers and every supervisor session are headless `claude` sessions on your Claude subscription. No Anthropic API key is read anywhere on that path (pinned by `07-daemon/tests/no-anthropic-api.test.ts`), and the daemon strips `ANTHROPIC_API_KEY` from every session it spawns so a session can never flip from the subscription to per-token billing.
+
+DevNeural is **brainstormer-first**. Voice brainstorm conversations are the substrate of the system, not derivative artifacts of project work. Retrieval ranks brainstorms above the wiki, brainstorms never decay, and brainstorm content is the highest-sensitivity privacy class. The wiki is downstream of brainstorming. See `docs/archive/voice-review.md` and `docs/archive/spec/PHASE-TWO-IMPLEMENTATION.md` for the original reframe.
 
 ---
 
@@ -48,7 +50,10 @@ A second brain has six properties. DevNeural has all six.
 | 6 | Notification hook → dashboard permission UI (CC permission/elicitation prompts surface in /sessions with answer buttons) | done, shipped |
 | 7 | Lex supervisory voice loop: daemon-PTY hosts a personality-typed Claude Code session; whisper.cpp cuBLAS STT in, Piper TTS out, silero VAD with mute auto-finalize, three voice modes (conversation / notes / push-to-talk), browser voice picker, barge-in. First-class brainstorm_sessions records, source-classed retrieval (`/lex/recall`), fenced-JSON artifact extraction, supervisor primitives, conflict-overlap signal on retrieval. | **shipped**: Slice A (brainstorm_sessions schema + WS pipeline), Slice B (`/lex/recall` source-classed retrieval), Slice C (fenced-JSON artifact extraction for research-note / wiki-draft / project-intent / notes-summary), Slice D (system prompt mode contracts + synthesis directive), Slice E (`/lex/steer` + `/lex/capture` + `/lex/snapshot`), voice UX (mute auto-finalize, AudioContext warm, notes-summary artifact emit, barge-in cooldown), STT-config defence (whisper-bin validator + cuBLAS auto-correct). **Follow-on (Phase Two work track, separately scoped)**: cross-session supervision, awareness broadcaster, personality fine-tune, smart compact, six-section resume, dashboard supervisor. Tracked in `docs/spec/PHASE-TWO-IMPLEMENTATION.md` with wave-by-wave detail. |
 
-See [docs/HANDOVER.md](docs/HANDOVER.md) for what state the repo was in at the most recent session boundary. Active multi-session work is tracked in `docs/HANDOVER.md` plus the spec files under `docs/spec/`.
+| 8 | Voice layers: Layer 1 voice (one headless haiku `claude` per brainstorm, spawned before the brain, personality and manner only, fail-safe forward), Layer 2 brain (opus `claude`, scoped to one supervised worker), Layer 3 workers. Barge that stops first and decides second, delivery verbs (repeat, slower, louder), AI-interpreted controls with one mechanical panic phrase, plan approval and dispatch confirm by voice, continuous TTS stream. | **shipped 2026-09-22** (`docs/spec/LAYER-1-CONTROL.md` v3) |
+| 9 | Context lifecycle (Phase C): the worker writes its handover, Lex vets and corrects it visibly in the file, the operator approves by voice, one seed after the clear; handovers at session end and after a crash from the transcript trail; Lex clears herself behind a structural vet, a live fact check and an outside judge; Layer 1 clears by respawn with a recent-talk ring; a rich context pack on every Lex cold start; one `auto_clear_mode` switch; a context gauge with the auto-clear point on every session surface. | **shipped 2026-09-22** (`docs/spec/SMART-COMPACT.md` section 5) |
+
+See [docs/HANDOVER.md](docs/HANDOVER.md) for what state the repo was in at the most recent session boundary. Active multi-session work is tracked in `docs/HANDOVER.md` plus the spec files under `docs/spec/`. Known bugs live in [BUGS.md](BUGS.md) (read the index block first); every shipped fix has a row in [FIXES.md](FIXES.md).
 
 ---
 
@@ -122,8 +127,9 @@ For Tailscale remote access from your phone, follow [docs/install/TAILSCALE.md](
 | **Reinforcement** | Useful injections raise page weight; corrections lower it; unused pages decay. Empirical, not editorial. |
 | **Dashboard** | Central hub on port 3747. Sessions, projects, search, system metrics with sparklines, daily brief, reminders, web push, force-directed wiki graph (Orb), and inline answer UI for CC permission/elicitation prompts so you can reply remotely without tabbing back to VS Code. PWA-installable on phone. Tailscale for remote access. |
 | **Backup pipeline** | Daily scheduled snapshot of the data root with SQLite atomic capture, manifest, integrity verification, and rotation. |
-| **Local-first** | Default LLM is ollama (qwen3:8b). Anthropic API supported as fallback. Zero cost in default config. |
-| **Lex (supervisory voice layer)** | Always-available coworker on top of the active worker sessions. Daemon-PTY hosts a `claude` session with a Lex system prompt (four mode contracts, one invariant voice, synthesis directive). Voice loop: whisper.cpp cuBLAS STT, silero VAD with mute auto-finalize, Piper TTS with picker. Three modes: conversation, notes (silent reply, auto-summarises on stop), push-to-talk. Emits structured artifacts inline as fenced JSON; the daemon persists them and fans notes-summary reminders into the reminder system. Source-classed retrieval at `/lex/recall` so canonical wiki outranks pending drafts outranks brainstorm transcripts outranks generic raw outranks reference. |
+| **Local-first** | Default wiki LLM is ollama (qwen3:8b); the Anthropic API is an opt-in fallback for wiki ingest only. Lex and the voice layers run as `claude` sessions on your subscription. Zero API cost in the default config. |
+| **Lex (three voice layers)** | Layer 1 is the voice: one headless haiku `claude` per brainstorm, no tools, thinking off, spawned before the brain so it is warm first; it knows how to talk (first person, like a person, never a file name or symbol aloud) and rebuilds its knowledge every turn from a `[live]` block (brain state, worker phase, last said, pending plan or dispatch or handover, the recent talk). Layer 2 is the brain: an opus `claude` scoped to exactly one supervised worker, acting on current state, driving the worker and the context lifecycle. Layer 3 is the worker. Voice loop: whisper.cpp cuBLAS STT, silero VAD, Piper TTS on one continuous stream per reply. Barge stops the sound at once, then Layer 1 decides finish, answer then finish, or rethink. Controls are interpreted by the voice (mute, stand by, repeat, slower, louder, approve, reject); only the panic phrase is mechanical. Source-classed retrieval at `/lex/recall`. Design of record: `docs/spec/LAYER-1-CONTROL.md`. |
+| **Context lifecycle** | Every layer clears its own context on one `auto_clear_mode` switch. Worker: at the setpoint Lex asks for a handover, the worker stops at a safe point and writes it, Lex vets and corrects it visibly in the file, the operator approves by voice, the worker clears and gets that one seed, Lex trail-confirms it resumed. Lex: writes the handover for her fresh self; the daemon vets it, fact-checks it against live state (the worker's real HEAD, the plan file, pending items) and asks an outside judge; then clears her and boots her on the handover plus a rich context pack. Layer 1: respawns at a quiet moment, the recent-talk ring carries the thread. Handovers are also written at every session end and recovered from the transcript after a crash; all are timestamped and browsable. Design of record: `docs/spec/SMART-COMPACT.md` section 5. |
 | **Session-end pipeline** | When any voice/Lex session ends (Stop button, spoken "end session" command, browser close, PTY exit), the daemon force-flushes the project's tail content through the wiki ingest LLM (bypasses the 600-byte periodic floor), refreshes the rolling session summary, and embeds the summary into `raw_chunks` tagged with `kind:'brainstorm-summary'` and `mode:<voice mode>`. The mode tag is the durable marker that distinguishes meeting recordings (`mode:'notes'`) from chat sessions even after the brainstorm row archives. |
 | **Reinforcement decay** | Every wiki page weight decays daily (`DEVNEURAL_DECAY_INTERVAL_MS`, default 24h). Pages that never get injected drift toward the archive threshold instead of staying at their last-touched weight forever. Hits boost weight, corrections drop it, decay fades the unused. |
 | **Pass 2 ingest fallback** | When the local LLM (`qwen3:8b`) exhausts retries on Pass 2 schema validation, an opt-in fallback (`DEVNEURAL_PASS2_FALLBACK=anthropic`) retries once against Anthropic Haiku. Off by default. Closes the keystone wiki-quality risk on borderline-hardware installs without breaking local-first. |
@@ -143,7 +149,7 @@ DevNeural is built on two complementary layers. Neither alone is sufficient.
 
 Without semantics: a junk drawer of insights nobody can find. Without logic: a vector store of noise that scores high but means nothing. The combination is what makes the wiki a brain.
 
-See [docs/spec/devneural-v2.md section 7](docs/spec/devneural-v2.md) for the full breakdown.
+See [docs/spec/FUNCTIONAL-SPEC.md](docs/spec/FUNCTIONAL-SPEC.md) for the current system contract and [docs/archive/spec/devneural-v2.md section 7](docs/archive/spec/devneural-v2.md) for the original breakdown.
 
 ---
 
@@ -188,8 +194,9 @@ Claude Code session(s)
               └──────────────────────────────────────┘
 ```
 
-For the full architecture, read [docs/spec/devneural-v2.md](docs/spec/devneural-v2.md).
-For the LLM's standing instructions on writing wiki pages, read [docs/spec/DEVNEURAL.md](docs/spec/DEVNEURAL.md).
+The voice layers sit on top of this: the dashboard's voice client talks to the daemon over a WebSocket; the daemon runs Layer 1 (voice) and Layer 2 (brain) as headless `claude` sessions in daemon-owned PTYs, and Layer 3 workers are the ordinary Claude Code sessions the supervisor hooks already watch.
+
+For the current system contract, read [docs/spec/FUNCTIONAL-SPEC.md](docs/spec/FUNCTIONAL-SPEC.md); for a one-page map of the layers, [docs/ARCHITECTURE-MAP.md](docs/ARCHITECTURE-MAP.md). The original architecture draft is archived at [docs/archive/spec/devneural-v2.md](docs/archive/spec/devneural-v2.md) and the wiki schema the LLM follows at [docs/archive/spec/DEVNEURAL.md](docs/archive/spec/DEVNEURAL.md) (the live copy is `wiki/DEVNEURAL.md` in the data root).
 
 ---
 
@@ -202,9 +209,12 @@ For the LLM's standing instructions on writing wiki pages, read [docs/spec/DEVNE
 | `08-dashboard/` | Next.js 15 + Tailwind v4 + Tanstack Query. Statically exported; daemon serves the build. |
 | `09-bridge/` | VS Code extension that pastes queued prompts into terminals. Phase 3.3. |
 | `archive/v1/` | Archived v1 modules (01-data-layer, 02-api-server, 04-session-intelligence). |
-| `docs/spec/` | System architecture, schema, phase plans (3, 4, 5). |
-| `docs/install/` | Install (01–04), coexistence audit (05), recovery (06, 08), troubleshooting (07), Tailscale, audio/video. |
-| `docs/HANDOVER.md` | Current state at most recent session boundary. |
+| `docs/spec/` | Design of record: FUNCTIONAL-SPEC, LAYER-1-CONTROL (voice layers), SMART-COMPACT (context lifecycle), PROJECT-ANCHORS, EVENT-DRIVEN-SUPERVISION, LEX-AUTONOMY-PAYLOAD-SPEC, PANIC-BUTTON and the other live specs. |
+| `docs/superpowers/plans/` | Executed implementation plans; a plan moves to `docs/archive/plans/` once every task in it has landed. |
+| `docs/archive/` | Superseded handovers, plans, specs and postmortems, kept for provenance. Nothing there describes the current build. |
+| `docs/install/` | Install (01 to 04), coexistence audit (05), recovery (06, 08), troubleshooting (07), Tailscale, audio/video. |
+| `docs/HANDOVER.md` | Current state at the most recent session boundary. |
+| `BUGS.md` / `FIXES.md` | The bug tracker (index block first) and the per-fix ledger with commits and rebuild flags. |
 | `INSTALL.md` | Top-level install entry point. |
 | `SHIP-CHECKLIST.md` | Production-readiness gate before declaring a build deployable. |
 
@@ -225,8 +235,16 @@ npm run verify-backup               # PRAGMA integrity_check + JSON parse on lat
 npm run restore                     # restore latest (refuses while daemon is up)
 npm run install-backup-task         # daily 03:00, retain 14, configurable target
 npm run backup-where                # show current backup target + schedule + last run + snapshots on disk
-npm test                            # 703 unit + integration tests (as of 2026-05-16)
+npm test                            # 2263 unit + integration tests (as of 2026-09-23; two known reds tracked in BUGS.md)
 ```
+
+Daemon restart without a shell (the daemon relaunches itself through Task Scheduler in about three seconds):
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3747/admin/daemon/restart -ContentType application/json -Body '{"reason":"new dist"}'
+```
+
+Live knobs (`runtime_config`, read on every use, no rebuild): `auto_clear_mode` (off, shadow, live: the one switch for every layer's context clear), `lex_self_clear_pct` (Lex's own setpoint, default 70), `l1_clear_pct` (the voice's setpoint, default 50), `top_model` (Layer 1 model, haiku), `dispatch_confirm_gate` (park Lex's worker dispatches for a spoken yes), `mid_permission_mode`. Set with `POST /runtime-config/<key> {"value": ...}` or the dashboard switches.
 
 ### Current backup configuration
 
@@ -286,6 +304,15 @@ in the daemon today.
   reminders → web push end-to-end with cross-restart dedupe ledger,
   5-minute iOS PWA push smoke test, shared supervision warn
   channel.
+- [docs/spec/LAYER-1-CONTROL.md](docs/spec/LAYER-1-CONTROL.md)
+  The three voice layers: boot order, the Layer 1 contract, the
+  per-utterance turn and the `[live]` block, barge v3, single-mouth
+  invariants, plan approval and dispatch confirm by voice, context
+  hygiene, the spoken test list.
+- [docs/spec/SMART-COMPACT.md](docs/spec/SMART-COMPACT.md)
+  The context lifecycle: who drives each layer's clear, the handover
+  frame, the routes, the self-clear checks, the context pack, the
+  restart-verify recipe.
 
 ---
 

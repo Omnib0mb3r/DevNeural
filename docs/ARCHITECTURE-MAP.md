@@ -1,19 +1,14 @@
 # DevNeural Architecture Map
 
-> **In progress.** Built from per-package deep traversal. Each section is the authoritative map for that package. Last updated: 2026-05-22.
+> **Partial, and honest about it.** The high-level pass below dates from 2026-05-22 and was never completed by the per-package agents it planned for. It is still a fair map of the capture, ingest, wiki, retrieval, dashboard and bridge layers. Status refreshed 2026-09-23.
 
-This doc replaces guesswork. When Lex needs to know how a piece works, the answer is here. If something is wrong, fix this doc.
+This doc replaces guesswork for the layers it covers. When Lex needs to know how a piece works, the answer is here or in the two design-of-record specs below. If something is wrong, fix this doc.
 
-Pending sections (filled by per-package agents):
-- [ ] 07-daemon (orchestrator, all modules, all routes, all tables)
-- [ ] 08-dashboard (every page, every component, every daemon route it hits)
-- [ ] 09-bridge (VSIX, presence files, paste injection)
-- [ ] 05-voice-interface (Whisper STT, Piper TTS, audio bundling)
-- [ ] 06-notebooklm-integration (current state)
-- [ ] 03-web-app (legacy, kept for reference)
-- [ ] Cross-cutting: hooks, live_state block, brainstorm lifecycle, smart-compact, cross-session inject
-
-Partial high-level pass from earlier exploration is below; will be replaced by per-package deep maps as they land.
+Not mapped here, specified elsewhere (read those instead of guessing):
+- The three voice layers (Layer 1 voice, Layer 2 brain, Layer 3 workers), the `[live]` block, barge, controls, single-mouth invariants: `docs/spec/LAYER-1-CONTROL.md` v3, code map at its end.
+- The context lifecycle (handover frames and routes, approval by voice, Lex self-clear with the vet, fact check and judge, the context pack, the `auto_clear_mode` switch, Layer 1 respawn): `docs/spec/SMART-COMPACT.md` section 5.
+- The supervisor (worker events from the transcript, the gate, the expectation supervisor, the judge session): `docs/HOW-TO-supervision-pipelines.md` plus `07-daemon/src/dashboard/worker-event-*.ts` headers.
+- `06-notebooklm-integration` no longer exists; `03-web-app` and `05-voice-interface` are legacy and the daemon owns voice now (`07-daemon/src/voice/`).
 
 ---
 

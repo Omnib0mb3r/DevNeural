@@ -31,9 +31,10 @@ is FOR (purpose), not a line-by-line summary.
 
 ## Subfolders
 
-- [archive/](archive/) - historical handovers, postmortems, superseded waves and phase plans, the pre-FUNCTIONAL-SPEC architecture drafts; read only for provenance
-- [bugs/](bugs/) - active bug log; appended-to, never multiplied. Open bugs in `bugs/README.md`; per-bug docs are dated files with root-cause sections
+- [archive/](archive/) - historical handovers, postmortems, executed plans (`archive/plans/`), superseded specs (`archive/spec/`), resolved per-bug postmortems (`archive/bugs/`), the pre-FUNCTIONAL-SPEC architecture drafts; read only for provenance
+- [bugs/](bugs/) - per-bug investigation docs for bugs that are still open; the tracker of record is the repo-root `BUGS.md` (index block first)
 - [install/](install/) - installation, prerequisites, file/path layout, troubleshooting, recovery, audio/video/heartbeat/notifications/tailscale subnotes
-- [spec/LAYER-1-CONTROL](spec/LAYER-1-CONTROL.md) - canonical voice-layers design: L1 voice (haiku headless terminal, personality, noise gate, sees L2), L2 brain, L3 workers; boot order, knobs, plan approval and dispatch gate through L1
-- [spec/](spec/) - current architecture and design specs (FUNCTIONAL-SPEC, LAYER-1-CONTROL, LEX-AUTONOMY-PAYLOAD-SPEC, LEX-STANDALONE-SUPERVISION, COALESCE-UTTERANCE-QUEUE, PROJECT-ANCHORS, SMART-COMPACT, EVENT-DRIVEN-SUPERVISION, PANIC-BUTTON, PHASE-8-RELIABILITY-PLAN, STREAMDECK-DEVNEURAL-ALIGNMENT, FUTURE-DAEMON-SPLIT, codex reviews)
-- [superpowers/](superpowers/) - shared "superpower" skill reference docs consumed by plugin-side hooks
+- [spec/LAYER-1-CONTROL](spec/LAYER-1-CONTROL.md) - canonical voice-layers design v3: L1 voice (one haiku headless terminal per brainstorm, identity in replace mode, manner not lines, the [live] block, barge stop-first), L2 brain, L3 workers; boot order, knobs, plan approval, dispatch gate and handover approval by voice, context hygiene, the spoken test list
+- [spec/SMART-COMPACT](spec/SMART-COMPACT.md) - the context lifecycle: who drives each layer's clear, the handover frame and routes, Lex self-clear (vet, fact check, judge), the context pack, the one auto_clear_mode switch, restart-verify
+- [spec/](spec/) - the design of record: FUNCTIONAL-SPEC (system contract), LAYER-1-CONTROL, SMART-COMPACT, PROJECT-ANCHORS (shipped), STREAMDECK-DEVNEURAL-ALIGNMENT (cross-repo contract), PHASE-8-RELIABILITY-PLAN (open), FUTURE-DAEMON-SPLIT (deferred)
+- [superpowers/](superpowers/) - shared "superpower" skill reference docs consumed by plugin-side hooks; `superpowers/plans/` holds a plan only while it is being executed

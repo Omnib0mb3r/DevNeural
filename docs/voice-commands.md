@@ -1,52 +1,68 @@
-# Voice control
+# Voice commands
 
-Rewritten 2026-07-15 for the spec-v2 voice top layer
-(`docs/superpowers/specs/2026-07-15-voice-top-layer-design.md`). The
-keyword grammar this file used to catalog is gone; this page now
-documents the one surviving keyword and how everything else works.
+Rewritten 2026-09-23 for the Layer 1 contract v3 (`docs/spec/LAYER-1-CONTROL.md`).
+The voice understands what you mean; there is no fixed phrase list any
+more. Layer 1 (the voice) reads every utterance, decides whether it is
+speech for the brain, a control, or background noise, and answers in
+its own words. One phrase is mechanical and never needs the model.
 
-## Talk naturally
+## The one mechanical phrase
 
-There is no command vocabulary anymore. You talk to the voice top
-layer (the dedicated persistent session in
-`07-daemon/src/lex/voice-brain-session.ts`, driven by
-`07-daemon/src/voice/voice-top-layer.ts`) the way you would talk to a
-person. It answers conversational turns itself, hands substance to Lex
-(the deep brain), and reads control intent from plain speech:
+- **"Lex, emergency stop"** (`matchPanicCommand`): stops the sound, drops
+  the reply, mutes. Deterministic, before any model sees the words. The
+  dashboard's global panic button (`Ctrl+Alt+.`, double Escape) does the
+  same from the keyboard.
 
-| You say (any phrasing)          | What happens                              |
-|---------------------------------|-------------------------------------------|
-| "be quiet" / "shut up"          | CONTROL stop_speaking or mute, model's read of your intent |
-| "you can talk again"            | CONTROL unmute                             |
-| "hold on, stop what you're doing" | CONTROL interrupt_work (old hold-up recap behavior) |
-| "stop listening for a bit"      | CONTROL standby                            |
-| "I'm back, listen"              | CONTROL listen                             |
-| "turn voice off"                | CONTROL disable (one-way; recover via the dashboard start-voice button) |
-| "we're done, end the session"   | CONTROL end_session                        |
+## Controls the voice interprets (say them however you like)
 
-The top layer errs toward NOT treating speech as a control; when it is
-unsure, your words go to Lex instead. The dashboard buttons remain the
-guaranteed path for every control.
+Layer 1 maps your words to one of these verbs and appends a
+`CONTROL: <verb>` line to its reply; the daemon acts on the verb.
 
-## The one keyword: panic
+| You want | Verb | What happens |
+|---|---|---|
+| Stop listening | `mute` | Mic stays open but nothing is transcribed until you unmute |
+| Listen again | `unmute` | |
+| Wait, do not act | `standby` | Everything heard is parked, nothing forwarded |
+| Go ahead | `listen` | Leaves standby |
+| Stop talking | `stop_speaking` | Cuts the sound; the reply text survives on screen |
+| Turn the voice off for now | `disable` | |
+| End the session | `end_session` | Runs the session-end pipeline (handover, distillation) |
+| Stop what the brain is doing | `interrupt_work` | |
+| Never mind that, do this instead | `cancel_redirect` | Drops the in-flight brain turn and forwards the new one |
+| Drop that reply | `drop_reply` | |
+| Add this to what I said | `combine` | Merges the interruption into the previous utterance |
+| Say that again | `repeat` / `start_over` | Re-speaks the last spoken text |
+| Slower / faster | `slower` / `faster` | Steps the speech rate (x1.25 / x0.8, clamped) |
+| Louder / quieter | `louder` / `softer` | Steps the output gain (0.2 to 1.0) |
+| Yes, do the plan | `approve_plan` | Presses Enter on the brain's ExitPlanMode prompt |
+| No, change the plan | `reject_plan <reason>` | Escape plus your reason as the next prompt |
+| Yes, send that to the worker | `confirm_dispatch` | Releases a dispatch the confirm gate parked |
+| No, do not send that | `reject_dispatch <reason>` | |
+| Yes, that handover is good | `approve_handover` | The worker clears and boots on the vetted handover |
+| No, fix the handover | `reject_handover <reason>` | Goes back to the brain with your reason |
+| Finish what you were saying | `finish` | After a barge: resumes the cut sentence |
+| Answer me, then finish | `answer_then_finish` | After a barge: answers first, then resumes |
 
-Phrasing: `lex emergency stop`
+Everything else is a conversation: Layer 1 answers from the `[live]`
+block when it can (brain state, worker phase, last said, pending plan,
+dispatch or handover, the recent talk) and forwards the rest to the
+brain with a short spoken ack. Background talk gets `IGNORE:` and a
+greyed "(not for Lex)" line in the transcript.
 
-The only mechanical phrase, matched by regex before any model runs, on
-both paths:
+## Barge (talking over the voice)
 
-- `07-daemon/src/voice/lex-voice-commands.ts` (`matchPanicCommand`,
-  whisper transcript path)
-- `08-dashboard/lib/voice-wake-word.ts` (Web Speech always-on path,
-  works even while TTS is playing and the mic is gated)
+The sound stops at once when you start speaking. Then: echo, noise and a
+backchannel ("mm-hm", "right") resume the sentence without the model;
+real words go to Layer 1 with the cut point, and it decides `finish`,
+`answer_then_finish`, or rethinks the reply. Unsigned means rethink.
 
-Both matchers must stay in lockstep; if either changes phrasing, the
-other follows in the same commit. The daemon's `wake-command` frame
-accepts only `kind=panic` from the client.
+## Modes
 
-## Failure behavior
+Conversation (default), notes (silent, auto-summarises on stop),
+push-to-talk. Mode switches are dashboard controls, not voice commands.
 
-If the voice-brain session is down or slow (timeout default 4s,
-`DEVNEURAL_VOICE_VERDICT_TIMEOUT_MS`), every utterance forwards to Lex
-untouched. The top layer can never eat your words. Panic never depends
-on any model.
+## Where the words live
+
+- Contract text: `07-daemon/src/voice/voice-top-layer.ts` (`CONTRACT`, `TopLayerControl`).
+- Verb handling: `07-daemon/src/voice/lex-voice-ws.ts` (`applyTopLayerControl`).
+- The mechanical phrase: `07-daemon/src/voice/lex-voice-commands.ts`.

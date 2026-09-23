@@ -5,7 +5,22 @@
 > threading (sibling index + Phase 2 preload + backfill), and the
 > cross-session inject + bridge presence substrate they share.
 >
-> Last updated: 2026-05-12.
+> Last updated: 2026-05-12; pointer block added 2026-09-23.
+
+> **2026-09 update.** Two things changed under this doc. (1) The
+> smart-compact orchestration it describes is now driven by Layer 2
+> through the Phase C routes (`handover-request`, `review`,
+> clear-and-paste by `handover_id`, `confirm`) with the worker's own
+> handover vetted visibly and the operator's approval by voice; the
+> older `/lex/smart-clear/plan` investigator path remains for a worker
+> that cannot write its own half. Read `docs/spec/SMART-COMPACT.md`
+> section 5 first. (2) The event detectors now read Bash tool_results
+> only, latched per record, with a five-minute recency bound and a
+> `turn_summary` event that carries the worker's end-of-turn text to
+> Lex (BUG-034, BUG-035, `worker-event-detect.ts`). The event set is
+> `idle, permission_denied, pending_prompt, test_failure, commit,
+> bridge_disconnect, expectation_drift, narrated_success_no_commit,
+> turn_summary`.
 
 This doc is the canonical reference when you (or Lex) need to know
 *where the wires are* and *what guarantees each layer makes*. The spec

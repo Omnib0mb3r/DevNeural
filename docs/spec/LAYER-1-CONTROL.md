@@ -17,7 +17,7 @@ Single source of truth for how the operator talks to Lex. Supersedes the
 shipped and still holds) and consolidates the scattered voice-layer design
 in `VOICE-TOP-LAYER-SPEC.md`, `VOICE-TOP-LAYER-SMARTS-SPEC.md`,
 `VOICE-BARGE-CLASSIFIER-SPEC.md`, `COALESCE-UTTERANCE-QUEUE.md` and
-`docs/superpowers/specs/2026-07-15-voice-top-layer-design.md`. Those stay as
+`docs/archive/spec/2026-07-15-voice-top-layer-design.md`. Those stay as
 history. This is the doc to build to.
 
 Written 2026-09-21 on operator direction. Decisions taken that day:

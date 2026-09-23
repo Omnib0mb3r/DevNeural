@@ -6,7 +6,25 @@ Update this file IN PLACE every time the cursor moves; never add a new
 dated file. Ground every claim against git before asserting; this doc
 reflects what was true at the last update.
 
-## Cursor (2026-09-22 evening, ONE WAVE IN PROGRESS: voice v3 + Phase C, plan `docs/superpowers/plans/2026-09-22-voice-and-clear-complete.md`)
+## Cursor (2026-09-23, voice v3 + Phase C wave COMPLETE and deployed; overnight closeout: BUG-034/035 fixed, docs reconciled and archived)
+
+Read first: `docs/spec/LAYER-1-CONTROL.md` (v3) and `docs/spec/SMART-COMPACT.md`
+section 5 are the design of record; `BUGS.md` index block for what is
+known broken; `FIXES.md` VL-17 to VL-27 for what shipped on 2026-09-22/23.
+The executed plan lives at `docs/archive/plans/2026-09-22-voice-and-clear-complete.md`.
+
+Overnight 2026-09-23 (operator asleep, "full authority, no gates"):
+BUG-034 and BUG-035 fixed (`6e06fd0`: the supervisor detectors read Bash
+tool_results only, latched per record, a later green run clears a red
+one); the voice path reads no API key at all (VL-27); superseded plans,
+specs, bug postmortems and brainstorm-folder design docs archived
+(`docs/archive/plans/`, `docs/archive/spec/`, `docs/archive/bugs/`,
+`<DATA_ROOT>/brainstorm/archive/`); every README rewritten to the
+three-layer model; the stale agent worktrees removed. The daemon still
+runs the 01:48Z dist until the closing restart recorded at the end of
+this cursor.
+
+### The wave as built (2026-09-22 evening)
 
 Operator direction: "I need this all done", no phases, merge to master at
 stable points, atomic commits, tree clean. Spec of record is
@@ -67,12 +85,9 @@ then vetted, fact-checked and judged by the daemon; L1 clears with no
 handover thanks to the recent-talk ring; Lex's cold start and reseed are
 rich even if they fill her context. T10 (context gauge +
 handover list UI) and T11 (continuous stream sink) ran in isolated
-worktree agents branched off `voice-layers`; merge their branches in T12.
-T12 merge, suite, build, trackers, restart, verify: pending.
-
-Daemon PID 34688 on the 18:08 dist; brainstorm `4bbafb48` open. Every
-task's commit body ends `Rebuild: yes|no`; nothing from this wave is
-deployed until T12's restart.
+worktree agents branched off `voice-layers`; both merged in T12 and the
+worktrees removed on 2026-09-23. Every task's commit body ends
+`Rebuild: yes|no`.
 
 ### Previous cursor (2026-09-22 18:10 local, voice fix wave DEPLOYED: daemon PID 34688 on the 18:08 dist, brainstorm `4bbafb48` open with L1 warm in `voice-l1`; BUG-031 resolved; BUG-026..030 SMOKE-TESTING, need the operator's voice)
 
@@ -87,13 +102,13 @@ Fresh-context resume seed (what landed, the reset, the checklist, the file
 map, in one file): `C:\dev\data\skill-connections\brainstorm\HANDOVER-2026-09-22-voice-layers.md`.
 
 Design of record: `docs/spec/LAYER-1-CONTROL.md` (v2, canonical). Plan:
-`docs/superpowers/plans/2026-09-21-voice-layers.md`. Trackers: BUG-022
+`docs/archive/plans/2026-09-21-voice-layers.md`. Trackers: BUG-022
 (chars=0 root cause, SMOKE-TESTING), BUG-023 (pre-existing dashboard test
 red), FIXES.md rows VL-1..VL-9.
 
 ### 2026-09-22 afternoon: fix wave built (operator said "complete all")
 
-Plan: `docs/superpowers/plans/2026-09-22-voice-layers-fixes.md`. Six
+Plan: `docs/archive/plans/2026-09-22-voice-layers-fixes.md`. Six
 commits, TDD, additive: `81e7958` L2 warm from the PTY (BUG-026),
 `d382d16` word gate + parser guards (BUG-030), `da38850` worker phase in
 the live block (BUG-029), `280a265` memory-free L1 cwd + "you do not know
@@ -765,16 +780,22 @@ diagnostic probes. Safe to /clear.
 - CuratorHealthCard "canary: not wired": honest label, probe does not
   exist yet.
 
-## Next steps
+## Next steps (refreshed 2026-09-23; the 2026-07 list above is history)
 
-1. Operator walks RESTART-TEST-CHECKLIST items 1-26 (dashboard wave +
-   voice wave) on the live daemon.
-2. Any failure: evidence is pre-wired - ws closes log code/reason,
-   TTS deaths log loudly, delivery truncation logs TRUNCATED DELIVERY.
-   Grep daemon.log first.
-3. Phase Two remains queued behind the P2-0 adversarial review of
+1. Operator: the spoken items 1 to 10 in `docs/spec/LAYER-1-CONTROL.md`
+   "Testing" on the live daemon, plus one car run for the stream
+   (BUG-032) and one real auto-clear cycle in live mode.
+2. Any failure: grep `daemon.log` first. Voice lines are `[voice-ws]`,
+   `[voice-brain]`, `[voice-l1]`; the lifecycle lines are `[handover]`,
+   `[self-clear]`, `[smart-compact]`, `[supervisor-event]`.
+3. Then arm the gates the wave staged: `POST /runtime-config/dispatch_confirm_gate
+   {"value":"on"}` and `mid_permission_mode` `plan`, once items 1 to 5 pass.
+4. Open backlog after that: `<DATA_ROOT>/brainstorm/BACKLOG.md` P1 (the
+   curator canary and the injection delivery gap) and P2 (the stale-reply
+   guard on the reply-text surface); BUG-017 (daemon heap, the Phase 8
+   headline); BUG-025 (wiki push dead since 2026-08-02).
+5. Phase Two remains queued behind the P2-0 adversarial review of
    FUNCTIONAL-SPEC (standing project rule).
-4. Meeting flow still untested end to end (checklist item 20).
 
 ## Standing rules (unchanged)
 

@@ -6,12 +6,28 @@ Captured 2026-05-04. Living list. Tick when shipped.
 `docs/HANDOVER.md` first.** This file is the durable backlog; the
 handover doc is the live cursor.
 
-Last refreshed: 2026-06-01 after Fix 52 through Fix 60 cycle. All
-items called out as "outstanding" during that cycle are now `[x]`.
-What remains is hardware-gated smoke (see `docs/SMOKE-TEST.md`),
-pre-publish prep (docs rewrite + dead-code sweep), Tier 5
-investigations awaiting ship (Fix 24/25/26 + voice PTY paste-no-
-commit), and longer-horizon spec work (Phase 7 / Phase 8).
+Last refreshed: 2026-09-23 after the voice v3 + Phase C wave and the
+overnight closeout. The docs rewrite and the dead-doc sweep in the
+"Pre-publish" section landed that night (every README rewritten,
+executed plans and superseded specs and bug docs archived under
+`docs/archive/`, the brainstorm-folder design docs under
+`<DATA_ROOT>/brainstorm/archive/`). `06-notebooklm-integration/` is
+gone; `archive/v1/`, `03-web-app/` and `05-voice-interface/` remain as
+legacy code. What remains open is listed under "Open threads" at the
+end of this file; the operator-only items are the spoken voice checks.
+
+## Open threads (2026-09-23)
+
+- [ ] Operator: spoken items 1 to 10 in `docs/spec/LAYER-1-CONTROL.md` "Testing"; one car run (BUG-032); one live auto-clear cycle.
+- [ ] Arm `dispatch_confirm_gate` and `mid_permission_mode=plan` once the spoken items pass.
+- [ ] BACKLOG P1 (`<DATA_ROOT>/brainstorm/BACKLOG.md`): curator canary wired into the daemon; the announced-but-not-landed injection gap.
+- [ ] BACKLOG P2: stale-reply guard on the reply-text surface (`coalescence-stale-reply-guard.md`).
+- [ ] BUG-017 daemon heap death (~24h): the Phase 8 headline (`docs/spec/PHASE-8-RELIABILITY-PLAN.md`, `FUTURE-DAEMON-SPLIT.md`).
+- [ ] BUG-025 wiki push dead since 2026-08-02 (`escapeScalar` / `parseScalar` asymmetry in `07-daemon/src/wiki/schema.ts`).
+- [ ] BUG-014 grooming-routes and the sessions-anchor-liveness reds: make the daemon suite fully green.
+- [ ] BUG-023 dashboard voice-mic-init test drift (four reds).
+- [ ] Unified knowledge index piece 3 (scoped query path), `<DATA_ROOT>/brainstorm/UNIFIED-KNOWLEDGE-INDEX-SPEC.md`.
+- [ ] The 2026-05 items below that were never walked: vad-error ring buffer capture on a desktop mic, one real reinforcement event end to end, meeting flow end to end.
 
 ## Gotchas worth knowing (read before debugging restart issues)
 
@@ -54,7 +70,7 @@ commit), and longer-horizon spec work (Phase 7 / Phase 8).
 
 - [x] **Voice "lex end session" = End button parity (Fix 30).** Shipped 2026-05-31. `lex-voice-ws.ts:end_session` now follows `fireSessionEndPipeline('voice-command')` with `ptyKill(row.current_pty_id)` + `setLexSessionStatus(anchorId, {status:'dormant', currentPtyId:null})` so the voice command matches the End button. Direct-llm anchors no-op the ptyKill; cc-pty anchors release. The in-flight tool_use gate from the original spec was not added; current behaviour treats voice end as authoritative since the operator just said the words.
 - [x] **Utterance queue coalesce (relevance-aware single structured reply).** Phase A shipped 2026-05-26 (Fix 35, direct-llm path). cc-pty speak-queue fix shipped 2026-05-26 (Fix 40). Phase B shipped 2026-06-01 (Fix 57: classifier with follow-up/new/noise/cancel tags, conflict push-back via passed rule set, AbortController plumbing into callVoiceChat so contradiction cancels the in-flight ollama call). Phase C shipped 2026-06-01 (Fix 57: t:'text-input' WS frame flows through the same pendingUserUtterances + runDirectLlmCoalesceLoop pipeline voice uses; cc-pty path routes through ptyInject).
-- [x] **Stages 5-12 of `docs/spec/LEX-AUTONOMY-PAYLOAD-SPEC.md`** (codex-reordered). All shipped 2026-05-26 to 2026-05-29: Stage 5 (Fix 36), Stages 6-12 absorbed under Fix 41-49 (sync barrier, freshness metadata, stale/failure surfacing, adaptive walk-back, worker boot payload builder via source-graph-payload, first-attach path, loose-ends handoff gate Fix 47, grooming/escalation watch Fix 48, project_scope_id Fix 49).
+- [x] **Stages 5-12 of `docs/archive/spec/LEX-AUTONOMY-PAYLOAD-SPEC.md`** (codex-reordered). All shipped 2026-05-26 to 2026-05-29: Stage 5 (Fix 36), Stages 6-12 absorbed under Fix 41-49 (sync barrier, freshness metadata, stale/failure surfacing, adaptive walk-back, worker boot payload builder via source-graph-payload, first-attach path, loose-ends handoff gate Fix 47, grooming/escalation watch Fix 48, project_scope_id Fix 49).
 
 ## Next after project-anchors spec
 

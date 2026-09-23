@@ -5,11 +5,16 @@ end on real hardware. Refresh as items get verified or new code lands.
 Source of truth for the daily smoke gate; rolling cursor for the rest
 of the state lives in `docs/HANDOVER.md`.
 
-Last refreshed: 2026-06-20 after all three pillars wired + committed and
-the distill-scheduler tests fixed. Switch-live pending operator restart.
-See ACTIVE BATCH below.
+Last refreshed: 2026-09-23. The current smoke gate for the voice layers
+and the context lifecycle is the spoken list in
+`docs/spec/LAYER-1-CONTROL.md` "Testing" (items 1 to 10) plus one car run
+for the stream (BUG-032) and one real auto-clear cycle in live mode
+(`docs/spec/SMART-COMPACT.md` section 6). What is already verified on
+the live daemon is recorded in `docs/HANDOVER.md`. Everything below this
+line is the older punch list, kept because some of its items (meeting
+flow end to end, push on iOS) were never walked.
 
-## PENDING RESTART VERIFY (2026-07-19): voice top-layer + bell + binding-terminal
+## SUPERSEDED BLOCK (2026-07-19): voice top-layer + bell + binding-terminal. The voice top layer it describes was rebuilt twice since (LAYER-1-CONTROL v3); the bell and binding items still apply.
 
 Shipped, committed, full dist rebuilt (daemon tsc + dashboard next build).
 Dormant until the operator restarts the daemon AND hard-refreshes the PWA.
@@ -47,7 +52,7 @@ Nothing below is hardware-verified.
 
 The current program. Goal (Michael, 2026-06-19): **one system** with three
 pillars — multi-agent cold start, distillation, separate-agent voice.
-Design of record: `docs/spec/INVESTIGATOR-PIPELINE-SPEC.md` +
+Design of record (archived 2026-09-23, never built): `docs/archive/spec/INVESTIGATOR-PIPELINE-SPEC.md` +
 `C:/dev/data/skill-connections/brainstorm/INVESTIGATOR-PIPELINE-PLAN.md`.
 
 Build status as of 2026-06-20 (HEAD `af6be39`, 1273 daemon tests green,

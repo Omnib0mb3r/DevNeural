@@ -12,6 +12,8 @@ This file lists every code path that sends data off-host. Voice-session content 
 
 ## Forbidden classes
 
+Lex, the voice layers, the judge session and the workers are `claude` sessions on the operator's Claude subscription; they are not outbound API calls and no API key is read on that path. `07-daemon/tests/no-anthropic-api.test.ts` pins the voice, handover, self-clear and context-pack modules free of any API surface, and the daemon strips `ANTHROPIC_API_KEY` from every session it spawns (`SPAWN_STRIP_ENV` in `pty-host.ts`).
+
 The following payload classes and provenance flags are refused at three layers (defence-in-depth):
 
 1. **Application layer** (`07-daemon/src/db/outbound-guard.ts`): the `outboundCall` wrapper rejects any call where `payloadClass` starts with `brainstorm-` or `meeting-`, OR where `containsVoiceSessionSource=true`. Refused calls throw `OutboundRefused` with `failureCode='voice-session-blocked'` and never reach the network.

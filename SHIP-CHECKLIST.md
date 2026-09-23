@@ -2,14 +2,16 @@
 
 > Production-readiness gate. Walk this top-to-bottom before declaring a build deployable to `OTLCDEV` and reachable to your phone via Tailscale. Everything here is a real check; nothing is filler.
 >
-> Last refreshed: 2026-05-04 (Phase 5 complete).
+> Last refreshed: 2026-09-23 (voice v3 + Phase C wave shipped). The ticks below record the last full walk; a tick is not a promise about today. Before declaring a build deployable, re-walk section A with the current numbers and read the OPEN rows of `BUGS.md` (BUG-017, the daemon heap death every ~24h, is the one that matters for a phone-reachable install).
+>
+> Voice layers gate (added 2026-09-23): the spoken items 1 to 10 in `docs/spec/LAYER-1-CONTROL.md` "Testing" pass on the live daemon; one multi-sentence reply plays as one stream in the car; one auto-clear cycle completes in live mode with the handover visible on the brainstorm page; `07-daemon/tests/no-anthropic-api.test.ts` is green (no API key on the Lex path).
 
 ---
 
 ## A. Code health
 
 - [x] Daemon `npm run build` passes (tsc clean)
-- [x] Daemon `npm test` passes (703 unit + integration tests as of 2026-05-16; two pre-existing timeouts in audit-findings + session-end-pipeline tracked separately)
+- [x] Daemon `npm test` passes (2263 of 2265 as of 2026-09-23; the two reds, `grooming-routes` and `sessions-anchor-liveness`, are BUG-014 and a known environmental flake)
 - [x] Dashboard `NODE_ENV=production npx next build` passes (13 static routes prerender)
 - [x] Dashboard `npx tsc --noEmit` clean
 - [x] Bridge `npm run build` passes

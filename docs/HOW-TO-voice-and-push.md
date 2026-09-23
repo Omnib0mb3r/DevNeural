@@ -4,7 +4,18 @@
 > UUID pronunciation, and the reminders → web push pipeline with its
 > 5-minute end-to-end smoke test.
 >
-> Last updated: 2026-05-12.
+> Last updated: 2026-05-12; pointer block added 2026-09-23.
+
+> **2026-09 update.** Voice is now three layers and the knobs below are
+> the dashboard client's; the layer model, the Layer 1 contract, barge
+> v3, the spoken controls (mute, stand by, repeat, slower, louder,
+> approve, reject; only the panic phrase is mechanical), the
+> `[live]` block and the runtime knobs `top_model`,
+> `dispatch_confirm_gate`, `mid_permission_mode`, `l1_clear_pct` are in
+> `docs/spec/LAYER-1-CONTROL.md`. The continuous TTS stream sink that
+> replaced per-sentence WAV blobs is `08-dashboard/lib/voice-engine/audio-stream-sink.ts`
+> (BUG-032). The context lifecycle knobs (`auto_clear_mode`,
+> `lex_self_clear_pct`) are in `docs/spec/SMART-COMPACT.md`.
 
 ---
 

@@ -20,9 +20,11 @@ skill-connections/
 /step5-verify-*.png
 
 # Claude Code local-only state. .claude/commands/ stays tracked (shared
-# slash commands); these two files are per-machine and must not ship.
+# slash commands); these files are per-machine and must not ship. The
+# worktrees folder is where the Agent tool checks out isolated copies.
 /.claude/scheduled_tasks.lock
 /.claude/settings.local.json
+/.claude/worktrees/
 
 # Build artifacts
 07-daemon/scripts/silent-shim/*.lscache

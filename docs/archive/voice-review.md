@@ -18,7 +18,7 @@ DevNeural's core layer matches Karpathy almost cell-for-cell:
 |---|---|
 | Raw sources (immutable) | jsonl transcripts + reference corpus + **brainstorm transcripts** |
 | LLM-maintained wiki (markdown + cross-refs) | `wiki/` with `[trigger] -> [insight]` schema |
-| Schema config (CLAUDE.md-style) | `docs/spec/DEVNEURAL.md` |
+| Schema config (CLAUDE.md-style) | `docs/archive/spec/DEVNEURAL.md` |
 | Ingest | Pass 1 + Pass 2 |
 | Query | curator + `/lex/recall` + dashboard search |
 | Lint | lint module (Phase 1) |
@@ -146,7 +146,7 @@ This section overrides any earlier assumption that brainstorms are downstream of
 
 ## 4. Steals from the Karpathy pattern
 
-1. **Schema-as-living-config.** Load `docs/spec/DEVNEURAL.md` into Pass 2 system-prompt context on every ingest call. Schema changes propagate automatically.
+1. **Schema-as-living-config.** Load `docs/archive/spec/DEVNEURAL.md` into Pass 2 system-prompt context on every ingest call. Schema changes propagate automatically.
 2. **Lint-as-first-class periodic job.** Promote lint to a scheduled nightly task. Surface findings in dashboard.
 3. **LLM self-audit.** Recurring fresh-CC-context task: "are these 10 random pages still accurate, useful, well-scoped?" Mitigates single-reviewer blind spots.
 

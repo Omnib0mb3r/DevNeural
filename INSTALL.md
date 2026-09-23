@@ -2,9 +2,11 @@
 
 > Entry point for installing or rebuilding DevNeural on a new (or wiped) machine.
 > Goal: any developer (or a Claude reading this doc) can stand the system up cleanly without breaking an existing setup.
-> Last updated: 2026-05-04.
+> Last updated: 2026-09-23.
 
 This file is the table of contents. The detailed instructions live under [docs/install/](docs/install/).
+
+For Lex and the voice layers you also need: the Claude Code CLI (`claude`) signed in to a Claude subscription (Layer 1 voice, Layer 2 brain and the judge session are headless `claude` sessions; no API key is used or needed), whisper.cpp (cuBLAS build) and Piper per [docs/install/AUDIO-VIDEO.md](docs/install/AUDIO-VIDEO.md), and a trusted `<data root>/voice-l1` folder (the daemon seeds the trust entry itself on the first Layer 1 spawn). Node 24 is what the daemon runs on today.
 
 ---
 

@@ -682,7 +682,7 @@ async function main(): Promise<void> {
     logger(`grooming-watch bootstrap failed: ${(err as Error).message}`);
   }
 
-  /* Phase 5 wire-up of docs/spec/LEX-STANDALONE-SUPERVISION.md.
+  /* Phase 5 wire-up of docs/archive/spec/LEX-STANDALONE-SUPERVISION.md.
    * Boots the idle-watcher with the production grooming deps so
    * standalone brainstorms get light/mid/cold/day-cap passes on
    * the spec-defined cadence (5/20/60 min, 6h).

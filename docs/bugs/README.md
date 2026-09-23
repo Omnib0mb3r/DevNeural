@@ -1,63 +1,28 @@
-# Bug Log
+# Bug investigation docs
 
-## Open bugs
+The tracker of record is the repo-root [BUGS.md](../../BUGS.md): read its
+index block first, then the one detail block you need. This folder holds
+the longer per-bug investigation write-ups for bugs that are still open.
+When a bug reaches RESOLVED in BUGS.md, its write-up moves to
+[docs/archive/bugs/](../archive/bugs/) in the same commit.
+
+## Open investigations
 
 | Date | Bug | Status | Severity |
 |------|-----|--------|----------|
-| 2026-07-26 | [Bridge worker drops off the Stream Deck when idle (liveness ignores the live anchor)](./2026-07-26-worker-drops-off-streamdeck-when-idle.md) | fix committed — liveAnchorSessionIds shared helper; pending daemon restart + live verify | high |
-| 2026-07-26 | [Sessions assert deploy/"fixed-in-prod" state from stale docs instead of live state](./2026-07-26-sessions-assert-deploy-state-from-stale-docs.md) | open — scheduled into cold-start layer build (live_state deploy-delta) | medium |
-| 2026-07-26 | [Worker terminal mirror blank — VS Code 1.130 removed the `terminalDataWriteEvent` proposed API](./2026-07-26-worker-mirror-blank-bridge-terminal-data.md) | migrated + installed (shell-integration API); pending operator reload + claude restart to validate | medium |
-| 2026-07-26 | [Start Claude one-click spawn stalls at first-run "trust this folder" prompt on new folders](./2026-07-26-start-claude-blocked-by-trust-prompt.md) | fix committed (72b332b) — pre-seed in queueProjectBootstrap; pending daemon restart + live verify | medium |
-| 2026-05-29 | [Voice PTY paste lands as `[Pasted text #N +5 lines]`, never submits](./2026-05-29-voice-pty-paste-no-commit-regression.md) | investigation shipped 2026-05-29; ship deferred (mirror Fix 32 850ms follow-up into direct-inject path) | high |
+| 2026-07-26 | [Bridge worker drops off the Stream Deck when idle (liveness ignores the live anchor)](./2026-07-26-worker-drops-off-streamdeck-when-idle.md) | fix committed (`liveAnchorSessionIds` shared helper); live verify pending; see BUGS.md BUG-001 / BUG-011 | high |
+| 2026-07-26 | [Sessions assert deploy/"fixed-in-prod" state from stale docs instead of live state](./2026-07-26-sessions-assert-deploy-state-from-stale-docs.md) | open; the 2026-09-22 L2 rule "current state first" and the context pack address the Lex side | medium |
+| 2026-07-26 | [Worker terminal mirror blank (VS Code removed the `terminalDataWriteEvent` proposed API)](./2026-07-26-worker-mirror-blank-bridge-terminal-data.md) | migrated to the shell-integration API; operator reload + verify pending; BUGS.md BUG-007 DEFERRED | medium |
+| 2026-07-26 | [Start Claude one-click spawn stalls at the first-run "trust this folder" prompt](./2026-07-26-start-claude-blocked-by-trust-prompt.md) | fix committed (`72b332b`); the same seed now guards the Layer 1 cwd (BUG-031 RESOLVED) | medium |
+| 2026-05-29 | [Voice PTY paste lands as `[Pasted text #N +5 lines]`, never submits](./2026-05-29-voice-pty-paste-no-commit-regression.md) | investigation shipped; ship deferred (mirror the Fix 32 850ms follow-up into the direct-inject path) | high |
 | 2026-05-23 | [Bridge terminal-name match is fragile (binding works, ergonomics)](./2026-05-23-bridge-terminal-name-fragility.md) | open | low |
+| 2026-05-16 | [Voice restart OOM regression (VAD/ORT singleton lifecycle)](./2026-05-16-voice-restart-oom-regression.md) | open; overlaps BUGS.md BUG-017 (daemon heap) and BUG-023 (ORT config test drift) | medium |
 
-## Recently closed
+## Resolved
 
-| Date | Bug | Status | Severity |
-|------|-----|--------|----------|
-| 2026-05-29 | [PRELOAD-1 SessionStart hook stdout shape](./2026-05-29-cold-start-hook-stdout-shape.md) | fixed (Fix 50, 20147a7) — investigation b18ffaa + ship commit + 2 test pins | high |
-| 2026-05-26 | [cc-pty voice double-talk regression](./2026-05-26-cc-pty-double-talk-investigation.md) | fixed (Fix 51, e0978ee) — Fix 40 SERIALIZE was correct but released on proc.exit instead of pcm 'end'; root cause closed | high |
-| 2026-05-24 | [No TTS on first prompt — fresh session spawn (recurrence)](./2026-05-14-no-tts-on-first-prompt-after-restart.md) | fixed (Fix 31, two-layer fix: daemon awaiting migration + client ptyId deps) | medium |
-| 2026-05-22 | [Lex cannot see worker on cold start](./2026-05-22-lex-blind-to-worker-on-cold-start.md) | fixed via supervisor wire stack (Fix 34/34b/34c/34d.1) + project_scope_id (Fix 49) | high |
-| 2026-05-22 | [Worker discovery fails for VS-Code-launched claude](./2026-05-22-worker-discovery-both-launch-paths.md) | fixed via bridge presence files + reconcile loop (memory: project_devneural_bridge_pty_ownership) | high |
-
-## Recently closed
-
-| Date | Bug | Status | Severity |
-|------|-----|--------|----------|
-| 2026-05-26 | [Supervisor wire routes to worker terminal, not Lex (Fix 34d aftermath)](./2026-05-26-supervisor-wire-routes-to-worker.md) | fixed (pending live verify), Fix 34d.1 | high |
-| 2026-05-24 | [Cold-start preload pulls stale distillation despite recent ended sessions](./2026-05-24-cold-start-preload-stale-distillation.md) | fixed (pending soak), 7957666 | medium |
-| 2026-05-22 | [TTS does not stop when user speaks (barge-in regression)](./2026-05-22-tts-bargein-regression.md) | fixed (pending soak), d6f094a + 6195466 + a00cea6 | high |
-| 2026-05-14 | [Cross-session inject lands in worker input field but never auto-submits](./2026-05-14-bridge-inject-missing-enter.md) | fixed (pending soak) | high |
-| 2026-05-14 | [VAD path uses deprecated ScriptProcessorNode](./2026-05-14-vad-scriptprocessornode-deprecation.md) | fixed (pending soak), 4ae0f0a | medium |
-| 2026-05-14 | [Wake-word stuck after "Lex shut up", "Lex unmute" never fires](./2026-05-14-wake-word-unmute-stuck.md) | fixed (pending soak), c1e3bd3 + 73fc697 | medium |
-| 2026-05-14 | [iOS PWA reminders not pushing](./2026-05-14-pwa-reminders-not-pushing.md) | fixed (pending soak) | medium |
-| 2026-05-14 | [Voice pill inconsistent + wake-word muted](./2026-05-14-voice-pill-inconsistent-and-wake-word-muted.md) | fixed (pending soak) | medium |
-| 2026-05-14 | [Enable-audio double permission prompt](./2026-05-14-enable-audio-double-permission-prompt.md) | fixed (pending soak) | medium |
-| 2026-05-14 | [No TTS on first prompt after restart](./2026-05-14-no-tts-on-first-prompt-after-restart.md) | fixed (pending soak) | medium |
-| 2026-05-05 | [Leftover session tiles](./2026-05-05-leftover-session-tiles.md) | closed | low |
-| 2026-05-10 | [Brainstorm picker and transcripts](./2026-05-10-brainstorm-picker-and-transcripts.md) | fixed (pending soak) | medium |
-| 2026-05-10 | [CC feedback prompt unanswerable](./2026-05-10-cc-feedback-prompt-unanswerable.md) | fixed (pending soak) | medium |
-| 2026-05-10 | [State tracker loses live sessions](./2026-05-10-state-tracker-loses-live-sessions.md) | fixed (pending soak) | medium |
-| 2026-05-11 | [Push-to-talk not releasing mic](./2026-05-11-push-to-talk-not-releasing-mic.md) | fixed (pending soak) | medium |
-| 2026-05-11 | [Cannot resume past brainstorms](./2026-05-11-cannot-resume-past-brainstorms.md) | fixed (pending soak) | medium |
-| 2026-05-11 | [Dashboard small screen overflow](./2026-05-11-dashboard-small-screen-overflow.md) | fixed (pending soak) | medium |
-
-Update this table whenever a bug is added, fixed, or its status changes.
-
----
-
-## Conventions
-
-One file per investigation. Naming: `YYYY-MM-DD-short-slug.md`.
-
-Each bug doc captures:
-
-- **Status:** open / investigating / fixed (pending soak) / closed
-- **Symptoms** the user actually saw
-- **Root causes** as understood, including the layered ones we missed at first
-- **Fixes shipped** with commit shas in the table so a future reader can run `git show <sha>`
-- **Verification** notes — what was actually exercised
-- **Open items** — soak windows, deeper rewrites that the workaround didn't address, follow-up tickets
-
-Closed bugs stay in this folder; we don't delete history. If the same problem recurs, append a new section to the existing file rather than starting a new one — context compounds.
+Every resolved bug has a row in [FIXES.md](../../FIXES.md) with its commit
+and a RESOLVED block in BUGS.md. The per-bug write-ups from 2026-05 to
+2026-06 (session tiles, voice pill, wake word, TTS regressions, cold-start
+preload, the lex-autonomy codex investigations, the supervisor wire, the
+mid-reply TTS truncation) are archived under
+[docs/archive/bugs/](../archive/bugs/).
