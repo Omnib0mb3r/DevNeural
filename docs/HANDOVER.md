@@ -52,8 +52,17 @@ verbs in the closed set: `start_worker`, `stop_worker`, `panic_worker`,
 dashboard's own functions; `worker-result` event phrased by the voice;
 `switch_project` rebinds the socket and sends `brainstorm-switched`.
 Spec: `docs/spec/LAYER-1-CONTROL.md` "The voice reaches the worker";
-user doc: `docs/voice-commands.md`. Both packages rebuilt; the restart
-and its verify are recorded at the end of this cursor.
+user doc: `docs/voice-commands.md`. Both packages rebuilt (daemon dist
+09:18 local, dashboard export 09:19). Restart DONE 2026-09-23T13:20:19Z:
+PID 4952 -> 54996, `[shutdown] complete` to `listening` in 1.2s, boot log
+clean apart from the pre-existing seed line (BUG-024); no brainstorm was
+live at the time, so nothing was reopened. Two hours later the VS Code
+extension host reloaded and the resume of this 3.7 MB session blew the
+extension's 60s init cap once (BUG-039; not the daemon, not the hooks).
+Last night's only outage on record is BUG-040: a relaunch at 02:10Z died
+on a missing `@anthropic-ai/sdk` and the relauncher recovered at
+02:13Z. The spoken verify, item 11 of the LAYER-1-CONTROL "Testing"
+list, needs the operator.
 
 Overnight 2026-09-23 (operator asleep, "full authority, no gates"):
 BUG-034 and BUG-035 fixed (`6e06fd0`: the supervisor detectors read Bash
