@@ -15,6 +15,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { DATA_ROOT, ensureDir } from '../paths.js';
+import { renderHandoverFrame, type HandoverFrame } from './handover-frame.js';
 
 export interface HandoverPayload {
   brainstormId: string;
@@ -136,6 +137,152 @@ export function writeHandover(
   const content = renderHandover(payload);
   writeFile(filePath, content);
   return { filePath, bytes: Buffer.byteLength(content, 'utf-8') };
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase C (2026-09-22): T5 frame files, browsing, archive             */
+/* ------------------------------------------------------------------ */
+
+export interface HandoverFsDeps {
+  rootDir?: string;
+  readdir?: (dir: string) => string[];
+  readFile?: (p: string) => string;
+  writeFile?: (p: string, content: string) => void;
+  rename?: (from: string, to: string) => void;
+  mkdir?: (dir: string) => void;
+  exists?: (p: string) => boolean;
+}
+
+function fsDeps(opts: HandoverFsDeps): Required<Omit<HandoverFsDeps, 'rootDir'>> {
+  return {
+    readdir: opts.readdir ?? ((d) => fs.readdirSync(d)),
+    readFile: opts.readFile ?? ((p) => fs.readFileSync(p, 'utf-8')),
+    writeFile: opts.writeFile ?? ((p, c) => fs.writeFileSync(p, c, 'utf-8')),
+    rename: opts.rename ?? ((a, b) => fs.renameSync(a, b)),
+    mkdir: opts.mkdir ?? ensureDir,
+    exists: opts.exists ?? ((p) => fs.existsSync(p)),
+  };
+}
+
+/* A handover file; the index (HANDOVER-INDEX.md) is not one. */
+export const HANDOVER_FILE_RE = /^HANDOVER-(?!INDEX\.md$)[0-9A-Za-z_-]+\.md$/;
+
+/** Persist a T5 frame as HANDOVER-<iso>.md under the anchor's dir. */
+export function writeFrameHandover(
+  frame: HandoverFrame,
+  opts: HandoverFsDeps = {},
+): HandoverWriteResult & { file: string } {
+  const d = fsDeps(opts);
+  const dir = brainstormDir(frame.anchorId, opts.rootDir);
+  d.mkdir(dir);
+  const file = buildHandoverFilename(frame.createdAt);
+  const filePath = path.posix.join(dir, file);
+  const content = renderHandoverFrame(frame);
+  d.writeFile(filePath, content);
+  return { filePath, bytes: Buffer.byteLength(content, 'utf-8'), file };
+}
+
+export interface HandoverListEntry {
+  file: string;
+  createdAt: string | null;
+  kind: string | null;
+  unvetted: boolean;
+  verdict: string | null;
+  /** True for the pre-Phase-C grooming format (no frame headers). */
+  legacy: boolean;
+}
+
+/* Newest first. Reads only the head of each file. Scoped to one anchor's
+ * own directory by construction. */
+export function listHandovers(anchorId: string, opts: HandoverFsDeps = {}): HandoverListEntry[] {
+  const d = fsDeps(opts);
+  const dir = brainstormDir(anchorId, opts.rootDir);
+  if (!d.exists(dir)) return [];
+  let entries: string[];
+  try {
+    entries = d.readdir(dir);
+  } catch {
+    return [];
+  }
+  const files = entries.filter((e) => HANDOVER_FILE_RE.test(e)).sort().reverse();
+  const out: HandoverListEntry[] = [];
+  for (const file of files) {
+    let head = '';
+    try {
+      head = d.readFile(path.posix.join(dir, file)).slice(0, 4_000);
+    } catch {
+      continue;
+    }
+    const kind = head.match(/^Kind: (.+)$/m)?.[1]?.trim() ?? null;
+    const createdAt = head.match(/^Created: (.+)$/m)?.[1]?.trim() ?? null;
+    const verdict = head.match(/^## Lex review \(([a-z]+),/m)?.[1] ?? null;
+    out.push({
+      file,
+      createdAt,
+      kind,
+      unvetted: /^Unvetted: yes$/m.test(head),
+      verdict,
+      legacy: kind === null,
+    });
+  }
+  return out;
+}
+
+/** One file's content, or null. The name must match HANDOVER_FILE_RE so
+ * a caller can never read outside the anchor's directory. */
+export function readHandover(
+  anchorId: string,
+  file: string,
+  opts: HandoverFsDeps = {},
+): string | null {
+  if (!HANDOVER_FILE_RE.test(file)) return null;
+  const d = fsDeps(opts);
+  const p = path.posix.join(brainstormDir(anchorId, opts.rootDir), file);
+  if (!d.exists(p)) return null;
+  try {
+    return d.readFile(p);
+  } catch {
+    return null;
+  }
+}
+
+/* T6 cleanup: archive, do not delete. Keep the newest `keep` in place,
+ * move older ones into archive/ and rewrite HANDOVER-INDEX.md with one
+ * line per archived file so the trail stays readable at a glance. */
+export function archiveOldHandovers(
+  anchorId: string,
+  keep = 10,
+  opts: HandoverFsDeps = {},
+): { archived: string[]; indexPath: string | null } {
+  const d = fsDeps(opts);
+  const dir = brainstormDir(anchorId, opts.rootDir);
+  if (!d.exists(dir)) return { archived: [], indexPath: null };
+  const files = d.readdir(dir).filter((e) => HANDOVER_FILE_RE.test(e)).sort();
+  if (files.length <= keep) return { archived: [], indexPath: null };
+  const older = files.slice(0, files.length - keep);
+  const archiveDir = path.posix.join(dir, 'archive');
+  d.mkdir(archiveDir);
+  const indexPath = path.posix.join(dir, 'HANDOVER-INDEX.md');
+  const existing = d.exists(indexPath) ? d.readFile(indexPath) : '# Archived handovers\n\n';
+  const lines: string[] = [];
+  for (const file of older) {
+    let firstLine = '';
+    let kind = 'legacy';
+    let created = '';
+    try {
+      const head = d.readFile(path.posix.join(dir, file)).slice(0, 4_000);
+      kind = head.match(/^Kind: (.+)$/m)?.[1]?.trim() ?? 'legacy';
+      created = head.match(/^(?:Created|Generated): (.+)$/m)?.[1]?.trim() ?? '';
+      const doing = head.split(/^### What I was doing\s*$/m)[1] ?? '';
+      firstLine = doing.trim().split('\n').find((l) => l.trim().length > 0)?.trim().slice(0, 120) ?? '';
+    } catch {
+      /* index line without detail */
+    }
+    d.rename(path.posix.join(dir, file), path.posix.join(archiveDir, file));
+    lines.push(`- archive/${file}: ${kind}${created ? `, ${created}` : ''}${firstLine ? `, ${firstLine}` : ''}`);
+  }
+  d.writeFile(indexPath, `${existing.trimEnd()}\n${lines.join('\n')}\n`);
+  return { archived: older, indexPath };
 }
 
 /* Surface the most recent HANDOVER-*.md path for a brainstorm. Used by
