@@ -23,7 +23,8 @@ vi.mock("@/lib/daemon-client", () => ({
         has_task: true,
         phase: "idle",
         pending_prompt: null,
-        context: null,
+        context: { tokens: 420_000, max: 1_000_000 },
+        ctx_pct: 42,
         user_label: null,
         derived_label: null,
       },
@@ -37,6 +38,15 @@ vi.mock("@/lib/daemon-client", () => ({
     ],
   }),
   startClaude: vi.fn().mockResolvedValue({ ok: true }),
+  /* Context gauge (2026-09-22): the rows read the trip marks from the
+   * smart-clear config so the compact gauge draws the same two lines
+   * as the Stream Deck tiles. */
+  smartClearConfig: vi.fn().mockResolvedValue({
+    ok: true,
+    mode: "shadow",
+    thresholdPct: 35,
+    ceilingPct: 70,
+  }),
 }));
 
 vi.mock("next/navigation", () => ({
@@ -79,5 +89,24 @@ describe("SessionsTable merged table", () => {
     await waitFor(() => {
       expect(screen.getByText(/not running/i)).toBeInTheDocument();
     });
+  });
+
+  /* Context gauge (2026-09-22 plan, Task 10): each session row carries
+   * the compact gauge, fed by the row's ctx_pct and the smart-clear
+   * trip marks from the config route. */
+  it("draws a compact context gauge on each session row with the configured marks", async () => {
+    renderTable();
+    const gauge = await screen.findByTestId("context-gauge");
+    expect(gauge).toHaveAttribute("data-compact", "1");
+    await waitFor(() => {
+      expect(screen.getByTestId("context-gauge-text")).toHaveTextContent(
+        "42% of context, clears at 35%",
+      );
+    });
+    expect(screen.getByTestId("context-gauge-threshold").style.left).toBe(
+      "35%",
+    );
+    expect(screen.getByTestId("context-gauge-ceiling").style.left).toBe("70%");
+    expect(gauge).toHaveClass("gauge-warn");
   });
 });

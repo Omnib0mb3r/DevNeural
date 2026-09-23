@@ -5,17 +5,20 @@ import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   lexAnchors,
+  lexAnchorTiles,
   patchLexAnchor,
   createLexAnchor,
   openLexAnchor,
   endLexAnchor,
   archiveLexAnchor,
+  type AnchorTile,
   type LexAnchor,
   type ProjectAnchorTile,
 } from "@/lib/daemon-client";
 import { relTime } from "@/lib/session-helpers";
 import { createCollapseStore } from "@/lib/transcript-collapse";
 import { emitVoiceAnchorSwitch } from "@/lib/voice-anchor-bus";
+import { ContextGauge } from "./ContextGauge";
 import { Icon } from "./Icon";
 import { StatusDot } from "./StatusDot";
 import { SupervisesPicker } from "./SupervisesPicker";
@@ -114,6 +117,19 @@ export function LexSessionList({
     queryFn: () => lexAnchors({ limit: 50 }),
     refetchInterval: 5_000,
   });
+  /* Context gauge (2026-09-22): the anchor tile feed carries Lex's own
+   * context pct, the supervised worker's pct and the smart-clear trip
+   * marks for every LIVE anchor. Shares the Stream Deck's query key so
+   * the two surfaces never disagree on a number. Dormant rows have no
+   * tile and draw no gauge. */
+  const tilesQ = useQuery({
+    queryKey: ["lex-anchor-tiles"],
+    queryFn: lexAnchorTiles,
+    refetchInterval: 5_000,
+  });
+  const tileById = new Map<string, AnchorTile>(
+    (tilesQ.data?.tiles ?? []).map((t) => [t.anchor_id, t]),
+  );
 
   const patchM = useMutation({
     mutationFn: (vars: {
@@ -394,6 +410,9 @@ export function LexSessionList({
                           </span>
                         )}
                       </div>
+                      {isLive && (
+                        <RowGauges anchorId={row.id} tile={tileById.get(row.id)} />
+                      )}
                       {/* Phase C-3: per-row supervises binding chip.
                        *
                        * Inline `<select>` PATCHes /lex/anchors/:id
@@ -526,6 +545,43 @@ export function LexSessionList({
             {liveCount > 0 ? `, ${liveCount} live` : ""}
           </span>
         </div>
+      )}
+    </div>
+  );
+}
+
+/* Context gauge (2026-09-22): Lex's own gauge on every live row, plus
+ * the supervised worker's gauge when the tile carries one (bound and
+ * known). Nothing renders until the tile feed has the row, so a row
+ * whose PTY died between polls never shows a stale number. */
+function RowGauges({
+  anchorId,
+  tile,
+}: {
+  anchorId: string;
+  tile: AnchorTile | undefined;
+}) {
+  if (!tile) return null;
+  return (
+    <div
+      data-testid={`lex-row-gauge-${anchorId}`}
+      className="mt-1 flex flex-col gap-1 max-w-xs"
+    >
+      <ContextGauge
+        pct={tile.lex_ctx_pct}
+        thresholdPct={tile.ctx_threshold_pct}
+        ceilingPct={tile.ctx_ceiling_pct}
+        label="Lex"
+        compact
+      />
+      {tile.worker_ctx_pct !== null && (
+        <ContextGauge
+          pct={tile.worker_ctx_pct}
+          thresholdPct={tile.ctx_threshold_pct}
+          ceilingPct={tile.ctx_ceiling_pct}
+          label="worker"
+          compact
+        />
       )}
     </div>
   );

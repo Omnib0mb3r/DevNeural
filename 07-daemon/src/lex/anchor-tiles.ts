@@ -7,19 +7,33 @@
  * anchor's most recent transcript jsonl using the same vocabulary
  * as /sessions (thinking/tool/permission/idle/unknown). The
  * 'dormant' state is included for completeness but never returned
- * here — callers filter by status='live'.
+ * here; callers filter by status='live'.
  *
  * No tap action. Tiles are visibility only per the plan; the click
  * action (spawn-or-bind to bring an anchor live) lives on the
  * /lex Past Sessions panel, not on the deck.
+ *
+ * Context gauge (2026-09-22, Task 10): every tile also carries the
+ * supervised worker's and Lex's own context usage as whole percents
+ * plus the smart-clear trip marks (threshold + ceiling), so the
+ * dashboard draws one gauge shape on every session surface.
  */
 import { listLexSessions, listTranscriptRefs } from './lex-session-store.js';
 import {
+  contextPct,
+  deriveContextFromTail,
   derivePhaseFromTail,
 } from '../dashboard/sessions.js';
 import { getPhase } from '../dashboard/session-phase.js';
 import { getPending, type PendingPrompt } from '../dashboard/pending-prompt.js';
 import { getLivePtyIds } from '../dashboard/pty-host.js';
+import { getStore } from './brainstorm-store.js';
+import { transcriptPathFor } from './spawn-lex-session.js';
+import {
+  DEFAULT_CEILING_PCT,
+  DEFAULT_THRESHOLD_PCT,
+  smartClearConfig,
+} from './smart-clear.js';
 
 export interface AnchorTile {
   anchor_id: string;
@@ -29,7 +43,7 @@ export interface AnchorTile {
   current_pty_id: string | null;
   current_cc_session_id: string | null;
   transcript_path: string | null;
-  /** thinking | tool | permission | idle | unknown — same vocab as
+  /** thinking | tool | permission | idle | unknown, the same vocab as
    * /sessions. */
   phase: 'thinking' | 'tool' | 'permission' | 'idle' | 'unknown';
   pending_prompt: PendingPrompt | null;
@@ -49,6 +63,19 @@ export interface AnchorTile {
    * formats that never string-match. The session id is the
    * authoritative binding the rest of the code already resolves. */
   supervised_worker_session_id: string | null;
+  /** Supervised worker's context usage, whole percent of its window,
+   * derived from the worker's own jsonl tail. Null when unbound, when
+   * the worker has no live session yet, or before its first usage
+   * record. Scope fail-closed: only THIS anchor's supervised worker. */
+  worker_ctx_pct: number | null;
+  /** Lex's own context usage, whole percent, from the anchor's
+   * current transcript. Null before the first usage record. */
+  lex_ctx_pct: number | null;
+  /** Smart-clear trip marks (runtime_config, smartClearConfig): the
+   * early wind-down threshold and the force-stop ceiling. The gauge
+   * draws both as vertical marks. */
+  ctx_threshold_pct: number;
+  ctx_ceiling_pct: number;
 }
 
 /** Resolve the supervised worker's project_slug for one lex session
@@ -82,12 +109,94 @@ export function supervisedWorkerSessionIdFor(
   }
 }
 
+/** Tail-derive seam: deriveContextFromTail in prod, injectable for
+ * pins that never touch the filesystem. */
+export type ContextDeriver = (
+  transcriptPath: string,
+) => { tokens: number; max: number } | null;
+
+/** Supervised worker's context usage (whole percent) for one lex
+ * session row. The worker jsonl lives exactly where Claude Code writes
+ * it: transcriptPathFor({ cwd: project_session.cwd, ccSessionId:
+ * project_session.current_session_id }). Null when unbound, when either
+ * half of the binding cannot be resolved, before the first usage
+ * record, or when anything throws. Never a fake 0. */
+export function workerCtxPctFor(
+  row: { supervises_project_anchor_id?: string | null },
+  resolveWorkerSessionId?: (anchorId: string) => string | null,
+  resolveWorkerCwd?: (anchorId: string) => string | null,
+  derive: ContextDeriver = deriveContextFromTail,
+): number | null {
+  const ccSessionId = supervisedWorkerSessionIdFor(row, resolveWorkerSessionId);
+  if (!ccSessionId || !resolveWorkerCwd) return null;
+  try {
+    const cwd = resolveWorkerCwd(row.supervises_project_anchor_id!);
+    if (!cwd) return null;
+    return contextPct(derive(transcriptPathFor({ cwd, ccSessionId })));
+  } catch {
+    return null;
+  }
+}
+
+/** Lex's own context usage (whole percent) from the anchor's current
+ * transcript. Null without a transcript, before the first usage
+ * record, or when the derive throws. */
+export function lexCtxPctFor(
+  transcriptPath: string | null | undefined,
+  derive: ContextDeriver = deriveContextFromTail,
+): number | null {
+  if (!transcriptPath) return null;
+  try {
+    return contextPct(derive(transcriptPath));
+  } catch {
+    return null;
+  }
+}
+
+export interface AnchorTileOptions {
+  /** cwd of the supervised worker's project anchor
+   * (project_session.cwd). Defaults to the store lookup. */
+  resolveWorkerCwd?: (anchorId: string) => string | null;
+  /** Live PTY ids for the liveness cross-check. Defaults to the
+   * pty-host map; injectable so a pin can run without a spawned PTY. */
+  livePtyIds?: ReadonlySet<string>;
+  /** Tail-derive seam (see ContextDeriver). */
+  deriveContext?: ContextDeriver;
+  /** Trip marks; default smartClearConfig(db). */
+  ctxConfig?: { thresholdPct: number; ceilingPct: number };
+}
+
+function storeWorkerCwd(anchorId: string): string | null {
+  try {
+    return getStore().db.getProjectSession(anchorId)?.cwd ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/* Read once per tile sweep: the two marks are dashboard-wide, so every
+ * tile in a response carries the same pair. Falls back to the
+ * built-in defaults when the store is unavailable rather than failing
+ * the whole tile feed over a config read. */
+function storeCtxConfig(): { thresholdPct: number; ceilingPct: number } {
+  try {
+    const cfg = smartClearConfig(getStore().db);
+    return { thresholdPct: cfg.thresholdPct, ceilingPct: cfg.ceilingPct };
+  } catch {
+    return { thresholdPct: DEFAULT_THRESHOLD_PCT, ceilingPct: DEFAULT_CEILING_PCT };
+  }
+}
+
 export function listAnchorTiles(
   resolveProjectSlug?: (anchorId: string) => string | null,
   resolveWorkerSessionId?: (anchorId: string) => string | null,
+  opts: AnchorTileOptions = {},
 ): AnchorTile[] {
   const live = listLexSessions({ status: 'live', limit: 200 });
-  const liveSet = getLivePtyIds();
+  const liveSet = opts.livePtyIds ?? getLivePtyIds();
+  const resolveWorkerCwd = opts.resolveWorkerCwd ?? storeWorkerCwd;
+  const derive = opts.deriveContext ?? deriveContextFromTail;
+  const ctxConfig = opts.ctxConfig ?? storeCtxConfig();
   const tiles: AnchorTile[] = [];
   for (const row of live) {
     /* Cross-check liveness against the actual live PTY map. The
@@ -134,6 +243,15 @@ export function listAnchorTiles(
         row,
         resolveWorkerSessionId,
       ),
+      worker_ctx_pct: workerCtxPctFor(
+        row,
+        resolveWorkerSessionId,
+        resolveWorkerCwd,
+        derive,
+      ),
+      lex_ctx_pct: lexCtxPctFor(current?.transcript_path ?? null, derive),
+      ctx_threshold_pct: ctxConfig.thresholdPct,
+      ctx_ceiling_pct: ctxConfig.ceilingPct,
     });
   }
   tiles.sort((a, b) => b.last_activity_ms - a.last_activity_ms);

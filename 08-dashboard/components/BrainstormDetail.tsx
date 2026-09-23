@@ -24,6 +24,7 @@ import {
   type BrainstormChunkRow,
   type WorkerExpectationRow,
 } from "@/lib/daemon-client";
+import { HandoverList } from "./HandoverList";
 import { SupervisesPicker } from "./SupervisesPicker";
 
 export function BrainstormDetail({ id }: { id: string }) {
@@ -111,6 +112,10 @@ export function BrainstormDetail({ id }: { id: string }) {
         loading={artifacts.isLoading}
       />
       <SupervisesSection brainstormId={id} />
+      {/* Phase C (2026-09-22): the anchor's timestamped handover files,
+        * newest first, both halves readable in place. Keyed on this
+        * brainstorm's anchor id only. */}
+      <HandoverList anchorId={id} />
       {bs.last_summary ? (
         <section>
           <h2 className="text-sm font-semibold">Summary</h2>
