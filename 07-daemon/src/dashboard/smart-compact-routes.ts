@@ -39,6 +39,10 @@
  */
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+/* Phase C (2026-09-22): clear-and-paste can take an approved handover
+ * by id and paste its reseed instead of a caller-supplied summary. */
+import { parseHandoverFrame, reseedFromFrame } from '../lex/handover-frame.js';
+import { readHandover } from '../lex/handover-writer.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import type { FastifyInstance } from 'fastify';
@@ -955,10 +959,34 @@ export function registerSmartCompactRoutes(
           io: { log: (msg) => log(msg) },
         });
     }
+    /* Phase C: { handover_id, brainstorm_id } names an approved T5 frame
+     * under the brainstorm's directory; its reseed is what gets pasted. */
+    const hb = (req.body ?? {}) as { handover_id?: string; brainstorm_id?: string };
+    let handoverSummary: string | null = null;
+    if (typeof hb.handover_id === 'string' && hb.handover_id) {
+      if (typeof hb.brainstorm_id !== 'string' || !hb.brainstorm_id) {
+        reply.code(400);
+        return { ok: false, error: 'brainstorm_id required with handover_id' };
+      }
+      const content = readHandover(hb.brainstorm_id, hb.handover_id);
+      const frame = content ? parseHandoverFrame(content) : null;
+      if (!frame) {
+        reply.code(404);
+        return { ok: false, error: 'handover not found or not a frame' };
+      }
+      handoverSummary = reseedFromFrame(frame);
+      log(
+        `[smart-compact] clear-and-paste by handover ${hb.handover_id} brainstorm=${hb.brainstorm_id.slice(0, 8)}`,
+      );
+    }
     const r = clearAndPaste(db, body.anchor_id, {
-      ...(body.caller !== undefined ? { caller: body.caller } : {}),
+      ...(body.caller !== undefined
+        ? { caller: body.caller }
+        : handoverSummary
+          ? { caller: 'smart-clear' }
+          : {}),
       reason: body.reason,
-      summary: body.summary ?? '',
+      summary: handoverSummary ?? body.summary ?? '',
       preCtxPct:
         typeof body.pre_ctx_pct === 'number' ? body.pre_ctx_pct : null,
       ...(body.use_readiness_gate !== undefined

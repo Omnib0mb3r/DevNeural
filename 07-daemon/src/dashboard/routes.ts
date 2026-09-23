@@ -493,6 +493,51 @@ export async function registerDashboardRoutes(
     ctxProvider: smartCompactCtxProvider,
   });
 
+  /* Phase C (2026-09-22, SMART-COMPACT.md section 5): the worker writes
+   * its handover, Lex reviews it, the approved frame is persisted with
+   * both halves visible and served ONCE as the reseed through
+   * /worker/clear-handoff. The registry is shared with the voice layer
+   * (approve_handover / reject_handover) below. */
+  const { registerHandoverRoutes } = await import('./handover-routes.js');
+  const { HandoverApprovalRegistry } = await import('../lex/handover-approval.js');
+  const handoverRegistry = new HandoverApprovalRegistry();
+  /* Late-bound: the voice layers wire (created below) installs the hook
+   * that reads a reviewed handover out through Layer 1. */
+  const handoverReviewedHook: {
+    fn: ((p: { handoverId: string; brainstormId: string; gist: string }) => Promise<void>) | null;
+  } = { fn: null };
+  registerHandoverRoutes(app, store.db, log, {
+    registry: handoverRegistry,
+    requestWorkerHandover: async (i) => {
+      const r = await app.inject({
+        method: 'POST',
+        url: '/lex/inject-cross-session',
+        payload: {
+          target_session: i.targetSession,
+          token: issueToken(i.targetSession),
+          text: i.text,
+          caller_label: 'smart-clear',
+          caller_brainstorm_id: i.brainstormId,
+          from_anchor_id: i.brainstormId,
+          commit: true,
+        },
+      });
+      let ok = false;
+      let decision: string | null = null;
+      try {
+        const j = r.json() as { ok?: boolean; decision?: string };
+        ok = Boolean(j.ok);
+        decision = typeof j.decision === 'string' ? j.decision : null;
+      } catch {
+        /* non-json body */
+      }
+      return { ok, status: r.statusCode, decision };
+    },
+    onReviewed: async (p) => {
+      await handoverReviewedHook.fn?.(p);
+    },
+  });
+
   /* Voice layers Phase B (2026-09-21, LAYER-1-CONTROL.md): the dispatch
    * confirm gate and plan approval, answered by voice through Layer 1.
    * Registered before any route handler can run; the inject and
@@ -6212,6 +6257,28 @@ export async function registerDashboardRoutes(
     if (!body.cwd || typeof body.cwd !== 'string') {
       reply.code(400);
       return { ok: false, error: 'cwd required' };
+    }
+    /* Phase C (2026-09-22): an approved handover for this worker's anchor
+     * IS the reseed. Serve it once and skip the recomputed legacy block so
+     * the fresh session gets one seed, not two (SMART-COMPACT.md section 5
+     * item 3). */
+    try {
+      const anchorRow = store.db.getProjectSessionByCwd(body.cwd.trim());
+      const approved = anchorRow ? handoverRegistry.consumeApproved(anchorRow.id) : null;
+      if (approved && anchorRow) {
+        log(
+          `[handover] clear-handoff served approved handover ${approved.handoverId} for anchor=${anchorRow.id.slice(0, 8)}`,
+        );
+        return {
+          ok: true,
+          block: approved.reseed,
+          reason: 'approved-handover',
+          handover_id: approved.handoverId,
+          source_graph_block: null,
+        };
+      }
+    } catch {
+      /* fall through to the legacy handoff */
     }
     const { buildWorkerHandoff } = await import('../lex/worker-handoff.js');
     const result = buildWorkerHandoff({

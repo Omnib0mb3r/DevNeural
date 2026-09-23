@@ -30,10 +30,15 @@ controller-level reply cache, the WS's `lastSpokenText` already serves
 `repeat`, and `start_over` is the same; `slower` / `faster` step then
 re-speak `lastSpokenText`; `louder` / `softer` step a per-connection
 `ttsGain` (0.2 to 1.0 by 0.2), send `{t:'tts-gain', gain}` (Agent B's
-sink applies it) and re-speak. T5 handover frame, T6 Phase C routes, T7
-end/crash handovers, T8 voice approval + L2 rules + the `turn_summary`
+sink applies it) and re-speak. T4 DONE (`7e8af1f`). T5 handover frame DONE (`83e3810`). T11 stream sink
+MERGED (`f70cde4`, Agent B). T6 Phase C routes DONE: `handover-routes.ts`
+(request, review, list, read, one auto-clear switch), `handover-approval.ts`
+(registry shared with the voice wire through `handoverReviewedHook.fn` in
+routes.ts, unset until T8), clear-and-paste by `handover_id` +
+`brainstorm_id`, `/worker/clear-handoff` serves an approved reseed once.
+T7 end/crash handovers, T8 voice approval + L2 rules + the `turn_summary`
 supervisor event (worker's end-of-turn text read out by Lex), T9 Lex
-self-clear: pending. T10 (context gauge +
+self-clear: pending. T10 (Agent A, gauge + handover list UI): running. T10 (context gauge +
 handover list UI) and T11 (continuous stream sink) run in isolated
 worktree agents branched off `voice-layers`; merge their branches in T12.
 T12 merge, suite, build, trackers, restart, verify: pending.
