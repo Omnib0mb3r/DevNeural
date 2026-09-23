@@ -17,8 +17,9 @@ import {
   readPersistedVoiceState,
   writePersistedActiveBrainstorm,
   writePersistedVoiceEnabled,
+  hrefWithBrainstorm,
 } from "@/lib/voice-active-anchor";
-import { onVoiceAnchorSwitch } from "@/lib/voice-anchor-bus";
+import { emitVoiceAnchorSwitch, onVoiceAnchorSwitch } from "@/lib/voice-anchor-bus";
 import {
   createDedupe,
   getSpeechRecognitionCtor,
@@ -2430,6 +2431,35 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
                 text: ignoredText,
                 layer: "operator",
                 ignored: true,
+              });
+            }
+            break;
+          }
+          case "brainstorm-switched": {
+            /* BUG-038: the operator said "switch to <project>" and the
+             * daemon has already rebound this socket to that project's
+             * brainstorm. Move the page selection the same way a click
+             * does: the anchor bus pins and persists the new id (the
+             * subscriber above), and the URL follows so a reload or a
+             * reconnect hellos the right brainstorm. The rebind effect
+             * re-hellos on its own once the pinned anchor's PTY differs. */
+            const switchedTo =
+              typeof msg.brainstorm_id === "string" ? msg.brainstorm_id : null;
+            if (switchedTo) {
+              emitVoiceAnchorSwitch(switchedTo);
+              try {
+                window.history.replaceState(
+                  null,
+                  "",
+                  hrefWithBrainstorm(window.location.href, switchedTo),
+                );
+              } catch {
+                /* history unavailable (private mode, odd embed): the pin
+                 * alone still carries the switch for this tab */
+              }
+              logVoice("ws-rebind", "daemon switched this call to another brainstorm", {
+                brainstorm_id: switchedTo,
+                label: typeof msg.label === "string" ? msg.label : null,
               });
             }
             break;

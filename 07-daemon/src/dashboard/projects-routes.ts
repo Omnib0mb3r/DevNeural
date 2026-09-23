@@ -214,6 +214,11 @@ export function createOpenInFlightMap(): OpenInFlightMap {
   return new Map();
 }
 
+/* One map for every caller of openProjectAnchor in this process (the
+ * route and, since BUG-038, the voice's start_worker), so a dashboard
+ * click and a spoken start on the same anchor collapse into one spawn. */
+export const projectOpenInFlight: OpenInFlightMap = createOpenInFlightMap();
+
 export async function openProjectAnchor(
   db: IndexDb,
   id: string,
@@ -402,7 +407,7 @@ export function registerProjectAnchorRoutes(
   db: IndexDb,
   log: (msg: string) => void = () => undefined,
 ): void {
-  const inflight = createOpenInFlightMap();
+  const inflight = projectOpenInFlight;
 
   /* Stream Deck feed. One tile per live anchor, deduped so multiple
    * VS Code windows on the same cwd render as a single tile with a

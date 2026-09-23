@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   createVoiceLayersWire,
+  resolveProjectByName,
   type VoiceLayersWireDeps,
 } from '../src/dashboard/voice-layers-wire.js';
 import type { TopLayerEvent } from '../src/voice/voice-top-layer.js';
@@ -284,5 +285,121 @@ describe('handover approval by voice (Phase C)', () => {
     );
     expect(wire.handlers().pendingHandover!('anchor-a')).toBeNull();
     expect(handovers.consumeApproved('proj-x')).toBeNull();
+  });
+});
+
+describe('worker and project effects by voice (BUG-038)', () => {
+  const BRAINSTORMS = [
+    { brainstormId: 'anchor-a', slug: 'dropship-01', title: null, live: true },
+    { brainstormId: 'anchor-b', slug: 'New-Letter-and-TikToks', title: 'newsletter', live: false },
+    { brainstormId: 'anchor-c', slug: 'DevNeural', title: 'DevNeural Testing', live: true },
+  ];
+
+  function workerRig(
+    over: Partial<VoiceLayersWireDeps> & { live?: boolean; interrupt?: string } = {},
+  ) {
+    const w = {
+      open: [] as string[],
+      end: [] as string[],
+      interrupt: [] as string[],
+      opened: [] as string[],
+    };
+    const r = rig({
+      supervisedProjectFor: (b) =>
+        b === 'anchor-a' ? { id: 'proj-1', slug: 'dropship-01', live: over.live ?? false } : null,
+      openWorker: async (id) => {
+        w.open.push(id);
+        return { ok: true, mode: 'spawning' };
+      },
+      endWorker: (id) => {
+        w.end.push(id);
+        return true;
+      },
+      interruptWorker: (id) => {
+        w.interrupt.push(id);
+        return { ok: over.interrupt !== 'pty_not_found', result: over.interrupt ?? 'accepted' };
+      },
+      listProjectBrainstorms: () => BRAINSTORMS,
+      openBrainstorm: async (id) => {
+        w.opened.push(id);
+        return { ok: true };
+      },
+      ...over,
+    });
+    return { ...r, w };
+  }
+
+  it('start_worker starts the supervised project, and says so when there is none', async () => {
+    const { wire, w } = workerRig();
+    expect(await wire.handlers().startWorker!('anchor-a', null)).toMatch(
+      /Starting the worker on dropship-01/,
+    );
+    expect(w.open).toEqual(['proj-1']);
+    expect(await wire.handlers().startWorker!('anchor-z', null)).toMatch(/no project/i);
+    expect(w.open).toEqual(['proj-1']);
+  });
+
+  it('start_worker on a running worker starts nothing', async () => {
+    const { wire, w } = workerRig({ live: true });
+    expect(await wire.handlers().startWorker!('anchor-a', null)).toMatch(/already running/);
+    expect(w.open).toEqual([]);
+  });
+
+  it('stop_worker releases a running worker and refuses a stopped one', async () => {
+    const stopped = workerRig();
+    expect(await stopped.wire.handlers().stopWorker!('anchor-a', null)).toMatch(/not running/);
+    expect(stopped.w.end).toEqual([]);
+    const running = workerRig({ live: true });
+    expect(await running.wire.handlers().stopWorker!('anchor-a', null)).toMatch(
+      /Released the worker on dropship-01/,
+    );
+    expect(running.w.end).toEqual(['proj-1']);
+  });
+
+  it('panic_worker interrupts the worker and reports an unreachable one', async () => {
+    const ok = workerRig({ live: true });
+    expect(await ok.wire.handlers().panicWorker!('anchor-a', null)).toMatch(
+      /Interrupted the worker on dropship-01/,
+    );
+    expect(ok.w.interrupt).toEqual(['proj-1']);
+    const gone = workerRig({ live: true, interrupt: 'pty_not_found' });
+    expect(await gone.wire.handlers().panicWorker!('anchor-a', null)).toMatch(/not reachable/);
+  });
+
+  it('switch_project opens the brainstorm of the named project and hands back its id', async () => {
+    const { wire, w } = workerRig();
+    const r = await wire.handlers().switchProject!('anchor-a', 'news letter');
+    expect(r.brainstormId).toBe('anchor-b');
+    expect(r.label).toBe('New-Letter-and-TikToks');
+    expect(r.status).toMatch(/Switched to New-Letter-and-TikToks/);
+    expect(w.opened).toEqual(['anchor-b']);
+  });
+
+  it('switch_project with no name, an unknown name, or the current project switches nothing', async () => {
+    const { wire, w } = workerRig();
+    expect((await wire.handlers().switchProject!('anchor-a', null)).brainstormId).toBeNull();
+    const unknown = await wire.handlers().switchProject!('anchor-a', 'banana stand');
+    expect(unknown.brainstormId).toBeNull();
+    expect(unknown.status).toMatch(/dropship-01/);
+    expect(unknown.status).toMatch(/DevNeural/);
+    const same = await wire.handlers().switchProject!('anchor-a', 'dropship');
+    expect(same.brainstormId).toBeNull();
+    expect(same.status).toMatch(/already on dropship-01/);
+    expect(w.opened).toEqual([]);
+  });
+
+  it('resolveProjectByName matches loosely and prefers a live brainstorm', () => {
+    expect(resolveProjectByName(BRAINSTORMS, 'DEVNEURAL')?.brainstormId).toBe('anchor-c');
+    expect(resolveProjectByName(BRAINSTORMS, 'drop ship')?.brainstormId).toBe('anchor-a');
+    expect(resolveProjectByName(BRAINSTORMS, 'tik toks')?.brainstormId).toBe('anchor-b');
+    expect(resolveProjectByName(BRAINSTORMS, 'the newsletter project')?.brainstormId).toBe(
+      'anchor-b',
+    );
+    expect(resolveProjectByName(BRAINSTORMS, 'banana')).toBeNull();
+    const twins = [
+      { brainstormId: 'old', slug: 'DevNeural', title: null, live: false },
+      { brainstormId: 'new', slug: 'DevNeural', title: null, live: true },
+    ];
+    expect(resolveProjectByName(twins, 'devneural')?.brainstormId).toBe('new');
   });
 });

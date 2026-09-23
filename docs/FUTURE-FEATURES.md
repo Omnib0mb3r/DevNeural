@@ -13,12 +13,9 @@ Last updated: 2026-09-23.
 - **Brainstorm threading Phase 3, the LLM-backed backfill scheduler**: shipped (`07-daemon/src/daemon.ts` wires the generator; `[distill-backfill]` ticks in `daemon.log`). Cross-thread retrieval remains below.
 - **Auto-discover projects**: raw top-level enumeration plus `fs.watch` shipped (Fix 52, `seedProjectAnchors`). The marker-file filter remains below. BUG-024 currently aborts the seed pass on a slug collision, so the shipped behaviour is broken until that is fixed.
 - **Docs refresh punch list (2026-05)**: done; every item landed in `docs/HOW-TO-voice-and-push.md`, `docs/HOW-TO-dashboard-ux.md`, `docs/HOW-TO-supervision-pipelines.md` and `docs/spec/SMART-COMPACT.md`.
+- **Layer 1 worker and project effects (BUG-038)**: shipped 2026-09-23 (FIXES VL-28): `start_worker`, `stop_worker`, `panic_worker`, `switch_project <name>` in the closed effect set, AI-interpreted like every other control, handlers on the dashboard's own functions (`docs/spec/LAYER-1-CONTROL.md` "The voice reaches the worker"). Why it mattered: the operator's goal is one voice that controls the entire system with no screen; worker control was the missing half.
 
 ## Near term (next milestone)
-
-### Layer 1 worker and project effects (BUG-038, in flight 2026-09-23)
-- The voice can mute, approve, repeat and slow down but cannot start, stop or kill the worker, or switch project. Those effects died with the July phrase grammar and never returned as verbs. Adding `start_worker`, `stop_worker`, `panic_worker`, `switch_project` to the closed effect set, AI-interpreted like every other control; the existing routes do the work.
-- Why: the operator's goal is one voice that controls the entire system with no screen. Worker control is the missing half.
 
 ### Curator canary and the injection delivery gap (BACKLOG P1)
 - `CuratorHealthCard` still renders "No canary probe is wired up on the daemon yet" and `canary_status` is hardcoded `unknown`; separately, an injection can be announced without the chunk landing in context (`lex_retrieval_log` shows zero rows for an announced chunk). Source: `<DATA_ROOT>/brainstorm/BACKLOG.md` P1.

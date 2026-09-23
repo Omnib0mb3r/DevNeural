@@ -112,6 +112,24 @@ describe('parseTopLayerReply', () => {
   });
 });
 
+describe('worker and project effects (BUG-038)', () => {
+  const VERBS = ['start_worker', 'stop_worker', 'panic_worker', 'switch_project'] as const;
+
+  it('the four worker effects are verbs the parser accepts, with the project name as the argument', () => {
+    for (const v of VERBS) expect(CONTROLS.has(v as never)).toBe(true);
+    const r = parseTopLayerReply('Switching us over.\nCONTROL: switch_project drop ship');
+    expect(r.speech).toBe('Switching us over.');
+    expect(r.control).toBe('switch_project');
+    expect(r.controlArg).toBe('drop ship');
+    expect(parseTopLayerReply('On it.\nCONTROL: panic_worker').control).toBe('panic_worker');
+  });
+
+  it('the contract names them so the voice can map any wording onto them', () => {
+    const p = buildTopLayerSystemPrompt();
+    for (const v of VERBS) expect(p).toContain(v);
+  });
+});
+
 describe('buildTopLayerSystemPrompt', () => {
   it('carries the shared persona, the spoken rules and the contract', () => {
     const p = buildTopLayerSystemPrompt();

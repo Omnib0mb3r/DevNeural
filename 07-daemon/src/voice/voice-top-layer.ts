@@ -62,7 +62,15 @@ export type TopLayerControl =
   | 'louder'
   | 'softer'
   | 'approve_handover'
-  | 'reject_handover';
+  | 'reject_handover'
+  /* BUG-038 (2026-09-23): the voice reaches the worker and the other
+   * projects. Same closed-set principle: the model reads the intent in
+   * whatever words were used and maps it onto one of these; the daemon
+   * does the effect and hands back a factual status to phrase. */
+  | 'start_worker'
+  | 'stop_worker'
+  | 'panic_worker'
+  | 'switch_project';
 
 export const CONTROLS: ReadonlySet<TopLayerControl> = new Set<TopLayerControl>([
   'mute',
@@ -90,6 +98,10 @@ export const CONTROLS: ReadonlySet<TopLayerControl> = new Set<TopLayerControl>([
   'softer',
   'approve_handover',
   'reject_handover',
+  'start_worker',
+  'stop_worker',
+  'panic_worker',
+  'switch_project',
 ]);
 
 /** What the daemon knows about the brain (L2) right now. */
@@ -154,7 +166,9 @@ export type TopLayerEventKind =
   | 'handover-ready'
   | 'handover-result'
   /* T4: the brain is clearing its own context (handover approved). */
-  | 'brain-clear';
+  | 'brain-clear'
+  /* BUG-038: what happened after a worker or project effect. */
+  | 'worker-result';
 
 export interface TopLayerEvent {
   kind: TopLayerEventKind;
@@ -264,7 +278,12 @@ or is still working). Decide, every time:
    this first, then pick the cut sentence back up), combine (fold this
    into the ask still waiting to go down), approve_plan, reject_plan
    <reason>, confirm_dispatch, reject_dispatch <reason>,
-   approve_handover, reject_handover <reason>. Unsure is not a control.
+   approve_handover, reject_handover <reason>, start_worker (start the
+   worker on the project this call supervises), stop_worker (release
+   him), panic_worker (interrupt him right now, whatever he is doing),
+   switch_project <name> (move this call to another project's
+   brainstorm; pass the project name as Michael said it, the daemon
+   resolves it). Unsure is not a control.
 4. Ignore background: the TV, other people, a fragment with no address
    to you, your own words echoing back. Trailing line IGNORE: <two-word
    reason>, and say nothing. When unsure whether it was meant for you,
@@ -305,6 +324,9 @@ the words themselves are always yours, never a script):
   used -> the matching CONTROL line, always, as the last line
 - a plan or a handover pending and his yes or no -> CONTROL: approve_plan |
   reject_plan <why> | approve_handover | reject_handover <why>
+- start, stop or interrupt the worker, or move to another project, in
+  whatever words he used -> CONTROL: start_worker | stop_worker |
+  panic_worker | switch_project <name>
 - the TV, another person, your own echo -> IGNORE: <two words>, nothing spoken
 
 If Michael speaks while you are being heard (during_tts: yes), the
@@ -330,7 +352,12 @@ then ask; yes is CONTROL: confirm_dispatch, no is
 CONTROL: reject_dispatch <why>. When a handover is pending (the worker
 wrote where it is, the brain reviewed it and added the next steps), read
 the gist in two or three sentences and ask; yes is
-CONTROL: approve_handover, no is CONTROL: reject_handover <why>.`;
+CONTROL: approve_handover, no is CONTROL: reject_handover <why>.
+
+After a worker or project control, an [event] worker-result line tells
+you what happened (started, already running, released, interrupted, not
+reachable, no such project and which ones exist, switched). Say it in
+your own words, then carry on.`;
 
 /** The Layer 1 spawn prompt: shared identity + persona + spoken rules
  * + the job contract. Injected once via --append-system-prompt. */

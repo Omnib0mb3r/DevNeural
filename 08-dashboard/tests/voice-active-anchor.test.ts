@@ -5,6 +5,7 @@ import {
   writePersistedActiveBrainstorm,
   writePersistedVoiceEnabled,
   clearPersistedVoiceState,
+  hrefWithBrainstorm,
 } from "../lib/voice-active-anchor";
 
 /**
@@ -112,5 +113,18 @@ describe("voice-active-anchor persistence (defect 2 restore-on-remount)", () => 
     const state = readPersistedVoiceState(throwing);
     expect(state.activeBrainstorm).toBeNull();
     expect(state.enabled).toBe(false);
+  });
+});
+
+describe("hrefWithBrainstorm (BUG-038: a spoken switch moves the page selection)", () => {
+  it("sets or replaces ?brainstorm= and keeps the rest of the URL", () => {
+    expect(hrefWithBrainstorm("http://x/lex", "b2")).toBe("http://x/lex?brainstorm=b2");
+    expect(hrefWithBrainstorm("http://x/lex?brainstorm=b1&tab=t", "b2")).toBe(
+      "http://x/lex?brainstorm=b2&tab=t",
+    );
+  });
+
+  it("hands back an unparseable href untouched", () => {
+    expect(hrefWithBrainstorm("not a url", "b2")).toBe("not a url");
   });
 });

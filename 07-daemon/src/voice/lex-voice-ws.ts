@@ -104,7 +104,6 @@ import { detectDeferral } from '../lex/deferral-detector.js';
 import { randomUUID } from 'node:crypto';
 import {
   matchPanicCommand,
-  ALL_VOICE_COMMAND_KINDS,
   type VoiceCommandKind,
 } from './lex-voice-commands.js';
 import {
@@ -2053,6 +2052,19 @@ export interface TopLayerControlHandlers {
   approveHandover?: (anchorId: string, arg: string | null) => Promise<string | null>;
   rejectHandover?: (anchorId: string, arg: string | null) => Promise<string | null>;
   pendingHandover?: (anchorId: string) => string | null;
+  /* BUG-038: the voice reaches the worker and the other projects. Each
+   * returns a factual status; switchProject also names the brainstorm
+   * this connection should move to (null = stay). */
+  startWorker?: (anchorId: string, arg: string | null) => Promise<string | null>;
+  stopWorker?: (anchorId: string, arg: string | null) => Promise<string | null>;
+  panicWorker?: (anchorId: string, arg: string | null) => Promise<string | null>;
+  switchProject?: (anchorId: string | null, arg: string | null) => Promise<SwitchProjectResult>;
+}
+
+export interface SwitchProjectResult {
+  status: string;
+  brainstormId: string | null;
+  label: string | null;
 }
 
 let topLayerControlHandlers: TopLayerControlHandlers = {};
@@ -3709,7 +3721,90 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         }
         return;
       }
+      case 'start_worker':
+      case 'stop_worker':
+      case 'panic_worker': {
+        /* BUG-038: the voice reaches the worker of the project this
+         * brainstorm supervises. The handler does the effect through the
+         * same functions the dashboard buttons use and returns a factual
+         * status; the voice phrases it (worker-result). */
+        const anchorId = currentAnchorId();
+        const h = topLayerControlHandlers;
+        const fn =
+          control === 'start_worker'
+            ? h.startWorker
+            : control === 'stop_worker'
+              ? h.stopWorker
+              : h.panicWorker;
+        if (!anchorId || !fn) {
+          logFn(`[voice-ws] L1 control ${control} not wired (anchor=${anchorId ?? 'none'})`);
+          return;
+        }
+        try {
+          const status = await fn(anchorId, arg);
+          logFn(`[voice-ws] L1 ${control}: ${status ?? '(no status)'}`);
+          if (status) await runTopLayerEventTurn({ kind: 'worker-result', text: status });
+        } catch (err) {
+          logFn(`[voice-ws] L1 control ${control} failed: ${(err as Error).message}`);
+        }
+        return;
+      }
+      case 'switch_project': {
+        /* BUG-038: move this call to another project's brainstorm, what
+         * the dashboard's ?brainstorm= selection does. The status is
+         * spoken by the voice we are leaving; then the connection rebinds
+         * and the client is told so its selection follows. */
+        const anchorId = currentAnchorId();
+        const h = topLayerControlHandlers;
+        if (!h.switchProject) {
+          logFn('[voice-ws] L1 control switch_project not wired');
+          return;
+        }
+        try {
+          const r = await h.switchProject(anchorId, arg);
+          logFn(
+            `[voice-ws] L1 switch_project ${JSON.stringify(arg ?? '')}: ${r.status}${
+              r.brainstormId ? ` -> ${r.brainstormId.slice(0, 8)}` : ''
+            }`,
+          );
+          await runTopLayerEventTurn({ kind: 'worker-result', text: r.status });
+          if (r.brainstormId && r.brainstormId !== anchorId) {
+            switchToBrainstorm(r.brainstormId, r.label);
+          }
+        } catch (err) {
+          logFn(`[voice-ws] L1 control switch_project failed: ${(err as Error).message}`);
+        }
+        return;
+      }
     }
+  }
+
+  /* BUG-038: rebind this connection to another brainstorm by voice. The
+   * per-brain state is dropped first so the new brain's warm state is
+   * recomputed and nothing queued for the old one leaks across; then
+   * the same bind the hello frame uses runs, and the client is told so
+   * its pinned selection and URL follow. */
+  function switchToBrainstorm(brainstormId: string, label: string | null): void {
+    const dropped = state.pendingForwardsUntilWarm.length + state.pendingTopUtterances.length;
+    if (dropped > 0) {
+      logFn(`[voice-ws] switch: dropped ${dropped} queued item(s) meant for the previous brain`);
+    }
+    state.pendingForwardsUntilWarm = [];
+    state.pendingTopUtterances = [];
+    if (state.warmQueueTimer) {
+      clearInterval(state.warmQueueTimer);
+      state.warmQueueTimer = null;
+    }
+    state.pendingUserUtterances = [];
+    state.awaitingResponseSince = 0;
+    state.midSeenAssistant = false;
+    state.midComposerSeen = false;
+    state.midLastToolName = null;
+    spokenSegmentHashes.clear();
+    dropBargeStash('switch-project');
+    bindByBrainstorm(brainstormId);
+    send({ t: 'brainstorm-switched', brainstorm_id: brainstormId, label });
+    logFn(`[voice-ws] switched to brainstorm ${brainstormId.slice(0, 8)} (${label ?? 'no label'})`);
   }
 
   /* A daemon-originated event handed to L1 (plan ready, dispatch pending,
@@ -4485,7 +4580,6 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   function dispatchVoiceCommand(
     kind: VoiceCommandKind,
     source: 'transcript' | 'wake',
-    payload?: { project_name?: string },
   ): boolean {
     const now = Date.now();
     const prev = state.lastVoiceCmdMs[kind] ?? 0;
@@ -4653,118 +4747,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         spokenSegmentHashes.clear();
         return true;
       }
-      case 'start_project': {
-        /* LEX-AUTONOMY codex 10c (Fix 47 step 3): "lex start project
-         * <name>" routes through the same dashboard endpoint that
-         * the Start Claude button hits, so the loose-ends gate +
-         * VS Code spawn behave identically across surfaces. The
-         * voice surface reads the result back to the operator: on
-         * 409 it enumerates the first three blocking loose-end
-         * classes; on success it confirms the project name. */
-        const projectName = (payload?.project_name ?? '').trim();
-        if (!projectName) return false;
-        void runStartProjectVoice(projectName);
-        return true;
-      }
     }
-  }
-
-  async function runStartProjectVoice(projectName: string): Promise<void> {
-    /* Resolve project registry by case-insensitive fuzzy match:
-     * exact id, then exact name, then prefix-of-name, then
-     * substring. First match wins. Bail with a spoken response
-     * when nothing matches so the operator hears the failure. */
-    let projectId: string | null = null;
-    let projectLabel = projectName;
-    try {
-      const { listProjects } = await import('../identity/registry.js');
-      const projects = listProjects();
-      const target = projectName.toLowerCase();
-      const exactId = projects.find((p) => p.id.toLowerCase() === target);
-      const exactName = projects.find(
-        (p) => (p.name ?? '').toLowerCase() === target,
-      );
-      const prefix = projects.find((p) =>
-        (p.name ?? '').toLowerCase().startsWith(target),
-      );
-      const substr = projects.find((p) =>
-        (p.name ?? '').toLowerCase().includes(target),
-      );
-      const hit = exactId ?? exactName ?? prefix ?? substr ?? null;
-      if (hit) {
-        projectId = hit.id;
-        projectLabel = hit.name ?? hit.id;
-      }
-    } catch {
-      /* registry read failed; fall through to "not found" path */
-    }
-    if (!projectId) {
-      void speak(`Could not find a project matching ${projectName}.`);
-      return;
-    }
-    const port = Number(process.env.DEVNEURAL_PORT ?? 3747);
-    const url = `http://127.0.0.1:${port}/projects/${encodeURIComponent(projectId)}/start-claude`;
-    const anchorId = state.brainstormId ?? null;
-    try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          dangerous: false,
-          ...(anchorId ? { anchor_id: anchorId } : {}),
-        }),
-      });
-      if (res.status === 409) {
-        const body = (await res.json()) as {
-          loose_ends?: {
-            ends?: Array<{ class: string; detail?: string }>;
-          };
-        };
-        const ends = body.loose_ends?.ends ?? [];
-        const top = ends.slice(0, 3).map((e) => e.class.replace(/_/g, ' '));
-        const list =
-          top.length > 0 ? top.join(', ') : 'an unspecified loose end';
-        void speak(
-          `Cannot start ${projectLabel} yet. Loose ends blocking: ${list}.`,
-        );
-        return;
-      }
-      if (!res.ok) {
-        void speak(
-          `Failed to start ${projectLabel}; daemon returned status ${res.status}.`,
-        );
-        return;
-      }
-      void speak(`Starting ${projectLabel}.`);
-      /* DRIVE-QUEUE 1b: state change. Push a fresh digest so the fast
-       * lane knows the moment (which project just started) instead of
-       * speaking from a prior turn's stale context. */
-      if (useVoiceHaiku()) {
-        const nowMs = Date.now();
-        lastLexTurnMs = nowMs;
-        pushDigest(
-          {
-            currentTask: `starting ${projectLabel}`,
-            lastDecision: `starting ${projectLabel}`,
-            openQuestion: '',
-            workerStatus: '',
-            nextSteps: '',
-          },
-          nowMs,
-        );
-      }
-    } catch (err) {
-      void speak(
-        `Could not reach the daemon to start ${projectLabel}: ${(err as Error).message}.`,
-      );
-    }
-  }
-
-  function isVoiceCommandKind(v: unknown): v is VoiceCommandKind {
-    return (
-      typeof v === 'string' &&
-      (ALL_VOICE_COMMAND_KINDS as ReadonlyArray<string>).includes(v)
-    );
   }
 
   /* N-deep barge integration (2026-05-22): render the unresolved

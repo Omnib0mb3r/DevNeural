@@ -279,7 +279,9 @@ IGNORE: <reason>
   sentence back up), `combine` (fold this utterance into the one still
   waiting to go down, one turn), `approve_plan`, `reject_plan`,
   `confirm_dispatch`, `reject_dispatch` (Phase B), `approve_handover`,
-  `reject_handover <reason>` (Phase C).
+  `reject_handover <reason>` (Phase C), `start_worker`, `stop_worker`,
+  `panic_worker`, `switch_project <name>` (BUG-038, 2026-09-23: the
+  worker and project effects; see "The voice reaches the worker").
 - Interrupt policy (v3, the approved barge design). Audio has already
   stopped, deterministically, the instant sound arrived. L1 then sees
   `during_tts: yes`, the reply text so far and the cut point in the live
@@ -590,6 +592,41 @@ the gate makes it mechanical.
 
 ---
 
+## The voice reaches the worker (BUG-038, 2026-09-23)
+
+The July grammar teardown removed "lex start project" and the v3 verb set
+covered speech, delivery and approvals only, so the voice could steer
+the brain but never the worker. Four effects close that gap on the same
+principle as every other control: AI-interpreted, closed set, unsure is
+not a control.
+
+| Verb | Effect | Same path as |
+|---|---|---|
+| `start_worker` | spawn-or-bind the worker on the project this brainstorm supervises | the Start button (`openProjectAnchor`, `POST /projects/:id/open`) |
+| `stop_worker` | release the worker (anchor dormant; the editor window stays open) | the End action (`endProjectAnchor`) |
+| `panic_worker` | double-ESC the worker, not the brain | the panic button on that anchor (`fireProjectInterrupt`) |
+| `switch_project <name>` | open the brainstorm supervising the named project and move this call to it | selecting a brainstorm on the dashboard (`POST /lex/anchors/:id/open`, then the bind the hello frame runs) |
+
+The daemon resolves the spoken name loosely (case, spaces and punctuation
+stripped; slug and title; a live brainstorm preferred), so "drop ship"
+finds `dropship-01`. Every handler returns a factual status (started,
+already running, released, interrupted, not reachable, no such project
+and which ones exist, switched) as a `worker-result` event that Layer 1
+says in her own words; nothing is spoken from a script. A switch drops
+what was queued for the old brain, rebinds the socket, and sends
+`brainstorm-switched` so the page's selection and URL follow. The scope
+rule holds: `start_worker`, `stop_worker` and `panic_worker` only ever
+reach the one project this brainstorm supervises; `switch_project` is
+how the operator changes which one that is.
+
+Handlers: `07-daemon/src/dashboard/voice-layers-wire.ts` (`startWorker`,
+`stopWorker`, `panicWorker`, `switchProject`, `resolveProjectByName`),
+deps wired in `routes.ts` next to the Phase B wire. Wire:
+`applyTopLayerControl` and `switchToBrainstorm` in `lex-voice-ws.ts`.
+Client: the `brainstorm-switched` frame in `VoiceClient.tsx`.
+
+---
+
 ## Transcript and client
 
 - One Lex in the transcript (2026-09-22): every assistant line, whether it
@@ -652,6 +689,12 @@ Live (after daemon restart + dashboard build):
 10. Handover by voice: at the trip point the worker writes its handover,
     L1 reads the brain's review, "go" clears and reseeds, the file under
     `brainstorms/<anchor>/HANDOVER-<iso>.md` shows both halves.
+11. The worker by voice (BUG-038): "start the worker", "stop the worker",
+    "kill the worker", "switch to <project>", each in your own words.
+    `daemon.log`: `L1 turn: ... control=start_worker` (and the rest),
+    `[voice-worker] start <slug>: ok=true`; the worker appears, is
+    released, or gets the double-ESC; the switch logs `switched to
+    brainstorm` and the page URL flips to the new `?brainstorm=`.
 
 ---
 

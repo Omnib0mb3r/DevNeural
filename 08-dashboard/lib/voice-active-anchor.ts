@@ -38,6 +38,20 @@ export function resolveActiveBrainstormId(
   return urlBrainstormId ?? persisted ?? null;
 }
 
+/** The page URL with `?brainstorm=` set to `id` (BUG-038: a spoken
+ * switch_project moves the page selection the same way clicking a
+ * brainstorm does). Every other query parameter survives; an href that
+ * does not parse comes back untouched. */
+export function hrefWithBrainstorm(href: string, id: string): string {
+  try {
+    const u = new URL(href);
+    u.searchParams.set("brainstorm", id);
+    return u.toString();
+  } catch {
+    return href;
+  }
+}
+
 function defaultStorage(): Storage | undefined {
   return typeof window !== "undefined" ? window.sessionStorage : undefined;
 }

@@ -1,20 +1,23 @@
 /**
  * Lex voice keyword matcher: panic only.
  *
- * 2026-07-15 voice-top-layer teardown (docs/superpowers/specs/
+ * 2026-07-15 voice-top-layer teardown (docs/archive/spec/
  * 2026-07-15-voice-top-layer-design.md). The old multi-command
  * keyword grammar (mute, unmute, standby, listen, disable,
  * end_session, hold_up, start_project) is gone. Those controls are
- * now interpreted by the voice top layer, which emits CONTROL lines
- * that fire the dispatch effects hub in lex-voice-ws.ts; the client
- * wake path is the other dispatch entry point. "lex emergency stop"
- * stays as the ONE mechanical keyword, checked before anything else,
- * so the operator can always halt the system even when the top layer
- * is down.
+ * interpreted by Layer 1 (docs/spec/LAYER-1-CONTROL.md v3), which
+ * emits CONTROL lines that fire the dispatch effects hub in
+ * lex-voice-ws.ts; the client wake path is the other dispatch entry
+ * point and accepts panic only. "lex emergency stop" stays as the ONE
+ * mechanical keyword, checked before anything else, so the operator
+ * can always halt the system even when the top layer is down. The
+ * engine's stop class (stop, quiet, hold on) is the other deterministic
+ * tier and lives in engine/interrupt-arbiter.ts.
  *
- * VoiceCommandKind and ALL_VOICE_COMMAND_KINDS keep the full kind
- * set: the effects hub keys its effects (and the wake-frame kind
- * guard) on every kind, even though only panic is matched here.
+ * VoiceCommandKind is the effects hub's key set. The worker and
+ * project effects (start, stop, interrupt the worker, switch project)
+ * are Layer 1 verbs handled in applyTopLayerControl, not kinds here
+ * (BUG-038; the old start_project kind was dead since the teardown).
  *
  * The lex-voice WS normalises whisper output to lower-cased,
  * punctuation-stripped, whitespace-collapsed text before reaching
@@ -30,20 +33,7 @@ export type VoiceCommandKind =
   | 'end_session'
   | 'standby'
   | 'listen'
-  | 'hold_up'
-  | 'start_project';
-
-export const ALL_VOICE_COMMAND_KINDS: ReadonlyArray<VoiceCommandKind> = [
-  'disable',
-  'mute',
-  'unmute',
-  'panic',
-  'end_session',
-  'standby',
-  'listen',
-  'hold_up',
-  'start_project',
-];
+  | 'hold_up';
 
 const LEX_PREFIX = String.raw`\blex\s+`;
 

@@ -42,7 +42,15 @@ import {
 import { dispatchConfirmGateOn, type RuntimeConfigReader } from '../lex/layer-model.js';
 import { HandoverApprovalRegistry, type PendingHandover } from '../lex/handover-approval.js';
 import type { TopLayerEvent } from '../voice/voice-top-layer.js';
-import type { TopLayerControlHandlers } from '../voice/lex-voice-ws.js';
+import type { SwitchProjectResult, TopLayerControlHandlers } from '../voice/lex-voice-ws.js';
+
+/** A brainstorm that supervises a project, as switch_project sees it. */
+export interface ProjectBrainstorm {
+  brainstormId: string;
+  slug: string;
+  title: string | null;
+  live: boolean;
+}
 
 export interface VoiceLayersWireDeps {
   cfg: RuntimeConfigReader;
@@ -85,6 +93,23 @@ export interface VoiceLayersWireDeps {
     projectAnchorId: string;
     handoverId: string;
   }) => Promise<{ ok: boolean; error?: string }>;
+  /* BUG-038 (2026-09-23): worker and project effects by voice. Every one
+   * of these is what the matching dashboard control calls. */
+  /** The project anchor a brainstorm supervises (scope rule: one). */
+  supervisedProjectFor?: (brainstormId: string) => { id: string; slug: string; live: boolean } | null;
+  /** Spawn-or-bind the worker on a project anchor (POST /projects/:id/open). */
+  openWorker?: (
+    projectAnchorId: string,
+  ) => Promise<{ ok: boolean; mode?: string; error?: string; warnings?: string[] }>;
+  /** Flip a project anchor dormant (POST /projects/:id/end). */
+  endWorker?: (projectAnchorId: string) => boolean;
+  /** Double-ESC the worker (POST /projects/:id/interrupt). */
+  interruptWorker?: (projectAnchorId: string) => { ok: boolean; result: string };
+  /** Every brainstorm that supervises a project, live ones first. */
+  listProjectBrainstorms?: () => ProjectBrainstorm[];
+  /** Open a brainstorm anchor (POST /lex/anchors/:id/open): spawns its
+   * Layer 1 and Layer 2, or binds when already live. */
+  openBrainstorm?: (brainstormId: string) => Promise<{ ok: boolean; error?: string }>;
 }
 
 export interface VoiceLayersWire {
@@ -109,6 +134,43 @@ export const DISPATCH_TTL_MS = 10 * 60_000;
 const EXPIRY_SWEEP_MS = 60_000;
 const PLAN_TAIL_BYTES = 256 * 1024;
 const PLAN_TEXT_CAP = 1_500;
+
+function normalizeProjectName(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+/** Resolve a spoken project name onto a brainstorm. Names are compared
+ * with case, spaces and punctuation stripped ("drop ship" finds
+ * dropship-01), on the project slug and the brainstorm title. Tiers:
+ * exact, then prefix, then the name inside the slug, then the slug
+ * inside the name ("the newsletter project"). Within a tier a live
+ * brainstorm beats a dormant one; otherwise list order wins. */
+export function resolveProjectByName(
+  candidates: ReadonlyArray<ProjectBrainstorm>,
+  query: string,
+): ProjectBrainstorm | null {
+  const q = normalizeProjectName(query);
+  if (!q) return null;
+  const tierOf = (c: ProjectBrainstorm): number => {
+    const names = [c.slug, c.title ?? ''].map(normalizeProjectName).filter(Boolean);
+    if (names.some((n) => n === q)) return 0;
+    if (names.some((n) => n.startsWith(q))) return 1;
+    if (names.some((n) => n.includes(q))) return 2;
+    if (names.some((n) => n.length >= 4 && q.includes(n))) return 3;
+    return -1;
+  };
+  let best: ProjectBrainstorm | null = null;
+  let bestTier = Number.POSITIVE_INFINITY;
+  for (const c of candidates) {
+    const t = tierOf(c);
+    if (t < 0) continue;
+    if (t < bestTier || (t === bestTier && best !== null && c.live && !best.live)) {
+      best = c;
+      bestTier = t;
+    }
+  }
+  return best;
+}
 
 /** Last `bytes` of a file as utf-8 ('' when unreadable). */
 export function readFileTail(path: string, bytes: number): string {
@@ -360,6 +422,87 @@ export function createVoiceLayersWire(deps: VoiceLayersWireDeps): VoiceLayersWir
     return 'Sent it back for another pass.';
   }
 
+  /* BUG-038: worker and project effects. Each returns a factual status
+   * for the voice to phrase; none speaks. */
+  const NO_PROJECT = 'This call supervises no project, so there is no worker to reach.';
+
+  async function startWorker(anchorId: string): Promise<string | null> {
+    const proj = deps.supervisedProjectFor?.(anchorId) ?? null;
+    if (!proj) return NO_PROJECT;
+    if (proj.live) return `The worker on ${proj.slug} is already running.`;
+    if (!deps.openWorker) return 'Starting a worker is not wired on this daemon.';
+    const r = await deps.openWorker(proj.id);
+    deps.log(
+      `[voice-worker] start ${proj.slug}: ok=${r.ok} mode=${r.mode ?? '-'}${
+        r.error ? ` error=${r.error}` : ''
+      }${r.warnings?.length ? ` warnings=${r.warnings.join(',')}` : ''}`,
+    );
+    if (!r.ok) return `Could not start the worker on ${proj.slug}: ${r.error ?? 'unknown error'}.`;
+    const offline = r.warnings?.includes('bridge_offline') ?? false;
+    return `Starting the worker on ${proj.slug}.${
+      offline ? ' No editor window has answered yet; it may take a moment.' : ''
+    }`;
+  }
+
+  async function stopWorker(anchorId: string): Promise<string | null> {
+    const proj = deps.supervisedProjectFor?.(anchorId) ?? null;
+    if (!proj) return NO_PROJECT;
+    if (!proj.live) return `The worker on ${proj.slug} is not running.`;
+    if (!deps.endWorker) return 'Stopping a worker is not wired on this daemon.';
+    const ok = deps.endWorker(proj.id);
+    deps.log(`[voice-worker] stop ${proj.slug}: ok=${ok}`);
+    return ok
+      ? `Released the worker on ${proj.slug}. Its editor window stays open.`
+      : `Could not release the worker on ${proj.slug}.`;
+  }
+
+  async function panicWorker(anchorId: string): Promise<string | null> {
+    const proj = deps.supervisedProjectFor?.(anchorId) ?? null;
+    if (!proj) return NO_PROJECT;
+    if (!deps.interruptWorker) return 'Interrupting a worker is not wired on this daemon.';
+    const r = deps.interruptWorker(proj.id);
+    deps.log(`[voice-worker] interrupt ${proj.slug}: result=${r.result}`);
+    switch (r.result) {
+      case 'accepted':
+      case 'bridge_esc':
+        return `Interrupted the worker on ${proj.slug}.`;
+      case 'pty_not_found':
+        return `The worker on ${proj.slug} is not reachable to interrupt.`;
+      case 'no_target':
+        return `Nothing is running on ${proj.slug} to interrupt.`;
+      default:
+        return `The interrupt on ${proj.slug} came back ${r.result}.`;
+    }
+  }
+
+  async function switchProject(
+    anchorId: string | null,
+    name: string | null,
+  ): Promise<SwitchProjectResult> {
+    const list = deps.listProjectBrainstorms?.() ?? [];
+    const known = (): string => {
+      const slugs = [...new Set(list.map((b) => b.slug))];
+      return slugs.length > 0
+        ? ` The projects with a brainstorm are ${slugs.join(', ')}.`
+        : ' No project has a brainstorm yet.';
+    };
+    const stay = (status: string): SwitchProjectResult => ({ status, brainstormId: null, label: null });
+    const q = (name ?? '').trim();
+    if (!q) return stay(`Which project?${known()}`);
+    const hit = resolveProjectByName(list, q);
+    if (!hit) return stay(`No project called ${q}.${known()}`);
+    if (hit.brainstormId === anchorId) return stay(`We are already on ${hit.slug}.`);
+    if (!deps.openBrainstorm) return stay('Switching projects is not wired on this daemon.');
+    const r = await deps.openBrainstorm(hit.brainstormId);
+    deps.log(
+      `[voice-worker] switch to ${hit.slug} (${hit.brainstormId.slice(0, 8)}): ok=${r.ok}${
+        r.error ? ` error=${r.error}` : ''
+      }`,
+    );
+    if (!r.ok) return stay(`Could not open ${hit.slug}: ${r.error ?? 'unknown error'}.`);
+    return { status: `Switched to ${hit.slug}.`, brainstormId: hit.brainstormId, label: hit.slug };
+  }
+
   const handlers: TopLayerControlHandlers = {
     pendingDispatch: (anchorId) => {
       const p = gate.pendingFor(anchorId);
@@ -373,6 +516,10 @@ export function createVoiceLayersWire(deps: VoiceLayersWireDeps): VoiceLayersWir
     pendingHandover: (anchorId) => handovers.pendingForBrainstorm(anchorId)?.gist ?? null,
     approveHandover,
     rejectHandover,
+    startWorker,
+    stopWorker,
+    panicWorker,
+    switchProject,
   };
 
   let sweep: unknown = null;

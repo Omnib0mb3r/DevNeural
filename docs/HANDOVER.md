@@ -43,6 +43,18 @@ Decisions and where they landed:
   pointers), PHASE-8 and STREAMDECK status blocks, both README files,
   INDEX.
 
+### 2026-09-23 daytime: the voice reaches the worker (BUG-038, VL-28)
+
+Built right after the reconcile, TDD, tsc clean, daemon suite 2264/2266
+(the known pair red), dashboard suite 334/338 (the known four). Four
+verbs in the closed set: `start_worker`, `stop_worker`, `panic_worker`,
+`switch_project <name>`; handlers in `voice-layers-wire.ts` on the
+dashboard's own functions; `worker-result` event phrased by the voice;
+`switch_project` rebinds the socket and sends `brainstorm-switched`.
+Spec: `docs/spec/LAYER-1-CONTROL.md` "The voice reaches the worker";
+user doc: `docs/voice-commands.md`. Both packages rebuilt; the restart
+and its verify are recorded at the end of this cursor.
+
 Overnight 2026-09-23 (operator asleep, "full authority, no gates"):
 BUG-034 and BUG-035 fixed (`6e06fd0`: the supervisor detectors read Bash
 tool_results only, latched per record, a later green run clears a red

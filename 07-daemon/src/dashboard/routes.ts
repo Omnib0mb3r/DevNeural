@@ -439,7 +439,8 @@ export async function registerDashboardRoutes(
   /* Project anchor REST surface (PROJECT-ANCHORS.md step 3 of 6).
    * Registered up front so route ordering is independent of the rest
    * of this file. */
-  const { registerProjectAnchorRoutes } = await import('./projects-routes.js');
+  const { registerProjectAnchorRoutes, openProjectAnchor, endProjectAnchor, projectOpenInFlight } =
+    await import('./projects-routes.js');
   registerProjectAnchorRoutes(app, store.db, log);
   const {
     decodeBridgeMarker,
@@ -455,7 +456,7 @@ export async function registerDashboardRoutes(
    * with a bridge fallback (control-transport fix, 2026-07-14) so
    * bridge-attached workers (no daemon-owned PTY) still receive the
    * interrupt via the suggestion queue when the PTY attempt misses. */
-  const { registerPanicRoutes } = await import('./panic-routes.js');
+  const { registerPanicRoutes, fireProjectInterrupt } = await import('./panic-routes.js');
   registerPanicRoutes(
     app,
     store.db,
@@ -626,6 +627,76 @@ export async function registerDashboardRoutes(
     resolveSupervisedTarget: (brainstormId) => {
       const r = resolveSupervisedTargetSession(store.db, brainstormId);
       return r.reason === 'bound-live' && r.target_session ? r.target_session : null;
+    },
+    /* BUG-038: worker and project effects by voice. Every dep here is the
+     * function the matching dashboard control already calls, so a spoken
+     * "start the worker" and the Start button take one path. */
+    supervisedProjectFor: (brainstormId) => {
+      const lex = store.db.getLexSession(brainstormId);
+      let pid: string | null = lex?.supervises_project_anchor_id ?? null;
+      if (!pid) {
+        /* Legacy mirror, same fallback supervisedAnchorIdFor uses. */
+        try {
+          const bs = store.db.getBrainstorm(brainstormId) as
+            | ({ project_scope_id?: string | null } & Record<string, unknown>)
+            | null;
+          pid = bs?.project_scope_id ?? null;
+        } catch {
+          pid = null;
+        }
+      }
+      const proj = pid ? store.db.getProjectSession(pid) : null;
+      return proj
+        ? { id: proj.id, slug: proj.project_slug, live: proj.status === 'live' }
+        : null;
+    },
+    openWorker: async (projectAnchorId) => {
+      const r = await openProjectAnchor(store.db, projectAnchorId, {}, projectOpenInFlight);
+      return r.ok
+        ? { ok: true, mode: r.mode, ...(r.warnings ? { warnings: r.warnings } : {}) }
+        : { ok: false, error: r.error };
+    },
+    endWorker: (projectAnchorId) => endProjectAnchor(store.db, projectAnchorId) !== null,
+    interruptWorker: (projectAnchorId) => {
+      const r = fireProjectInterrupt(store.db, projectAnchorId, {
+        caller: 'lex-voice',
+        clickedMs: Date.now(),
+        injector: ptyInject,
+        bridgeSuggest: queueSessionSuggestion,
+        resolveDeliverableBridge: resolveDeliverableBridgeForSession,
+      });
+      return { ok: r.ok, result: r.result };
+    },
+    listProjectBrainstorms: () => {
+      const out: Array<{ brainstormId: string; slug: string; title: string | null; live: boolean }> =
+        [];
+      for (const lex of listLexSessions({ limit: 200 })) {
+        if ((lex as { archived?: number | null }).archived) continue;
+        const pid = lex.supervises_project_anchor_id ?? null;
+        if (!pid) continue;
+        const proj = store.db.getProjectSession(pid);
+        if (!proj) continue;
+        out.push({
+          brainstormId: lex.id,
+          slug: proj.project_slug,
+          title: lex.title ?? lex.derived_title ?? null,
+          live: lex.status === 'live',
+        });
+      }
+      /* Live first; the store already lists newest first within a tier. */
+      return out.sort((a, b) => Number(b.live) - Number(a.live));
+    },
+    openBrainstorm: async (brainstormId) => {
+      const r = await app.inject({
+        method: 'POST',
+        url: `/lex/anchors/${encodeURIComponent(brainstormId)}/open`,
+      });
+      try {
+        const j = r.json() as { ok?: boolean; error?: string };
+        return { ok: Boolean(j.ok), ...(j.error ? { error: j.error } : {}) };
+      } catch {
+        return { ok: false, error: `status ${r.statusCode}` };
+      }
     },
     lexPtyFor: (anchorId) => getLexSession(anchorId)?.current_pty_id ?? null,
     ptyInject: (ptyId, text, commit) => ptyInject(ptyId, text, commit),
