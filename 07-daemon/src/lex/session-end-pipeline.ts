@@ -63,6 +63,7 @@ import {
 import { runMeetingDiarization, hasHfToken } from './meeting-diarize.js';
 import { writeThreadDoc } from './thread-doc.js';
 import { publishDashboardEvent } from '../dashboard/event-bus.js';
+import { writeTrailHandover } from './handover-from-trail.js';
 
 export interface SessionEndInput {
   /** Brainstorm row id, used only for logging; the pipeline does not
@@ -87,6 +88,9 @@ export interface SessionEndInput {
  * generator defaults to spawnHeadlessOpus. */
 export interface SessionEndDeps {
   spawnHeadless?: SpawnHeadlessOpus;
+  /** Phase C (2026-09-22): the session-end handover writer. Tests inject
+   * a recorder; production writes HANDOVER-<iso>.md from the trail. */
+  writeSessionEndHandover?: (brainstormId: string) => string | null;
 }
 
 export interface SessionEndResult {
@@ -185,6 +189,18 @@ export async function runSessionEndPipeline(
    * conversation skip in maybePushNotification, so bell + phone
    * push both surface the wrap regardless of severity. */
   if (primaryRan) {
+    /* Phase C (AUTO-CLEAR T6, operator 2026-09-22): a handover at every
+     * terminal end, next to distillation. Distillation stays the
+     * knowledge layer (T10.1); the handover is the resume seed. Best
+     * effort, never blocks the end. */
+    try {
+      const write =
+        deps.writeSessionEndHandover ??
+        ((id: string) => defaultSessionEndHandover(store, id, log));
+      write(input.brainstormId);
+    } catch (err) {
+      log(`[session-end] handover write failed: ${(err as Error).message}`);
+    }
     try {
       const row = store.db.getBrainstorm(input.brainstormId);
       const label =
@@ -213,6 +229,35 @@ export async function runSessionEndPipeline(
     }
   }
   return { ...result, was_primary_runner: primaryRan };
+}
+
+/* Phase C: resolve the brainstorm's supervised worker (or its own session)
+ * and write the trail handover. Sync and best effort. */
+export function defaultSessionEndHandover(
+  store: Store,
+  brainstormId: string,
+  log: (msg: string) => void,
+): string | null {
+  let worker: { role: 'worker'; sessionId: string | null; cwd: string | null } | null = null;
+  let lex: { role: 'lex'; sessionId: string | null; cwd: string | null } | null = null;
+  try {
+    const lexRow = store.db.getLexSession?.(brainstormId) as
+      | { supervises_project_anchor_id?: string | null }
+      | null
+      | undefined;
+    const projId = lexRow?.supervises_project_anchor_id ?? null;
+    const proj = projId ? store.db.getProjectSession(projId) : null;
+    if (proj) {
+      worker = { role: 'worker', sessionId: proj.current_session_id ?? null, cwd: proj.cwd ?? null };
+    }
+    const bs = store.db.getBrainstorm(brainstormId) as
+      | { claude_session_id?: string | null; cwd?: string | null }
+      | undefined;
+    if (bs) lex = { role: 'lex', sessionId: bs.claude_session_id ?? null, cwd: bs.cwd ?? null };
+  } catch (err) {
+    log(`[session-end] handover source lookup failed: ${(err as Error).message}`);
+  }
+  return writeTrailHandover(brainstormId, 'session-end', { worker, lex }, {}, log);
 }
 
 /* Brainstorm-as-durable-primary-entity (2026-05-22, plan section F

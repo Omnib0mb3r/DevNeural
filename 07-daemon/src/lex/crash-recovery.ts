@@ -179,7 +179,7 @@ function defaultRecover(
 ): (gap: CrashGap) => Promise<void> {
   return async (gap: CrashGap) => {
     const bs = store.db.getBrainstorm(gap.anchorId) as
-      | { claude_session_id?: string | null; mode?: string }
+      | { claude_session_id?: string | null; mode?: string; cwd?: string | null }
       | undefined;
     const { runDistillationFlush } = await import('./session-end-pipeline.js');
     await runDistillationFlush(
@@ -192,5 +192,39 @@ function defaultRecover(
       },
       log,
     );
+    /* Phase C (AUTO-CLEAR T6, operator 2026-09-22): the last thing done
+     * goes on record even when nobody wrote it. A handover from the jsonl
+     * trail, marked unvetted, recovered after the crash. */
+    await writeCrashHandover(store, gap.anchorId, log);
   };
+}
+
+/** The crash handover from the trail. Exported for the pin; best effort. */
+export async function writeCrashHandover(
+  store: Store,
+  anchorId: string,
+  log: (msg: string) => void,
+  writer: typeof import('./handover-from-trail.js').writeTrailHandover | null = null,
+): Promise<string | null> {
+  try {
+    const { writeTrailHandover } = await import('./handover-from-trail.js');
+    const write = writer ?? writeTrailHandover;
+    let worker: { role: 'worker'; sessionId: string | null; cwd: string | null } | null = null;
+    let lex: { role: 'lex'; sessionId: string | null; cwd: string | null } | null = null;
+    const lexRow = store.db.getLexSession?.(anchorId) as
+      | { supervises_project_anchor_id?: string | null }
+      | null
+      | undefined;
+    const projId = lexRow?.supervises_project_anchor_id ?? null;
+    const proj = projId ? store.db.getProjectSession(projId) : null;
+    if (proj) worker = { role: 'worker', sessionId: proj.current_session_id ?? null, cwd: proj.cwd ?? null };
+    const bs = store.db.getBrainstorm(anchorId) as
+      | { claude_session_id?: string | null; cwd?: string | null }
+      | undefined;
+    if (bs) lex = { role: 'lex', sessionId: bs.claude_session_id ?? null, cwd: bs.cwd ?? null };
+    return write(anchorId, 'crash-recovery', { worker, lex }, {}, log);
+  } catch (err) {
+    log(`[crash-recovery] handover write failed for ${anchorId.slice(0, 8)}: ${(err as Error).message}`);
+    return null;
+  }
 }
