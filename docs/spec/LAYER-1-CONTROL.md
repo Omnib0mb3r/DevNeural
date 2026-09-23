@@ -468,21 +468,47 @@ The context-clearing design lives in `C:\dev\data\skill-connections\brainstorm\A
    review, reads the gist in two or three sentences, and the operator's
    yes or no comes back as `CONTROL: approve_handover` (the clear
    proceeds) or `CONTROL: reject_handover <reason>` (the brain revises).
-   Same shape as plan approval.
+   Same shape as plan approval. BUILT (T8, `4ea4a15`).
+7. **The brain's own clear is announced, never narrated from a script.**
+   When L2 passes its setpoint and its handover clears the three checks
+   (SMART-COMPACT.md section 5 item 5), L1 gets a `brain-clear` event
+   with the facts ("clearing its own context at 74%; its handover passed
+   the checks; back in a moment") and says it in her own words; the
+   live block shows `brain: warming` until the fresh L2 is up, and
+   forwards park as usual. BUILT (T9, `043d0cd`).
+8. **Worker summaries reach the brain, then the operator.** The
+   `turn_summary` supervisor event hands L2 the worker's end-of-turn
+   text as it lands; L2 reads it to Michael in her words (first
+   person), and L1 speaks that delivery like any other L2 reply.
+   Nothing about another project ever rides along (scope rule).
 
 ## Context hygiene: L1 is disposable
 
-L1's transcript is throwaway. Policy:
+L1's transcript is throwaway. Policy (v3, 2026-09-22 evening, operator:
+"layer 1 can clear as needed with limited context ... no handover at all
+may make it seem like she had amnesia, figure out how to avoid that"):
 
-- Respawn when the L1 jsonl passes a size threshold (default 400 KB,
-  `DEVNEURAL_VOICE_BRAIN_MAX_JSONL_BYTES`), on brainstorm switch, and on the
-  L2 compaction restart (already wired).
-- Respawn is blue/green: the replacement spawns and warms in the background
-  while the old session keeps answering; the swap happens between turns
-  (no ask in flight, no TTS active); the old PTY is then killed. A clear
-  never drops an utterance and never leaves the operator waiting on a boot.
-- The fresh session gets no carry-over. Continuity comes from the live
-  block on every turn (digest, last said line).
+- The voice never carried state in its context. Every turn is rebuilt
+  from the `[live]` block, which now holds the **recent talk ring**: the
+  last six exchanges (what he said, what she said back), kept in the
+  daemon (`lex-voice-ws.ts` `rememberTalk`, rendered by
+  `renderLiveBlock` as `recent talk (oldest first)`). That ring is what
+  makes a clear invisible: no handover document, no L2 review, and no
+  amnesia, because nothing she needed lived only in her transcript.
+- Clear = respawn at a quiet moment. `maybeClearL1()` measures the L1
+  transcript every 30s (`deriveContextFromTail` on
+  `voiceBrainJsonlPath`); past the setpoint (`l1_clear_pct` runtime
+  config, default 50) it arms and waits for quiet: no TTS active, no
+  barge stash, no pending finish, no reply in flight, not speaking,
+  eight seconds since his last word. Then `killVoiceBrainSession` +
+  `prewarmVoiceBrainSession`; the wire parks forwards until warm. Log:
+  `[voice-l1] self-clear at N%: respawning the voice session`.
+- The older size threshold (default 400 KB,
+  `DEVNEURAL_VOICE_BRAIN_MAX_JSONL_BYTES`), the brainstorm-switch respawn
+  and the standby rotation after asks stay as they are.
+- The fresh session gets no carry-over document. Continuity is the live
+  block on every turn (digest, last said line, recent talk, pending
+  items, the cut).
 
 ---
 

@@ -36,10 +36,23 @@ MERGED (`f70cde4`, Agent B). T6 Phase C routes DONE: `handover-routes.ts`
 (registry shared with the voice wire through `handoverReviewedHook.fn` in
 routes.ts, unset until T8), clear-and-paste by `handover_id` +
 `brainstorm_id`, `/worker/clear-handoff` serves an approved reseed once.
-T7 end/crash handovers, T8 voice approval + L2 rules + the `turn_summary`
-supervisor event (worker's end-of-turn text read out by Lex), T9 Lex
-self-clear: pending. T10 (Agent A, gauge + handover list UI): running. T10 (context gauge +
-handover list UI) and T11 (continuous stream sink) run in isolated
+T7 end/crash handovers DONE (`dce6834`). T8 voice approval + L2 rules +
+`turn_summary` DONE (`4ea4a15`). T9 Lex self-clear (three checks, judge,
+stagger, kick, trail-confirm) + L1 clear by respawn (recent-talk ring) +
+the rich context pack DONE (`043d0cd`). T10 gauge + handover list MERGED
+(`c7e2f7d`, Agent A). T12 closeout: daemon suite 2260/2262 (the two known
+reds: grooming-routes, sessions-anchor-liveness), dashboard suite 332/336
+(the known reds: voice-mic-init x4, plus the two Playwright specs vitest
+cannot run), both packages built, `tests/no-anthropic-api.test.ts` pinned, BUGS.md
+032/033 SMOKE-TESTING, FIXES.md VL-17 to VL-25, specs cross-linked;
+restart + live verify follow (see the spoken items list in
+LAYER-1-CONTROL.md "Testing"). Operator additions folded in during T8/T9
+(2026-09-22 late): the L3 flow as he described it matches the build;
+L2's self-clear handover is self-reviewed after she reads current state,
+then vetted, fact-checked and judged by the daemon; L1 clears with no
+handover thanks to the recent-talk ring; Lex's cold start and reseed are
+rich even if they fill her context. T10 (context gauge +
+handover list UI) and T11 (continuous stream sink) ran in isolated
 worktree agents branched off `voice-layers`; merge their branches in T12.
 T12 merge, suite, build, trackers, restart, verify: pending.
 

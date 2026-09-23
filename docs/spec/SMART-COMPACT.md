@@ -149,12 +149,30 @@ order:
    instead of recomputing one (kills the double reseed).
 4. Merge `smart_clear_mode` and `smart_compact_mode` into one
    `auto_clear_mode` with a single dashboard switch.
-5. Lex self-clear (T4): `writeHandover` on the stop pipeline, a
-   `POST /lex/clear-handoff` that serves `findLatestHandover`, and
-   `postLexClearHandoff` in the `clear` / `compact` branch of the
-   SessionStart hook (today the Lex preload fires only on `startup`);
-   a secondary agent approves; never clear Lex and the worker in the
-   same instant.
+5. Lex self-clear (T4, BUILT `043d0cd`): Lex writes the handover for
+   her fresh self and posts it to `POST /lex/self-clear`. Nobody above
+   her reviews it, so the daemon makes sure it is good, three checks,
+   every note visible in the file (`Lex draft` then `Judge review`):
+   the structural vet; a deterministic fact check against live state
+   (a quoted sha must be the worker's real HEAD, the plan file she
+   names must exist, a pending handover or dispatch must be
+   mentioned, a bound worker must be named); and an outside approver,
+   the judge session (`askText`, a headless `claude` on the
+   subscription) answering `OK` or `NO: <one line>`. A NO is a 422 and
+   she revises (twice at most, then tells Michael); a worker clear in
+   flight is a 409 (stagger rule, `SelfClearGate`). Approved: the
+   daemon types `/clear` into her PTY, the SessionStart hook posts
+   `POST /lex/clear-handoff` (`postLexClearHandoff`, clear/compact
+   branch, brainstorm cwd only) and gets the reseed once, a kick prompt
+   six seconds later is her first turn (it carries the whole reseed
+   itself when nobody fetched the handoff), and `confirmResumeOnTask`
+   trail-confirms her fresh self replied (one re-paste, then a bell).
+   The daemon nudges her with `[self-clear-due]` past
+   `lex_self_clear_pct` (default 70) in live mode, once per ten minutes.
+   Her reseed is RICH (operator, 2026-09-22 evening: "Lex's layer 2 cold
+   start and handover docs should be very rich in context even if it
+   fills her context"): `richReseedFromFrame` (no 2400 clip) plus the
+   context pack (item 13).
 6. Archive, do not delete: keep the recent N handovers in full, roll
    older ones into a meta-handover.
 7. Session end and crash (T6, operator 2026-09-22): every terminal end
@@ -174,6 +192,32 @@ order:
     worker and for Lex with the threshold and ceiling; the dashboard
     draws the bar with both marks on the deck, the Lex tab and the
     sessions table.
+12. Worker summaries reach Lex (T8, `4ea4a15`): the `turn_summary`
+    supervisor event carries the worker's end-of-turn text (80+ chars,
+    head 600) to the supervising L2 only, one per 60s per anchor,
+    exempt from the hourly cap; L2 reads it to Michael in her words.
+    The review route answers `decision: held_for_approval` when a
+    voice client took the `[handover-ready]`, `no_voice` otherwise
+    (then Lex tells him in text and drives the clear herself by
+    `handover_id`, which marks the frame approved so the worker's
+    clear-handoff hook serves the same frame: one seed).
+13. The context pack (T9, `lex-context-pack.ts`): one builder, scoped
+    to the brainstorm's own directory and its ONE supervised worker,
+    capped only by a runaway guard (40k chars): the worker (slug, cwd,
+    session, branch, HEAD, dirty, last commits), the newest worker
+    handovers in full (draft and review), Lex's own last handover in
+    full, the plan's task state (its checkbox lines), the worker's
+    recent turn summaries from its transcript, the open BUGS.md index
+    rows, the voice digest. Rides the cold-start preload
+    (`/lex/cold-start-preload`), the self-clear reseed, and
+    `GET /lex/context-pack?brainstorm_id=` on demand.
+14. Layer 1 clear (T9): no handover, no review, no amnesia. The `[live]`
+    block carries a recent-talk ring (the last six things he said and
+    she said, kept in the daemon), so a Layer 1 clear is a respawn at a
+    quiet moment (no speech, no cut sentence pending, no reply in
+    flight, eight quiet seconds) once its transcript passes
+    `l1_clear_pct` (default 50). Checked every 30s. See
+    LAYER-1-CONTROL.md "Context hygiene".
 
 Scope rule that must hold (AUTO-CLEAR T10.1): the handover replaces
 distillation ONLY as the resume seed. Brainstorm distillation stays as
