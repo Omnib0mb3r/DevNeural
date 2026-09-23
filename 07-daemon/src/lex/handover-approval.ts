@@ -86,6 +86,16 @@ export class HandoverApprovalRegistry {
     return p;
   }
 
+  /** Lex drove the clear herself (clear-and-paste by handover id, no
+   * voice client): mark the frame approved so the worker's clear-handoff
+   * hook serves this frame instead of a recomputed legacy block. */
+  approveById(handoverId: string): PendingHandover | null {
+    const p = this.items.get(handoverId) ?? null;
+    if (!p || p.rejectedAtMs !== null) return null;
+    if (p.approvedAtMs === null) p.approvedAtMs = this.now();
+    return p;
+  }
+
   reject(brainstormId: string): PendingHandover | null {
     const p = this.pendingForBrainstorm(brainstormId);
     if (!p) return null;

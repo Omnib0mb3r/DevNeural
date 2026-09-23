@@ -65,6 +65,9 @@ export interface AnchorTailState {
    * when HEAD advances (commit landed) or replaced when a newer
    * claim is observed. */
   pendingSuccessClaim: PendingSuccessClaim | null;
+  /** ts of the last turn_summary sent, so the same turn never fires
+   * twice off a re-read tail. Optional for older state literals. */
+  lastSummaryTs?: number | null;
 }
 
 export function newAnchorTailState(): AnchorTailState {
@@ -101,6 +104,24 @@ export interface ParsedTail {
   trailingToolUse: boolean;
   /** Raw text we pass through to the WorkerEvent snippet field. */
   snippet: string;
+  /** The newest assistant turn-end text (not a pre-tool ack) and its
+   * ts, for the turn_summary event. null when the tail has none. */
+  newestSummary: { text: string; ts: number } | null;
+}
+
+/* A turn-end record worth reading out: text, not a tool_use ack, at
+ * least this long. */
+export const TURN_SUMMARY_MIN_CHARS = 80;
+export const TURN_SUMMARY_HEAD_CHARS = 600;
+
+function assistantText(rec: ParsedLine): string {
+  const c = rec.message?.content;
+  if (typeof c === 'string') return c;
+  if (!Array.isArray(c)) return '';
+  return (c as Array<{ type?: string; text?: string }>)
+    .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+    .map((b) => b.text as string)
+    .join('\n');
 }
 
 export function parseJsonlTail(tail: string, snippetMaxBytes = 2048): ParsedTail {
@@ -108,6 +129,7 @@ export function parseJsonlTail(tail: string, snippetMaxBytes = 2048): ParsedTail
   let newestAssistantMs: number | null = null;
   let newestToolMs: number | null = null;
   let trailingToolUse = false;
+  let newestSummary: { text: string; ts: number } | null = null;
   for (const line of lines) {
     let rec: ParsedLine;
     try {
@@ -120,6 +142,13 @@ export function parseJsonlTail(tail: string, snippetMaxBytes = 2048): ParsedTail
     if (role === 'assistant' && ts !== null) {
       if (newestAssistantMs === null || ts > newestAssistantMs) {
         newestAssistantMs = ts;
+      }
+      const stop = (rec.message as { stop_reason?: string } | undefined)?.stop_reason;
+      const text = assistantText(rec).trim();
+      if (stop !== 'tool_use' && text.length >= TURN_SUMMARY_MIN_CHARS) {
+        if (newestSummary === null || ts >= newestSummary.ts) {
+          newestSummary = { text: text.replace(/\s+/g, ' ').slice(0, TURN_SUMMARY_HEAD_CHARS), ts };
+        }
       }
     }
     /* Tool tracking: lines that mention tool_use bump newestToolMs
@@ -140,8 +169,12 @@ export function parseJsonlTail(tail: string, snippetMaxBytes = 2048): ParsedTail
     tail.length <= snippetMaxBytes
       ? tail
       : tail.slice(tail.length - snippetMaxBytes);
-  return { newestAssistantMs, newestToolMs, trailingToolUse, snippet };
+  return { newestAssistantMs, newestToolMs, trailingToolUse, snippet, newestSummary };
 }
+
+/* turn_summary's own gap: one per minute per anchor is plenty to keep
+ * Lex current without narrating every tool call. */
+export const TURN_SUMMARY_GAP_MS = 60_000;
 
 export interface DeriveOptions {
   /** Per-event-type minimum gap between fires from this module. The
@@ -287,6 +320,26 @@ export function deriveEvents(
   }
   if (detectCommit(parsed.snippet)) {
     pushIfFireable('commit');
+  }
+  /* Operator, 2026-09-22: the worker's own end-of-turn words reach Lex
+   * so she reads what it reported instead of improvising. Fires once
+   * per turn (ts latch), at most once per TURN_SUMMARY_GAP_MS. */
+  if (
+    parsed.newestSummary &&
+    parsed.newestSummary.ts !== (prev.lastSummaryTs ?? null) &&
+    shouldFire(nextState, 'turn_summary', now, TURN_SUMMARY_GAP_MS)
+  ) {
+    events.push({
+      type: 'turn_summary',
+      anchor_id: anchor.id,
+      worker_session_id: ccSessionId,
+      timestamp: stamp,
+      snippet: parsed.newestSummary.text,
+    });
+    nextState.lastFiredAt.turn_summary = now;
+    nextState.lastSummaryTs = parsed.newestSummary.ts;
+  } else {
+    nextState.lastSummaryTs = prev.lastSummaryTs ?? null;
   }
   if (
     detectIdle({

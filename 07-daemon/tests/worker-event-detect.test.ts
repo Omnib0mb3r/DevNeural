@@ -220,6 +220,90 @@ describe('deriveEvents', () => {
   });
 });
 
+/* Operator, 2026-09-22: the worker's end-of-turn words reach Lex as a
+ * turn_summary so she reads what it reported instead of improvising. */
+describe('deriveEvents turn_summary (worker summaries reach Lex)', () => {
+  const LONG =
+    'Task 6 is done. I wired the handover routes, added the vet, and the ' +
+    'tests are green. Next I will start on the voice approval half.';
+  function assistantLine(text: string, ts: string, stop_reason = 'end_turn'): string {
+    return JSON.stringify({
+      type: 'assistant',
+      timestamp: ts,
+      message: { role: 'assistant', stop_reason, content: [{ type: 'text', text }] },
+    });
+  }
+
+  it('fires turn_summary with the head of a qualifying end-turn record', () => {
+    const parsed = parseJsonlTail(assistantLine(LONG, ASSISTANT_TS));
+    expect(parsed.newestSummary?.text).toBe(LONG);
+    const r = deriveEvents(parsed, newAnchorTailState(), anchor(), NOW, 'sig-ts-1');
+    const e = r.events.find((x) => x.type === 'turn_summary');
+    expect(e).toBeDefined();
+    expect(e!.snippet).toBe(LONG);
+    expect(e!.worker_session_id).toBe('cc-A');
+    expect(r.nextState.lastSummaryTs).toBe(Date.parse(ASSISTANT_TS));
+  });
+
+  it('ignores tool_use acks and short lines', () => {
+    const tail =
+      assistantLine(LONG, ASSISTANT_TS, 'tool_use') +
+      '\n' +
+      assistantLine('On it.', ASSISTANT_TS);
+    const parsed = parseJsonlTail(tail);
+    expect(parsed.newestSummary).toBeNull();
+    const r = deriveEvents(parsed, newAnchorTailState(), anchor(), NOW, 'sig-ts-2');
+    expect(r.events.map((e) => e.type)).not.toContain('turn_summary');
+  });
+
+  it('caps the head at 600 chars and collapses whitespace', () => {
+    const big = ('word '.repeat(200) + '\n\nmore').trim();
+    const parsed = parseJsonlTail(assistantLine(big, ASSISTANT_TS));
+    expect(parsed.newestSummary!.text.length).toBe(600);
+    expect(parsed.newestSummary!.text).not.toMatch(/\n/);
+  });
+
+  it('never re-fires the same turn, and throttles a new one inside 60s', () => {
+    const first = deriveEvents(
+      parseJsonlTail(assistantLine(LONG, ASSISTANT_TS)),
+      newAnchorTailState(),
+      anchor(),
+      NOW,
+      'sig-a',
+    );
+    expect(first.events.map((e) => e.type)).toContain('turn_summary');
+    /* Same record re-read on the next tick: no second fire. */
+    const again = deriveEvents(
+      parseJsonlTail(assistantLine(LONG, ASSISTANT_TS)),
+      first.nextState,
+      anchor(),
+      NOW + 5_000,
+      'sig-b',
+    );
+    expect(again.events.map((e) => e.type)).not.toContain('turn_summary');
+    expect(again.nextState.lastSummaryTs).toBe(Date.parse(ASSISTANT_TS));
+    /* A newer turn 20s later is throttled by the 60s gap ... */
+    const laterTs = new Date(NOW + 20_000).toISOString();
+    const throttled = deriveEvents(
+      parseJsonlTail(assistantLine(LONG + ' Also ran lint.', laterTs)),
+      again.nextState,
+      anchor(),
+      NOW + 20_000,
+      'sig-c',
+    );
+    expect(throttled.events.map((e) => e.type)).not.toContain('turn_summary');
+    /* ... and fires once the gap has passed. */
+    const later = deriveEvents(
+      parseJsonlTail(assistantLine(LONG + ' Also ran lint.', laterTs)),
+      throttled.nextState,
+      anchor(),
+      NOW + 61_000,
+      'sig-d',
+    );
+    expect(later.events.map((e) => e.type)).toContain('turn_summary');
+  });
+});
+
 describe('deriveEvents — narrated_success_no_commit (Fix 34d.2)', () => {
   function claimAssistant(text: string, tsMs: number): string {
     return JSON.stringify({

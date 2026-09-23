@@ -40,6 +40,7 @@ import {
   rejectPlan,
 } from '../lex/plan-approval.js';
 import { dispatchConfirmGateOn, type RuntimeConfigReader } from '../lex/layer-model.js';
+import { HandoverApprovalRegistry, type PendingHandover } from '../lex/handover-approval.js';
 import type { TopLayerEvent } from '../voice/voice-top-layer.js';
 import type { TopLayerControlHandlers } from '../voice/lex-voice-ws.js';
 
@@ -75,9 +76,22 @@ export interface VoiceLayersWireDeps {
   clearSchedule?: (handle: unknown) => void;
   /** Gate TTL override (tests). */
   dispatchTtlMs?: number;
+  /* Phase C (2026-09-22): handover approval by voice. The registry is
+   * shared with the handover routes; the clear runs through the same
+   * clear-and-paste route Lex would call, by handover id. */
+  handovers?: HandoverApprovalRegistry;
+  clearAndPasteByHandover?: (input: {
+    brainstormId: string;
+    projectAnchorId: string;
+    handoverId: string;
+  }) => Promise<{ ok: boolean; error?: string }>;
 }
 
 export interface VoiceLayersWire {
+  /** A reviewed handover landed: read it out through Layer 1 (bell
+   * fallback when no voice client is bound). Resolves true when a voice
+   * client took it. */
+  announceHandover(p: PendingHandover): Promise<boolean>;
   /** Route hook for POST /lex/inject-cross-session: a parked response
    * when the gate holds the dispatch, null when the route proceeds. */
   maybePark(
@@ -294,6 +308,58 @@ export function createVoiceLayersWire(deps: VoiceLayersWireDeps): VoiceLayersWir
     return expired;
   }
 
+  /* Phase C: handover approval by voice, the same shape as plan
+   * approval. The worker wrote its half, Lex reviewed it, the operator
+   * says yes or no. */
+  const handovers = deps.handovers ?? new HandoverApprovalRegistry(deps.now);
+
+  async function announceHandover(p: PendingHandover): Promise<boolean> {
+    const delivered = await deps.notify(p.brainstormId, {
+      kind: 'handover-ready',
+      id: p.handoverId,
+      text: p.gist,
+    });
+    deps.log(
+      `[handover] announced ${p.handoverId} on brainstorm ${p.brainstormId.slice(0, 8)} voice=${delivered}`,
+    );
+    if (!delivered) {
+      deps.bell({
+        title: 'A handover is waiting for your go',
+        body: p.gist.slice(0, 200),
+        dedup_key: `handover:${p.handoverId}`,
+        anchor_id: p.brainstormId,
+      });
+    }
+    return delivered;
+  }
+
+  async function approveHandover(anchorId: string): Promise<string | null> {
+    const p = handovers.approve(anchorId);
+    if (!p) return 'No handover is waiting.';
+    deps.log(`[handover] approved ${p.handoverId} on brainstorm ${anchorId.slice(0, 8)}`);
+    if (!deps.clearAndPasteByHandover) return 'Approved. The worker will pick it up on its next start.';
+    const r = await deps.clearAndPasteByHandover({
+      brainstormId: p.brainstormId,
+      projectAnchorId: p.projectAnchorId,
+      handoverId: p.handoverId,
+    });
+    deps.log(`[handover] clear-and-paste ${p.handoverId}: ok=${r.ok}${r.error ? ` error=${r.error}` : ''}`);
+    return r.ok
+      ? 'Approved. The worker is clearing and picking up from the handover.'
+      : `Approved, but the clear did not go through (${r.error ?? 'unknown'}).`;
+  }
+
+  async function rejectHandover(anchorId: string, reason: string | null): Promise<string | null> {
+    const p = handovers.reject(anchorId);
+    if (!p) return 'No handover is waiting.';
+    rejectToBrain(
+      anchorId,
+      `[handover-rejected ${p.handoverId}] The operator said no${reason ? `: ${reason}` : ''}. Revise the review (corrections, next steps) and post it again.`,
+    );
+    deps.log(`[handover] rejected ${p.handoverId} on brainstorm ${anchorId.slice(0, 8)}: ${reason ?? '(no reason)'}`);
+    return 'Sent it back for another pass.';
+  }
+
   const handlers: TopLayerControlHandlers = {
     pendingDispatch: (anchorId) => {
       const p = gate.pendingFor(anchorId);
@@ -304,12 +370,16 @@ export function createVoiceLayersWire(deps: VoiceLayersWireDeps): VoiceLayersWir
     rejectDispatch,
     approvePlan: approve,
     rejectPlan: reject,
+    pendingHandover: (anchorId) => handovers.pendingForBrainstorm(anchorId)?.gist ?? null,
+    approveHandover,
+    rejectHandover,
   };
 
   let sweep: unknown = null;
   if (deps.schedule) sweep = deps.schedule(() => expireNow(), EXPIRY_SWEEP_MS);
 
   return {
+    announceHandover,
     maybePark,
     onPendingPrompt,
     handlers: () => handlers,

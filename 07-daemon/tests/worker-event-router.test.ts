@@ -162,6 +162,20 @@ describe('WorkerEventGate', () => {
     }
   });
 
+  it('turn_summary bypasses the per-type gap and the hourly cap (its gap lives in deriveEvents)', () => {
+    const gate = new WorkerEventGate({
+      perTypeMinGapMs: 5 * 60 * 1000,
+      perAnchorHourlyCap: 1,
+      killSwitchPerTenMinutes: 999,
+    });
+    expect(gate.evaluate(event({ type: 'commit' }), 1_000).decision).toBe('accept');
+    /* Cap reached for the anchor; a summary still goes through, twice. */
+    expect(gate.evaluate(event({ type: 'turn_summary' }), 2_000).decision).toBe('accept');
+    expect(gate.evaluate(event({ type: 'turn_summary' }), 3_000).decision).toBe('accept');
+    /* And it never consumed the window: idle is capped, not the summary. */
+    expect(gate.evaluate(event({ type: 'idle' }), 4_000).decision).toBe('debounce');
+  });
+
   it('accepts different event types independently', () => {
     const gate = new WorkerEventGate(debounceDefaults());
     const e1 = event({ type: 'permission_denied' });

@@ -74,7 +74,10 @@ export interface HandoverRouteDeps {
     text: string;
   }) => Promise<{ ok: boolean; status: number; decision: string | null }>;
   /** A review landed: the voice layer reads it out (Task 8 wires this). */
-  onReviewed?: (p: PendingHandover) => Promise<void>;
+  /** Called after a review is registered. Resolves true when a voice
+   * client received the handover-ready event (the operator will answer
+   * by voice); false or void when nobody is listening. */
+  onReviewed?: (p: PendingHandover) => Promise<boolean | void>;
   fs?: HandoverFsDeps;
   now?: () => number;
 }
@@ -228,11 +231,16 @@ export function registerHandoverRoutes(
     log(
       `[handover] reviewed brainstorm=${body.brainstorm_id.slice(0, 8)} anchor=${body.anchor_id.slice(0, 8)} verdict=${verdict} vet_ok=${vet.ok} file=${written.file}`,
     );
+    let heldByVoice = false;
     try {
-      await deps.onReviewed?.(pending);
+      heldByVoice = (await deps.onReviewed?.(pending)) === true;
     } catch (err) {
       log(`[handover] onReviewed threw (ignored): ${(err as Error).message}`);
     }
+    /* held_for_approval: a voice client has it; the operator answers by
+     * voice and the voice layer runs the clear. no_voice: nobody is
+     * listening; Lex tells Michael in text and drives the clear herself
+     * by handover_id once he agrees. */
     return {
       ok: true,
       handover_id: written.file,
@@ -241,6 +249,7 @@ export function registerHandoverRoutes(
       reseed,
       gist,
       verdict,
+      decision: heldByVoice ? 'held_for_approval' : 'no_voice',
     };
   });
 

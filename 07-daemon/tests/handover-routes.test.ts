@@ -61,7 +61,7 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-function build(over: { now?: () => number } = {}) {
+function build(over: { now?: () => number; voice?: boolean } = {}) {
   const app = Fastify({ logger: false });
   const requests: Array<{ targetSession: string; brainstormId: string; text: string }> = [];
   const reviewed: string[] = [];
@@ -75,6 +75,7 @@ function build(over: { now?: () => number } = {}) {
     },
     onReviewed: async (p) => {
       reviewed.push(p.handoverId);
+      return over.voice === true;
     },
     fs: { rootDir },
     ...(over.now ? { now: over.now } : {}),
@@ -119,6 +120,23 @@ describe('handover routes', () => {
     expect(missing.statusCode).toBe(404);
   });
 
+  it('review answers held_for_approval when a voice client took the handover', async () => {
+    const { app, registry } = build({ voice: true });
+    const r = await app.inject({
+      method: 'POST',
+      url: '/lex/smart-clear/review',
+      payload: { brainstorm_id: 'bs-1', anchor_id: 'proj-a', worker_draft: DRAFT, lex: LEX },
+    });
+    expect(r.statusCode).toBe(200);
+    expect((r.json() as { decision: string }).decision).toBe('held_for_approval');
+    /* Lex driving the clear herself by handover id marks it approved so
+     * the worker's clear-handoff hook serves this frame once. */
+    const id = (r.json() as { handover_id: string }).handover_id;
+    expect(registry.approveById(id)?.approvedAtMs).not.toBeNull();
+    expect(registry.consumeApproved('proj-a')?.handoverId).toBe(id);
+    expect(registry.consumeApproved('proj-a')).toBeNull();
+  });
+
   it('review persists both halves, registers the approval, lists it for that brainstorm only', async () => {
     const { app, reviewed, registry, rootDir } = build();
     const r = await app.inject({
@@ -139,6 +157,8 @@ describe('handover routes', () => {
     expect(onDisk).toMatch(/^- Step 3 is the review route/m);
     expect(reviewed).toEqual([j.handover_id]);
     expect(registry.pendingForBrainstorm('bs-1')?.handoverId).toBe(j.handover_id);
+    /* The test hook resolves void: nobody is listening by voice. */
+    expect((r.json() as { decision: string }).decision).toBe('no_voice');
 
     const list = await app.inject({ method: 'GET', url: '/lex/anchors/bs-1/handovers' });
     const lj = list.json() as { handovers: Array<{ file: string; verdict: string | null; unvetted: boolean }> };

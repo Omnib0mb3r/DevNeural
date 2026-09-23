@@ -141,7 +141,10 @@ export type TopLayerEventKind =
   | 'plan-result'
   | 'dispatch-pending'
   | 'dispatch-result'
-  | 'brain-progress';
+  | 'brain-progress'
+  /* Phase C: a reviewed handover waits for the operator's yes. */
+  | 'handover-ready'
+  | 'handover-result';
 
 export interface TopLayerEvent {
   kind: TopLayerEventKind;

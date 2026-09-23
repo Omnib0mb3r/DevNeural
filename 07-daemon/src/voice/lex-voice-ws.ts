@@ -2042,6 +2042,10 @@ export interface TopLayerControlHandlers {
   rejectDispatch?: (anchorId: string, arg: string | null) => Promise<string | null>;
   pendingPlan?: (anchorId: string) => string | null;
   pendingDispatch?: (anchorId: string) => { id: string; summary: string } | null;
+  /* Phase C: handover approval by voice. */
+  approveHandover?: (anchorId: string, arg: string | null) => Promise<string | null>;
+  rejectHandover?: (anchorId: string, arg: string | null) => Promise<string | null>;
+  pendingHandover?: (anchorId: string) => string | null;
 }
 
 let topLayerControlHandlers: TopLayerControlHandlers = {};
@@ -3406,7 +3410,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     }
     return {
       cut,
-      pendingHandover: null,
+      pendingHandover: anchorId && h.pendingHandover ? h.pendingHandover(anchorId) : null,
       mid: ms.mid,
       midSinceMs: ms.sinceMs,
       midTool: ms.tool,
@@ -3576,7 +3580,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       case 'approve_plan':
       case 'reject_plan':
       case 'confirm_dispatch':
-      case 'reject_dispatch': {
+      case 'reject_dispatch':
+      case 'approve_handover':
+      case 'reject_handover': {
         const anchorId = currentAnchorId();
         const h = topLayerControlHandlers;
         const fn =
@@ -3586,7 +3592,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
               ? h.rejectPlan
               : control === 'confirm_dispatch'
                 ? h.confirmDispatch
-                : h.rejectDispatch;
+                : control === 'reject_dispatch'
+                  ? h.rejectDispatch
+                  : control === 'approve_handover'
+                    ? h.approveHandover
+                    : h.rejectHandover;
         if (!anchorId || !fn) {
           logFn(`[voice-ws] L1 control ${control} not wired (anchor=${anchorId ?? 'none'})`);
           return;
@@ -3597,7 +3607,11 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
             /* The handler's factual status is phrased by the voice, never
              * spoken as a hardcoded line. */
             await runTopLayerEventTurn({
-              kind: control.endsWith('_plan') ? 'plan-result' : 'dispatch-result',
+              kind: control.endsWith('_plan')
+                ? 'plan-result'
+                : control.endsWith('_handover')
+                  ? 'handover-result'
+                  : 'dispatch-result',
               text: status,
             });
           }

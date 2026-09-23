@@ -754,6 +754,10 @@ export function wrapPaste(
 
 export interface RegisterOptions {
   ctxProvider?: (jsonlPath: string) => number | null;
+  /** Phase C: clear-and-paste by handover_id marks that frame approved
+   * in the shared registry so the worker's clear-handoff hook serves
+   * the same frame (one seed, never a recomputed legacy block). */
+  onHandoverClear?: (handoverId: string, brainstormId: string) => void;
 }
 
 export function registerSmartCompactRoutes(
@@ -978,6 +982,11 @@ export function registerSmartCompactRoutes(
       log(
         `[smart-compact] clear-and-paste by handover ${hb.handover_id} brainstorm=${hb.brainstorm_id.slice(0, 8)}`,
       );
+      try {
+        options.onHandoverClear?.(hb.handover_id, hb.brainstorm_id);
+      } catch {
+        /* registry bookkeeping only; never block the clear */
+      }
     }
     const r = clearAndPaste(db, body.anchor_id, {
       ...(body.caller !== undefined

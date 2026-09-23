@@ -143,6 +143,7 @@ import {
   type VoiceControlKind,
 } from '../voice/lex-voice-ws.js';
 import { createVoiceLayersWire, readFileTail } from './voice-layers-wire.js';
+import type { PendingHandover } from '../lex/handover-approval.js';
 import { issueToken } from '../lex/cross-session-inject.js';
 import { lintQueueStatus } from '../wiki/lint-queue.js';
 import { providerStatus } from '../llm/index.js';
@@ -482,8 +483,21 @@ export async function registerDashboardRoutes(
     if (!ctx || ctx.max <= 0) return null;
     return Math.round((ctx.tokens / ctx.max) * 1000) / 10;
   };
+  /* Phase C (2026-09-22, SMART-COMPACT.md section 5): the worker writes
+   * its handover, Lex reviews it, the approved frame is persisted with
+   * both halves visible and served ONCE as the reseed through
+   * /worker/clear-handoff. The registry is shared with the voice layer
+   * (approve_handover / reject_handover) below and with clear-and-paste
+   * by handover id (Lex driving the clear herself marks it approved). */
+  const { registerHandoverRoutes } = await import('./handover-routes.js');
+  const { HandoverApprovalRegistry } = await import('../lex/handover-approval.js');
+  const handoverRegistry = new HandoverApprovalRegistry();
   registerSmartCompactRoutes(app, store.db, smartCompactInjector, log, {
     ctxProvider: smartCompactCtxProvider,
+    onHandoverClear: (handoverId) => {
+      const p = handoverRegistry.approveById(handoverId);
+      if (p) log(`[handover] ${handoverId} approved by clear-and-paste (Lex-driven)`);
+    },
   });
   /* DRIVE-QUEUE 4: smart-clear trigger surface. Shares the same ctx
    * derivation so /smart-clear/state and /smart-compact/state report
@@ -493,18 +507,10 @@ export async function registerDashboardRoutes(
     ctxProvider: smartCompactCtxProvider,
   });
 
-  /* Phase C (2026-09-22, SMART-COMPACT.md section 5): the worker writes
-   * its handover, Lex reviews it, the approved frame is persisted with
-   * both halves visible and served ONCE as the reseed through
-   * /worker/clear-handoff. The registry is shared with the voice layer
-   * (approve_handover / reject_handover) below. */
-  const { registerHandoverRoutes } = await import('./handover-routes.js');
-  const { HandoverApprovalRegistry } = await import('../lex/handover-approval.js');
-  const handoverRegistry = new HandoverApprovalRegistry();
   /* Late-bound: the voice layers wire (created below) installs the hook
    * that reads a reviewed handover out through Layer 1. */
   const handoverReviewedHook: {
-    fn: ((p: { handoverId: string; brainstormId: string; gist: string }) => Promise<void>) | null;
+    fn: ((p: PendingHandover) => Promise<boolean>) | null;
   } = { fn: null };
   registerHandoverRoutes(app, store.db, log, {
     registry: handoverRegistry,
@@ -534,7 +540,7 @@ export async function registerDashboardRoutes(
       return { ok, status: r.statusCode, decision };
     },
     onReviewed: async (p) => {
-      await handoverReviewedHook.fn?.(p);
+      return (await handoverReviewedHook.fn?.(p)) === true;
     },
   });
 
@@ -581,6 +587,26 @@ export async function registerDashboardRoutes(
       return { status: r.statusCode, ok, decision };
     },
     freshToken: (subject) => issueToken(subject),
+    handovers: handoverRegistry,
+    clearAndPasteByHandover: async (i) => {
+      const r = await app.inject({
+        method: 'POST',
+        url: '/lex/smart-compact/clear-and-paste',
+        payload: {
+          anchor_id: i.projectAnchorId,
+          brainstorm_id: i.brainstormId,
+          handover_id: i.handoverId,
+          reason: 'ctx-fill-clear',
+          caller: 'smart-clear',
+        },
+      });
+      try {
+        const j = r.json() as { ok?: boolean; error?: string };
+        return { ok: Boolean(j.ok), ...(j.error ? { error: j.error } : {}) };
+      } catch {
+        return { ok: false, error: `status ${r.statusCode}` };
+      }
+    },
     resolveSupervisedTarget: (brainstormId) => {
       const r = resolveSupervisedTargetSession(store.db, brainstormId);
       return r.reason === 'bound-live' && r.target_session ? r.target_session : null;
@@ -622,6 +648,8 @@ export async function registerDashboardRoutes(
     clearSchedule: (h) => clearInterval(h as ReturnType<typeof setInterval>),
   });
   setTopLayerControlHandlers(voiceLayers.handlers());
+  /* Phase C: a reviewed handover is read out through Layer 1. */
+  handoverReviewedHook.fn = (p) => voiceLayers.announceHandover(p);
 
   /* Background poll that binds a daemon-owned PTY to its claude
    * session_id once the .jsonl file appears. Single global timer; no

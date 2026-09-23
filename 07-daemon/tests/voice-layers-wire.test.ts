@@ -9,6 +9,7 @@ import {
   type VoiceLayersWireDeps,
 } from '../src/dashboard/voice-layers-wire.js';
 import type { TopLayerEvent } from '../src/voice/voice-top-layer.js';
+import { HandoverApprovalRegistry } from '../src/lex/handover-approval.js';
 
 const PLAN_TAIL =
   JSON.stringify({
@@ -201,5 +202,87 @@ describe('plan approval (pending-prompt hook)', () => {
     expect(calls.inject).toHaveLength(1);
     expect(calls.inject[0]![1]).toMatch(/^\[plan-rejected\] The operator said no: too risky/);
     expect(calls.cleared).toEqual(['cc-l2']);
+  });
+});
+
+/* Phase C (2026-09-22): the worker wrote its half, Lex reviewed it, the
+ * operator says yes or no by voice. Same shape as plan approval. */
+describe('handover approval by voice (Phase C)', () => {
+  function handoverRig(over: Partial<VoiceLayersWireDeps> & { voice?: boolean } = {}) {
+    const handovers = new HandoverApprovalRegistry(() => 1_000);
+    const clears: Array<{ brainstormId: string; projectAnchorId: string; handoverId: string }> = [];
+    const base = rig({
+      handovers,
+      clearAndPasteByHandover: async (i) => {
+        clears.push(i);
+        return { ok: true };
+      },
+      ...(over.voice === false
+        ? {
+            notify: async () => false,
+          }
+        : {}),
+      ...over,
+    });
+    const pending = handovers.register({
+      handoverId: 'HANDOVER-2026-09-22T20-00-00Z.md',
+      file: 'HANDOVER-2026-09-22T20-00-00Z.md',
+      brainstormId: 'anchor-a',
+      projectAnchorId: 'proj-x',
+      reseed: 'RESEED TEXT',
+      gist: 'worker at end of step 3; Lex added steps 4 and 5',
+    });
+    return { ...base, handovers, clears, pending };
+  }
+
+  it('announces a reviewed handover to Layer 1 and exposes the gist as pending', async () => {
+    const { wire, calls, pending } = handoverRig();
+    expect(await wire.announceHandover(pending)).toBe(true);
+    expect(calls.notify[0]![1]).toMatchObject({
+      kind: 'handover-ready',
+      id: pending.handoverId,
+      text: 'worker at end of step 3; Lex added steps 4 and 5',
+    });
+    expect(calls.bell).toEqual([]);
+    expect(wire.handlers().pendingHandover!('anchor-a')).toBe(
+      'worker at end of step 3; Lex added steps 4 and 5',
+    );
+  });
+
+  it('bells and reports no voice when nobody is listening', async () => {
+    const { wire, calls, pending } = handoverRig({ voice: false });
+    expect(await wire.announceHandover(pending)).toBe(false);
+    expect(calls.bell).toEqual(['A handover is waiting for your go']);
+  });
+
+  it('approve runs clear-and-paste by handover id exactly once and clears the pending', async () => {
+    const { wire, clears, handovers } = handoverRig();
+    const status = await wire.handlers().approveHandover!('anchor-a', null);
+    expect(status).toMatch(/Approved/);
+    expect(clears).toEqual([
+      {
+        brainstormId: 'anchor-a',
+        projectAnchorId: 'proj-x',
+        handoverId: 'HANDOVER-2026-09-22T20-00-00Z.md',
+      },
+    ]);
+    expect(wire.handlers().pendingHandover!('anchor-a')).toBeNull();
+    /* Approved entries are what the worker's clear-handoff hook serves. */
+    expect(handovers.consumeApproved('proj-x')?.reseed).toBe('RESEED TEXT');
+    expect(await wire.handlers().approveHandover!('anchor-a', null)).toMatch(/No handover is waiting/);
+    expect(clears).toHaveLength(1);
+  });
+
+  it('reject sends the reason back to the brain and clears the pending', async () => {
+    const { wire, calls, handovers } = handoverRig();
+    const status = await wire.handlers().rejectHandover!('anchor-a', 'missing the migration');
+    expect(status).toMatch(/another pass/);
+    expect(calls.inject).toHaveLength(1);
+    expect(calls.inject[0]![0]).toBe('lexpty-anchor-a');
+    expect(calls.inject[0]![1]).toMatch(
+      /^\[handover-rejected HANDOVER-2026-09-22T20-00-00Z\.md\] The operator said no: missing the migration/,
+    );
+    expect(wire.handlers().pendingHandover!('anchor-a')).toBeNull();
+    expect(handovers.consumeApproved('proj-x')).toBeNull();
   });
 });

@@ -41,7 +41,11 @@ export type WorkerEventType =
    * has not advanced for >=60 s since the claim. Cron-driven Lex
    * supervision was trusting narration over git; this surfaces the
    * mismatch so Lex can challenge rather than rubber-stamp. */
-  | 'narrated_success_no_commit';
+  | 'narrated_success_no_commit'
+  /* Operator, 2026-09-22: the worker's end-of-turn text, so Lex reads
+   * what the worker just reported instead of improvising from "commit"
+   * or "idle". Its own 60s gap; exempt from the hourly cap. */
+  | 'turn_summary';
 
 export interface WorkerEvent {
   type: WorkerEventType;
@@ -153,6 +157,11 @@ export class WorkerEventGate {
    * 'debounce' (queueing happens at the batch layer in the spec; left
    * for v2). */
   evaluate(event: WorkerEvent, now: number): RouteDecision {
+    /* turn_summary keeps Lex current on what the worker reported; it
+     * carries its own 60s gap in deriveEvents and never counts against
+     * the per-type gap or the hourly cap, so a chatty worker cannot
+     * starve the real alarms. */
+    if (event.type === 'turn_summary') return { decision: 'accept' };
     const last = this.lastFire.get(event.anchor_id) ?? new Map();
     const lastForType = last.get(event.type);
     if (
