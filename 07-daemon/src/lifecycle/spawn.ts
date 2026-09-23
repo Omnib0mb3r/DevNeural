@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -70,42 +70,101 @@ export function ensureDaemonRunning(): { started: boolean; pid: number | null } 
     }
 
     ensureDataRoot();
-    /* Pipe child stdout/stderr to a sidecar file, NOT daemon.log.
-     * The daemon's own logger appends every line to daemon.log via
-     * appendFileSync; if we also wired stderr into daemon.log here,
-     * each logger() call would land twice (once via appendFile, once
-     * via the inherited stderr fd). The sidecar captures any rogue
-     * console output (uncaught throws, native warnings) that does
-     * not go through logger. */
-    const logPath = daemonLogFile().replace(/\.log$/, '.spawn.log');
-    const out = fs.openSync(logPath, 'a');
-    const err = fs.openSync(logPath, 'a');
-
     const entry = daemonEntryPath();
     if (!fs.existsSync(entry)) {
       // Daemon not built yet. Hooks should still capture; daemon will start later.
       return { started: false, pid: null };
     }
 
-    const child = spawn(process.execPath, [entry], {
-      detached: true,
-      stdio: ['ignore', out, err],
-      // Without windowsHide, every lazy-spawn from a hook creates a visible
-      // console window for the daemon process. That's the flash users see
-      // on every prompt. detached: true on Windows allocates a new console;
-      // windowsHide: true tells CreateProcess to set SW_HIDE so the console
-      // is created invisibly and stdio still gets redirected to the log.
-      windowsHide: true,
-      cwd: daemonPackageRoot(),
-      env: {
-        ...sanitizeDaemonEnv(process.env),
-        DEVNEURAL_SPAWNED_BY_HOOK: '1',
-      },
+    const r = launchDaemonOutsideHook({
+      entry,
+      sidecarPath: daemonLogFile().replace(/\.log$/, '.spawn.log'),
     });
-    child.unref();
-
-    return { started: true, pid: child.pid ?? null };
+    return { started: r.path !== 'failed', pid: r.pid };
   } finally {
     lock.release();
   }
+}
+
+export const DAEMON_TASK_NAME = 'DevNeural-Daemon';
+
+export type DaemonLaunchPath = 'schtasks' | 'powershell' | 'direct' | 'failed';
+
+export interface DaemonLaunchArgs {
+  /** dist/daemon.js */
+  entry: string;
+  /** Where the direct path sends the child's stdout and stderr. */
+  sidecarPath: string;
+  platform?: NodeJS.Platform;
+  spawnSyncFn?: typeof spawnSync;
+  spawnFn?: typeof spawn;
+  taskName?: string;
+}
+
+/* BUG-039 (2026-09-23): the daemon must never be a child of the hook
+ * process on Windows.
+ *
+ * A hook runs under Claude Code with its stdio on pipes (through the
+ * silent shim). A Windows child inherits every inheritable handle of its
+ * parent, and node's spawn does not restrict that set, so a daemon
+ * spawned here kept the CLI's pipe write-ends open for its whole life.
+ * Claude Code waits for the hook's pipe to close before it moves on, so
+ * every daemon death or restart turned the next tool call into a hang
+ * of hours: "thinking", Escape ignored, until the daemon or VS Code was
+ * killed. detached and unref do not help; the handles are the leak.
+ *
+ * So on Windows the launch goes through the Task Scheduler
+ * (`schtasks /run /tn DevNeural-Daemon`, the same task the restart
+ * route arms and the logon autostart uses): the daemon becomes a child
+ * of the scheduler service and inherits nothing from the hook. If the
+ * task cannot run, PowerShell's Start-Process is the fallback (it does
+ * not pass handles either). Off Windows the direct detached spawn stays,
+ * with the sidecar and the env hygiene from 2026-07-17. */
+export function launchDaemonOutsideHook(args: DaemonLaunchArgs): {
+  path: DaemonLaunchPath;
+  pid: number | null;
+} {
+  const platform = args.platform ?? process.platform;
+  if (platform === 'win32') {
+    const spawnSyncFn = args.spawnSyncFn ?? spawnSync;
+    const taskName = args.taskName ?? DAEMON_TASK_NAME;
+    const viaTask = spawnSyncFn('schtasks', ['/run', '/tn', taskName], {
+      stdio: 'ignore',
+      windowsHide: true,
+      timeout: 5_000,
+    });
+    if (!viaTask.error && viaTask.status === 0) return { path: 'schtasks', pid: null };
+
+    const psCommand =
+      `Start-Process -FilePath '${process.execPath.replace(/'/g, "''")}' ` +
+      `-ArgumentList '"${args.entry}"' ` +
+      `-WorkingDirectory '${daemonPackageRoot().replace(/'/g, "''")}' -WindowStyle Hidden`;
+    const viaPs = spawnSyncFn(
+      'powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', psCommand],
+      { stdio: 'ignore', windowsHide: true, timeout: 8_000 },
+    );
+    if (!viaPs.error && viaPs.status === 0) return { path: 'powershell', pid: null };
+    return { path: 'failed', pid: null };
+  }
+
+  /* Pipe child stdout/stderr to a sidecar file, NOT daemon.log.
+   * The daemon's own logger appends every line to daemon.log via
+   * appendFileSync; if we also wired stderr into daemon.log here,
+   * each logger() call would land twice (once via appendFile, once
+   * via the inherited stderr fd). The sidecar captures any rogue
+   * console output (uncaught throws, native warnings) that does
+   * not go through logger. */
+  const out = fs.openSync(args.sidecarPath, 'a');
+  const err = fs.openSync(args.sidecarPath, 'a');
+  const spawnFn = args.spawnFn ?? spawn;
+  const child = spawnFn(process.execPath, [args.entry], {
+    detached: true,
+    stdio: ['ignore', out, err],
+    windowsHide: true,
+    cwd: daemonPackageRoot(),
+    env: sanitizeDaemonEnv(process.env),
+  });
+  child.unref();
+  return { path: 'direct', pid: child.pid ?? null };
 }

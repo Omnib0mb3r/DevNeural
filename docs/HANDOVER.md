@@ -56,13 +56,25 @@ user doc: `docs/voice-commands.md`. Both packages rebuilt (daemon dist
 09:18 local, dashboard export 09:19). Restart DONE 2026-09-23T13:20:19Z:
 PID 4952 -> 54996, `[shutdown] complete` to `listening` in 1.2s, boot log
 clean apart from the pre-existing seed line (BUG-024); no brainstorm was
-live at the time, so nothing was reopened. Two hours later the VS Code
-extension host reloaded and the resume of this 3.7 MB session blew the
-extension's 60s init cap once (BUG-039; not the daemon, not the hooks).
-Last night's only outage on record is BUG-040: a relaunch at 02:10Z died
-on a missing `@anthropic-ai/sdk` and the relauncher recovered at
-02:13Z. The spoken verify, item 11 of the LAYER-1-CONTROL "Testing"
-list, needs the operator.
+live at the time, so nothing was reopened.
+
+### 2026-09-23 afternoon: the hours-long hangs, found and fixed (BUG-039, VL-29)
+
+The restart above hung this session for 1h51m ("thinking", Escape
+ignored) until the operator quit VS Code; the 2026-09-22 heap death had
+done the same for 5h12m. Cause: every hook phase lazy-spawned the daemon
+as a child of the hook when its pid was dead, the daemon inherited the
+CLI's hook pipe handles (Windows inheritance through the silent shim),
+and Claude Code waits for that pipe to close. Fix in
+`07-daemon/src/lifecycle/spawn.ts`: the launch goes through
+`schtasks /run /tn DevNeural-Daemon`, never a direct child; dist rebuilt
+(hooks read it on their next call, no restart needed); proof rig passed
+against the live daemon. Full detail with the evidence chain in BUGS.md
+BUG-039. BUG-040 is separate: last night's relaunch at 02:10Z died on a
+missing `@anthropic-ai/sdk` while an `npm install` was rewriting
+`node_modules`, and the relauncher recovered at 02:13Z. The spoken
+verify, item 11 of the LAYER-1-CONTROL "Testing" list, needs the
+operator.
 
 Overnight 2026-09-23 (operator asleep, "full authority, no gates"):
 BUG-034 and BUG-035 fixed (`6e06fd0`: the supervisor detectors read Bash
