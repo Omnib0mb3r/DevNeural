@@ -1,16 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import {
-  voiceApiKey,
-  useVoiceHaiku,
-  enableVoiceHaikuIfKeyPresent,
-} from '../src/voice/voice-haiku.js';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { enableVoiceHaiku, useVoiceHaiku } from '../src/voice/voice-haiku.js';
 
 /**
- * 2026-07-09: voice fell back to flat hardcoded lines because the daemon
- * had no ANTHROPIC_API_KEY (start-daemon.ps1's env block is skipped on a
- * manual `node dist/daemon.js` restart). voiceApiKey() now also reads the
- * persistent BRIDGER_ANTHROPIC_API, and useVoiceHaiku() auto-enables when
- * a key is present, so the smart lane no longer depends on the launcher.
+ * 2026-09-23: the voice tier reads no API key (operator: subscription
+ * sessions only, never the Anthropic API). The flag self-enables at boot
+ * unless the operator opts out, and a key in the environment changes
+ * nothing.
  */
 const KEYS = ['ANTHROPIC_API_KEY', 'BRIDGER_ANTHROPIC_API', 'DEVNEURAL_VOICE_HAIKU'];
 let saved: Record<string, string | undefined>;
@@ -29,47 +27,32 @@ afterEach(() => {
   }
 });
 
-describe('voiceApiKey', () => {
-  it('prefers ANTHROPIC_API_KEY when set', () => {
-    process.env.ANTHROPIC_API_KEY = 'sk-primary';
-    process.env.BRIDGER_ANTHROPIC_API = 'sk-bridger';
-    expect(voiceApiKey()).toBe('sk-primary');
-  });
-  it('falls back to BRIDGER_ANTHROPIC_API', () => {
-    process.env.BRIDGER_ANTHROPIC_API = 'sk-bridger';
-    expect(voiceApiKey()).toBe('sk-bridger');
-  });
-  it('is undefined when neither is set', () => {
-    expect(voiceApiKey()).toBeUndefined();
-  });
-});
-
 describe('useVoiceHaiku (strict flag gate)', () => {
   it('is on only when DEVNEURAL_VOICE_HAIKU is exactly "1"', () => {
     process.env.DEVNEURAL_VOICE_HAIKU = '1';
     expect(useVoiceHaiku()).toBe(true);
   });
-  it('is off when unset, even with a key present (pure gate)', () => {
+  it('is off when unset, whatever keys sit in the environment', () => {
     process.env.BRIDGER_ANTHROPIC_API = 'sk-bridger';
+    process.env.ANTHROPIC_API_KEY = 'sk-primary';
     expect(useVoiceHaiku()).toBe(false);
   });
 });
 
-describe('enableVoiceHaikuIfKeyPresent (daemon boot self-enable)', () => {
-  it('turns the flag on in-process when a key is present and flag unset', () => {
-    process.env.BRIDGER_ANTHROPIC_API = 'sk-bridger';
-    expect(enableVoiceHaikuIfKeyPresent()).toBe(true);
+describe('enableVoiceHaiku (daemon boot self-enable)', () => {
+  it('turns the flag on in-process with no key at all', () => {
+    expect(enableVoiceHaiku()).toBe(true);
     expect(process.env.DEVNEURAL_VOICE_HAIKU).toBe('1');
     expect(useVoiceHaiku()).toBe(true);
   });
-  it('leaves the flag off when no key is present', () => {
-    expect(enableVoiceHaikuIfKeyPresent()).toBe(false);
-    expect(process.env.DEVNEURAL_VOICE_HAIKU).toBeUndefined();
-  });
-  it('respects an explicit opt-out (=== "0") even with a key', () => {
-    process.env.BRIDGER_ANTHROPIC_API = 'sk-bridger';
+  it('respects an explicit opt-out (=== "0")', () => {
     process.env.DEVNEURAL_VOICE_HAIKU = '0';
-    expect(enableVoiceHaikuIfKeyPresent()).toBe(false);
+    expect(enableVoiceHaiku()).toBe(false);
     expect(process.env.DEVNEURAL_VOICE_HAIKU).toBe('0');
+  });
+  it('the module reads no key name at all', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const src = fs.readFileSync(path.resolve(here, '..', 'src', 'voice', 'voice-haiku.ts'), 'utf-8');
+    expect(src).not.toMatch(/process\.env\.(ANTHROPIC_API_KEY|BRIDGER_ANTHROPIC_API)/);
   });
 });

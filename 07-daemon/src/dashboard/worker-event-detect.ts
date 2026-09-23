@@ -68,6 +68,10 @@ export interface AnchorTailState {
   /** ts of the last turn_summary sent, so the same turn never fires
    * twice off a re-read tail. Optional for older state literals. */
   lastSummaryTs?: number | null;
+  /** BUG-034: ts of the newest Bash tool_result that fired each
+   * command-evidenced event, so one denial, failure or commit fires
+   * once and never again off a re-read tail. */
+  lastMatchTs?: Partial<Record<WorkerEvent['type'], number>>;
 }
 
 export function newAnchorTailState(): AnchorTailState {
@@ -87,6 +91,33 @@ interface ParsedLine {
   message?: { role?: string; content?: unknown };
   timestamp?: string;
   uuid?: string;
+  /* Legacy top-level tool_result shape (hooks, older CC). */
+  tool_use_id?: string;
+  content?: unknown;
+  is_error?: boolean;
+}
+
+/* BUG-035: a command the worker actually RAN, with what it printed.
+ * Only Bash tool_results evidence a denial, a test run or a commit;
+ * a file it read or wrote may contain the same words and proves
+ * nothing. */
+export interface BashResult {
+  ts: number | null;
+  /** The command from the originating tool_use, when the tail holds it. */
+  command: string | null;
+  /** The tool_result text. */
+  text: string;
+  /** The tool_use line and the tool_result line, for the snippet extractor. */
+  rawLines: string;
+}
+
+function contentText(c: unknown): string {
+  if (typeof c === 'string') return c;
+  if (!Array.isArray(c)) return '';
+  return (c as Array<{ type?: string; text?: string }>)
+    .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+    .map((b) => b.text as string)
+    .join('\n');
 }
 
 function parseTs(s: string | undefined): number | null {
@@ -107,6 +138,10 @@ export interface ParsedTail {
   /** The newest assistant turn-end text (not a pre-tool ack) and its
    * ts, for the turn_summary event. null when the tail has none. */
   newestSummary: { text: string; ts: number } | null;
+  /** BUG-035: Bash tool_results in tail order (oldest first). The
+   * command-evidenced detectors (permission_denied, test_failure,
+   * commit) read these and nothing else. */
+  bashResults: BashResult[];
 }
 
 /* A turn-end record worth reading out: text, not a tool_use ack, at
@@ -130,6 +165,10 @@ export function parseJsonlTail(tail: string, snippetMaxBytes = 2048): ParsedTail
   let newestToolMs: number | null = null;
   let trailingToolUse = false;
   let newestSummary: { text: string; ts: number } | null = null;
+  const bashResults: BashResult[] = [];
+  /* tool_use id -> the Bash command and its raw line, so a tool_result
+   * can be tied to the command that produced it (BUG-035). */
+  const bashUses = new Map<string, { command: string | null; rawLine: string }>();
   for (const line of lines) {
     let rec: ParsedLine;
     try {
@@ -139,6 +178,7 @@ export function parseJsonlTail(tail: string, snippetMaxBytes = 2048): ParsedTail
     }
     const ts = parseTs(rec.timestamp);
     const role = rec.role ?? rec.message?.role;
+    const content = rec.message?.content;
     if (role === 'assistant' && ts !== null) {
       if (newestAssistantMs === null || ts > newestAssistantMs) {
         newestAssistantMs = ts;
@@ -150,6 +190,34 @@ export function parseJsonlTail(tail: string, snippetMaxBytes = 2048): ParsedTail
           newestSummary = { text: text.replace(/\s+/g, ' ').slice(0, TURN_SUMMARY_HEAD_CHARS), ts };
         }
       }
+    }
+    if (role === 'assistant' && Array.isArray(content)) {
+      for (const b of content as Array<{ type?: string; id?: string; name?: string; input?: unknown }>) {
+        if (b && b.type === 'tool_use' && b.name === 'Bash' && typeof b.id === 'string') {
+          const cmd = (b.input as { command?: unknown } | undefined)?.command;
+          bashUses.set(b.id, { command: typeof cmd === 'string' ? cmd : null, rawLine: line });
+        }
+      }
+    }
+    /* tool_result blocks inside a user record, or the legacy top-level
+     * shape; only those tied to a Bash tool_use count. */
+    const results: Array<{ tool_use_id?: string; content?: unknown }> = [];
+    if (role === 'user' && Array.isArray(content)) {
+      for (const b of content as Array<{ type?: string; tool_use_id?: string; content?: unknown }>) {
+        if (b && b.type === 'tool_result') results.push(b);
+      }
+    } else if (rec.type === 'tool_result' && typeof rec.tool_use_id === 'string') {
+      results.push({ tool_use_id: rec.tool_use_id, content: rec.content });
+    }
+    for (const r of results) {
+      const use = r.tool_use_id ? bashUses.get(r.tool_use_id) : undefined;
+      if (!use) continue;
+      bashResults.push({
+        ts,
+        command: use.command,
+        text: contentText(r.content),
+        rawLines: `${use.rawLine}\n${line}`,
+      });
     }
     /* Tool tracking: lines that mention tool_use bump newestToolMs
      * and flag trailingToolUse; tool_result clears the trailing
@@ -169,7 +237,15 @@ export function parseJsonlTail(tail: string, snippetMaxBytes = 2048): ParsedTail
     tail.length <= snippetMaxBytes
       ? tail
       : tail.slice(tail.length - snippetMaxBytes);
-  return { newestAssistantMs, newestToolMs, trailingToolUse, snippet, newestSummary };
+  return { newestAssistantMs, newestToolMs, trailingToolUse, snippet, newestSummary, bashResults };
+}
+
+/* BUG-034: a Bash result older than this is history, not an event. */
+export const RECENT_RESULT_MS = 5 * 60_000;
+
+/* A later test run that went green clears a red predecessor. */
+export function reportsPass(text: string): boolean {
+  return /\b\d+\s+passed\b/i.test(text) && !/\b\d+\s+failed\b|\bFAIL\b|×/.test(text);
 }
 
 /* turn_summary's own gap: one per minute per anchor is plenty to keep
@@ -276,6 +352,7 @@ export function deriveEvents(
     pendingSuccessClaim: prev.pendingSuccessClaim
       ? { ...prev.pendingSuccessClaim }
       : null,
+    lastMatchTs: { ...(prev.lastMatchTs ?? {}) },
   };
 
   if (tailSig && tailSig === prev.lastTailSig) {
@@ -291,8 +368,9 @@ export function deriveEvents(
   function pushIfFireable(
     type: WorkerEvent['type'],
     extraSnippetOpts: Parameters<typeof extractEventSnippet>[2] = {},
-  ): void {
-    if (!shouldFire(nextState, type, now, gap)) return;
+    snippetSource: string = parsed.snippet,
+  ): boolean {
+    if (!shouldFire(nextState, type, now, gap)) return false;
     /* Fix 34d.1 addendum (2026-05-26): replace raw-tail-bytes snippet
      * with per-event-type high-signal extraction. The raw tail was
      * usually CC's SessionStart skill-catalog or hook_additional_context
@@ -304,23 +382,48 @@ export function deriveEvents(
       anchor_id: anchor.id,
       worker_session_id: ccSessionId,
       timestamp: stamp,
-      snippet: extractEventSnippet(type, parsed.snippet, {
+      snippet: extractEventSnippet(type, snippetSource, {
         now,
         ...extraSnippetOpts,
       }),
     });
     nextState.lastFiredAt[type] = now;
+    return true;
   }
 
-  if (detectPermissionDenied(parsed.snippet)) {
-    pushIfFireable('permission_denied');
+  /* BUG-034 / BUG-035 (2026-09-23): the command-evidenced events read
+   * Bash tool_results only, newest first, within RECENT_RESULT_MS, and
+   * each result fires at most once (ts latch). A file the worker read
+   * or wrote never counts, however many alarm words it holds. */
+  function fireFromBash(
+    type: 'permission_denied' | 'test_failure' | 'commit',
+    detect: (text: string) => boolean,
+    guard?: (match: BashResult, index: number) => boolean,
+  ): void {
+    for (let i = parsed.bashResults.length - 1; i >= 0; i--) {
+      const r = parsed.bashResults[i]!;
+      if (r.ts !== null && now - r.ts > RECENT_RESULT_MS) continue;
+      if (!detect(`${r.command ?? ''}\n${r.text}`)) continue;
+      const last = prev.lastMatchTs?.[type] ?? null;
+      if (r.ts !== null && last !== null && r.ts <= last) return;
+      if (guard && !guard(r, i)) return;
+      if (pushIfFireable(type, {}, r.rawLines) && r.ts !== null) {
+        nextState.lastMatchTs![type] = r.ts;
+      }
+      return;
+    }
   }
-  if (detectTestFailure(parsed.snippet)) {
-    pushIfFireable('test_failure');
-  }
-  if (detectCommit(parsed.snippet)) {
-    pushIfFireable('commit');
-  }
+
+  fireFromBash('permission_denied', detectPermissionDenied);
+  fireFromBash('test_failure', detectTestFailure, (m, i) => {
+    /* A later run that reports a pass clears this failure. */
+    for (let j = i + 1; j < parsed.bashResults.length; j++) {
+      const later = parsed.bashResults[j]!;
+      if ((later.ts ?? 0) >= (m.ts ?? 0) && reportsPass(later.text)) return false;
+    }
+    return true;
+  });
+  fireFromBash('commit', detectCommit);
   /* Operator, 2026-09-22: the worker's own end-of-turn words reach Lex
    * so she reads what it reported instead of improvising. Fires once
    * per turn (ts latch), at most once per TURN_SUMMARY_GAP_MS. */

@@ -296,14 +296,13 @@ $env:DEVNEURAL_VOICE_HAIKU = '1'
 # only. Enabled 2026-07-09 (operator directive: no gates).
 $env:DEVNEURAL_INVESTIGATOR_HEADLESS = '1'
 
-# NOTE (2026-07-09): the voice-haiku live model key is NOT sourced here.
-# The daemon reads BRIDGER_ANTHROPIC_API directly (voice-haiku.ts
-# voiceApiKey) - a persistent User env var the daemon inherits on every
-# launch path, including a manual `node dist/daemon.js` that skips this
-# env block. Deliberately do NOT set $env:ANTHROPIC_API_KEY here: that
-# would flip spawned Lex sessions from Claude Max to per-token API
-# billing. Claude Code ignores BRIDGER_ANTHROPIC_API, so the daemon gets
-# a live voice key while Lex stays on Max.
+# NOTE (2026-09-23): no API key anywhere on the voice or Lex path. Every
+# model call is a headless `claude` session on the operator's Claude
+# subscription (Layer 1 voice, Layer 2 brain, the judge session, the
+# workers). Deliberately do NOT set $env:ANTHROPIC_API_KEY here: Claude
+# Code treats it as a Max-to-API billing override, and spawnLex strips it
+# from every child as defense-in-depth. The old BRIDGER_ANTHROPIC_API
+# voice key is no longer read by anything (voice-haiku.ts).
 
 $proc = Start-Process `
     -FilePath $node `

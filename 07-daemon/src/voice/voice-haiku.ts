@@ -12,49 +12,28 @@
  * flag is flipped (a separate Michael step that needs a daemon restart).
  */
 
-/* Voice-tier API key. Read ANTHROPIC_API_KEY first, then fall back to
- * BRIDGER_ANTHROPIC_API. Two reasons for the fallback (2026-07-09):
- *   1. Robustness. BRIDGER_ANTHROPIC_API is a persistent User env var, so
- *      the daemon inherits it no matter how it was launched (Task
- *      Scheduler, /admin restart, or a manual `node dist/daemon.js` that
- *      skips start-daemon.ps1's env block - the last of which is exactly
- *      why the voice key kept coming up absent).
- *   2. Billing safety. Claude Code only treats ANTHROPIC_API_KEY as a
- *      Max->API billing override; it ignores BRIDGER_ANTHROPIC_API. So a
- *      spawned Lex inherits the BRIDGER var harmlessly and stays on Max,
- *      while the daemon still gets a live voice key. (spawnLex also
- *      strips ANTHROPIC_API_KEY as defense-in-depth.) */
-export function voiceApiKey(): string | undefined {
-  return process.env.ANTHROPIC_API_KEY ?? process.env.BRIDGER_ANTHROPIC_API;
-}
+/* No API key on the voice path (operator, 2026-09-22: everything runs on
+ * the Claude subscription, never the Anthropic API). The voice tier is a
+ * headless `claude` session (voice-brain-session.ts); this flag only
+ * gates the single-mouth grant and the spoken-output strip. It used to
+ * self-enable on a key in the environment; it now self-enables on boot
+ * unless the operator opts out, and reads no key at all. */
 
-/** True when the haiku voice tier owns the mouth + front desk. Strictly
- * gated on DEVNEURAL_VOICE_HAIKU==='1'. The daemon self-enables this at
- * boot when a voice key is present (see enableVoiceHaikuIfKeyPresent),
- * so the flag no longer depends on start-daemon.ps1's env block reaching
- * the process - but the gate itself stays a pure, explicit '1' check so
- * flag-off behavior is deterministic and unit-testable. */
+/** True when the voice tier owns the mouth + the spoken-output strip.
+ * Strictly gated on DEVNEURAL_VOICE_HAIKU==='1' so flag-off behavior is
+ * deterministic and unit-testable. */
 export function useVoiceHaiku(): boolean {
   return process.env.DEVNEURAL_VOICE_HAIKU === '1';
 }
 
-/* Daemon boot self-enable (2026-07-09). The smart voice lane needs the
- * flag on AND a key present. The key is now robust (BRIDGER fallback,
- * always inherited), but the flag rode on start-daemon.ps1's env block,
- * which a manual `node dist/daemon.js` restart skips - so the daemon kept
- * booting with voice flat. Called once at boot: when a voice key is
- * present and the operator has not explicitly opted out (=== '0'), turn
- * the flag on IN THIS PROCESS. Mutates only the daemon's own env (never
- * a persistent/user var), so tests and unrelated processes are untouched.
- * Returns the resolved on/off for the boot log. */
-export function enableVoiceHaikuIfKeyPresent(): boolean {
+/* Daemon boot self-enable. On unless the operator opted out (=== '0').
+ * Mutates only the daemon's own env (never a persistent/user var), so
+ * tests and unrelated processes are untouched. Returns the resolved
+ * on/off for the boot log. */
+export function enableVoiceHaiku(): boolean {
   if (process.env.DEVNEURAL_VOICE_HAIKU === '0') return false;
-  if (process.env.DEVNEURAL_VOICE_HAIKU === '1') return true;
-  if (voiceApiKey()) {
-    process.env.DEVNEURAL_VOICE_HAIKU = '1';
-    return true;
-  }
-  return false;
+  process.env.DEVNEURAL_VOICE_HAIKU = '1';
+  return true;
 }
 
 /* Talk-layer model. Default: Anthropic Haiku (latency-optimal; the plan

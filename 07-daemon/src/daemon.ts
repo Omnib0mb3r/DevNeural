@@ -35,8 +35,7 @@ import { setJudgeSessionLogger } from './lex/judge-session.js';
 import { setVoiceBrainSessionLogger } from './lex/voice-brain-session.js';
 import {
   useVoiceHaiku,
-  voiceApiKey,
-  enableVoiceHaikuIfKeyPresent,
+  enableVoiceHaiku,
 } from './voice/voice-haiku.js';
 import { embedOne, warmUp, getEmbedDim, getModelId, setEmbedderLogger, embedderStats } from './embedder/index.js';
 import { ensureWiki } from './wiki/scaffolding.js';
@@ -1468,15 +1467,12 @@ async function main(): Promise<void> {
     const host = process.env.DEVNEURAL_BIND ?? '0.0.0.0';
     await app.listen({ port: PORT, host });
     logger(`listening on http://${host}:${PORT}`);
-    /* Voice-haiku readiness (2026-07-09). Self-enable the smart voice
-     * lane when a key is present so it no longer depends on
-     * start-daemon.ps1's env block reaching this process, then log the
-     * resolved state - a flat-voice complaint becomes a one-line log
-     * check. The key resolves from ANTHROPIC_API_KEY or the BRIDGER
-     * fallback. */
-    enableVoiceHaikuIfKeyPresent();
+    /* Voice tier flag. Self-enabled at boot unless the operator opted
+     * out; no API key is read anywhere on the voice path (the voice tier
+     * is a headless claude session on the subscription). */
+    enableVoiceHaiku();
     logger(
-      `[voice-haiku] enabled=${useVoiceHaiku()} api_key=${voiceApiKey() ? 'present' : 'absent'} flag=${process.env.DEVNEURAL_VOICE_HAIKU ?? 'unset'}`,
+      `[voice-haiku] enabled=${useVoiceHaiku()} flag=${process.env.DEVNEURAL_VOICE_HAIKU ?? 'unset'} (subscription sessions only; no API key read)`,
     );
   } catch (err) {
     logger(`http listen failed: ${(err as Error).message}`);

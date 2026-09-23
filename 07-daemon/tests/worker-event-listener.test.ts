@@ -32,6 +32,34 @@ let db: IndexDb;
 
 const CC_ID = 'cc-evt-1111-2222-3333-4444';
 
+/* BUG-035: detectors read Bash tool_results only, so the fixture is a
+ * Bash tool_use and its denied tool_result, stamped inside the recency
+ * window of the listener's fixed clock (9_000_000). */
+function deniedBashLines(): string[] {
+  const ts = new Date(9_000_000 - 60_000).toISOString();
+  return [
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: ts,
+      message: {
+        role: 'assistant',
+        stop_reason: 'tool_use',
+        content: [{ type: 'tool_use', id: 'b1', name: 'Bash', input: { command: 'npm test' } }],
+      },
+    }),
+    JSON.stringify({
+      type: 'user',
+      timestamp: ts,
+      message: {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'b1', content: 'Permission to use Bash has been denied', is_error: true },
+        ],
+      },
+    }),
+  ];
+}
+
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devneural-evt-listen-'));
   const dbFile = path.join(tmpDir, 'index.db');
@@ -120,11 +148,7 @@ describe('processChange', () => {
 
   it('skips anchors whose supervision_mode is not event', () => {
     seedAnchor('polling');
-    const file = writeJsonl([
-      JSON.stringify({
-        content: 'Permission to use Bash has been denied',
-      }),
-    ]);
+    const file = writeJsonl(deniedBashLines());
     const deps = baseDeps();
     const r = processChange(file, deps);
     expect(r.outcome).toBe('skipped-mode');
@@ -133,11 +157,7 @@ describe('processChange', () => {
 
   it('routes permission_denied through to the inject spy', () => {
     seedAnchor('event');
-    const file = writeJsonl([
-      JSON.stringify({
-        content: 'Permission to use Bash has been denied',
-      }),
-    ]);
+    const file = writeJsonl(deniedBashLines());
     const deps = baseDeps();
     const r = processChange(file, deps);
     expect(r.outcome).toBe('routed');
@@ -190,11 +210,7 @@ describe('processChange', () => {
 
   it('fires the kill-switch handler when the gate trips', () => {
     seedAnchor('event');
-    const file = writeJsonl([
-      JSON.stringify({
-        content: 'Permission to use Bash has been denied',
-      }),
-    ]);
+    const file = writeJsonl(deniedBashLines());
     const deps = baseDeps();
     deps.gate = new WorkerEventGate({
       perTypeMinGapMs: 0,

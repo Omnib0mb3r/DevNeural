@@ -37,7 +37,46 @@ function anchor(over: Partial<ProjectSessionRow> = {}): ProjectSessionRow {
   };
 }
 
+/* BUG-035 (2026-09-23): the command-evidenced detectors read Bash
+ * tool_results only. Fixtures use the real jsonl shapes: a tool_use
+ * block in an assistant record, its tool_result in a user record. */
+function toolUse(id: string, name: string, input: Record<string, unknown>, ts: string): string {
+  return JSON.stringify({
+    type: 'assistant',
+    timestamp: ts,
+    message: { role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'tool_use', id, name, input }] },
+  });
+}
+function bashUse(id: string, command: string, ts: string): string {
+  return toolUse(id, 'Bash', { command }, ts);
+}
+function toolResult(id: string, content: string, ts: string, isError = false): string {
+  return JSON.stringify({
+    type: 'user',
+    timestamp: ts,
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: id, content, ...(isError ? { is_error: true } : {}) }],
+    },
+  });
+}
+const DENIED = 'Permission to use Bash has been denied';
+const COMMITTED = '[master abc1234] feat: stuff\n 3 files changed, 9 insertions';
+const FAILED = 'FAIL tests/foo.test.ts\n Tests failed\n exit code 1';
+
 describe('parseJsonlTail', () => {
+  it('ties Bash tool_results to their command and ignores every other tool', () => {
+    const tail = [
+      bashUse('b1', 'npm test', TOOL_TS),
+      toolResult('b1', FAILED, TOOL_TS, true),
+      toolUse('r1', 'Read', { file_path: 'x.ts' }, TOOL_TS),
+      toolResult('r1', DENIED, TOOL_TS),
+    ].join('\n');
+    const p = parseJsonlTail(tail);
+    expect(p.bashResults).toHaveLength(1);
+    expect(p.bashResults[0]).toMatchObject({ command: 'npm test', text: FAILED, ts: Date.parse(TOOL_TS) });
+  });
+
   it('extracts the newest assistant timestamp', () => {
     const older = new Date(NOW - 5 * 60 * 1000).toISOString();
     const newer = new Date(NOW - 1 * 60 * 1000).toISOString();
@@ -106,13 +145,9 @@ describe('deriveEvents', () => {
     expect(r.events).toEqual([]);
   });
 
-  it('fires permission_denied when the tail contains the canonical phrase', () => {
+  it('fires permission_denied when a Bash result carries the canonical phrase', () => {
     const parsed = parseJsonlTail(
-      JSON.stringify({
-        type: 'tool_result',
-        is_error: true,
-        content: 'Permission to use Bash has been denied',
-      }),
+      [bashUse('b1', 'npm test', TOOL_TS), toolResult('b1', DENIED, TOOL_TS, true)].join('\n'),
     );
     const r = deriveEvents(parsed, basePrev(), anchor(), NOW, 'sig-x');
     expect(r.events.map((e) => e.type)).toContain('permission_denied');
@@ -146,45 +181,82 @@ describe('deriveEvents', () => {
     expect(r.events.map((e) => e.type)).not.toContain('idle');
   });
 
-  it('debounces consecutive permission_denied fires within perTypeMinFireGapMs', () => {
-    const tail = JSON.stringify({
-      content: 'Permission to use Bash has been denied',
-    });
+  it('BUG-034: one denial fires once, never again off a re-read tail, even after the gap', () => {
+    const tail = [bashUse('b1', 'npm test', TOOL_TS), toolResult('b1', DENIED, TOOL_TS, true)].join('\n');
     const parsed = parseJsonlTail(tail);
-    const after1 = deriveEvents(parsed, basePrev(), anchor(), NOW, 'sig-1');
+    const after1 = deriveEvents(parsed, basePrev(), anchor(), NOW, 'sig-1', { perTypeMinFireGapMs: 10_000 });
     expect(after1.events.map((e) => e.type)).toContain('permission_denied');
-    /* same line still in the tail, signature changes but the
-     * detector should debounce within the per-type gap. */
-    const after2 = deriveEvents(
-      parsed,
-      after1.nextState,
-      anchor(),
-      NOW + 5_000,
-      'sig-2',
-      { perTypeMinFireGapMs: 30_000 },
-    );
-    expect(after2.events.map((e) => e.type)).not.toContain(
-      'permission_denied',
-    );
-  });
-
-  it('re-fires the same type after the per-type gap elapses', () => {
-    const tail = JSON.stringify({
-      content: 'Permission to use Bash has been denied',
-    });
-    const parsed = parseJsonlTail(tail);
-    const after1 = deriveEvents(parsed, basePrev(), anchor(), NOW, 'sig-1', {
+    const after2 = deriveEvents(parsed, after1.nextState, anchor(), NOW + 5_000, 'sig-2', {
       perTypeMinFireGapMs: 10_000,
     });
-    const after2 = deriveEvents(
-      parsed,
-      after1.nextState,
-      anchor(),
-      NOW + 20_000,
-      'sig-2',
-      { perTypeMinFireGapMs: 10_000 },
+    expect(after2.events.map((e) => e.type)).not.toContain('permission_denied');
+    const after3 = deriveEvents(parsed, after2.nextState, anchor(), NOW + 60_000, 'sig-3', {
+      perTypeMinFireGapMs: 10_000,
+    });
+    expect(after3.events.map((e) => e.type)).not.toContain('permission_denied');
+  });
+
+  it('a NEW denial after the gap fires again', () => {
+    const t1 = new Date(NOW - 60_000).toISOString();
+    const t2 = new Date(NOW - 10_000).toISOString();
+    const first = parseJsonlTail([bashUse('b1', 'npm test', t1), toolResult('b1', DENIED, t1, true)].join('\n'));
+    const after1 = deriveEvents(first, basePrev(), anchor(), NOW - 50_000, 'sig-1', { perTypeMinFireGapMs: 10_000 });
+    expect(after1.events.map((e) => e.type)).toContain('permission_denied');
+    const second = parseJsonlTail(
+      [
+        bashUse('b1', 'npm test', t1),
+        toolResult('b1', DENIED, t1, true),
+        bashUse('b2', 'npm run lint', t2),
+        toolResult('b2', DENIED, t2, true),
+      ].join('\n'),
     );
+    const after2 = deriveEvents(second, after1.nextState, anchor(), NOW, 'sig-2', { perTypeMinFireGapMs: 10_000 });
     expect(after2.events.map((e) => e.type)).toContain('permission_denied');
+    expect(after2.nextState.lastMatchTs?.permission_denied).toBe(Date.parse(t2));
+  });
+
+  it('BUG-034: a Bash result older than five minutes is history, not an event', () => {
+    const old = new Date(NOW - 6 * 60_000).toISOString();
+    const parsed = parseJsonlTail([bashUse('b1', 'npm test', old), toolResult('b1', DENIED, old, true)].join('\n'));
+    const r = deriveEvents(parsed, basePrev(), anchor(), NOW, 'sig-old');
+    expect(r.events.map((e) => e.type)).not.toContain('permission_denied');
+  });
+
+  it('BUG-034: a test failure fires once and a later green run clears it', () => {
+    const t1 = new Date(NOW - 90_000).toISOString();
+    const t2 = new Date(NOW - 30_000).toISOString();
+    const red = parseJsonlTail([bashUse('b1', 'npx vitest run', t1), toolResult('b1', FAILED, t1, true)].join('\n'));
+    const r1 = deriveEvents(red, basePrev(), anchor(), NOW - 80_000, 'sig-red');
+    expect(r1.events.map((e) => e.type)).toContain('test_failure');
+    const again = deriveEvents(red, r1.nextState, anchor(), NOW - 40_000, 'sig-red-2');
+    expect(again.events.map((e) => e.type)).not.toContain('test_failure');
+    const green = parseJsonlTail(
+      [
+        bashUse('b1', 'npx vitest run', t1),
+        toolResult('b1', FAILED, t1, true),
+        bashUse('b2', 'npx vitest run', t2),
+        toolResult('b2', 'Test Files  4 passed (4)\n Tests  55 passed (55)', t2),
+      ].join('\n'),
+    );
+    const r2 = deriveEvents(green, basePrev(), anchor(), NOW, 'sig-green');
+    expect(r2.events.map((e) => e.type)).not.toContain('test_failure');
+  });
+
+  it('BUG-035: alarm words the worker merely READ or WROTE never fire', () => {
+    const fixtureText = `it('x', () => { const a = '${DENIED}'; const b = '${COMMITTED}'; const c = '${FAILED}'; })`;
+    const tail = [
+      toolUse('r1', 'Read', { file_path: 'tests/worker-event-detect.test.ts' }, TOOL_TS),
+      toolResult('r1', fixtureText, TOOL_TS),
+      toolUse('e1', 'Edit', { file_path: 'x.ts', old_string: DENIED, new_string: COMMITTED }, TOOL_TS),
+      toolResult('e1', 'The file has been updated successfully.', TOOL_TS),
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: TOOL_TS,
+        message: { role: 'assistant', content: [{ type: 'text', text: `I read the fixture: ${DENIED} and ${COMMITTED}` }] },
+      }),
+    ].join('\n');
+    const r = deriveEvents(parseJsonlTail(tail), basePrev(), anchor(), NOW, 'sig-read');
+    expect(r.events.filter((e) => ['permission_denied', 'commit', 'test_failure'].includes(e.type))).toEqual([]);
   });
 
   it('carries lastAssistantMs forward across empty ticks', () => {
@@ -203,15 +275,13 @@ describe('deriveEvents', () => {
     expect(second.nextState.lastAssistantMs).toBe(Date.parse(ASSISTANT_TS));
   });
 
-  it('emits multiple event types from one tail when each detector fires', () => {
-    const tail =
-      JSON.stringify({
-        content: 'Permission to use Bash has been denied',
-      }) +
-      '\n' +
-      JSON.stringify({
-        content: '[master abc1234] feat: stuff\n 3 files changed, 9 insertions',
-      });
+  it('emits multiple event types from one tail when each Bash result fires', () => {
+    const tail = [
+      bashUse('b1', 'npm test', TOOL_TS),
+      toolResult('b1', DENIED, TOOL_TS, true),
+      bashUse('b2', 'git commit -m "feat: stuff"', TOOL_TS),
+      toolResult('b2', COMMITTED, TOOL_TS),
+    ].join('\n');
     const parsed = parseJsonlTail(tail);
     const r = deriveEvents(parsed, basePrev(), anchor(), NOW, 'sig-multi');
     const types = r.events.map((e) => e.type).sort();
