@@ -45,8 +45,22 @@ reds: grooming-routes, sessions-anchor-liveness), dashboard suite 332/336
 (the known reds: voice-mic-init x4, plus the two Playwright specs vitest
 cannot run), both packages built, `tests/no-anthropic-api.test.ts` pinned, BUGS.md
 032/033 SMOKE-TESTING, FIXES.md VL-17 to VL-25, specs cross-linked;
-restart + live verify follow (see the spoken items list in
-LAYER-1-CONTROL.md "Testing"). Operator additions folded in during T8/T9
+restart DONE 2026-09-23T01:48:02Z (PID 24024, 3s), live verify DONE:
+the reaped brainstorm `4bbafb48` reopened (L2 cc `747a13bf`), Layer 1
+spawned in `voice-l1` and warm in 9.5s, its argv carries
+`--system-prompt` + `--exclude-dynamic-system-prompt-sections` and no
+`--append-system-prompt` (BUG-033 fix live), `/lex/auto-clear/mode` =
+live, tiles carry `worker_ctx_pct` (37) + `lex_ctx_pct` + threshold +
+ceiling, `/lex/self-clear/state` and `/lex/context-pack` answer (pack
+13.3k chars, DevNeural only), a synthetic review answered
+`decision: no_voice` and logged `[handover] announced ... voice=false`
+(the T8 hook is wired; that smoke file `HANDOVER-2026-09-23_01-51-27-454Z.md`
+is labelled and can be ignored). Spoken items still need the operator
+(LAYER-1-CONTROL.md "Testing"). Boot-log notes: `[voice-haiku]
+api_key=present` is a legacy feature flag only (the key is stripped from
+every claude child by `SPAWN_STRIP_ENV`; the only SDK client is
+`llm/anthropic.ts` and the provider is ollama); `project anchor seed
+FAILED: UNIQUE constraint` is a pre-existing boot line (90 in the log). Operator additions folded in during T8/T9
 (2026-09-22 late): the L3 flow as he described it matches the build;
 L2's self-clear handover is self-reviewed after she reads current state,
 then vetted, fact-checked and judged by the daemon; L1 clears with no
