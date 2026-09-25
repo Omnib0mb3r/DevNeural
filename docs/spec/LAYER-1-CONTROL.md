@@ -178,7 +178,15 @@ bare assistant. Two guards now stand behind the flag:
 - A boot-time probe (`07-daemon/src/lex/prompt-delivery-probe.ts`) runs
   one throwaway `claude -p --system-prompt-file` with a one-line prompt
   and reports `prompt_delivery: ok | failed` in `GET /health` and
-  `[prompt-probe]` in `daemon.log`.
+  `[prompt-probe]` in `daemon.log`. It spawns with the Layer 1 shape
+  (`--tools "" --strict-mcp-config --setting-sources project,local`),
+  45 s after boot, retries once, and kills its process tree on timeout
+  (BUG-049).
+- Every claude the daemon spawns (Layer 1, Layer 2, workers, the probe)
+  runs with `DISABLE_AUTOUPDATER=1`. The CLI updated itself twice on
+  2026-09-24 underneath live sessions, and one update changed how the
+  prompt is passed. The operator's own interactive claude does the
+  updating; a headless session never does.
 
 One person (2026-09-24): the contract's gap rule is "you are already
 looking", never "I don't have context". A question the [live] block

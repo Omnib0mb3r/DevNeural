@@ -492,6 +492,14 @@ export function spawnLex(opts: SpawnLexOptions): SpawnLexResult {
      * child-session mode, which writes no transcript jsonl and makes
      * voice/mirror go dark. */
     env: sanitizeClaudeSpawnEnv({
+      /* BUG-049 (2026-09-25): the CLI auto-updated twice on 2026-09-24
+       * (2.1.273 -> 2.1.274 -> 2.1.282, npm to native) underneath live
+       * daemon sessions, and one update silently changed how prompts
+       * are passed (BUG-041). A headless Lex session is never the
+       * process that updates the operator's CLI; the operator's own
+       * interactive claude does that. process.env and opts.env can
+       * still override. */
+      DISABLE_AUTOUPDATER: '1',
       ...process.env,
       ...(opts.env ?? {}),
     }),
