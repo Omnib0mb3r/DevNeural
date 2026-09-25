@@ -125,6 +125,7 @@ import {
   analyzeTurn,
   decideCoalesce,
   emptyCoalescerState,
+  smartTurnHoldWindowMs,
   type TurnVerdict,
 } from './smart-turn.js';
 import { runHoldUp } from './lex-voice-hold-up.js';
@@ -2031,6 +2032,43 @@ export function _planTopLayerActionsImpl(
   return out;
 }
 
+/* BUG-047 (2026-09-24): how long a Smart Turn "incomplete" verdict may
+ * hold an utterance before the governor ships it anyway. The Smart Turn
+ * hold window (1.6 s default, DEVNEURAL_SMART_TURN_HOLD_MS), not the
+ * endpoint governor's 3 s ceiling: a wrong verdict on "Thank you." must
+ * cost one short pause. Exported for the pin. */
+export function heldTurnFlushMaxHoldMs(): number {
+  return smartTurnHoldWindowMs();
+}
+
+/* BUG-048 (2026-09-24): L1 answered IGNORE ("unclear address") to
+ * "Next in session." (whisper's rendering of "end session") seconds after
+ * its own line, and the operator got silence. IGNORE is for sound that
+ * is not Michael talking to Lex. When the reason is not a background
+ * category, the words are not a parenthetical noise tag, and the
+ * exchange is live (his last exchange within the window), the daemon
+ * hands the words back as an [event] so L1 asks him what he meant.
+ * Pure and exported for tests. */
+const IGNORE_BACKGROUND_REASON =
+  /noise|tv\b|television|radio|music|echo|other|someone|else|background|crowd|child|kid|dog|phone|speaker|audio|playback|self|myself|own words/i;
+export const IGNORE_CHALLENGE_WINDOW_MS = 90_000;
+
+export function _shouldChallengeIgnoreImpl(
+  reason: string | null,
+  utterance: string,
+  msSinceLastExchange: number | null,
+): boolean {
+  if (msSinceLastExchange === null || msSinceLastExchange > IGNORE_CHALLENGE_WINDOW_MS) {
+    return false;
+  }
+  const u = utterance.trim();
+  if (!u || !/[a-z]/i.test(u)) return false;
+  /* "(water bubbling)", "[laughter]": whisper's own noise tags. */
+  if (/^[([].*[)\]]$/.test(u)) return false;
+  if (reason && IGNORE_BACKGROUND_REASON.test(reason)) return false;
+  return true;
+}
+
 /* Single-mouth invariant 6: a delivery cut mid-stream is FINAL. It is
  * never re-delivered from the top (that would re-speak the heard
  * prefix) and never spoken raw; the full text stays in the transcript. */
@@ -3534,12 +3572,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   /* The voice's working memory: the last few exchanges, kept here in
    * the daemon and rendered into every [live] block. Survives a Layer 1
    * respawn by construction. */
-  const recentTalk: Array<{ heard: string; said: string }> = [];
+  const recentTalk: Array<{ heard: string; said: string; atMs: number }> = [];
   function rememberTalk(heard: string, said: string): void {
     const h = heard.trim();
     const s = said.trim();
     if (!h && !s) return;
-    recentTalk.push({ heard: h, said: s });
+    recentTalk.push({ heard: h, said: s, atMs: Date.now() });
     while (recentTalk.length > RECENT_TALK_MAX) recentTalk.shift();
   }
 
@@ -3810,8 +3848,8 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   /* A daemon-originated event handed to L1 (plan ready, dispatch pending,
    * brain progress, a handler's result). Same speaker, same queue; never
    * fail-safe-forwards. */
-  async function runTopLayerEventTurn(event: TopLayerEvent): Promise<void> {
-    if (state.closed) return;
+  async function runTopLayerEventTurn(event: TopLayerEvent): Promise<string> {
+    if (state.closed) return '';
     const anchorId = currentAnchorId();
     const speaker = makeLineSpeaker();
     const turn = await topLayerEventTurn(event, {
@@ -3821,6 +3859,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       deps: { onSpeech: speaker.speakLine },
     });
     if (turn.speech) speaker.speakLine(turn.speech);
+    const spoken = speaker.lines().join(' ') || turn.speech || '';
     if (turn.control) await applyTopLayerControl(turn.control, turn.controlArg, turn, event.text);
     if (turn.forward && turn.control !== 'combine') {
       if (midState().mid === 'warming') {
@@ -3830,6 +3869,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         await forwardToL2(turn.forward, 0);
       }
     }
+    return spoken;
   }
 
   /* While L2 is mid-turn and the operator is quiet, hand L1 one
@@ -5139,10 +5179,18 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       heldTurnFlushTimer = null;
       if (state.closed) return;
       if (!smartTurnCoalescer.heldText) return;
+      /* BUG-047 (2026-09-24): the ceiling is the Smart Turn hold window
+       * (1.6 s by default), not the endpoint governor's 3 s. "Thank
+       * you." judged mid-thought by the model sat unanswered for the
+       * whole ceiling; a wrong "incomplete" verdict must cost one
+       * short pause, never a silence a person would notice. A genuine
+       * continuation that arrives later is merged by the coalescer as
+       * it always was. */
       const d = decideEndpoint(
         createEndpointState(heldSinceMs),
         'incomplete',
         Date.now(),
+        { maxHoldMs: heldTurnFlushMaxHoldMs() },
       );
       if (d.action === 'hold') {
         heldTurnFlushTimer = setTimeout(
@@ -5320,6 +5368,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     state.topOwnsAck = speaker.streamed() || turn.speech !== null;
     const warming = midState().mid === 'warming';
     const actions = _planTopLayerActionsImpl(turn, warming);
+    /* How live the exchange is, measured BEFORE this turn is recorded:
+     * the IGNORE challenge below needs the gap to the previous one. */
+    const prevExchange = recentTalk[recentTalk.length - 1];
+    const sinceLastExchangeMs = prevExchange ? Date.now() - prevExchange.atMs : null;
     rememberTalk(
       trimmed,
       speaker.lines().join(' ') ||
@@ -5334,12 +5386,26 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         case 'speak':
           speaker.speakLine(action.text);
           break;
-        case 'ignore':
+        case 'ignore': {
+          if (_shouldChallengeIgnoreImpl(action.reason, trimmed, sinceLastExchangeMs)) {
+            const gapS = Math.round((sinceLastExchangeMs ?? 0) / 1000);
+            logFn(
+              `[voice-ws] L1 ignore challenged (${action.reason}): Michael's own voice ${gapS}s after the last exchange, handing it back: ${JSON.stringify(trimmed.slice(0, 80))}`,
+            );
+            const asked = await runTopLayerEventTurn({
+              kind: 'addressed',
+              text: `You answered IGNORE (${action.reason}) to ${JSON.stringify(trimmed)}. That was Michael's own voice, ${gapS}s after the last exchange, not background. If the words do not parse, ask him what he meant, in five words or fewer; if they do, answer them.`,
+            });
+            const last = recentTalk[recentTalk.length - 1];
+            if (last && last.heard === trimmed) last.said = asked || '(asked what he meant)';
+            break;
+          }
           logFn(
             `[voice-ws] L1 ignored (${action.reason}): ${JSON.stringify(trimmed.slice(0, 80))}`,
           );
           send({ t: 'ignored', text: trimmed, reason: action.reason });
           break;
+        }
         case 'control':
           await applyTopLayerControl(action.control, action.arg, turn, trimmed);
           break;
@@ -5679,7 +5745,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
   const topLayerSink: TopLayerEventSink = {
     anchorId: () => currentAnchorId(),
     closed: () => state.closed,
-    run: (event) => runTopLayerEventTurn(event),
+    run: async (event) => {
+      await runTopLayerEventTurn(event);
+    },
   };
   topLayerEventSinks.add(topLayerSink);
 

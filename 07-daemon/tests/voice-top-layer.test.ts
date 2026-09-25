@@ -166,6 +166,17 @@ describe('buildTopLayerSystemPrompt', () => {
     expect(p).toMatch(/give me a moment, I'm looking into it/);
   });
 
+  it('answers a courtesy with a courtesy and never IGNOREs Michael\'s own voice (2026-09-24)', () => {
+    const p = buildTopLayerSystemPrompt();
+    /* "Thank you." got "Still on it, give me a moment." twice (BUG-047). */
+    expect(p).toMatch(/A courtesy gets a courtesy/);
+    expect(p).toMatch(/Never turn his thanks\s+into a status report/);
+    /* "Next in session." (whisper's "end session") got IGNORE: unclear
+     * address, i.e. silence (BUG-048). */
+    expect(p).toMatch(/IGNORE is only for sound\s+that is not Michael talking to you/);
+    expect(p).toMatch(/Unsure means ask, not silence/);
+  });
+
   it('carries the warmup contract so a promptless session cannot pass warmup (BUG-041)', () => {
     const p = buildTopLayerSystemPrompt();
     expect(p).toContain('The daemon\'s boot probe is the exact message "Warmup check."');

@@ -188,6 +188,27 @@ it" and the question queues. L1 never asks Michael which project or
 what it is about: the supervised project is in the [live] worker line
 and its files are L2's to read (L2 contract: "Go and look").
 
+Courtesies and mishears (2026-09-24 evening test, BUG-047 / BUG-048):
+
+- A courtesy gets a courtesy whatever the brain is doing. "Thank you"
+  gets "you're welcome" in Lex's own words; news that the brain is
+  still working comes after it, never instead of it. (Observed: "Thank
+  you." answered twice with "Still on it, give me a moment.")
+- IGNORE is only for sound that is not Michael talking to Lex: a
+  parenthetical noise tag, the TV, another person, her own echo. His
+  own voice in a live exchange is addressed to her even when the words
+  do not parse (a mishear, a fragment); the contract says ask, in five
+  words or fewer. The daemon backs this with a deterministic check
+  (`_shouldChallengeIgnoreImpl`): an IGNORE whose reason is not a
+  background category, on real words, within 90 s of the last exchange,
+  is handed back to L1 as an `[event] addressed` and L1 asks him what
+  he meant. (Observed: "Next in session.", whisper's rendering of "end
+  session", got `IGNORE: unclear address` and silence.)
+- A Smart Turn "incomplete" verdict holds an utterance for at most the
+  Smart Turn hold window (1.6 s, `DEVNEURAL_SMART_TURN_HOLD_MS`), no
+  longer the endpoint governor's 3 s ceiling (`heldTurnFlushMaxHoldMs`).
+  A wrong verdict on a complete two-word sentence costs one short pause.
+
 Effort note: `--effort` levels are low / medium / high / xhigh / max. Haiku
 4.5 has no effort parameter (the CLI accepts the flag on haiku and it changes
 nothing). The knob exists so Sonnet 5 or Opus can be flipped in at `low` for
