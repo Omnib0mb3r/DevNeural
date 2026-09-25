@@ -229,9 +229,12 @@ export function buildVoiceSnapshot(opts: VoiceSnapshotOptions = {}): string {
   })();
 
   /* Anchor-backed open_projects lines. Format per spec:
-   *   - <slug> (anchor <id8>, session <cc8>, status=live, bridge=ok|N)
+   *   - <slug> (anchor <id8>, session <cc8>, status=live, bridge=ok|N, root <cwd>)
    * where bridge=ok for single-window connections and bridge=N when
-   * multiple VS Code windows are bound to the same anchor. */
+   * multiple VS Code windows are bound to the same anchor. The root is
+   * the project folder on disk (2026-09-24): it is where Lex goes to
+   * look (README, docs, OTLC-Brainstorm.md, git log) when a question
+   * about the supervised project is not answered by the live state. */
   const sessionLines = projectAnchors.length
     ? projectAnchors
         .slice(0, 12)
@@ -250,7 +253,9 @@ export function buildVoiceSnapshot(opts: VoiceSnapshotOptions = {}): string {
             a.status === 'live'
               ? 'status=live'
               : `status=${a.status}, offline`;
-          return `  - ${a.project_slug} (anchor ${anchorShort}, session ${ccShort}, ${statusTag}, ${bridge})`;
+          const root = (a.cwd ?? '').replace(/\\/g, '/').replace(/\/+$/, '');
+          const rootTag = root ? `, root ${root}` : '';
+          return `  - ${a.project_slug} (anchor ${anchorShort}, session ${ccShort}, ${statusTag}, ${bridge}${rootTag})`;
         })
         .join('\n')
     : scope

@@ -34,3 +34,4 @@ skill-connections/
 # the project folder). Regenerated on every boot, with a growing archive/
 # subfolder; must never be tracked.
 investigator-reports/
+08-dashboard/.next-dev/

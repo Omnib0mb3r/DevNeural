@@ -33,7 +33,7 @@ import { triggerShutdown, hasShutdownHook } from '../lifecycle/shutdown-hook.js'
 import { ReferenceStore } from '../reference/store.js';
 import { ingestUpload } from '../reference/process.js';
 import { getSystemMetrics } from './system-metrics.js';
-import { checkAll, rollupStatus } from './services.js';
+import { checkAllCached, rollupStatus } from './services.js';
 import {
   listSessions,
   liveAnchorSessionIds,
@@ -195,7 +195,7 @@ import {
   type Notification,
 } from './notifications.js';
 import { createProject } from './projects-new.js';
-import { buildGraph } from './graph.js';
+import { buildGraphCached } from './graph.js';
 import { buildUnifiedGraph } from './unified-graph.js';
 import {
   vapidPublicKey,
@@ -1101,8 +1101,10 @@ export async function registerDashboardRoutes(
 
   // ── Dashboard surface ─────────────────────────────────────────────
   app.get('/dashboard/health', async () => {
+    /* BUG-042: both readings come from caches refreshed off the
+     * request path; this handler is polled every 5 s by the top bar. */
     const metrics = await getSystemMetrics();
-    const services = await checkAll();
+    const services = await checkAllCached();
     return {
       ok: true,
       rollup: rollupStatus(services),
@@ -1382,7 +1384,7 @@ export async function registerDashboardRoutes(
   });
 
   // ── Wiki graph for the orb ───────────────────────────────────────
-  app.get('/graph', async () => buildGraph());
+  app.get('/graph', async () => buildGraphCached());
 
   // ── Unified graph (all 4 node kinds) for the unified orb ─────────
   app.get('/graph/unified', async () => buildUnifiedGraph(store.db));
@@ -1454,7 +1456,7 @@ export async function registerDashboardRoutes(
 
   // ── Services manifest ─────────────────────────────────────────────
   app.get('/services', async () => {
-    const services = await checkAll();
+    const services = await checkAllCached();
     return { ok: true, services, rollup: rollupStatus(services) };
   });
 
@@ -4319,6 +4321,45 @@ export async function registerDashboardRoutes(
     };
   });
 
+  /* BUG-043 (2026-09-24): the Claude Code hook process resolves the
+   * project identity for every captured event and used to write
+   * projects.json itself, racing the daemon (torn reads emptied the
+   * registry). It posts the identity here instead; the daemon is the
+   * registry's single writer. Shape-checked, root must exist, `global`
+   * is never recorded. Hot path (every hook event), so no logging. */
+  app.post('/projects/record-identity', async (req, reply) => {
+    const body = (req.body ?? {}) as Partial<{
+      id: string;
+      name: string;
+      root: string;
+      remote: string | null;
+      scope: string;
+    }>;
+    const id = typeof body.id === 'string' ? body.id : '';
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    const root =
+      typeof body.root === 'string'
+        ? body.root.replace(/\\/g, '/').replace(/\/+$/, '')
+        : '';
+    const remote =
+      body.remote === null || typeof body.remote === 'string'
+        ? body.remote
+        : undefined;
+    const scope =
+      body.scope === 'remote' || body.scope === 'path' ? body.scope : null;
+    if (!/^[a-f0-9]{12}$/i.test(id) || !name || !root || remote === undefined || !scope) {
+      reply.code(400);
+      return { ok: false, error: 'identity {id, name, root, remote, scope} required' };
+    }
+    if (!fs.existsSync(root)) {
+      reply.code(400);
+      return { ok: false, error: `root not found: ${root}` };
+    }
+    const { recordIdentity } = await import('../identity/registry.js');
+    recordIdentity({ id, name, root, remote, scope });
+    return { ok: true };
+  });
+
   /* Start Claude in an existing registered project.
    *
    * Looks up the project root from the registry, drops a workspace-
@@ -4630,63 +4671,84 @@ export async function registerDashboardRoutes(
   // ── Stats: total lines of code across registered projects ──────
   /* Walks every registered project's root with `git ls-files` and
    * counts lines. Skips lockfiles, vendored bundles, and binary file
-   * extensions. Cached in-process for 5 minutes because git ls-files
-   * + wc on N projects is several hundred ms; the dashboard ticker
-   * polls every 60s and can tolerate a stale value within the cache
-   * window. */
+   * extensions. Cached in-process for 5 minutes; the dashboard ticker
+   * polls every 60s and can tolerate a stale value within the window.
+   *
+   * BUG-042 (2026-09-24): this was execSync plus readFileSync over every
+   * tracked file of every project, on the request path. With the
+   * registry restored to 50+ projects (BUG-043) that is seconds of
+   * frozen event loop every five minutes. Now async (execFile and
+   * fs.promises with a bounded read pool) and stale-while-revalidate:
+   * a request past the TTL gets the last value at once and one
+   * recompute runs in the background; only the very first request
+   * after boot waits for a computation. */
   interface LocCacheEntry {
     total: number;
     by_project: { id: string; name: string; lines: number }[];
     computed_at: string;
   }
   let locCache: { value: LocCacheEntry; expires_at: number } | null = null;
+  let locInFlight: Promise<LocCacheEntry> | null = null;
   const LOC_CACHE_MS = 5 * 60 * 1000;
-  app.get('/stats/loc', async () => {
-    if (locCache && Date.now() < locCache.expires_at) {
-      return { ok: true, ...locCache.value, cache: 'hit' };
-    }
-    const { listProjects: lp } = await import('../identity/registry.js');
-    const { execSync } = await import('node:child_process');
-    const projects = lp();
-    const by_project: { id: string; name: string; lines: number }[] = [];
-    let total = 0;
-    /* Skip files that inflate the count without representing source.
-     * Ignored: package-lock, raster images, archives, binaries,
-     * vendored ML wasm + onnx bundles. */
-    const skip =
-      /(?:^|\/)(package-lock\.json|.*\.png|.*\.ico|.*\.svg|.*\.zip|.*\.exe|.*\.dll|.*\.pdb|.*\.bin|.*\.onnx|.*\.wasm)$|public\/vad\//i;
-    for (const project of projects) {
-      const root = project.root.replace(/\\/g, '/');
-      if (!fs.existsSync(root)) continue;
-      try {
-        /* git ls-files lists tracked files only — the right unit
-         * because that's what the developer actually owns. */
-        const out = execSync('git ls-files', {
+  /* Skip files that inflate the count without representing source.
+   * Ignored: package-lock, raster images, archives, binaries,
+   * vendored ML wasm + onnx bundles. */
+  const LOC_SKIP =
+    /(?:^|\/)(package-lock\.json|.*\.png|.*\.ico|.*\.svg|.*\.zip|.*\.exe|.*\.dll|.*\.pdb|.*\.bin|.*\.onnx|.*\.wasm)$|public\/vad\//i;
+
+  async function countProjectLines(root: string): Promise<number> {
+    const { execFile } = await import('node:child_process');
+    /* git ls-files lists tracked files only: the right unit because
+     * that's what the developer actually owns. */
+    const out = await new Promise<string>((resolve, reject) => {
+      execFile(
+        'git',
+        ['ls-files'],
+        {
           cwd: root,
           encoding: 'utf-8',
           windowsHide: true,
-          stdio: ['ignore', 'pipe', 'ignore'],
           maxBuffer: 16 * 1024 * 1024,
-        });
-        const files = out
-          .split(/\r?\n/)
-          .filter((f) => f.length > 0 && !skip.test(f));
-        let lines = 0;
-        for (const rel of files) {
-          const p = path.posix.join(root, rel);
-          try {
-            const buf = fs.readFileSync(p);
-            /* Count newlines + 1 for last line if non-empty. Cheap
-             * approximation; matches `wc -l` semantics closely. */
-            let nl = 0;
-            for (let i = 0; i < buf.length; i++) {
-              if (buf[i] === 0x0a) nl++;
-            }
-            lines += nl;
-          } catch {
-            /* unreadable / deleted between ls-files and read */
+          timeout: 30_000,
+        },
+        (err, stdout) => (err ? reject(err) : resolve(stdout)),
+      );
+    });
+    const files = out
+      .split(/\r?\n/)
+      .filter((f) => f.length > 0 && !LOC_SKIP.test(f));
+    let lines = 0;
+    let next = 0;
+    const POOL = 16;
+    async function readSome(): Promise<void> {
+      while (next < files.length) {
+        const rel = files[next++]!;
+        try {
+          const buf = await fs.promises.readFile(path.posix.join(root, rel));
+          /* Count newlines; matches `wc -l` semantics closely. */
+          let nl = 0;
+          for (let i = 0; i < buf.length; i++) {
+            if (buf[i] === 0x0a) nl++;
           }
+          lines += nl;
+        } catch {
+          /* unreadable / deleted between ls-files and read */
         }
+      }
+    }
+    await Promise.all(Array.from({ length: POOL }, () => readSome()));
+    return lines;
+  }
+
+  async function computeLoc(): Promise<LocCacheEntry> {
+    const { listProjects: lp } = await import('../identity/registry.js');
+    const by_project: { id: string; name: string; lines: number }[] = [];
+    let total = 0;
+    for (const project of lp()) {
+      const root = project.root.replace(/\\/g, '/');
+      if (!fs.existsSync(root)) continue;
+      try {
+        const lines = await countProjectLines(root);
         if (lines > 0) {
           by_project.push({ id: project.id, name: project.name, lines });
           total += lines;
@@ -4696,12 +4758,38 @@ export async function registerDashboardRoutes(
       }
     }
     by_project.sort((a, b) => b.lines - a.lines);
-    const value: LocCacheEntry = {
-      total,
-      by_project,
-      computed_at: new Date().toISOString(),
-    };
-    locCache = { value, expires_at: Date.now() + LOC_CACHE_MS };
+    return { total, by_project, computed_at: new Date().toISOString() };
+  }
+
+  function refreshLoc(): Promise<LocCacheEntry> {
+    if (locInFlight) return locInFlight;
+    locInFlight = computeLoc()
+      .then((value) => {
+        locCache = { value, expires_at: Date.now() + LOC_CACHE_MS };
+        return value;
+      })
+      .finally(() => {
+        locInFlight = null;
+      });
+    return locInFlight;
+  }
+  /* Warm the cache shortly after boot so the first dashboard load does
+   * not wait on a 50-project walk; unref'd so it never holds the
+   * process open (tests, shutdown). */
+  if (!process.env.VITEST) {
+    const warm = setTimeout(() => void refreshLoc().catch(() => undefined), 15_000);
+    warm.unref();
+  }
+
+  app.get('/stats/loc', async () => {
+    if (locCache && Date.now() < locCache.expires_at) {
+      return { ok: true, ...locCache.value, cache: 'hit' };
+    }
+    if (locCache) {
+      void refreshLoc();
+      return { ok: true, ...locCache.value, cache: 'stale' };
+    }
+    const value = await refreshLoc();
     return { ok: true, ...value, cache: 'miss' };
   });
 

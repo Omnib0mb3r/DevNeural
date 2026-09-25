@@ -703,8 +703,8 @@ Built from a full traversal of `07-daemon/src/` (130 .ts files, ~44.9k LOC) on 2
 - Exports: `searchAll`, `SearchAllOptions`, `SearchAllHit`, `SourceClass`.
 
 #### `dashboard/services.ts`
-- Purpose: Reads `<DATA_ROOT>/dashboard/config.jsonc`; pings each defined service (http/tcp/process/cmd/file).
-- Exports: `checkAll`, `rollupStatus`, `ServiceDef`, `ServiceResult`.
+- Purpose: Reads `<DATA_ROOT>/dashboard/config.jsonc`; pings each defined service (http/tcp/process/cmd/file). `cmd` probes run through async `exec` (BUG-042: they were `execSync` and froze the event loop). `checkAllCached` memoises one run for 4 s and shares the in-flight run, so the top bar (5 s) and the vitals ribbon (8 s) pollers cost one probe set between them.
+- Exports: `checkAll`, `checkAllCached`, `rollupStatus`, `ServiceDef`, `ServiceResult`.
 
 #### `dashboard/session-phase.ts`
 - Purpose: In-memory `Map<sessionId, {phase, updated_at}>` with 60s decay back to idle.
@@ -734,8 +734,8 @@ Built from a full traversal of `07-daemon/src/` (130 .ts files, ~44.9k LOC) on 2
 - Exports: `markSuperseded`, `isSuperseded`.
 
 #### `dashboard/system-metrics.ts`
-- Purpose: CPU/memory/disk/uptime via `os` + minor Windows shell-outs.
-- Exports: `getSystemMetrics`, `CpuMetric`, `MemoryMetric`, `DiskMetric`.
+- Purpose: CPU/memory/disk/uptime via `os`. Drive usage (one async PowerShell call) and data-root size (async walk) are background-refreshed cached readings with a 60 s TTL; Ollama reachability is memoised 5 s. Nothing spawns or walks on the request path (BUG-042: the old `execSync` PowerShell probe cost 413 ms of frozen event loop per poll, and the ribbon polls every 4 s).
+- Exports: `getSystemMetrics`, `CpuMetric`, `MemoryMetric`, `DiskMetric`, `_resetSystemMetricsCachesForTests`.
 
 #### `dashboard/terminal-stream.ts`
 - Purpose: Per-session 256KB ring buffer + WebSocket fan-out. Bridge writes via `/sessions/:id/terminal-stream`.
@@ -814,8 +814,8 @@ Built from a full traversal of `07-daemon/src/` (130 .ts files, ~44.9k LOC) on 2
 - Exports: `resolveProjectIdentity`, `normalizeRemote`, `hashId`.
 
 #### `identity/registry.ts`
-- Purpose: Persisted project registry at `<DATA_ROOT>/projects.json`; per-project `project.json`.
-- Exports: `listProjects`, `recordIdentity`, `getProject`.
+- Purpose: Persisted project registry at `<DATA_ROOT>/projects.json`; per-project `project.json`. Single writer: the daemon (hooks post identities to `POST /projects/record-identity`, BUG-043). Saves are atomic (temp + rename); an unreadable registry is quarantined as `projects.json.corrupt-<ts>` and rebuilt from the per-project `project.json` files instead of starting empty; `restoreFromProjectMeta` runs at boot before the dupe reconcile and the dead-root prune.
+- Exports: `listProjects`, `recordIdentity`, `getProject`, `restoreFromProjectMeta`, `reconcileAllProjects`, `pruneMissingProjects`, `setRegistryLogger`.
 
 ### `lifecycle/`
 
@@ -1262,7 +1262,8 @@ Mounted at `0.0.0.0:3747` (env `DEVNEURAL_BIND` / `DEVNEURAL_PORT`). All routes 
 | GET | /graph | Wiki graph | routes.ts:478 |
 | GET | /graph/unified | Unified node graph | routes.ts:481 |
 | GET | /wiki/page/:id | Wiki page detail | routes.ts:484 |
-| GET | /services | Service status manifest | routes.ts:549 |
+| GET | /services | Service status manifest (cached 4 s, BUG-042) | routes.ts:549 |
+| POST | /projects/record-identity | Hook-supplied project identity; the daemon is the registry's single writer (BUG-043) | routes.ts |
 | GET | /sessions | List CC sessions | routes.ts:555 |
 | GET | /sessions/:id | Session detail | routes.ts:633 |
 | GET | /sessions/:id/transcript | Transcript chunks | routes.ts:647 |

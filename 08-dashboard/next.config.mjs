@@ -87,6 +87,19 @@ const nextConfig = PROD
     }
   : {
       reactStrictMode: true,
+      // The daemon's dashboard supervisor keeps `next dev` running in
+      // this folder for the life of the daemon, and a production build
+      // (`next build`, static export to out/) runs in the same folder
+      // whenever the export is refreshed. Both defaulted to `.next/`:
+      // the build's `rimraf .next` under the live dev server, then the
+      // dev server rewriting the directory mid-build, produced "Cannot
+      // find module for page: /brainstorms/detail" (ENOENT) while
+      // collecting page data and left out/ deleted (BUG-046,
+      // 2026-09-24). Dev owns its own directory; the build keeps
+      // `.next` and exports to out/, which the daemon serves. (With
+      // output: 'export' Next writes the export INTO distDir, so the
+      // production side cannot be the one that moves.)
+      distDir: '.next-dev',
       // Single-origin pattern: every daemon endpoint is reachable from the Next dev
       // server through a transparent rewrite. The daemon issues Set-Cookie on its
       // own response; Next passes the header through; the browser stores it on the

@@ -93,6 +93,47 @@ function loadAllPages(): PageEntry[] {
   ];
 }
 
+/* BUG-042 (2026-09-24): buildGraph parses every wiki page from disk on
+ * every call (500 ms, 720 KB on this box) and the home-page orb asks for
+ * it on mount and every 30 s. The parse is synchronous CPU work, so it
+ * froze the daemon for half a second per call. The payload only changes
+ * when a page file changes, so it is rebuilt only then: a fingerprint of
+ * every page's name, size and mtime across the three wiki dirs (a few
+ * hundred stats, single-digit ms) decides whether the cached payload is
+ * still current. */
+function wikiFingerprint(): string {
+  const parts: string[] = [];
+  for (const dir of [wikiPagesDir(), wikiPendingDir(), wikiArchiveDir()]) {
+    for (const file of readDirSafe(dir)) {
+      try {
+        const st = fs.statSync(path.posix.join(dir, file));
+        parts.push(`${dir}/${file}:${st.size}:${st.mtimeMs}`);
+      } catch {
+        /* vanished between readdir and stat; the next call sees the
+         * new listing */
+      }
+    }
+  }
+  return parts.join('|');
+}
+
+let graphCache: { fingerprint: string; payload: GraphPayload } | null = null;
+
+export function buildGraphCached(): GraphPayload {
+  const fingerprint = wikiFingerprint();
+  if (graphCache && graphCache.fingerprint === fingerprint) {
+    return graphCache.payload;
+  }
+  const payload = buildGraph();
+  graphCache = { fingerprint, payload };
+  return payload;
+}
+
+/** Test seam. */
+export function _resetGraphCacheForTests(): void {
+  graphCache = null;
+}
+
 function recencyBoost(mtime: number): number {
   const ageDays = (Date.now() - mtime) / (1000 * 60 * 60 * 24);
   if (ageDays <= 1) return 1.0;

@@ -167,7 +167,7 @@ async function warmSession(
   anchorId: string | null,
 ): Promise<string> {
   const path = pathForSession(pty.spawnCalls.length + 1);
-  io.scheduleAssistantRecord(path, 3_500, 'OK');
+  io.scheduleAssistantRecord(path, 3_500, 'LEX READY');
   prewarmVoiceBrainSession(anchorId);
   await _voiceBrainWarmupForTests(anchorId);
   expect(isVoiceBrainSessionWarm(anchorId)).toBe(true);
@@ -284,7 +284,7 @@ describe('blue/green rotation past the jsonl cap', () => {
       expect(await askVoice({ anchorId: 'a', prompt: 'p2', timeoutMs: 5000 })).toBe('still old');
       expect(pty.injectCalls.filter((c) => c.text === 'p2')[0]!.ptyId).toBe('pty-1');
       /* The standby's boot probe answers; the swap job runs on the queue. */
-      io.scheduleAssistantRecord(pathB, 10, 'OK');
+      io.scheduleAssistantRecord(pathB, 10, 'LEX READY');
       await _voiceBrainWarmupForTests('a', { standby: true });
       await _rotateForTests('a');
       expect(pty.killCalls).toEqual(['pty-1']);

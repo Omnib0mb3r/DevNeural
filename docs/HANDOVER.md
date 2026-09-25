@@ -8,6 +8,77 @@ reflects what was true at the last update. Previous cursors (2026-07-18
 to 2026-09-22) are in `docs/archive/HANDOVER-history-2026-07-to-09.md`;
 this file holds the current cursor only.
 
+## Cursor (2026-09-24 midday: Lex's prompt was not reaching the model, the daemon's event loop was freezing on every dashboard poll, the project registry had been wiped; all three root-caused and fixed, daemon PID 70140 live on the new dist, changes UNCOMMITTED on `voice-layers`)
+
+Read first: `BUGS.md` BUG-041 to BUG-046 and `FIXES.md` OP-1 to OP-6 (the
+2026-09-24 wave); `docs/spec/LAYER-1-CONTROL.md` "Prompt delivery" and
+"One person" (new sections).
+
+### Resume here (written 2026-09-24 for a fresh session)
+
+State: branch `voice-layers`, working tree DIRTY (the whole wave is
+uncommitted: 24 modified files, 3 new). Daemon PID 70140 booted
+15:33:22Z on the dist built 15:26Z; the dashboard export in `out/` is
+from 15:31Z (built into `.next-prod/` by the first distDir attempt and
+copied over; `08-dashboard/.next-prod/` is a leftover the operator
+should delete). Next.js rewrote `08-dashboard/tsconfig.json` (formatting
+plus `.next-dev/types` in `include`); keep it.
+
+What was wrong, in the order it mattered:
+
+1. **Lex had no prompt (BUG-041).** Claude Code 2.1.273 stopped
+   expanding `--system-prompt @<file>`; every session since the CLI
+   update ran as a bare assistant. The operator's Salem Road Trip
+   brainstorm got "I don't have any context about a specific project"
+   from Layer 1, which never forwarded. Fixed with the file flags, a
+   warmup that proves the contract landed (`Warmup check.` ->
+   `LEX READY`), a boot probe (`prompt_delivery` in `/health`), and the
+   one-person wording in both contracts (Layer 1 says it is looking and
+   forwards; Layer 2 reads the project's README, docs, brief and git log
+   before greeting and on every project question; `open_projects`
+   carries `root <folder>`).
+2. **Every dashboard fetch queued behind a frozen event loop
+   (BUG-042).** `execSync` PowerShell in system-metrics (413 ms) polled
+   every 4 s and 5 s, plus sync service probes, a sync wiki parse for
+   `/graph` and sync file reads for `/stats/loc`. Measured before:
+   `/dashboard/health` 1825 ms, everything else 1.1 to 1.8 s. After:
+   system-metrics 6 ms, health 30 ms, services 5 ms, graph 18 ms.
+3. **Registry wiped to two projects (BUG-043).** The hook process and
+   the daemon both wrote `projects.json` non-atomically; a torn read
+   became "no projects". Atomic saves, quarantine-and-rebuild from the
+   per-project meta, hooks post to the daemon, boot restore: the new
+   boot logged `project-registry: restored 37`, `/projects` lists 39,
+   the LOC card computes 38 projects (3.3 M lines).
+4. Also: the static export threw React #418 on every load (BUG-044,
+   `DailyBrief` clock at build time; fixed), and `npm run build` raced
+   the supervisor's `next dev` over `.next/` (BUG-046; dev now uses
+   `.next-dev`).
+
+Operator facts to carry: the browser was on **port 3000**, the
+supervisor's `next dev` (1 to 3.5 s compile-on-demand page loads,
+`GET /version.json 404` every minute in the log). The daily driver is
+**http://localhost:3747** (the static export). Nothing in the repo
+points at 3000 except the dev docs; the bookmark or PWA does.
+`07-daemon/node_modules` was partially deleted by a `git worktree
+remove` that followed a node_modules junction (my mistake, 15:2xZ) and
+restored with `npm install` (52 packages re-added); the daemon that was
+live at the time (PID 14168) died hard at 15:19Z, BEFORE that, with no
+shutdown line and no trace in `daemon.spawn.log`; the relauncher's
+72992 ran the old dist until the planned restart at 15:33Z.
+
+Verify live (spoken, operator): open the Salem brainstorm, ask "what
+project are you supervising" and "what's going on with it". Expected:
+the voice says it is looking, the brain answers with the project, what
+its README and recent commits say, and a next move. `daemon.log` must
+show `warm: ... contract confirmed` for the L1 and `[prompt-probe] ok`.
+
+Then: commit the wave (one commit, body ends with `Rebuild: yes`),
+delete `08-dashboard/.next-prod/`, and confirm `npm run build` in
+`08-dashboard` passes with the dev server up (BUG-046 verify). Known
+red in the suite, both pre-existing: BUG-014 (`grooming-routes`) and
+BUG-045 (`sessions-anchor-liveness`). Everything else was green
+(2269 passed, plus the new pins).
+
 ## Cursor (2026-09-23 afternoon: docs are the single source of truth, Layer 1 worker verbs shipped, the hours-long session hangs root-caused and fixed; everything committed, daemon PID 54996 live)
 
 Read first: `docs/spec/LAYER-1-CONTROL.md` (v3) and `docs/spec/SMART-COMPACT.md`

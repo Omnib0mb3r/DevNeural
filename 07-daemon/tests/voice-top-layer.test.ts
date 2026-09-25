@@ -158,8 +158,18 @@ describe('buildTopLayerSystemPrompt', () => {
 
   it('tells the voice it holds no project facts (BUG-028)', () => {
     const p = buildTopLayerSystemPrompt();
-    expect(p).toMatch(/you do not know it/);
     expect(p).toMatch(/hold no project facts/);
+    /* 2026-09-24: a gap in the live block means "I am looking", never
+     * "I don't know" and never a question back about the project. */
+    expect(p).toMatch(/you are\s+already looking/);
+    expect(p).toMatch(/Never "I don't have context"/);
+    expect(p).toMatch(/give me a moment, I'm looking into it/);
+  });
+
+  it('carries the warmup contract so a promptless session cannot pass warmup (BUG-041)', () => {
+    const p = buildTopLayerSystemPrompt();
+    expect(p).toContain('The daemon\'s boot probe is the exact message "Warmup check."');
+    expect(p).toMatch(/Reply to\s+it with exactly LEX READY and nothing else/);
   });
 
   it('v3: directive shapes only, no scripted sentences; first person; no facts; barge policy; AI commands', () => {

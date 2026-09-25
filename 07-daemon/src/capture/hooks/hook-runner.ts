@@ -18,7 +18,6 @@
  * Always exit 0. Hooks must never block Claude.
  */
 import { resolveProjectIdentity } from '../../identity/project-id.js';
-import { recordIdentity } from '../../identity/registry.js';
 import {
   appendObservation,
   bumpSignalCounter,
@@ -28,7 +27,12 @@ import { evaluateGuards } from '../../lifecycle/guards.js';
 import { scrubSecrets, scrubObject } from '../secret-scrub.js';
 import { ensureDaemonRunning } from '../../lifecycle/spawn.js';
 import { readPid, isAlive } from '../../lifecycle/pid.js';
-import type { HookPayload, HookPhase, Observation } from '../../types.js';
+import type {
+  HookPayload,
+  HookPhase,
+  Observation,
+  ProjectIdentity,
+} from '../../types.js';
 
 const CURATE_TIMEOUT_MS = Number(
   process.env.DEVNEURAL_CURATE_TIMEOUT_MS ?? 1500,
@@ -232,6 +236,27 @@ export async function postColdStartPreload(
  * SessionStart (startup AND clear/compact) so a /clear inside a
  * project anchor restores the full context, not just a one-line
  * stop hook summary. */
+/* Hand the resolved project identity to the daemon, the registry's
+ * single writer (BUG-043). Bounded, best-effort, never throws. */
+async function postRecordIdentity(identity: ProjectIdentity): Promise<void> {
+  if (!identity || identity.id === 'global') return;
+  const url = `http://127.0.0.1:${DAEMON_PORT}/projects/record-identity`;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 1500);
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(identity),
+      signal: ctrl.signal,
+    });
+  } catch {
+    /* daemon down or slow; the hook must not block on it */
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 export async function postWorkerHandoff(
   sessionId: string,
   cwd: string,
@@ -621,11 +646,13 @@ async function main(): Promise<void> {
     return;
   }
 
-  try {
-    recordIdentity(identity);
-  } catch {
-    /* registry write failures must not block the hook */
-  }
+  /* BUG-043 (2026-09-24): this process used to write projects.json
+   * itself, on every captured phase, racing the daemon's own writes;
+   * a torn read in the other side's truncate window emptied the
+   * registry. The daemon is the registry's only writer now; the hook
+   * hands it the identity. Daemon down: its transcript watcher
+   * registers the project when it sees the session. */
+  await postRecordIdentity(identity);
 
   const obs = buildObservation(phase, payload, identity.id, identity.name);
   try {

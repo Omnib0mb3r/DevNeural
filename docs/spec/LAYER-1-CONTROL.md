@@ -148,18 +148,45 @@ claude --session-id <pre-minted uuid>
        --tools "" --strict-mcp-config (no built-ins, zero MCP)
        --setting-sources project,local
        --dangerously-skip-permissions
-       --system-prompt <L1 prompt>       (REPLACES Claude Code's default, v3)
+       --system-prompt-file <L1 prompt file>  (REPLACES Claude Code's default, v3)
        --exclude-dynamic-system-prompt-sections
 ```
 
-Identity (v3, BUG-033): the L1 prompt is passed with `--system-prompt`,
-not `--append-system-prompt`. Appending left Claude Code's own "You are
+Identity (v3, BUG-033): the L1 prompt replaces Claude Code's default
+prompt, it is not appended. Appending left Claude Code's own "You are
 Claude Code" identity ahead of Lex's on every turn, and under a direct
 question ("are you controlling the worker?") haiku answered as Claude
 Code. L1 has no tools and no CLAUDE.md, so nothing in the default prompt
 is needed. `--exclude-dynamic-system-prompt-sections` keeps the
-per-machine sections out as well. L2 keeps `--append-system-prompt`; it
-uses the tools the default prompt describes.
+per-machine sections out as well. L2 keeps appending
+(`--append-system-prompt-file`); it uses the tools the default prompt
+describes.
+
+Prompt delivery (BUG-041, 2026-09-24): the prompt is materialised to a
+file and passed with the CLI's file flags, `--system-prompt-file` (L1)
+and `--append-system-prompt-file` (L2), never as `--system-prompt @<path>`.
+Claude Code 2.1.273 stopped expanding the `@<path>` form; the literal
+path string became the whole prompt and every Lex session booted as a
+bare assistant. Two guards now stand behind the flag:
+
+- The warmup probe proves the contract landed. The daemon injects
+  exactly `Warmup check.`; only the contract knows the reply (`LEX READY`).
+  Any other reply logs `WARMUP FAILED: contract not loaded (BUG-041)`,
+  the session is killed, and the fail-safe path forwards every utterance
+  untouched to L2 until a later spawn passes. A promptless L1 can never
+  take an ask.
+- A boot-time probe (`07-daemon/src/lex/prompt-delivery-probe.ts`) runs
+  one throwaway `claude -p --system-prompt-file` with a one-line prompt
+  and reports `prompt_delivery: ok | failed` in `GET /health` and
+  `[prompt-probe]` in `daemon.log`.
+
+One person (2026-09-24): the contract's gap rule is "you are already
+looking", never "I don't have context". A question the [live] block
+cannot answer gets one first-person line ("checking now") and a FORWARD;
+with L2 still warming the line is "give me a moment, I'm looking into
+it" and the question queues. L1 never asks Michael which project or
+what it is about: the supervised project is in the [live] worker line
+and its files are L2's to read (L2 contract: "Go and look").
 
 Effort note: `--effort` levels are low / medium / high / xhigh / max. Haiku
 4.5 has no effort parameter (the CLI accepts the flag on haiku and it changes

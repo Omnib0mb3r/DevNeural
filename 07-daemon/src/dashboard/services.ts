@@ -8,7 +8,7 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { execSync } from 'node:child_process';
+import { exec } from 'node:child_process';
 import { DATA_ROOT, ensureDir } from '../paths.js';
 
 const DASHBOARD_DIR = path.posix.join(DATA_ROOT, 'dashboard');
@@ -147,29 +147,36 @@ function checkFile(def: ServiceDef): ServiceResult {
   };
 }
 
-function checkCmd(def: ServiceDef): ServiceResult {
-  try {
-    execSync(def.target, {
-      stdio: ['ignore', 'ignore', 'ignore'],
-      timeout: def.timeout_ms ?? 3000,
-      windowsHide: true,
-    });
-    return {
-      id: def.id,
-      label: def.label,
-      kind: def.kind,
-      status: 'ok',
-      detail: 'command exited 0',
-    };
-  } catch (err) {
-    return {
-      id: def.id,
-      label: def.label,
-      kind: def.kind,
-      status: 'fail',
-      detail: (err as Error).message.slice(0, 200),
-    };
-  }
+/* BUG-042 (2026-09-24): this was execSync, which parked the whole daemon
+ * for the life of the child (the tailscale probe, and up to the 3 s
+ * timeout when a command hung). The manifest is operator-authored, so
+ * the shell form is kept; only the blocking is gone. */
+function checkCmd(def: ServiceDef): Promise<ServiceResult> {
+  return new Promise((resolve) => {
+    exec(
+      def.target,
+      { timeout: def.timeout_ms ?? 3000, windowsHide: true },
+      (err) => {
+        if (err) {
+          resolve({
+            id: def.id,
+            label: def.label,
+            kind: def.kind,
+            status: 'fail',
+            detail: err.message.slice(0, 200),
+          });
+          return;
+        }
+        resolve({
+          id: def.id,
+          label: def.label,
+          kind: def.kind,
+          status: 'ok',
+          detail: 'command exited 0',
+        });
+      },
+    );
+  });
 }
 
 export async function checkAll(): Promise<ServiceResult[]> {
@@ -177,7 +184,7 @@ export async function checkAll(): Promise<ServiceResult[]> {
   const results: Promise<ServiceResult>[] = cfg.services.map((def) => {
     if (def.kind === 'http') return checkHttp(def);
     if (def.kind === 'file') return Promise.resolve(checkFile(def));
-    if (def.kind === 'cmd') return Promise.resolve(checkCmd(def));
+    if (def.kind === 'cmd') return checkCmd(def);
     return Promise.resolve({
       id: def.id,
       label: def.label,
@@ -187,6 +194,38 @@ export async function checkAll(): Promise<ServiceResult[]> {
     });
   });
   return Promise.all(results);
+}
+
+/* Two dashboard pollers ask for the same manifest (the top bar through
+ * /dashboard/health every 5 s, the vitals ribbon through /services every
+ * 8 s), and each run hits the internet probe and spawns tailscale. One
+ * run per TTL serves both; concurrent callers share the in-flight run.
+ * The TTL sits under the fastest poll so nobody sees a stale rollup for
+ * longer than they already tolerated. */
+const CHECK_ALL_TTL_MS = 4_000;
+let checkAllCache: { value: ServiceResult[]; takenAt: number } | null = null;
+let checkAllInFlight: Promise<ServiceResult[]> | null = null;
+
+export function checkAllCached(): Promise<ServiceResult[]> {
+  if (checkAllCache && Date.now() - checkAllCache.takenAt < CHECK_ALL_TTL_MS) {
+    return Promise.resolve(checkAllCache.value);
+  }
+  if (checkAllInFlight) return checkAllInFlight;
+  checkAllInFlight = checkAll()
+    .then((value) => {
+      checkAllCache = { value, takenAt: Date.now() };
+      return value;
+    })
+    .finally(() => {
+      checkAllInFlight = null;
+    });
+  return checkAllInFlight;
+}
+
+/** Test seam. */
+export function _resetServicesCacheForTests(): void {
+  checkAllCache = null;
+  checkAllInFlight = null;
 }
 
 export function rollupStatus(results: ServiceResult[]): ServiceStatus {

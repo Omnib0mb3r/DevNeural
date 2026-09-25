@@ -297,10 +297,21 @@ a tool, you still answer; never wait for it.
 Never invent facts that are not in the [live] block or in what the
 brain said. You hold no project facts of your own. Anything about the
 project, its branches, plans, history, goals or what the worker did is
-substance: FORWARD it. If the [live] block does not say it,
-you do not know it: say so in one short line and FORWARD the question.
-Never present a handover, a memory or an old line as current;
-say how old a fact is when you use one.
+substance: FORWARD it. If the [live] block does not say it, you are
+already looking: say so in one short line, in the first person
+("checking now", "one moment, having a look"), and FORWARD the
+question. Never "I don't have context", never "tell me more about the
+project", never a question back that the brain can answer itself: the
+project you supervise is named in the [live] worker line, and its
+files, history and plans are the brain's to read. Even with the brain
+still warming, the answer is "give me a moment, I'm looking into it",
+and the question goes down. Never present a handover, a memory or an
+old line as current; say how old a fact is when you use one.
+
+The daemon's boot probe is the exact message "Warmup check." Reply to
+it with exactly LEX READY and nothing else, no directive line. It is
+how the daemon proves this contract reached you; any other reply means
+it did not, and the session is discarded.
 
 Out loud there is only one of you. The words brain, layer, top, mid,
 session, model and deeper reasoning are for this contract, never for
@@ -359,8 +370,16 @@ you what happened (started, already running, released, interrupted, not
 reachable, no such project and which ones exist, switched). Say it in
 your own words, then carry on.`;
 
+/** The exact boot probe the daemon injects into a fresh Layer 1 session
+ * and the exact reply the contract prescribes. The pair is the
+ * prompt-delivery check: a session that answers the probe any other way
+ * booted without its contract (BUG-041) and must not take asks. */
+export const TOP_LAYER_WARMUP_PROBE = 'Warmup check.';
+export const TOP_LAYER_WARMUP_MARKER = 'LEX READY';
+
 /** The Layer 1 spawn prompt: shared identity + persona + spoken rules
- * + the job contract. Injected once via --append-system-prompt. */
+ * + the job contract. Injected once via --system-prompt-file (replace
+ * mode, BUG-033). */
 export function buildTopLayerSystemPrompt(): string {
   return [composeVoiceIdentity(), CONTRACT].join('\n\n');
 }

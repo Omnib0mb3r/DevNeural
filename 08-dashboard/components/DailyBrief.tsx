@@ -1,15 +1,33 @@
 "use client";
 
 import { useMutation, useQuery } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
 import { dailyBrief, regenerateWhatsNew } from "@/lib/daemon-client";
 import { Icon } from "./Icon";
 
-function greeting(): string {
-  const h = new Date().getHours();
+function greeting(now: Date): string {
+  const h = now.getHours();
   if (h < 5) return "Working late,";
   if (h < 12) return "Good morning,";
   if (h < 18) return "Afternoon,";
   return "Evening,";
+}
+
+/* BUG-044 (2026-09-24): the greeting and the date label were computed
+ * during render. In the static export the render happens at BUILD time,
+ * so the HTML the daemon serves says whatever the clock said when
+ * `next build` ran; the browser then renders a different hour and day,
+ * React throws hydration error #418 (text mismatch) and re-renders the
+ * whole tree from scratch on every home-page load. The clock is read on
+ * the client after mount, so the first paint matches the export. */
+function useClientClock(): Date | null {
+  const [now, setNow] = useState<Date | null>(null);
+  useEffect(() => {
+    setNow(new Date());
+    const id = window.setInterval(() => setNow(new Date()), 60_000);
+    return () => window.clearInterval(id);
+  }, []);
+  return now;
 }
 
 /* Tiny markdown renderer — handles headings, bold, lists, links, paragraphs.
@@ -117,11 +135,14 @@ export function DailyBrief() {
   const staleHours = summary?.whats_new_age_hours ?? null;
   const isStale = staleHours !== null && staleHours > 168;
 
-  const dateLabel = new Date().toLocaleDateString(undefined, {
-    weekday: "short",
-    month: "short",
-    day: "numeric",
-  });
+  const now = useClientClock();
+  const dateLabel = now
+    ? now.toLocaleDateString(undefined, {
+        weekday: "short",
+        month: "short",
+        day: "numeric",
+      })
+    : "";
   return (
     <section className="rounded-panel bg-surface1 hairline relative overflow-hidden">
       <div className="absolute inset-0 grid-bg pointer-events-none" />
@@ -161,7 +182,7 @@ export function DailyBrief() {
       </div>
       <div className="relative px-7 py-6">
         <h1 className="font-display text-3xl font-bold leading-snug text-txt1 mb-2">
-          {greeting()} <span className="text-brandSoft">Michael</span>.
+          {now ? greeting(now) : "Hello,"} <span className="text-brandSoft">Michael</span>.
         </h1>
         {q.isLoading ? (
           <div className="space-y-1.5">

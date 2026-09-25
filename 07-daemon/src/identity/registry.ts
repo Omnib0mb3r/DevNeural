@@ -1,5 +1,11 @@
 import * as fs from 'node:fs';
-import { ensureDataRoot, projectsRegistry, projectMetaFile, ensureProjectDir } from '../paths.js';
+import {
+  ensureDataRoot,
+  projectsRegistry,
+  projectsRoot,
+  projectMetaFile,
+  ensureProjectDir,
+} from '../paths.js';
 import type { ProjectIdentity, ProjectRegistryEntry } from '../types.js';
 
 interface RegistryFile {
@@ -7,26 +13,99 @@ interface RegistryFile {
   projects: Record<string, ProjectRegistryEntry>;
 }
 
-function loadRegistry(): RegistryFile {
-  ensureDataRoot();
-  const file = projectsRegistry();
-  if (!fs.existsSync(file)) {
-    return { version: 1, projects: {} };
-  }
+/* BUG-043 (2026-09-24): the registry kept collapsing to one or two
+ * entries (DevNeural's first_seen reset on 2026-07-15 and again on
+ * 2026-09-23 while the per-project meta dir holds 52 projects). Two
+ * processes wrote projects.json: the daemon, and every Claude Code hook
+ * invocation (hook-runner called recordIdentity directly on every
+ * captured phase). writeFileSync truncates then writes, so a reader
+ * that landed in the other process's truncate window got an empty file,
+ * loadRegistry silently answered "no projects", and the next save wrote
+ * a registry containing only the caller's project. Three fixes:
+ *   1. saves are atomic (temp file + rename), so no reader ever sees a
+ *      half-written registry;
+ *   2. an unreadable registry is never treated as empty: it is
+ *      quarantined and rebuilt from the per-project meta files
+ *      (projects/<id>/project.json, written on every registration);
+ *   3. the hook process no longer writes the registry at all; it posts
+ *      the identity to the daemon, the single writer (see hook-runner
+ *      and POST /projects/record-identity). */
+let registryLog: (msg: string) => void = (msg) => {
+  // eslint-disable-next-line no-console
+  console.error(msg);
+};
+
+/** The daemon routes registry warnings into daemon.log; the hook
+ * process and tests keep the stderr default. */
+export function setRegistryLogger(fn: (msg: string) => void): void {
+  registryLog = fn;
+}
+
+function isEntry(v: unknown): v is ProjectRegistryEntry {
+  if (!v || typeof v !== 'object') return false;
+  const e = v as Record<string, unknown>;
+  return (
+    typeof e.id === 'string' &&
+    typeof e.name === 'string' &&
+    typeof e.root === 'string' &&
+    (e.remote === null || typeof e.remote === 'string') &&
+    typeof e.first_seen === 'string' &&
+    typeof e.last_seen === 'string'
+  );
+}
+
+function readRegistryFile(file: string): RegistryFile | 'missing' | 'corrupt' {
+  if (!fs.existsSync(file)) return 'missing';
   try {
     const raw = fs.readFileSync(file, 'utf-8');
+    if (raw.trim().length === 0) return 'corrupt';
     const parsed = JSON.parse(raw) as RegistryFile;
-    if (parsed.version !== 1 || typeof parsed.projects !== 'object') {
-      return { version: 1, projects: {} };
+    if (
+      parsed.version !== 1 ||
+      typeof parsed.projects !== 'object' ||
+      parsed.projects === null
+    ) {
+      return 'corrupt';
     }
     return parsed;
   } catch {
-    return { version: 1, projects: {} };
+    return 'corrupt';
   }
 }
 
+function loadRegistry(): RegistryFile {
+  ensureDataRoot();
+  const file = projectsRegistry();
+  const read = readRegistryFile(file);
+  if (read === 'missing') return { version: 1, projects: {} };
+  if (read !== 'corrupt') return read;
+  /* Quarantine the bytes for forensics, then rebuild from the meta
+   * files instead of starting empty. The rebuilt registry is saved so
+   * the next reader (and the next crash) starts from something whole. */
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const quarantine = `${file}.corrupt-${stamp}`;
+  try {
+    fs.copyFileSync(file, quarantine);
+  } catch {
+    /* best-effort */
+  }
+  const reg: RegistryFile = { version: 1, projects: {} };
+  const restored = restoreFromProjectMeta(reg);
+  registryLog(
+    `[registry] projects.json unreadable; quarantined to ${quarantine}; rebuilt ${restored.length} entr(y/ies) from per-project meta (BUG-043)`,
+  );
+  saveRegistry(reg);
+  return reg;
+}
+
 function saveRegistry(reg: RegistryFile): void {
-  fs.writeFileSync(projectsRegistry(), JSON.stringify(reg, null, 2), 'utf-8');
+  const file = projectsRegistry();
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmp, JSON.stringify(reg, null, 2), 'utf-8');
+  /* rename replaces the target atomically on the same volume (NTFS
+   * MoveFileEx with REPLACE_EXISTING), so a concurrent reader sees the
+   * old bytes or the new bytes, never a truncated file. */
+  fs.renameSync(tmp, file);
 }
 
 /* Root comparison key. Same normalization the dashboard uses to join
@@ -170,6 +249,71 @@ export function pruneMissingProjects(): { removed: string[] } {
 
 export function listProjects(): ProjectRegistryEntry[] {
   return Object.values(loadRegistry().projects);
+}
+
+/* Rebuild missing registry entries from the per-project meta files
+ * (BUG-043). Every recordIdentity also writes projects/<id>/project.json,
+ * so the meta dir is a durable mirror of everything ever registered.
+ * An entry is restored when its meta parses, its id matches its folder,
+ * and its root still exists on disk (a dead root would only be pruned
+ * again at the next boot). Path-scoped orphans of a folder that also
+ * has a remote-scoped entry are skipped, and remote-scoped restores fold
+ * their own path dupes, so a restore never resurrects the "two John
+ * Simms" split that reconcileAllProjects heals.
+ *
+ * With `reg` supplied the caller owns saving (the corrupt-file path in
+ * loadRegistry); without it the registry is loaded, healed and saved
+ * here (the boot call in daemon.ts). Returns the ids added. */
+export function restoreFromProjectMeta(reg?: RegistryFile): string[] {
+  const own = reg ?? loadRegistry();
+  const added: string[] = [];
+  let ids: string[] = [];
+  try {
+    ids = fs.readdirSync(projectsRoot());
+  } catch {
+    return added;
+  }
+  const remoteScopedRoots = new Set<string>(
+    Object.values(own.projects)
+      .filter((e) => e.remote)
+      .map((e) => normalizeRoot(e.root)),
+  );
+  const candidates: ProjectRegistryEntry[] = [];
+  for (const id of ids) {
+    if (id === 'global' || own.projects[id]) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(fs.readFileSync(projectMetaFile(id), 'utf-8'));
+    } catch {
+      continue;
+    }
+    if (!isEntry(parsed) || parsed.id !== id) continue;
+    if (!parsed.root || !fs.existsSync(parsed.root)) continue;
+    candidates.push(parsed);
+    if (parsed.remote) remoteScopedRoots.add(normalizeRoot(parsed.root));
+  }
+  for (const entry of candidates) {
+    if (!entry.remote && remoteScopedRoots.has(normalizeRoot(entry.root))) {
+      continue;
+    }
+    own.projects[entry.id] = entry;
+    added.push(entry.id);
+  }
+  for (const entry of candidates) {
+    if (!entry.remote || !own.projects[entry.id]) continue;
+    reconcilePathDupes(
+      {
+        id: entry.id,
+        name: entry.name,
+        root: entry.root,
+        remote: entry.remote,
+        scope: 'remote',
+      },
+      own,
+    );
+  }
+  if (!reg && added.length > 0) saveRegistry(own);
+  return added;
 }
 
 export function getProject(id: string): ProjectRegistryEntry | undefined {

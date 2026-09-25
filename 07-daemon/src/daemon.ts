@@ -76,6 +76,10 @@ import {
   startDashboardSupervisor,
   type DashboardSupervisorHandle,
 } from './dashboard/dashboard-supervisor.js';
+import {
+  runPromptDeliveryProbe,
+  getPromptDeliveryStatus,
+} from './lex/prompt-delivery-probe.js';
 import { emitAwarenessEvent } from './lex/awareness.js';
 import fastifyCookie from '@fastify/cookie';
 import fastifyMultipart from '@fastify/multipart';
@@ -173,9 +177,23 @@ async function main(): Promise<void> {
    * folder (the two-"John Simms" split from registering a folder before
    * its git remote existed). Idempotent; no-op on a clean registry. */
   try {
-    const { reconcileAllProjects, pruneMissingProjects } = await import(
-      './identity/registry.js'
-    );
+    const {
+      reconcileAllProjects,
+      pruneMissingProjects,
+      restoreFromProjectMeta,
+      setRegistryLogger,
+    } = await import('./identity/registry.js');
+    setRegistryLogger(logger);
+    /* BUG-043 (2026-09-24): restore first, then reconcile and prune,
+     * so a registry that a torn cross-process write emptied comes back
+     * from the per-project meta files before the dupe and dead-root
+     * sweeps run over it. */
+    const restored = restoreFromProjectMeta();
+    if (restored.length > 0) {
+      logger(
+        `project-registry: restored ${restored.length} entr(y/ies) from per-project meta (BUG-043): ${restored.join(', ')}`,
+      );
+    }
     const { removed } = reconcileAllProjects();
     if (removed.length > 0) {
       logger(
@@ -1089,6 +1107,9 @@ async function main(): Promise<void> {
       pid: process.pid,
       uptime_s: Math.round(process.uptime()),
       phase: 'P3.2-reference-corpus',
+      /* BUG-041: does the installed Claude Code still deliver a prompt
+       * file to the model? ok | failed | pending | skipped. */
+      prompt_delivery: getPromptDeliveryStatus(),
       raw_chunks: store.rawChunks.size(),
       wiki_pages: store.wikiPages.size(),
       llm: providerStatus(),
@@ -1474,6 +1495,15 @@ async function main(): Promise<void> {
     logger(
       `[voice-haiku] enabled=${useVoiceHaiku()} flag=${process.env.DEVNEURAL_VOICE_HAIKU ?? 'unset'} (subscription sessions only; no API key read)`,
     );
+    /* BUG-041 (2026-09-24): Claude Code auto-updates underneath the
+     * daemon, and one update silently stopped honouring the way Lex's
+     * prompt was passed; every session booted as a bare assistant for
+     * two days before anyone noticed. This probe spawns one throwaway
+     * `claude -p` with a one-line prompt file and checks the reply, so
+     * the next such change is a loud line in daemon.log and a red field
+     * in /health within a minute of boot, not a puzzled operator. Runs
+     * in the background; never blocks boot. */
+    void runPromptDeliveryProbe({ log: logger });
   } catch (err) {
     logger(`http listen failed: ${(err as Error).message}`);
   }

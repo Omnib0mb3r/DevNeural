@@ -210,12 +210,21 @@ export function getLivePtyIds(): ReadonlySet<string> {
 }
 
 /** The argv pair (or triple) that hands Claude Code a system prompt file.
- * Pure and exported for the BUG-033 pin. */
+ * Pure and exported for the BUG-033 / BUG-041 pins.
+ *
+ * BUG-041 (2026-09-24): Claude Code 2.1.273 no longer expands the
+ * `@<path>` form of --system-prompt / --append-system-prompt. The
+ * literal string "@C:/.../abc.txt" became the whole system prompt, so
+ * every Lex session since the CLI update ran as a bare assistant with
+ * no persona, no contract and no supervised-project block. The CLI's
+ * own file flags (--system-prompt-file, --append-system-prompt-file)
+ * are the supported way to pass a prompt from disk; verified with a
+ * one-line probe prompt on this box. */
 export function systemPromptArgs(mode: 'append' | 'replace', file: string): string[] {
   if (mode === 'replace') {
-    return ['--system-prompt', `@${file}`, '--exclude-dynamic-system-prompt-sections'];
+    return ['--system-prompt-file', file, '--exclude-dynamic-system-prompt-sections'];
   }
-  return ['--append-system-prompt', `@${file}`];
+  return ['--append-system-prompt-file', file];
 }
 
 export interface SpawnLexOptions {

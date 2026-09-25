@@ -266,7 +266,7 @@ async function warmSession(
   pty: ReturnType<typeof makeFakePtyLayer>,
   sessionN: number,
 ): Promise<void> {
-  io.scheduleAssistantRecord(pathForSession(sessionN), 3_500, 'OK');
+  io.scheduleAssistantRecord(pathForSession(sessionN), 3_500, 'LEX READY');
   const trigger = await askVoice({ prompt: 'warm trigger', timeoutMs: 100 });
   expect(trigger).toBeNull();
   await _voiceBrainWarmupForTests();
@@ -396,7 +396,7 @@ describe('warmup gate (2026-07-16 smoke-test fix 2/3)', () => {
 
     /* Reply lands 20s in: after the first re-probe (probe at 3s,
      * re-probe due at 18s) but well inside the warmup window. */
-    io.scheduleAssistantRecord(pathForSession(1), 20_000, 'OK');
+    io.scheduleAssistantRecord(pathForSession(1), 20_000, 'LEX READY');
     await askVoice({ prompt: 'trigger', timeoutMs: 100 });
     await _voiceBrainWarmupForTests();
 
@@ -412,7 +412,7 @@ describe('warmup gate (2026-07-16 smoke-test fix 2/3)', () => {
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
 
     /* Reply lands 9.5s in: probe at 3s, one re-nudge due at 8s. */
-    io.scheduleAssistantRecord(pathForSession(1), 9_500, 'OK');
+    io.scheduleAssistantRecord(pathForSession(1), 9_500, 'LEX READY');
     await askVoice({ prompt: 'trigger', timeoutMs: 100 });
     await _voiceBrainWarmupForTests();
 
@@ -427,7 +427,7 @@ describe('warmup gate (2026-07-16 smoke-test fix 2/3)', () => {
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
 
-    io.scheduleAssistantRecord(pathForSession(1), 3_500, 'OK');
+    io.scheduleAssistantRecord(pathForSession(1), 3_500, 'LEX READY');
     prewarmVoiceBrainSession();
     await _voiceBrainWarmupForTests();
 
@@ -1113,7 +1113,7 @@ describe('signal-based liveness (2026-07-17)', () => {
        * 3.5s keeps the boot alive; the real reply at 5.5s is past the
        * base bound - old behavior: WARMUP FAILED kill. */
       io.scheduleAssistantRecord(pathForSession(1), 3_500, null);
-      io.scheduleAssistantRecord(pathForSession(1), 5_500, 'boot OK');
+      io.scheduleAssistantRecord(pathForSession(1), 5_500, 'LEX READY');
       const trigger = await askVoice({ prompt: 'warm trigger', timeoutMs: 100 });
       expect(trigger).toBeNull();
       await _voiceBrainWarmupForTests();
@@ -1241,5 +1241,45 @@ describe('L1 spawn env (voice layers)', () => {
     await warmSession(io, pty, 1);
     const env = (pty.spawnCalls[0] as { env?: Record<string, string> }).env ?? {};
     expect(env.MAX_THINKING_TOKENS).toBe('0');
+  });
+});
+
+/* BUG-041 (2026-09-24): Claude Code stopped expanding the `@<path>` form
+ * of --system-prompt, so Layer 1 booted with no contract for two days and
+ * nothing noticed: the old probe told the model what to answer ("Reply
+ * with exactly: OK"), so a bare assistant passed warmup and then answered
+ * project questions on its own instead of forwarding. The probe is now
+ * "Warmup check." and only the contract knows the answer. */
+describe('warmup proves the contract landed (BUG-041)', () => {
+  it('kills a session whose probe reply lacks the LEX READY marker', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    io.scheduleAssistantRecord(
+      pathForSession(1),
+      3_500,
+      "I'm ready to help! Could you provide more details about what project you're referring to?",
+    );
+    const trigger = await askVoice({ prompt: 'warm trigger', timeoutMs: 100 });
+    expect(trigger).toBeNull();
+    await _voiceBrainWarmupForTests();
+    expect(_voiceBrainSessionSnapshotForTests().warm).toBe(false);
+    expect(pty.killCalls).toEqual(['pty-1']);
+    /* The probe itself no longer leaks the expected answer. */
+    const probes = pty.injectCalls.filter((c) => c.text.startsWith('Warmup check'));
+    expect(probes.length).toBeGreaterThan(0);
+    expect(probes.every((c) => c.text === 'Warmup check.')).toBe(true);
+  });
+
+  it('warms a session whose probe reply carries the marker', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    io.scheduleAssistantRecord(pathForSession(1), 3_500, 'LEX READY');
+    const trigger = await askVoice({ prompt: 'warm trigger', timeoutMs: 100 });
+    expect(trigger).toBeNull();
+    await _voiceBrainWarmupForTests();
+    expect(_voiceBrainSessionSnapshotForTests().warm).toBe(true);
+    expect(pty.killCalls).toEqual([]);
   });
 });

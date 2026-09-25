@@ -87,7 +87,11 @@ import { seedProjectTrust } from '../dashboard/projects-new.js';
 /* Static import is acyclic at module-eval time: voice-top-layer only
  * reaches back into this module through a lazy dynamic import inside
  * its default ask. */
-import { buildTopLayerSystemPrompt } from '../voice/voice-top-layer.js';
+import {
+  buildTopLayerSystemPrompt,
+  TOP_LAYER_WARMUP_MARKER,
+  TOP_LAYER_WARMUP_PROBE,
+} from '../voice/voice-top-layer.js';
 
 export interface AskVoiceInput {
   /** Brainstorm anchor whose voice brain answers this ask. Null or
@@ -603,7 +607,11 @@ const WARMUP_RENUDGE_MS = 5_000;
  * commit CR submits one garbled turn - harmless, since any assistant
  * reply warms the session. */
 const WARMUP_REPROBE_MS = 15_000;
-const WARMUP_PROBE_TEXT = 'Warmup check. Reply with exactly: OK';
+/* BUG-041 (2026-09-24): the probe no longer tells the model what to
+ * answer. The contract does ("Warmup check." -> "LEX READY"), so the
+ * reply proves the contract reached the model. A session that answers
+ * any other way booted without its prompt and is discarded below. */
+const WARMUP_PROBE_TEXT = TOP_LAYER_WARMUP_PROBE;
 /* 90s, not 45s (2026-07-16 failure 1): a healthy boot on this box
  * measured 27s (04:29:38Z spawn -> 04:30:05Z first reply) and the
  * respawn under load blew straight through 45s and got killed. The
@@ -699,14 +707,28 @@ async function runWarmup(s: VoiceBrainSessionState, ptyId: string): Promise<void
           } catch {
             continue;
           }
-          if (extractAssistantText(rec)) {
+          const probeReply = extractAssistantText(rec);
+          if (probeReply) {
+            if (!probeReply.includes(TOP_LAYER_WARMUP_MARKER)) {
+              /* The model answered, but not as Lex: the contract never
+               * reached it (BUG-041). A promptless voice layer answers
+               * project questions on its own instead of forwarding, so
+               * it must never take an ask. Kill it; the fail-safe path
+               * forwards every utterance untouched to the brain until a
+               * later spawn passes this check. */
+              deps.log(
+                `[voice-brain] ${tag(s)} WARMUP FAILED: contract not loaded (BUG-041); probe reply=${JSON.stringify(probeReply.slice(0, 160))}; killing session`,
+              );
+              killCurrent(s, 'warmup-no-contract');
+              return;
+            }
             s.warm = true;
             s.consecutiveTimeouts = 0;
             const onWarm = s.onWarm;
             s.onWarm = null;
             if (onWarm) onWarm();
             deps.log(
-              `[voice-brain] ${tag(s)} warm: first reply after ${deps.now() - startedAt}ms; session ready for asks`,
+              `[voice-brain] ${tag(s)} warm: first reply after ${deps.now() - startedAt}ms; contract confirmed; session ready for asks`,
             );
             return;
           }
