@@ -8,6 +8,74 @@ reflects what was true at the last update. Previous cursors (2026-07-18
 to 2026-09-22) are in `docs/archive/HANDOVER-history-2026-07-to-09.md`;
 this file holds the current cursor only.
 
+## Cursor (2026-09-25 morning: Layer 1 asks were never submitting, so every word went to the brain late and twice; the voice was parroting scripted lines from its own contract; deliveries ran on a second mouth; BUG-050 to BUG-054 logged and fixed, daemon restart pending)
+
+Read first: `BUGS.md` BUG-050 to BUG-054, `FIXES.md` OP-10 to OP-15,
+`docs/spec/LAYER-1-CONTROL.md` "No scripted lines", "One mouth",
+"Submit ladder", "Fail-safe forward, narrowed", and the per-anchor note
+under "Context hygiene".
+
+### Resume here (written 2026-09-25 for a fresh session)
+
+What the operator heard on 2026-09-25 (04:39 to 04:45 local, then 07:22
+and 09:11): "good morning" answered 52 s and 112 s later, three times;
+"checking the live server and the error log now" three times in ten
+seconds; every reply opening "Right, got it" / "Right, back"; a new
+question answered together with the previous one (photo counts). The
+transcripts and `daemon.log` say why, in order:
+
+1. **Layer 1 never received a single utterance (BUG-050).** Every
+   conversational inject sat in Claude Code's composer as one growing
+   paste (`conversational ask timed out (records=0 bytes_grew=false)`,
+   21 to 35 s each), the daemon fail-safe-forwarded the raw words to
+   the brain (including "(dog barks)", and "good morning" twice from a
+   socket that had already closed), and the pile went out at 08:43:21Z
+   as one 2.5 KB record with four `[heard]` lines. The delivery session
+   showed the same alternation: one stuck, the next inject's CR pushed
+   both through, so at 11:23Z three stale "deliver this" prompts were
+   read aloud as one. The night before (00:43Z) the same code answered
+   10 of 10 in about 2 s. Fix: `waitForSubmit` (confirm growth in 1.6 s,
+   CR ladder, kill a wedged session), reply deadline from the submit,
+   composer redraw no longer counts as liveness, fail-safe narrowed.
+2. **Scripted talking (BUG-051).** `lexReplySystem` ordered a lead-in;
+   the contract handed her "still on it", "give me a moment", "right,
+   got it" and quoted example lines (two of them added under BUG-047 /
+   BUG-048 the evening before); the daemon re-asked her with a scripted
+   instruction when it disliked an IGNORE. All removed; one instruction
+   replaces them: read what you said, never say it again, nothing in
+   front of the answer.
+3. **Two mouths (BUG-052).** Deliveries ran on the `default` Layer 1
+   with no [live] block. Now on the anchor's own session, with the
+   block, and his words interrupt a delivery (Escape) instead of
+   queueing behind it.
+4. **Mode switch resets (BUG-053)** and **typed messages get no reply
+   row (BUG-054)**: the dashboard half is in `08-dashboard` (socket
+   effect no longer keyed on `mode`; the typed box sends `text-input`
+   on the live socket); the daemon half is the per-anchor voice memory.
+5. **Not a bug:** mic sensitivity and the Test mic tuner are on the
+   Settings page (gear icon), never on the voice tab; the barge-in
+   cooldown knob was removed on purpose on 2026-07-20 (`fd38db2`) as
+   dead code after the sound-stops barge baseline.
+
+Live verify, in this order, on the restarted daemon: (a) say "good
+morning" and watch `daemon.log` for `ask replied in ~2000ms` with NO
+`ask not submitted` line, or with one nudge line and then `submitted
+after nudge`; (b) ask for something that takes the brain a while and
+check the delivery starts with the answer and repeats nothing the voice
+already said; (c) talk over a delivery and check `delivery interrupted
+(operator spoke)` and that your words get answered at once; (d) switch
+push-to-talk to conversation mid-call and check no `ws-close` line and
+no `client connected (attach)` line; (e) type in the box and check the
+reply row appears. If (a) shows `ASK NEVER SUBMITTED` more than once a
+session, the CR ladder is not enough for this CLI build (2.1.282 native)
+and the next step is bracketed-paste markers around the inject, tried
+on Layer 1 only.
+
+Open on the previous cursor and still open: BUG-049 (probe stall,
+cause unknown; the same stalled-child shape hit the per-session
+headless distill at 08:43:44Z), BUG-040, BUG-017, BUG-014, BUG-045,
+BUG-023.
+
 ## Cursor (2026-09-24 midday: Lex's prompt was not reaching the model, the daemon's event loop was freezing on every dashboard poll, the project registry had been wiped; all three root-caused and fixed, daemon PID 70140 live on the new dist, changes UNCOMMITTED on `voice-layers`)
 
 Read first: `BUGS.md` BUG-041 to BUG-046 and `FIXES.md` OP-1 to OP-6 (the

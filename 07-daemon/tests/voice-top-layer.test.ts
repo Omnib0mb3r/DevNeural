@@ -14,6 +14,7 @@ import {
   buildTopLayerSystemPrompt,
   buildTopLayerTurnMessage,
   parseTopLayerReply,
+  shouldFailSafeForward,
   speechOnly,
   topLayerEventTurn,
   topLayerTurn,
@@ -163,18 +164,34 @@ describe('buildTopLayerSystemPrompt', () => {
      * "I don't know" and never a question back about the project. */
     expect(p).toMatch(/you are\s+already looking/);
     expect(p).toMatch(/Never "I don't have context"/);
-    expect(p).toMatch(/give me a moment, I'm looking into it/);
+    expect(p).toMatch(/you are looking and the question goes\s+down/);
   });
 
   it('answers a courtesy with a courtesy and never IGNOREs Michael\'s own voice (2026-09-24)', () => {
     const p = buildTopLayerSystemPrompt();
     /* "Thank you." got "Still on it, give me a moment." twice (BUG-047). */
-    expect(p).toMatch(/A courtesy gets a courtesy/);
-    expect(p).toMatch(/Never turn his thanks\s+into a status report/);
+    expect(p).toMatch(/A courtesy is answered as a courtesy/);
+    expect(p).toMatch(/never as a status report/);
     /* "Next in session." (whisper's "end session") got IGNORE: unclear
      * address, i.e. silence (BUG-048). */
     expect(p).toMatch(/IGNORE is only for sound\s+that is not Michael talking to you/);
-    expect(p).toMatch(/Unsure means ask, not silence/);
+    expect(p).toMatch(/Unsure means ask,\s+not silence/);
+  });
+
+  it('hands the voice no lines to parrot; it reads what it said before it speaks (BUG-051)', () => {
+    const p = buildTopLayerSystemPrompt();
+    /* The old contract handed her "still on it", "give me a moment",
+     * "right, got it", "give me a second, go on" and quoted example
+     * questions; she said them, three times in ten seconds. */
+    expect(p).not.toMatch(/Its answer\s+arrives/);
+    expect(p).not.toMatch(/say "give me a second, go on"/);
+    expect(p).not.toMatch(/"checking now", "one moment/);
+    expect(p).not.toMatch(/Next in session\? Say that again/);
+    expect(p).not.toMatch(/"thank\s+you" gets "you're welcome"/);
+    expect(p).toMatch(/Before you speak, read your last spoken line and the recent talk/);
+    expect(p).toMatch(/Never say again what you already said/);
+    expect(p).toMatch(/put nothing\s+in front of it/);
+    expect(p).toMatch(/Silence is the\s+default; speak only when there is news he has not heard/);
   });
 
   it('carries the warmup contract so a promptless session cannot pass warmup (BUG-041)', () => {
@@ -195,9 +212,11 @@ describe('buildTopLayerSystemPrompt', () => {
     expect(p).toMatch(/Unsigned means rethink/);
     expect(p).toMatch(/whatever words he used/);
     expect(p).toMatch(/say how old/);
-    /* The spoken warming line is gone; "give me a second" replaces it. */
+    /* The spoken warming line is gone; she tells him in her own words
+     * (BUG-051: no quoted line to parrot). */
     expect(p).not.toMatch(/still waking up/);
-    expect(p).toMatch(/give me a second, go on/);
+    expect(p).not.toMatch(/give me a second, go on/);
+    expect(p).toMatch(/brain is warming, tell him once, in your own words, keep talking/);
     /* Operator, 2026-09-22 evening: human speech, no names or symbols read
      * aloud; longer when it helps; challenge him; say when a deeper look
      * will take a while and keep him company meanwhile. */
@@ -225,9 +244,23 @@ describe('buildTopLayerSystemPrompt', () => {
 describe('topLayerTurn', () => {
   beforeEach(() => _resetGlueHistory());
 
-  it('fail-safe: a null ask forwards the utterance verbatim and never ignores', async () => {
+  it('fail-safe: a null ask forwards the utterance verbatim, flagged, and never ignores words', async () => {
     const r = await topLayerTurn('deploy the thing', ctx(async () => null));
-    expect(r).toEqual({ ...EMPTY, forward: 'deploy the thing' });
+    expect(r).toEqual({ ...EMPTY, forward: 'deploy the thing', failSafe: true });
+  });
+
+  it('fail-safe: a noise tag with no words behind it is dropped, not sent to the brain (BUG-050)', async () => {
+    /* "(dog barks)" went to the brain as a question on 2026-09-25. */
+    for (const noise of ['(dog barks)', '[BLANK_AUDIO]', '(water bubbling)', '...', '']) {
+      const r = await topLayerTurn(noise, ctx(async () => null));
+      expect(r.forward, noise).toBeNull();
+      expect(r.failSafe, noise).toBe(true);
+    }
+    /* Words in parentheses mid-sentence are still words. */
+    expect(shouldFailSafeForward('go check (the database) please')).toBe(true);
+    expect(shouldFailSafeForward('Good morning, Lex')).toBe(true);
+    expect(shouldFailSafeForward('(dog barks)')).toBe(false);
+    expect(shouldFailSafeForward('[laughter]')).toBe(false);
   });
 
   it('a thrown ask also fail-safes', async () => {
@@ -343,6 +376,42 @@ describe('voiceLexReply (TTS hooked only to the top layer)', () => {
     await voiceLexReply('body', { onSpeech: () => undefined, anchorId: 'anchor-z', deps: { ask } });
     expect(seen!.anchorId).toBe('anchor-z');
     expect(seen!.system).toMatch(/deliver/i);
+  });
+
+  it('orders no lead-in and carries the [live] block so the one voice knows what it just said (BUG-051, BUG-052)', async () => {
+    let seen: Parameters<AskFn>[0] | null = null;
+    const ask: AskFn = async (a) => {
+      seen = a;
+      return 'ok';
+    };
+    const live = {
+      mid: 'idle' as const,
+      midSinceMs: null,
+      midTool: null,
+      worker: null,
+      lastSaid: 'Checking the live server now.',
+      digest: null,
+      pendingPlan: null,
+      pendingDispatch: null,
+      cut: null,
+      pendingHandover: null,
+      recentTalk: [{ heard: 'check the app', said: 'Checking the live server now.' }],
+      nowMs: 0,
+    };
+    await voiceLexReply('Trip mode is live.', {
+      onSpeech: () => undefined,
+      anchorId: 'anchor-z',
+      live,
+      deps: { ask },
+    });
+    /* "Open with a few words of your own that make clear the brain is
+     * back with it" produced "Right, got it." on every delivery. */
+    expect(seen!.system).not.toMatch(/brain is back with it/i);
+    expect(seen!.system).toMatch(/no lead-in/i);
+    expect(seen!.system).toMatch(/already said, leave that\s+part out/i);
+    expect(seen!.prompt).toMatch(/^\[live\] brain: idle/);
+    expect(seen!.prompt).toMatch(/last said: "Checking the live server now\."/);
+    expect(seen!.prompt).toMatch(/\[brain reply\] deliver this, verbatim on all facts:\n\nTrip mode is live\./);
   });
 
   it('falls back to the resolved text when no partials stream', async () => {

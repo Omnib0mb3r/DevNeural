@@ -198,24 +198,47 @@ and its files are L2's to read (L2 contract: "Go and look").
 
 Courtesies and mishears (2026-09-24 evening test, BUG-047 / BUG-048):
 
-- A courtesy gets a courtesy whatever the brain is doing. "Thank you"
-  gets "you're welcome" in Lex's own words; news that the brain is
-  still working comes after it, never instead of it. (Observed: "Thank
-  you." answered twice with "Still on it, give me a moment.")
+- A courtesy is answered as a courtesy whatever the brain is doing,
+  never as a status report. (Observed: "Thank you." answered twice with
+  "Still on it, give me a moment.")
 - IGNORE is only for sound that is not Michael talking to Lex: a
   parenthetical noise tag, the TV, another person, her own echo. His
   own voice in a live exchange is addressed to her even when the words
-  do not parse (a mishear, a fragment); the contract says ask, in five
-  words or fewer. The daemon backs this with a deterministic check
-  (`_shouldChallengeIgnoreImpl`): an IGNORE whose reason is not a
-  background category, on real words, within 90 s of the last exchange,
-  is handed back to L1 as an `[event] addressed` and L1 asks him what
-  he meant. (Observed: "Next in session.", whisper's rendering of "end
-  session", got `IGNORE: unclear address` and silence.)
+  do not parse (a mishear, a fragment); the contract says ask, in her
+  own words, five words or fewer. (Observed: "Next in session.",
+  whisper's rendering of "end session", got `IGNORE: unclear address`
+  and silence.) The daemon-side re-ask that backed this for one day
+  (`_shouldChallengeIgnoreImpl`, `[event] addressed`) is gone: it was
+  the daemon scripting her next line (BUG-051).
 - A Smart Turn "incomplete" verdict holds an utterance for at most the
   Smart Turn hold window (1.6 s, `DEVNEURAL_SMART_TURN_HOLD_MS`), no
   longer the endpoint governor's 3 s ceiling (`heldTurnFlushMaxHoldMs`).
   A wrong verdict on a complete two-word sentence costs one short pause.
+
+No scripted lines (2026-09-25, BUG-051; operator: "hard coded got it,
+on it shit is fucking stupid ... make her think about what she is about
+to say"):
+
+- The contract hands the voice no phrases. The old lines ("still on
+  it", "give me a moment", "right, got it", "give me a second, go on",
+  the quoted example questions in rule 4, the quoted courtesies in rule
+  1) are out; Haiku said every one of them, up to three times in ten
+  seconds. What replaced them is one instruction: before speaking, read
+  your last spoken line and the recent talk; never say again what you
+  already said; a status is worth a word only when it changed; put
+  nothing in front of the answer.
+- The delivery framing (`lexReplySystem`) no longer orders a lead-in
+  ("open with a few words of your own that make clear the brain is
+  back with it" produced "Right, got it." / "Right, back." / "Got it
+  back." on every reply). The delivery starts with the answer and
+  leaves out anything she already said.
+- A brain-progress event defaults to silence; she speaks only when
+  there is news he has not heard.
+- The daemon never re-asks her with an instruction on what to say. Her
+  IGNORE stands.
+
+Every ask submits before it is waited on (2026-09-25, BUG-050): see
+"Submit ladder" under Layer 1 session below.
 
 Effort note: `--effort` levels are low / medium / high / xhigh / max. Haiku
 4.5 has no effort parameter (the CLI accepts the flag on haiku and it changes
@@ -472,6 +495,50 @@ raw L2 body so L2 is never silenced. A cut (partials spoken, ask never
 closed) is recorded as `cut` and is never re-delivered from the top
 (single mouth rule 6); only the FINISH path speaks its remainder.
 
+One mouth (2026-09-25, BUG-052): the delivery runs on the anchor's own
+Layer 1 session, with the same `[live]` block a conversational turn gets
+(last said line, recent talk), and what it said joins the recent talk.
+Until then `speakViaBrain` passed no anchor id, so every delivery ran on
+a separate `default` session that knew nothing of the conversation (the
+session BUG-027 saw spawn and called "cost only"): at 08:43:21Z the
+anchor L1 said "checking the live server and the error log now" and
+three seconds later the default session said it again inside the
+delivery. The default session no longer spawns on the voice path.
+
+Because the delivery and the conversational turns now share one ask
+queue, the operator's words interrupt a delivery in flight
+(`interruptDelivery` -> `interruptVoiceBrainAsk`): the daemon sends
+Escape to the voice session, the ask resolves with what streamed so far
+(logged `ask interrupted in Nms`), `deliverySeq` supersedes the delivery
+so its raw body is never spoken after the fact, and his turn runs at
+once instead of queueing behind up to thirty seconds of streaming. The
+audio itself already stopped on sound (v3 barge); the tail stays in the
+transcript (single mouth rule 6).
+
+Submit ladder (2026-09-25, BUG-050): `askVoiceInner` confirms every ask
+SUBMITTED before it waits for a reply. Claude Code writes the user record
+the moment a prompt submits, so transcript growth within 1.6 s
+(`ASK_SUBMIT_CONFIRM_MS`) is the proof. No growth: a bare CR, then
+space-Enter twice (`ASK_SUBMIT_LADDER`; on the morning session a bare CR
+never submitted a stuck paste, text plus CR always did), each followed by
+a growth check. Still nothing: `ASK NEVER SUBMITTED ... the composer is
+wedged (BUG-050)`, the session is killed for respawn and the ask
+fail-safes, so the next utterance gets a fresh session instead of
+appending to the pile. The reply deadline runs from the submit. Pty
+output counts as liveness only after the transcript grew beyond the
+submit record (the composer repainting an unsubmitted paste is output
+too; it stretched the stuck asks to 21 to 35 s). Observed before the fix:
+six of six asks on 2026-09-25 08:39Z sat in the composer and went out at
+08:43:21Z as one 2.5 KB record with four `[heard]` lines; the delivery
+session read three stale "deliver this" prompts as one at 11:23Z.
+
+Fail-safe forward, narrowed (BUG-050): a null Layer 1 result still
+forwards the operator's words to the brain, flagged `failSafe`, but a
+whisper noise tag ("(dog barks)", "[BLANK_AUDIO]") is dropped, the same
+words fail-safe-forwarded again within 60 s are suppressed
+(`_isRepeatFailSafeImpl`, per anchor), a socket that closed while Layer 1
+was thinking drops the turn, and `forwardToL2` refuses a closed socket.
+
 ### BUG-008 root cause (found 2026-09-21)
 
 Claude Code writes an assistant turn as two jsonl records sharing one
@@ -551,11 +618,16 @@ may make it seem like she had amnesia, figure out how to avoid that"):
 
 - The voice never carried state in its context. Every turn is rebuilt
   from the `[live]` block, which now holds the **recent talk ring**: the
-  last six exchanges (what he said, what she said back), kept in the
-  daemon (`lex-voice-ws.ts` `rememberTalk`, rendered by
-  `renderLiveBlock` as `recent talk (oldest first)`). That ring is what
-  makes a clear invisible: no handover document, no L2 review, and no
-  amnesia, because nothing she needed lived only in her transcript.
+  last six exchanges (what he said, what she said back, what the brain's
+  delivery said), kept in the daemon per anchor (`lex-voice-ws.ts`
+  `voiceMemoryFor` / `rememberTalk`, rendered by `renderLiveBlock` as
+  `recent talk (oldest first)`). That ring is what makes a clear
+  invisible: no handover document, no L2 review, and no amnesia, because
+  nothing she needed lived only in her transcript. Per anchor, not per
+  socket (BUG-053, 2026-09-25): it used to live in the connection
+  closure, so every socket cycle (a mode switch, a reconnect; four in
+  five minutes on the morning session) handed her an empty block. The
+  last spoken line lives in the same memory.
 - Clear = respawn at a quiet moment. `maybeClearL1()` measures the L1
   transcript every 30s (`deriveContextFromTail` on
   `voiceBrainJsonlPath`); past the setpoint (`l1_clear_pct` runtime

@@ -11,6 +11,7 @@ import { LexThumbs } from "./LexThumbs";
 import { listPtys, lexAnchors, type PtyEntry } from "@/lib/daemon-client";
 import { emitVoiceSettingUpdate, onVoiceSettingUpdate } from "@/lib/voice-settings-bus";
 import { emitTranscriptTurn, emitTranscriptClear } from "@/lib/transcript-bus";
+import { onVoiceTextInput } from "@/lib/voice-text-input-bus";
 import { shouldFinalizeUtteranceOnMute } from "@/lib/mute-finalize";
 import {
   resolveActiveBrainstormId,
@@ -452,14 +453,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   useEffect(() => {
     writePersistedVoiceEnabled(enabled);
   }, [enabled]);
-  /* Warmup lock (2026-07-18): `mode` is a dep of the big WS/VAD effect,
-   * so switching mode tears the pipeline down + brings it back up. While
-   * the engine is still connecting/warming the WS has not finished its
-   * handshake; closing a CONNECTING socket makes the browser report
-   * close code 1006 (abnormal) and drops voice into a reconnect loop -
-   * the "switched to push-to-talk and it errored out" repro. Lock the
-   * mode switch until the top brain reports ready. */
-  const warmingUp = enabled && (status === "connecting" || status === "warming");
+  /* The 2026-07-18 warmup lock on the mode buttons is gone (BUG-053).
+   * It existed because a mode change re-ran the whole WS/VAD effect and
+   * closing a CONNECTING socket reports code 1006, which dropped voice
+   * into a reconnect loop. A mode change no longer touches the socket
+   * (see changeMode), so there is nothing left to lock. */
   const [muted, setMuted] = useState<boolean>(false);
 
   /* Auto-stop voice when Lex disappears, but debounced so a kill→
@@ -966,7 +964,18 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   }, [enabled]);
 
   const wsRef = useRef<WebSocket | null>(null);
+  /* BUG-053: the socket the capture path is bound to. Set on hello-ack,
+   * cleared on close and on teardown. The capture effect keys on it, so
+   * the mic comes up once the bind is live and is rebuilt only when the
+   * socket object changes (a reconnect), never on a re-hello. */
+  const [ackedSocket, setAckedSocket] = useState<WebSocket | null>(null);
   const vadRef = useRef<unknown>(null);
+  /* Push-to-talk press / release handlers, installed by the capture
+   * effect and cleared with it. They used to hang off the WebSocket
+   * object (__pttStart / __pttStop), which a reconnect replaced without
+   * them, so push-to-talk went dead after any socket bounce. */
+  const pttStartRef = useRef<(() => void) | null>(null);
+  const pttStopRef = useRef<(() => void) | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const ttsRateRef = useRef<number>(22050);
   const playheadRef = useRef<number>(0);
@@ -1257,6 +1266,79 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
     return true;
   }
 
+  /* Tear down the mic capture path only (BUG-053): the VAD or the
+   * push-to-talk rig, the shared parallel-capture stream + context, the
+   * utterance timers and buffers. The WebSocket, the TTS AudioContext
+   * (Fix 22) and the stream sink are untouched, so this can run on every
+   * mode change and on every socket rebind without an audible blip on
+   * the reply side. Idempotent. */
+  function teardownCapture(): void {
+    const v = vadRef.current as { destroy?: () => void } | null;
+    try {
+      v?.destroy?.();
+    } catch {
+      /* ignore */
+    }
+    vadRef.current = null;
+    /* Disable + restart OOM fix: vad.destroy() terminates ORT's
+     * threaded-backend worker pool, but the singleton getVadModule
+     * cache still reports configured=true and would hand the next
+     * MicVAD.new a half-disposed env. Reset the cache so the next
+     * init re-imports + re-pins cleanly. Tab-switch remount
+     * (component unmount with enabled stays true) goes through a
+     * different path that never reaches this teardown, so the
+     * singleton warm-path stays intact for that case. */
+    resetVadModuleCache();
+    try {
+      captureProcRef.current?.disconnect();
+    } catch {
+      /* ignore */
+    }
+    try {
+      captureStreamRef.current?.getTracks().forEach((t) => t.stop());
+    } catch {
+      /* ignore */
+    }
+    const cctx = captureCtxRef.current;
+    if (cctx && cctx.state !== "closed") {
+      try {
+        void cctx.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    captureProcRef.current = null;
+    captureStreamRef.current = null;
+    captureCtxRef.current = null;
+    captureCapturingRef.current = false;
+    captureBufRef.current = [];
+    /* Shared VAD gain stage: cctx.close() above already tears down
+     * the GainNode + MediaStreamAudioDestinationNode graph; just
+     * drop the refs so a stale gain node / stream can't leak into
+     * the next init. */
+    micGainNodeRef.current = null;
+    micVadStreamRef.current = null;
+    vadListenerOpenRef.current = false;
+    probWindowRef.current = [];
+    if (utteranceTimerRef.current) {
+      clearInterval(utteranceTimerRef.current);
+      utteranceTimerRef.current = null;
+    }
+    if (utteranceCapRef.current) {
+      clearTimeout(utteranceCapRef.current);
+      utteranceCapRef.current = null;
+    }
+    setUtteranceMs(0);
+    pttStartRef.current = null;
+    pttStopRef.current = null;
+    /* An utterance the old VAD had open dies with it: nothing was
+     * shipped and nothing needs ending, the same contract as the
+     * stuck-open recovery. Only the client-owned "listening" state is
+     * reset; transcribing / thinking / speaking are server-driven and
+     * carry on over the live socket. */
+    setStatus((cur) => (cur === "listening" ? "ready" : cur));
+  }
+
   /* Hard mute. The WS stays open so unmuting is instant. The mic
    * hardware stops capturing (MediaStream tracks disabled), so no
    * FURTHER audio is heard once muted (the 2026-05-11-mute-still-hears
@@ -1353,6 +1435,27 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       /* ignore */
     }
   }
+
+  /* BUG-054: the Lex page's typed box reaches the live socket through
+   * lib/voice-text-input-bus. Answer true only when the frame actually
+   * went out on an OPEN socket while voice is enabled; on false the page
+   * keeps its HTTP inject. The daemon answers a text-input frame with a
+   * transcript echo (source 'text-input'), an injected ack, a
+   * tts-skipped notice and the assistant-text reply, all handled in
+   * handleServerMsg below. */
+  useEffect(() => {
+    return onVoiceTextInput((text) => {
+      if (!enabled) return false;
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      try {
+        ws.send(JSON.stringify({ t: "text-input", text }));
+      } catch {
+        return false;
+      }
+      return true;
+    });
+  }, [enabled]);
 
   /* Always-on wake-word dispatch. The Web Speech matcher is panic-
    * only (voice top layer v2 spec): "lex emergency stop" is the sole
@@ -1954,14 +2057,14 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    /* Tear down every resource the effect owns. Idempotent: safe to
-     * call from the !enabled branch, from React's cleanup phase on
-     * deps change (e.g. mode flip from conversation to push-to-talk),
-     * or twice in a row. Centralised so the mode-swap path can't leak
-     * the prior VAD / MediaStream / WS. A previous shape only torn
-     * down on the !enabled flip, which meant switching to PTT mid-
-     * session left the conversation-mode VAD live and firing
-     * transcripts without the talk key held. */
+    /* Socket lifecycle only (BUG-053). This effect owns the WebSocket,
+     * its reconnect loop and the frame handler. The mic capture path
+     * (VAD for conversation / notes, push-to-talk capture) lives in the
+     * capture effect below, keyed on the mode and on this socket being
+     * hello-acked, so a mode change never closes the socket, never
+     * re-hellos and never drops the status to "connecting". teardown()
+     * is idempotent: safe from the !enabled branch, from React's cleanup
+     * on the enabled flip, or twice in a row. */
     function teardown(): void {
       try {
         wsRef.current?.close();
@@ -1969,76 +2072,21 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         /* ignore */
       }
       wsRef.current = null;
-      const v = vadRef.current as { destroy?: () => void } | null;
-      try {
-        v?.destroy?.();
-      } catch {
-        /* ignore */
-      }
-      vadRef.current = null;
-      /* Disable + restart OOM fix: vad.destroy() terminates ORT's
-       * threaded-backend worker pool, but the singleton
-       * getVadModule cache still reports configured=true and would
-       * hand the next MicVAD.new a half-disposed env. Reset the
-       * cache so the next enable cycle re-imports + re-pins
-       * cleanly. Tab-switch remount (component unmount with
-       * enabled stays true) goes through a different path that
-       * never reaches this teardown, so the singleton warm-path
-       * stays intact for that case. */
-      resetVadModuleCache();
-      try {
-        captureProcRef.current?.disconnect();
-      } catch {
-        /* ignore */
-      }
-      try {
-        captureStreamRef.current?.getTracks().forEach((t) => t.stop());
-      } catch {
-        /* ignore */
-      }
-      const cctx = captureCtxRef.current;
-      if (cctx && cctx.state !== "closed") {
-        try {
-          void cctx.close();
-        } catch {
-          /* ignore */
-        }
-      }
-      captureProcRef.current = null;
-      captureStreamRef.current = null;
-      captureCtxRef.current = null;
-      captureCapturingRef.current = false;
-      captureBufRef.current = [];
-      /* Shared VAD gain stage: cctx.close() above already tears down
-       * the GainNode + MediaStreamAudioDestinationNode graph; just
-       * drop the refs so a stale gain node / stream can't leak into
-       * the next session. */
-      micGainNodeRef.current = null;
-      micVadStreamRef.current = null;
       if (finalizeTimeoutRef.current) {
         clearTimeout(finalizeTimeoutRef.current);
         finalizeTimeoutRef.current = null;
       }
       awaitingFinalizeRef.current = false;
-      if (utteranceTimerRef.current) {
-        clearInterval(utteranceTimerRef.current);
-        utteranceTimerRef.current = null;
-      }
-      if (utteranceCapRef.current) {
-        clearTimeout(utteranceCapRef.current);
-        utteranceCapRef.current = null;
-      }
-      /* Fix 22 (2026-05-24): AudioContext close moved OUT of teardown.
-       * teardown runs on every effect cleanup (sessionId change, mode
-       * change, !enabled). Closing the ctx on sessionId change tore
-       * down the audio sink right before the new brainstorm's first
+      /* Fix 22 (2026-05-24): AudioContext close is NOT part of teardown.
+       * Closing the ctx on a teardown that is not a real voice-off tore
+       * down the audio sink right before the next brainstorm's first
        * tts-start tried to use it; tts-start refuses to lazy-create
        * per voice-audio-warm.ts (autoplay policy), so the first reply
        * was silenced and only the ~10s watchdog heal (resetVoiceAudio)
        * re-warmed it for subsequent turns. The AudioContext is owned
-       * by the page (VoiceClient mounts once at app root, comment at
-       * line 287-294), not by the WS or the brainstorm session, so it
-       * must survive any teardown that is not a real voice-off. */
+       * by the page (VoiceClient mounts once at app root), not by the
+       * WS or the brainstorm session, so it must survive any teardown
+       * that is not a real voice-off. */
     }
 
     function closeAudioCtxOnDisable(): void {
@@ -2243,6 +2291,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
         ws.onclose = (ev) => {
           stopKeepalive();
           if (cancelled) return;
+          /* BUG-053: this socket is no longer bound, so the capture
+           * effect tears the mic down and rebuilds it on the next
+           * hello-ack. Guarded so a late close from an older socket can
+           * never unbind a newer one. */
+          setAckedSocket((cur) => (cur === ws ? null : cur));
           /* If the close happened because Lex itself was just ended,
            * the auto-stop effect is already on its way to flipping
            * `enabled` off. Don't surface a noisy ERROR pill in that
@@ -2290,7 +2343,7 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
           if (typeof ev.data === "string") {
             try {
               const msg = JSON.parse(ev.data) as { t: string; [k: string]: unknown };
-              handleServerMsg(msg);
+              handleServerMsg(msg, ws);
             } catch {
               /* malformed json, ignore */
             }
@@ -2309,7 +2362,10 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
        * through scheduleReconnect() above. */
       connectWs();
 
-      function handleServerMsg(msg: { t: string; [k: string]: unknown }): void {
+      function handleServerMsg(
+        msg: { t: string; [k: string]: unknown },
+        ws: WebSocket,
+      ): void {
         switch (msg.t) {
           case "hello-ack": {
             const rate = Number(msg.voice_rate) || 22050;
@@ -2320,7 +2376,12 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
              * (or the top session is disabled -> daemon sent ready:true
              * immediately) this goes straight to "ready". */
             setStatus(voiceStatusForBrainReady(brainReadyRef.current));
-            void initVad();
+            /* BUG-053: the capture path (VAD or push-to-talk) is brought
+             * up by the capture effect, keyed on this socket being acked.
+             * A re-hello on the live socket (brainstorm switch) acks the
+             * same object and leaves the mic alone; a reconnect is a new
+             * object and rebuilds it. */
+            if (ws === wsRef.current) setAckedSocket(ws);
             /* Deploy-order safety net: if no voice-brain frame arrives
              * shortly (old daemon), stop gating and go live. */
             if (brainGateFallbackRef.current) {
@@ -2362,7 +2423,14 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             const text = String(msg.text ?? "").trim();
             if (text) {
               setStatus("thinking");
-              const turnId = `u-${Date.now()}-${Math.random()
+              /* BUG-054: a typed line sent as a text-input frame comes
+               * back through here as the daemon's echo (source
+               * 'text-input'); it renders as an ordinary operator row,
+               * with the same "u-typed-" id prefix the page's HTTP
+               * fallback uses, so nothing downstream has to tell the
+               * two apart. */
+              const idPrefix = msg.source === "text-input" ? "u-typed" : "u";
+              const turnId = `${idPrefix}-${Date.now()}-${Math.random()
                 .toString(36)
                 .slice(2, 8)}`;
               setTurns((prev) => {
@@ -2498,7 +2566,20 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             break;
           }
           case "injected":
+            /* Also the ack for a typed text-input frame (BUG-054). The
+             * daemon already echoed the user row as a transcript frame
+             * with source 'text-input', so nothing renders here; the
+             * reply follows as assistant-text. */
             setStatus("thinking");
+            break;
+          case "tts-skipped":
+            /* Typed turn: the daemon skips speech for the reply on
+             * purpose (docs/HOW-TO-voice-and-push.md, section 2). Not
+             * an error and not a row; the assistant-text still lands. */
+            break;
+          case "mode-set":
+            /* Ack for the set-mode frame a live mode change sends
+             * (BUG-053). Nothing to do: the client already switched. */
             break;
           case "assistant-text": {
             const replyText = String(msg.text ?? "");
@@ -2745,718 +2826,6 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             break;
         }
       }
-
-      /* Capture-chain probe (2026-07-18 silent-mic investigation).
-       * Live A/B against the pre-wave client proved the daemon side
-       * is healthy; the regression is in this client's capture
-       * chain. Fields, reported via voice_health "cp:" rows:
-       *   w  = AudioWorklet tap frames (raw mic alive)
-       *   v  = vad-web onFrameProcessed frames (silero fed)
-       *   m  = max isSpeech probability (silero hears speech)
-       *   la = average isSpeech over the trailing ~20 frames
-       *        (what silero hears during SILENCE; if this floats
-       *        above the 0.4 negative threshold the utterance can
-       *        never close no matter the redemption window)
-       *   ss/se = onSpeechStart / onSpeechEnd fire counts
-       *   mu = hard-mute flag, rd = live redemption ms
-       * Diagnostic only; remove once the capture regression is
-       * fixed and verified. */
-      const captureProbe = {
-        workletFrames: 0,
-        vadFrames: 0,
-        maxProb: 0,
-        recentProbs: [] as number[],
-        speechStarts: 0,
-        speechEnds: 0,
-        ticks: 0,
-        timer: null as ReturnType<typeof setInterval> | null,
-      };
-
-      async function initParallelCapture(): Promise<void> {
-        /* Open a dedicated mic stream and run a 16 kHz int16 frame
-         * collector in parallel with silero VAD. We only ship from
-         * here on the mute-finalize path; normal end-of-utterance
-         * still uses the audio buffer VAD itself emits. Two parallel
-         * streams is fine on every browser we care about. */
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
-            },
-          });
-          if (cancelled) {
-            stream.getTracks().forEach((t) => t.stop());
-            return;
-          }
-          captureStreamRef.current = stream;
-          /* First-grant gate for the wake-word recognizer. The
-           * getUserMedia returned a stream which means the user
-           * granted (or auto-allowed) microphone access; flag this
-           * synchronously so the wake-word useEffect can start the
-           * Web Speech recognizer without racing a parallel
-           * permission prompt. */
-          setMicPermissionGranted(true);
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const Cls: any =
-            (window as unknown as { AudioContext?: typeof AudioContext })
-              .AudioContext ??
-            (window as unknown as { webkitAudioContext?: typeof AudioContext })
-              .webkitAudioContext;
-          const ctx = new Cls({ sampleRate: 16000 });
-          captureCtxRef.current = ctx;
-          const src = ctx.createMediaStreamSource(stream);
-          /* Gain stage for silero VAD's injected stream (R3 of the
-           * mic-slider-wiring audit). Tapped off the same source node
-           * as the worklet below so we open exactly one raw mic
-           * stream for the whole conversation-mode pipeline instead
-           * of MicVAD separately calling getUserMedia a second time.
-           * gain.value is kept live-synced to micGain by the effect
-           * near the micGain state declaration. Built BEFORE the
-           * worklet addModule call below so a worklet load failure
-           * (missing /vad-tap.worklet.js, unsupported browser, etc.)
-           * cannot take the VAD-triggering path down with it; only
-           * the transcription-buffer rig degrades in that case,
-           * matching the pre-existing "VAD path keeps working"
-           * resilience of this function. */
-          const gainNode = ctx.createGain();
-          gainNode.gain.value = micGainRef.current;
-          micGainNodeRef.current = gainNode;
-          src.connect(gainNode);
-          const vadDest = ctx.createMediaStreamDestination();
-          gainNode.connect(vadDest);
-          micVadStreamRef.current = vadDest.stream;
-          /* AudioWorklet replaces the deprecated ScriptProcessorNode
-           * (bug 2026-05-14-vad-scriptprocessornode-deprecation). The
-           * worklet module posts Float32 mono frames over its port;
-           * gain + Int16 conversion stays on the main thread so the
-           * downstream consumer (captureBufRef) is byte-for-byte
-           * equivalent to the prior onaudioprocess callback. This tap
-           * runs on the raw (pre-gain-node) signal; gain is applied
-           * per-sample below exactly as before, so the outbound
-           * transcription buffer's gain handling is unchanged. */
-          await ctx.audioWorklet.addModule("/vad-tap.worklet.js");
-          if (cancelled) {
-            stream.getTracks().forEach((t) => t.stop());
-            try {
-              await ctx.close();
-            } catch {
-              /* ignore */
-            }
-            return;
-          }
-          const proc = new AudioWorkletNode(ctx, "vad-tap");
-          captureProcRef.current = proc;
-          proc.port.onmessage = (ev: MessageEvent<Float32Array>) => {
-            /* Probe count BEFORE any gating so it reflects the raw
-             * worklet cadence, not the capture-armed windows. */
-            captureProbe.workletFrames += 1;
-            if (!captureCapturingRef.current) return;
-            /* Drop frames while the TTS gate is active. tts-start
-             * already disarmed captureCapturingRef but a buffer
-             * that landed mid-flip would still push into
-             * captureBufRef without this check. */
-            if (micGatedRef.current) return;
-            const f = ev.data;
-            if (!f || f.length === 0) return;
-            const gain = micGainRef.current;
-            const i16 = new Int16Array(f.length);
-            for (let i = 0; i < f.length; i++) {
-              const s = Math.max(-1, Math.min(1, (f[i] ?? 0) * gain));
-              i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-            }
-            captureBufRef.current.push(i16);
-          };
-          src.connect(proc);
-          proc.connect(ctx.destination);
-        } catch {
-          /* parallel capture failure is non-fatal; mute-finalize just
-           * won't ship audio when this rig isn't up. VAD path keeps
-           * working. */
-        }
-      }
-
-      async function initVad(): Promise<void> {
-        if (modeRef.current === "push-to-talk") {
-          /* Push-to-talk uses raw getUserMedia + AudioWorklet
-           * sampling instead of silero VAD. The user controls
-           * utterance boundaries with the talk button; no need to
-           * spin up VAD or the parallel capture rig. */
-          await initPushToTalk();
-          return;
-        }
-        await initParallelCapture();
-        try {
-          /* Singleton load: getVadModule caches the dynamic import +
-           * the configureVadOrt pin, so VoiceClient remount (page
-           * nav, mic-mode toggle, dev HMR) reuses the ORT module
-           * record instead of forcing a fresh WASM
-           * compile/instantiate cycle. The previous behavior re-ran
-           * configureVadOrt on every mount; with the threaded WASM
-           * build the second remount would OOM the per-tab heap.
-           * See lib/voice-ort-config.ts. */
-          const mod = await getVadModule();
-          if (cancelled) return;
-          /* Helper to ship the captured audio + finalize the utterance.
-           * Used by both the natural VAD speech-end path and the
-           * forced-finalize cap so the server-side handling stays the
-           * same in both branches. */
-          const finalizeUtterance = (audio: Float32Array) => {
-            if (utteranceTimerRef.current) {
-              clearInterval(utteranceTimerRef.current);
-              utteranceTimerRef.current = null;
-            }
-            if (utteranceCapRef.current) {
-              clearTimeout(utteranceCapRef.current);
-              utteranceCapRef.current = null;
-            }
-            setUtteranceMs(0);
-            const gain = micGainRef.current;
-            const int16 = new Int16Array(audio.length);
-            for (let i = 0; i < audio.length; i++) {
-              const s = Math.max(-1, Math.min(1, (audio[i] ?? 0) * gain));
-              int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-            }
-            sendBinary(int16.buffer);
-            sendJson({ t: "utterance-end" });
-            setStatus("transcribing");
-          };
-
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          let vadInstance: any = null;
-
-          /* Inject the shared gain-adjusted stream built in
-           * initParallelCapture (R3 of the mic-slider-wiring audit)
-           * so mic gain actually tames what triggers listening, not
-           * just what gets transcribed. vad-web has no plain `stream`
-           * option; the real injection point is the getStream /
-           * pauseStream / resumeStream callback triad on
-           * RealTimeVADOptions (node_modules/@ricky0123/vad-web/dist/
-           * real-time-vad.d.ts):
-           *   getStream: () => Promise<MediaStream>
-           *   pauseStream: (stream: MediaStream) => Promise<void>
-           *   resumeStream: (stream: MediaStream) => Promise<MediaStream>
-           * MicVAD.start() calls getStream() once, then on every
-           * subsequent pause()/start() cycle calls pauseStream() then
-           * resumeStream() instead of getStream() again. Overriding
-           * getStream alone is not enough: the default pauseStream
-           * calls stream.getTracks().forEach(t => t.stop()), which
-           * would permanently end our synthetic (GainNode ->
-           * MediaStreamAudioDestinationNode) stream's tracks the
-           * first time vad.pause() runs (stuck-open recovery and the
-           * MAX_UTTERANCE_MS cap both call pause()+start() routinely),
-           * and the default resumeStream would then silently reopen a
-           * brand new raw getUserMedia stream that bypasses the gain
-           * node entirely. All three are overridden together so the
-           * injected stream survives pause/resume cycles. Falls back
-           * to vad-web's own default getUserMedia grant (no gain
-           * applied to triggering) when the shared rig failed to come
-           * up, matching this function's existing "VAD path keeps
-           * working" resilience when initParallelCapture fails. */
-          /* 2026-07-18 silent-mic FIX: the R3 synthetic-stream
-           * injection is disabled. With the synthetic GainNode ->
-           * MediaStreamAudioDestinationNode feed the live capture
-           * probe showed silero OPENING speech (ss>0) but NEVER
-           * closing it (se=0 across every session) - the utterance
-           * never finalized and no audio ever shipped. The A/B run
-           * of the pre-wave client (MicVAD opens its own raw
-           * getUserMedia grant) against the current daemon worked
-           * immediately in this same browser/room, which also
-           * proves the own-grant + ORT init path is healthy in
-           * this environment. Restore that acquisition path. Cost:
-           * the mic-gain slider no longer shapes VAD triggering
-           * (it still shapes the transcribed bytes via the
-           * parallel-capture rig), matching pre-wave behavior. */
-          const vadStreamOverrides = {};
-
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const vad: any = await (mod as any).MicVAD.new({
-            baseAssetPath: "/vad/",
-            onnxWASMBasePath: "/vad/",
-            ...vadStreamOverrides,
-            onSpeechStart: () => {
-              /* Probe count BEFORE the mute gate so the snapshot
-               * shows whether vad-web fired the callback at all. */
-              captureProbe.speechStarts += 1;
-              if (mutedRef.current) return;
-              /* No more micGated early-return here. Path 1 of the
-               * voice-cmd-blocked-during-TTS audit: VAD stays live
-               * during TTS so the wake matcher can catch "Lex
-               * disable" / "Lex shut up" mid-reply. The daemon
-               * gates the inject on its end so AEC residual that
-               * gets transcribed but does not match a wake phrase
-               * never lands as a phantom user turn (see
-               * `state.utteranceStartedDuringTts` in
-               * lex-voice-ws.ts). The barge-in path below still
-               * cancels the in-flight TTS playback so the user is
-               * heard immediately. */
-              /* Word-gated barge (2026-07-17 voice engine cut,
-               * VOICE-TOP-LAYER-SPEC): a VAD onset never kills
-               * playback anymore - it ARMS the daemon's word gate.
-               * Playback dies only when streaming ASR words (the
-               * wake recognizer's interims, forwarded as asr-interim/
-               * asr-final) prove a real interruption: the daemon then
-               * sends tts-cancel and resetTtsPlayback reports the
-               * played ms. The barge cooldown knob is gone with the
-               * raw-VAD trigger it papered over; noise cannot stop
-               * Lex, words always can. */
-              sendJson({
-                t: "vad-onset",
-                playback_active:
-                  speakingRef.current || ttsActiveRef.current,
-              });
-              setStatus("listening");
-              /* Reset + arm the parallel capture so a mute mid-
-               * utterance has audio to flush. */
-              captureBufRef.current = [];
-              captureCapturingRef.current = true;
-              utteranceStartRef.current = Date.now();
-              utteranceSamplesRef.current = 0;
-              setUtteranceMs(0);
-              /* Arm rolling probability window for stuck-open
-               * recovery. Cleared on every open so the previous
-               * utterance's frames can't trip an early close on
-               * this one. */
-              vadListenerOpenRef.current = true;
-              probWindowRef.current = [];
-              if (utteranceTimerRef.current) {
-                clearInterval(utteranceTimerRef.current);
-              }
-              utteranceTimerRef.current = setInterval(() => {
-                setUtteranceMs(Date.now() - utteranceStartRef.current);
-              }, 100);
-              if (utteranceCapRef.current) {
-                clearTimeout(utteranceCapRef.current);
-              }
-              /* Hard cap: if VAD never fires speech-end (user keeps
-               * talking through pauses too short to trip the threshold),
-               * finalize at MAX_UTTERANCE_MS so Lex actually gets a
-               * chance to respond.
-               *
-               * 2026-05-22: cap path now ships the parallel capture
-               * buffer via flushParallelCapture so a long-form
-               * utterance is delivered to STT even when the cap
-               * trips. The legacy behavior dropped audio and forced
-               * the user to repeat themselves; we trust STT for long
-               * audio instead. */
-              utteranceCapRef.current = setTimeout(() => {
-                if (vadInstance && typeof vadInstance.pause === "function") {
-                  vadInstance.pause();
-                  vadListenerOpenRef.current = false;
-                  probWindowRef.current = [];
-                  const shipped = flushParallelCapture();
-                  if (!shipped) {
-                    /* No buffered audio (parallel capture was off or
-                     * empty). Send utterance-end so the server does
-                     * not think we are hanging, even though the cap
-                     * fire produced nothing transcribable. */
-                    sendJson({ t: "utterance-end" });
-                    setStatus("transcribing");
-                  }
-                  /* Resume VAD listening after a moment. */
-                  setTimeout(() => {
-                    try {
-                      vadInstance.start();
-                    } catch {
-                      /* ignore */
-                    }
-                  }, 250);
-                }
-              }, MAX_UTTERANCE_MS);
-            },
-            onSpeechEnd: (audio: Float32Array) => {
-              /* Probe count BEFORE the mute gate (see onSpeechStart). */
-              captureProbe.speechEnds += 1;
-              /* Disarm parallel capture; VAD's audio is the source
-               * of truth on the normal end-of-utterance path. */
-              captureCapturingRef.current = false;
-              captureBufRef.current = [];
-              vadListenerOpenRef.current = false;
-              probWindowRef.current = [];
-              if (mutedRef.current) return;
-              finalizeUtterance(audio);
-            },
-            /* Stuck-open recovery. Silero invokes this on every
-             * 32ms frame whether or not speech is currently open;
-             * we only accumulate while the listener is open. If
-             * the rolling average isSpeech probability stays below
-             * VAD_PROB_FLOOR across the full VAD_PROB_WINDOW_MS,
-             * force the listener closed locally and recycle VAD so
-             * the next real utterance starts clean. We deliberately
-             * do NOT ship audio or send utterance-end here: the
-             * daemon's micBuf hasn't received any binary frames yet
-             * (those only flow on the real end-of-utterance path),
-             * so simply dropping the in-progress utterance leaves
-             * the daemon in a consistent state for the next
-             * utterance-start. */
-            onFrameProcessed: (probs: {
-              isSpeech: number;
-              notSpeech: number;
-            }) => {
-              /* Probe counts BEFORE the listener-open gate so they
-               * reflect whether silero receives frames at all and
-               * what it hears during silence. */
-              captureProbe.vadFrames += 1;
-              if (probs.isSpeech > captureProbe.maxProb) {
-                captureProbe.maxProb = probs.isSpeech;
-              }
-              captureProbe.recentProbs.push(probs.isSpeech);
-              if (captureProbe.recentProbs.length > 20) {
-                captureProbe.recentProbs.shift();
-              }
-              if (!vadListenerOpenRef.current) return;
-              /* 2026-07-18 silent-mic FIX (the actual regression):
-               * this recovery used the fixed 1500ms window, and the
-               * rolling average crosses below the 0.4 floor after
-               * only ~915ms of real end-of-utterance silence, while
-               * the FrameProcessor's redemption close needs
-               * redemptionMs (1400ms = 14 legacy frames = 1344ms).
-               * The recovery therefore ALWAYS fired first, and
-               * vad.pause() with vad-web's default
-               * submitUserSpeechOnPause:false runs reset(): the
-               * buffered utterance audio is DISCARDED and SpeechEnd
-               * never fires. Live signature: voice_health cp: rows
-               * with ss>0, se=0, la=0.02 forever; the operator saw
-               * "listening" that never became "transcribing". The
-               * pre-wave client had no such recovery, which is why
-               * the A/B of the old bundle worked. Fix: derive the
-               * evaluation window from the LIVE redemption setting
-               * plus a wide margin so legitimate silence always
-               * closes through redemption first; the recovery only
-               * catches a listener that redemption failed to close
-               * (its original purpose: the stuck-open bug). */
-              const now = Date.now();
-              const recoveryWindowMs = Math.max(
-                VAD_PROB_WINDOW_MS,
-                vadRedemptionRef.current + 1500,
-              );
-              const w = probWindowRef.current;
-              w.push({ t: now, p: probs.isSpeech });
-              while (w.length > 0 && now - w[0]!.t > recoveryWindowMs) {
-                w.shift();
-              }
-              /* Require a full window before evaluating so the
-               * opening stretch of an utterance can't trip the
-               * floor before we've actually heard the speaker. */
-              if (w.length === 0) return;
-              if (
-                now - w[0]!.t <
-                recoveryWindowMs - VAD_PROB_WINDOW_SLOP_MS
-              ) {
-                return;
-              }
-              let sum = 0;
-              for (const x of w) sum += x.p;
-              const avg = sum / w.length;
-              if (avg >= VAD_PROB_FLOOR) return;
-              vadListenerOpenRef.current = false;
-              probWindowRef.current = [];
-              captureCapturingRef.current = false;
-              captureBufRef.current = [];
-              if (utteranceTimerRef.current) {
-                clearInterval(utteranceTimerRef.current);
-                utteranceTimerRef.current = null;
-              }
-              if (utteranceCapRef.current) {
-                clearTimeout(utteranceCapRef.current);
-                utteranceCapRef.current = null;
-              }
-              setUtteranceMs(0);
-              try {
-                vadInstance?.pause?.();
-              } catch {
-                /* ignore */
-              }
-              setStatus((cur) =>
-                cur === "listening" || cur === "transcribing" ? "ready" : cur,
-              );
-              setTimeout(() => {
-                try {
-                  vadInstance?.start?.();
-                } catch {
-                  /* ignore */
-                }
-              }, 250);
-            },
-            /* ms-based option set: positive/negativeSpeechThreshold
-             * derived from the user-tunable mic sensitivity (0=ignore
-             * noise, 1=fire easily; 0.5 matches the legacy 0.5/0.4
-             * pair), redemptionMs from the pause-tolerance slider,
-             * preSpeechPadMs/minSpeechMs fixed at 256ms. These are the
-             * ONLY keys the installed vad-web (0.0.30) actually reads
-             * off this options object; it builds its internal
-             * FrameProcessor from an explicit
-             * {positiveSpeechThreshold, negativeSpeechThreshold,
-             * redemptionMs, preSpeechPadMs, minSpeechMs,
-             * submitUserSpeechOnPause} literal, not a spread of the
-             * full options (node_modules/@ricky0123/vad-web/dist/
-             * real-time-vad.js). The legacy redemptionFrames /
-             * preSpeechPadFrames / minSpeechFrames keys this used to
-             * pass here were silently dropped and did nothing; see
-             * lib/voice-vad-options.ts for the shared builder also
-             * used by the live setOptions() path below. */
-            ...buildVadOptionSet(
-              vadSensitivityRef.current,
-              vadRedemptionRef.current,
-            ),
-          });
-          vadInstance = vad;
-          vadRef.current = vad;
-          vad.start();
-          /* Arm the capture-probe reporter: 6 snapshots, 5s apart,
-           * shipped to the daemon voice_health table. See the
-           * captureProbe declaration above for field meanings. */
-          captureProbe.timer = setInterval(() => {
-            captureProbe.ticks += 1;
-            if (captureProbe.ticks > 6 || cancelled) {
-              if (captureProbe.timer) clearInterval(captureProbe.timer);
-              captureProbe.timer = null;
-              return;
-            }
-            const rp = captureProbe.recentProbs;
-            const la =
-              rp.length > 0
-                ? rp.reduce((a, b) => a + b, 0) / rp.length
-                : 0;
-            const kind =
-              `cp:w=${captureProbe.workletFrames}` +
-              `,v=${captureProbe.vadFrames}` +
-              `,m=${captureProbe.maxProb.toFixed(2)}` +
-              `,la=${la.toFixed(2)}` +
-              `,ss=${captureProbe.speechStarts}` +
-              `,se=${captureProbe.speechEnds}` +
-              `,mu=${mutedRef.current ? 1 : 0}` +
-              `,rd=${vadRedemptionRef.current}`;
-            void postVoiceHealth([
-              {
-                ts_ms: Date.now(),
-                check_kind: kind.slice(0, 64),
-                status: "probe",
-                heal_attempt: Math.min(9, captureProbe.ticks),
-                recovered: 0,
-              },
-            ]);
-          }, 5_000);
-        } catch (err) {
-          /* Fix 2026-05-25: mic-init OOM recurrence on mobile Safari.
-           * Clear the cached vadModulePromise + vadModuleConfigured
-           * singletons BEFORE surfacing the error so the next Retry
-           * boots a fresh ORT env rather than landing on a poisoned
-           * backend ("previous call to initWasm() failed"). Extends
-           * the 2026-05-16 disable-path reset to the error path.
-           * logVoice lands the failure in the ring buffer + Voice
-           * diagnostics panel; setErrMsg only fires a UI toast and
-           * was invisible to operator + audit. */
-          resetVadModuleCache();
-          logVoice(
-            "vad-error",
-            (err as Error).message,
-            undefined,
-            "error",
-          );
-          /* Silent-mic investigation (2026-07-18): mirror the mic
-           * init failure to the daemon voice_health table so the
-           * exact error name+message is readable server-side
-           * without DevTools on the affected device. */
-          void postVoiceHealth([
-            {
-              ts_ms: Date.now(),
-              check_kind: `vad-err:${(err as Error).name}:${
-                (err as Error).message
-              }`.slice(0, 64),
-              status: "probe",
-              heal_attempt: 0,
-              recovered: 0,
-            },
-          ]);
-          setStatus("error");
-          setErrMsg(`mic init failed: ${(err as Error).message}`);
-        }
-      }
-
-      /* Push-to-talk path. Holds a MediaStream + AudioWorklet that
-       * forwards 16kHz int16 PCM frames into a buffer; flushes the
-       * buffer on talk-button release. No VAD; the user is the gate.
-       * Useful when VAD over-fires on background noise. */
-      let pttCtx: AudioContext | null = null;
-      let pttStream: MediaStream | null = null;
-      let pttBuffer: Int16Array[] = [];
-      let pttCapturing = false;
-
-      async function initPushToTalk(): Promise<void> {
-        try {
-          pttStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
-            },
-          });
-          /* Hold the mic in a disabled state until the user actually
-           * presses talk. getUserMedia activates the OS mic indicator
-           * the moment the stream is granted; flipping enabled=false
-           * on every track immediately dims that indicator on
-           * Chromium/Edge/Firefox and stops the underlying media flow.
-           * __pttStart re-enables before reading frames. */
-          pttStream.getAudioTracks().forEach((t) => {
-            t.enabled = false;
-          });
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const Cls: any =
-            (window as unknown as { AudioContext?: typeof AudioContext })
-              .AudioContext ??
-            (window as unknown as { webkitAudioContext?: typeof AudioContext })
-              .webkitAudioContext;
-          pttCtx = new Cls({ sampleRate: 16000 });
-          if (!pttCtx) throw new Error("no AudioContext");
-          const src = pttCtx.createMediaStreamSource(pttStream);
-          /* Use a ScriptProcessorNode for simplicity: it's deprecated
-           * but universally supported and the data path is short.
-           * AudioWorklet would be cleaner but needs an extra worklet
-           * file deployed to /vad/. */
-          const proc = pttCtx.createScriptProcessor(4096, 1, 1);
-          proc.onaudioprocess = (e) => {
-            if (!pttCapturing) return;
-            /* TTS gate also applies to push-to-talk: holding the
-             * talk button while Lex is speaking should not capture
-             * her audio. The user can still barge in by releasing
-             * the button and pressing again after tts-end. */
-            if (micGatedRef.current) return;
-            const f = e.inputBuffer.getChannelData(0);
-            const gain = micGainRef.current;
-            const i16 = new Int16Array(f.length);
-            for (let i = 0; i < f.length; i++) {
-              const s = Math.max(-1, Math.min(1, (f[i] ?? 0) * gain));
-              i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-            }
-            pttBuffer.push(i16);
-          };
-          src.connect(proc);
-          proc.connect(pttCtx.destination);
-          /* Stash refs on vadRef so the cleanup path tears down. */
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          vadRef.current = {
-            destroy: () => {
-              try {
-                pttStream?.getTracks().forEach((t) => t.stop());
-              } catch {
-                /* ignore */
-              }
-              try {
-                proc.disconnect();
-              } catch {
-                /* ignore */
-              }
-              try {
-                src.disconnect();
-              } catch {
-                /* ignore */
-              }
-              try {
-                if (pttCtx && pttCtx.state !== "closed") void pttCtx.close();
-              } catch {
-                /* ignore */
-              }
-            },
-          } as { destroy: () => void };
-          setStatus("ready");
-        } catch (err) {
-          /* Fix 2026-05-25: same reset + log path as the VAD mic-init
-           * catch above. Push-to-talk mode does not hit the wasm OOM
-           * path (no ORT modules) but the cached vadModule state can
-           * still be poisoned from an earlier conversation-mode init
-           * attempt; resetting on every error keeps the next Retry
-           * deterministic regardless of which mode tripped first. */
-          resetVadModuleCache();
-          logVoice(
-            "vad-error",
-            (err as Error).message,
-            undefined,
-            "error",
-          );
-          /* Silent-mic investigation (2026-07-18): mirror the mic
-           * init failure to the daemon voice_health table so the
-           * exact error name+message is readable server-side
-           * without DevTools on the affected device. */
-          void postVoiceHealth([
-            {
-              ts_ms: Date.now(),
-              check_kind: `vad-err:${(err as Error).name}:${
-                (err as Error).message
-              }`.slice(0, 64),
-              status: "probe",
-              heal_attempt: 0,
-              recovered: 0,
-            },
-          ]);
-          setStatus("error");
-          setErrMsg(`mic init failed: ${(err as Error).message}`);
-        }
-      }
-
-      /* Push-to-talk wire helpers exposed via a closure so the
-       * top-level component can call them on button mousedown / up.
-       * We hang them on the WS object via a side-channel ref so
-       * React doesn't have to re-bind. */
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (wsRef.current as any).__pttStart = () => {
-        if (modeRef.current !== "push-to-talk") return;
-        if (mutedRef.current) return;
-        if (speakingRef.current) {
-          sendJson({ t: "barge-in" });
-          resetTtsPlayback();
-        }
-        pttBuffer = [];
-        pttCapturing = true;
-        /* Re-enable the mic tracks before the first onaudioprocess
-         * tick lands. Was set to enabled=false at init + on every
-         * release so the OS mic indicator is dark between presses. */
-        pttStream?.getAudioTracks().forEach((t) => {
-          t.enabled = true;
-        });
-        sendJson({ t: "utterance-start" });
-        setStatus("listening");
-        utteranceStartRef.current = Date.now();
-        if (utteranceTimerRef.current) {
-          clearInterval(utteranceTimerRef.current);
-        }
-        utteranceTimerRef.current = setInterval(() => {
-          setUtteranceMs(Date.now() - utteranceStartRef.current);
-        }, 100);
-      };
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (wsRef.current as any).__pttStop = () => {
-        if (modeRef.current !== "push-to-talk") return;
-        if (!pttCapturing) return;
-        pttCapturing = false;
-        /* Disable the mic tracks the moment the user releases so the
-         * OS mic indicator goes dark and the underlying media flow
-         * stops. Stream + AudioContext stay alive so the next press
-         * has no re-grant latency. */
-        pttStream?.getAudioTracks().forEach((t) => {
-          t.enabled = false;
-        });
-        if (utteranceTimerRef.current) {
-          clearInterval(utteranceTimerRef.current);
-          utteranceTimerRef.current = null;
-        }
-        setUtteranceMs(0);
-        const total = pttBuffer.reduce((sum, c) => sum + c.length, 0);
-        const merged = new Int16Array(total);
-        let off = 0;
-        for (const c of pttBuffer) {
-          merged.set(c, off);
-          off += c.length;
-        }
-        pttBuffer = [];
-        if (merged.length > 0) {
-          sendBinary(merged.buffer);
-        }
-        sendJson({ t: "utterance-end" });
-        setStatus("transcribing");
-      };
     })();
 
     return () => {
@@ -3467,18 +2836,774 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
       }
       logVoice("engine-disable", "voice engine effect cleanup");
       teardown();
+      setAckedSocket(null);
     };
-    /* SESSIONS-VIEW defect 2 (2026-07-18): the WS + VAD lifecycle no
-     * longer depends on lexPty.ptyId. A brainstorm switch used to change
-     * this dep and tear the whole engine down (WS close + ORT VAD
-     * destroy) then reconnect - an audible blip. Now the engine is built
-     * once per enable/mode and a bind-target change RE-HELLOs on the live
-     * socket (see the rebind effect below), so switching never blips.
-     * Fix 31's original concern (the sessionId-resolve race tearing down
-     * WS #1 mid-first-turn) is subsumed: sessionId never drove teardown,
-     * and now neither does ptyId - the rebind is a hello, not a
-     * reconnect, and is guarded to skip the sessionId-resolve case. */
-  }, [enabled, mode]);
+    /* SESSIONS-VIEW defect 2 (2026-07-18): the WS lifecycle does not
+     * depend on lexPty.ptyId. A brainstorm switch used to change this
+     * dep and tear the whole engine down (WS close + ORT VAD destroy)
+     * then reconnect - an audible blip. The socket is built once per
+     * enable and a bind-target change RE-HELLOs on the live socket (see
+     * the rebind effect below), so switching never blips. Fix 31's
+     * original concern (the sessionId-resolve race tearing down WS #1
+     * mid-first-turn) is subsumed: sessionId never drove teardown, and
+     * neither does ptyId - the rebind is a hello, not a reconnect, and
+     * is guarded to skip the sessionId-resolve case. BUG-053 took
+     * `mode` out of these deps for the same reason: a mode change is a
+     * set-mode frame plus a capture-path rebuild (next effect), never a
+     * reconnect. */
+  }, [enabled]);
+
+  /* Capture path (BUG-053): the mic side of the engine, keyed on the
+   * mode and on the socket being hello-acked. Conversation and notes
+   * run silero VAD next to the shared parallel-capture rig; push-to-talk
+   * runs its own raw stream. A mode change re-keys this effect only:
+   * the cleanup destroys the old mode's VAD / push-to-talk capture,
+   * stops the tracks and clears the utterance timers and buffers
+   * (teardownCapture), and the next run brings the new mode's path up
+   * on the same socket. The VAD gets a fresh MicVAD.new per mode, which
+   * is what the old whole-effect re-run existed for. A reconnect (new
+   * socket object) rebuilds the capture the same way once the new
+   * socket is acked; a re-hello on the live socket (brainstorm switch)
+   * is the same object and leaves the mic alone. */
+  useEffect(() => {
+    if (!enabled || !ackedSocket) return;
+    let cancelled = false;
+
+    /* Capture-chain probe (2026-07-18 silent-mic investigation).
+     * Live A/B against the pre-wave client proved the daemon side
+     * is healthy; the regression is in this client's capture
+     * chain. Fields, reported via voice_health "cp:" rows:
+     *   w  = AudioWorklet tap frames (raw mic alive)
+     *   v  = vad-web onFrameProcessed frames (silero fed)
+     *   m  = max isSpeech probability (silero hears speech)
+     *   la = average isSpeech over the trailing ~20 frames
+     *        (what silero hears during SILENCE; if this floats
+     *        above the 0.4 negative threshold the utterance can
+     *        never close no matter the redemption window)
+     *   ss/se = onSpeechStart / onSpeechEnd fire counts
+     *   mu = hard-mute flag, rd = live redemption ms
+     * Diagnostic only; remove once the capture regression is
+     * fixed and verified. */
+    const captureProbe = {
+      workletFrames: 0,
+      vadFrames: 0,
+      maxProb: 0,
+      recentProbs: [] as number[],
+      speechStarts: 0,
+      speechEnds: 0,
+      ticks: 0,
+      timer: null as ReturnType<typeof setInterval> | null,
+    };
+
+    async function initParallelCapture(): Promise<void> {
+      /* Open a dedicated mic stream and run a 16 kHz int16 frame
+       * collector in parallel with silero VAD. We only ship from
+       * here on the mute-finalize path; normal end-of-utterance
+       * still uses the audio buffer VAD itself emits. Two parallel
+       * streams is fine on every browser we care about. */
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        captureStreamRef.current = stream;
+        /* BUG-053: a capture path rebuilt while hard-muted (mode
+         * switch, socket rebind) starts muted, exactly as
+         * setMicMuted(true) leaves a live one: tracks disabled, so no
+         * audio flows until the operator unmutes. mutedRef alone only
+         * gated the VAD callbacks; the fresh tracks came back enabled. */
+        if (mutedRef.current) {
+          for (const track of stream.getAudioTracks()) {
+            track.enabled = false;
+          }
+        }
+        /* First-grant gate for the wake-word recognizer. The
+         * getUserMedia returned a stream which means the user
+         * granted (or auto-allowed) microphone access; flag this
+         * synchronously so the wake-word useEffect can start the
+         * Web Speech recognizer without racing a parallel
+         * permission prompt. */
+        setMicPermissionGranted(true);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const Cls: any =
+          (window as unknown as { AudioContext?: typeof AudioContext })
+            .AudioContext ??
+          (window as unknown as { webkitAudioContext?: typeof AudioContext })
+            .webkitAudioContext;
+        const ctx = new Cls({ sampleRate: 16000 });
+        captureCtxRef.current = ctx;
+        const src = ctx.createMediaStreamSource(stream);
+        /* Gain stage for silero VAD's injected stream (R3 of the
+         * mic-slider-wiring audit). Tapped off the same source node
+         * as the worklet below so we open exactly one raw mic
+         * stream for the whole conversation-mode pipeline instead
+         * of MicVAD separately calling getUserMedia a second time.
+         * gain.value is kept live-synced to micGain by the effect
+         * near the micGain state declaration. Built BEFORE the
+         * worklet addModule call below so a worklet load failure
+         * (missing /vad-tap.worklet.js, unsupported browser, etc.)
+         * cannot take the VAD-triggering path down with it; only
+         * the transcription-buffer rig degrades in that case,
+         * matching the pre-existing "VAD path keeps working"
+         * resilience of this function. */
+        const gainNode = ctx.createGain();
+        gainNode.gain.value = micGainRef.current;
+        micGainNodeRef.current = gainNode;
+        src.connect(gainNode);
+        const vadDest = ctx.createMediaStreamDestination();
+        gainNode.connect(vadDest);
+        micVadStreamRef.current = vadDest.stream;
+        /* AudioWorklet replaces the deprecated ScriptProcessorNode
+         * (bug 2026-05-14-vad-scriptprocessornode-deprecation). The
+         * worklet module posts Float32 mono frames over its port;
+         * gain + Int16 conversion stays on the main thread so the
+         * downstream consumer (captureBufRef) is byte-for-byte
+         * equivalent to the prior onaudioprocess callback. This tap
+         * runs on the raw (pre-gain-node) signal; gain is applied
+         * per-sample below exactly as before, so the outbound
+         * transcription buffer's gain handling is unchanged. */
+        await ctx.audioWorklet.addModule("/vad-tap.worklet.js");
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          try {
+            await ctx.close();
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
+        const proc = new AudioWorkletNode(ctx, "vad-tap");
+        captureProcRef.current = proc;
+        proc.port.onmessage = (ev: MessageEvent<Float32Array>) => {
+          /* Probe count BEFORE any gating so it reflects the raw
+           * worklet cadence, not the capture-armed windows. */
+          captureProbe.workletFrames += 1;
+          if (!captureCapturingRef.current) return;
+          /* Drop frames while the TTS gate is active. tts-start
+           * already disarmed captureCapturingRef but a buffer
+           * that landed mid-flip would still push into
+           * captureBufRef without this check. */
+          if (micGatedRef.current) return;
+          const f = ev.data;
+          if (!f || f.length === 0) return;
+          const gain = micGainRef.current;
+          const i16 = new Int16Array(f.length);
+          for (let i = 0; i < f.length; i++) {
+            const s = Math.max(-1, Math.min(1, (f[i] ?? 0) * gain));
+            i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+          }
+          captureBufRef.current.push(i16);
+        };
+        src.connect(proc);
+        proc.connect(ctx.destination);
+      } catch {
+        /* parallel capture failure is non-fatal; mute-finalize just
+         * won't ship audio when this rig isn't up. VAD path keeps
+         * working. */
+      }
+    }
+
+    async function initVad(): Promise<void> {
+      if (mode === "push-to-talk") {
+        /* Push-to-talk uses raw getUserMedia + AudioWorklet
+         * sampling instead of silero VAD. The user controls
+         * utterance boundaries with the talk button; no need to
+         * spin up VAD or the parallel capture rig. */
+        await initPushToTalk();
+        return;
+      }
+      await initParallelCapture();
+      try {
+        /* Singleton load: getVadModule caches the dynamic import +
+         * the configureVadOrt pin, so VoiceClient remount (page
+         * nav, mic-mode toggle, dev HMR) reuses the ORT module
+         * record instead of forcing a fresh WASM
+         * compile/instantiate cycle. The previous behavior re-ran
+         * configureVadOrt on every mount; with the threaded WASM
+         * build the second remount would OOM the per-tab heap.
+         * See lib/voice-ort-config.ts. */
+        const mod = await getVadModule();
+        if (cancelled) return;
+        /* Helper to ship the captured audio + finalize the utterance.
+         * Used by both the natural VAD speech-end path and the
+         * forced-finalize cap so the server-side handling stays the
+         * same in both branches. */
+        const finalizeUtterance = (audio: Float32Array) => {
+          if (utteranceTimerRef.current) {
+            clearInterval(utteranceTimerRef.current);
+            utteranceTimerRef.current = null;
+          }
+          if (utteranceCapRef.current) {
+            clearTimeout(utteranceCapRef.current);
+            utteranceCapRef.current = null;
+          }
+          setUtteranceMs(0);
+          const gain = micGainRef.current;
+          const int16 = new Int16Array(audio.length);
+          for (let i = 0; i < audio.length; i++) {
+            const s = Math.max(-1, Math.min(1, (audio[i] ?? 0) * gain));
+            int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+          }
+          sendBinary(int16.buffer);
+          sendJson({ t: "utterance-end" });
+          setStatus("transcribing");
+        };
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let vadInstance: any = null;
+
+        /* Inject the shared gain-adjusted stream built in
+         * initParallelCapture (R3 of the mic-slider-wiring audit)
+         * so mic gain actually tames what triggers listening, not
+         * just what gets transcribed. vad-web has no plain `stream`
+         * option; the real injection point is the getStream /
+         * pauseStream / resumeStream callback triad on
+         * RealTimeVADOptions (node_modules/@ricky0123/vad-web/dist/
+         * real-time-vad.d.ts):
+         *   getStream: () => Promise<MediaStream>
+         *   pauseStream: (stream: MediaStream) => Promise<void>
+         *   resumeStream: (stream: MediaStream) => Promise<MediaStream>
+         * MicVAD.start() calls getStream() once, then on every
+         * subsequent pause()/start() cycle calls pauseStream() then
+         * resumeStream() instead of getStream() again. Overriding
+         * getStream alone is not enough: the default pauseStream
+         * calls stream.getTracks().forEach(t => t.stop()), which
+         * would permanently end our synthetic (GainNode ->
+         * MediaStreamAudioDestinationNode) stream's tracks the
+         * first time vad.pause() runs (stuck-open recovery and the
+         * MAX_UTTERANCE_MS cap both call pause()+start() routinely),
+         * and the default resumeStream would then silently reopen a
+         * brand new raw getUserMedia stream that bypasses the gain
+         * node entirely. All three are overridden together so the
+         * injected stream survives pause/resume cycles. Falls back
+         * to vad-web's own default getUserMedia grant (no gain
+         * applied to triggering) when the shared rig failed to come
+         * up, matching this function's existing "VAD path keeps
+         * working" resilience when initParallelCapture fails. */
+        /* 2026-07-18 silent-mic FIX: the R3 synthetic-stream
+         * injection is disabled. With the synthetic GainNode ->
+         * MediaStreamAudioDestinationNode feed the live capture
+         * probe showed silero OPENING speech (ss>0) but NEVER
+         * closing it (se=0 across every session) - the utterance
+         * never finalized and no audio ever shipped. The A/B run
+         * of the pre-wave client (MicVAD opens its own raw
+         * getUserMedia grant) against the current daemon worked
+         * immediately in this same browser/room, which also
+         * proves the own-grant + ORT init path is healthy in
+         * this environment. Restore that acquisition path. Cost:
+         * the mic-gain slider no longer shapes VAD triggering
+         * (it still shapes the transcribed bytes via the
+         * parallel-capture rig), matching pre-wave behavior. */
+        const vadStreamOverrides = {};
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const vad: any = await (mod as any).MicVAD.new({
+          baseAssetPath: "/vad/",
+          onnxWASMBasePath: "/vad/",
+          ...vadStreamOverrides,
+          onSpeechStart: () => {
+            /* Probe count BEFORE the mute gate so the snapshot
+             * shows whether vad-web fired the callback at all. */
+            captureProbe.speechStarts += 1;
+            if (mutedRef.current) return;
+            /* No more micGated early-return here. Path 1 of the
+             * voice-cmd-blocked-during-TTS audit: VAD stays live
+             * during TTS so the wake matcher can catch "Lex
+             * disable" / "Lex shut up" mid-reply. The daemon
+             * gates the inject on its end so AEC residual that
+             * gets transcribed but does not match a wake phrase
+             * never lands as a phantom user turn (see
+             * `state.utteranceStartedDuringTts` in
+             * lex-voice-ws.ts). The barge-in path below still
+             * cancels the in-flight TTS playback so the user is
+             * heard immediately. */
+            /* Word-gated barge (2026-07-17 voice engine cut,
+             * VOICE-TOP-LAYER-SPEC): a VAD onset never kills
+             * playback anymore - it ARMS the daemon's word gate.
+             * Playback dies only when streaming ASR words (the
+             * wake recognizer's interims, forwarded as asr-interim/
+             * asr-final) prove a real interruption: the daemon then
+             * sends tts-cancel and resetTtsPlayback reports the
+             * played ms. The barge cooldown knob is gone with the
+             * raw-VAD trigger it papered over; noise cannot stop
+             * Lex, words always can. */
+            sendJson({
+              t: "vad-onset",
+              playback_active:
+                speakingRef.current || ttsActiveRef.current,
+            });
+            setStatus("listening");
+            /* Reset + arm the parallel capture so a mute mid-
+             * utterance has audio to flush. */
+            captureBufRef.current = [];
+            captureCapturingRef.current = true;
+            utteranceStartRef.current = Date.now();
+            utteranceSamplesRef.current = 0;
+            setUtteranceMs(0);
+            /* Arm rolling probability window for stuck-open
+             * recovery. Cleared on every open so the previous
+             * utterance's frames can't trip an early close on
+             * this one. */
+            vadListenerOpenRef.current = true;
+            probWindowRef.current = [];
+            if (utteranceTimerRef.current) {
+              clearInterval(utteranceTimerRef.current);
+            }
+            utteranceTimerRef.current = setInterval(() => {
+              setUtteranceMs(Date.now() - utteranceStartRef.current);
+            }, 100);
+            if (utteranceCapRef.current) {
+              clearTimeout(utteranceCapRef.current);
+            }
+            /* Hard cap: if VAD never fires speech-end (user keeps
+             * talking through pauses too short to trip the threshold),
+             * finalize at MAX_UTTERANCE_MS so Lex actually gets a
+             * chance to respond.
+             *
+             * 2026-05-22: cap path now ships the parallel capture
+             * buffer via flushParallelCapture so a long-form
+             * utterance is delivered to STT even when the cap
+             * trips. The legacy behavior dropped audio and forced
+             * the user to repeat themselves; we trust STT for long
+             * audio instead. */
+            utteranceCapRef.current = setTimeout(() => {
+              if (vadInstance && typeof vadInstance.pause === "function") {
+                vadInstance.pause();
+                vadListenerOpenRef.current = false;
+                probWindowRef.current = [];
+                const shipped = flushParallelCapture();
+                if (!shipped) {
+                  /* No buffered audio (parallel capture was off or
+                   * empty). Send utterance-end so the server does
+                   * not think we are hanging, even though the cap
+                   * fire produced nothing transcribable. */
+                  sendJson({ t: "utterance-end" });
+                  setStatus("transcribing");
+                }
+                /* Resume VAD listening after a moment. */
+                setTimeout(() => {
+                  try {
+                    vadInstance.start();
+                  } catch {
+                    /* ignore */
+                  }
+                }, 250);
+              }
+            }, MAX_UTTERANCE_MS);
+          },
+          onSpeechEnd: (audio: Float32Array) => {
+            /* Probe count BEFORE the mute gate (see onSpeechStart). */
+            captureProbe.speechEnds += 1;
+            /* Disarm parallel capture; VAD's audio is the source
+             * of truth on the normal end-of-utterance path. */
+            captureCapturingRef.current = false;
+            captureBufRef.current = [];
+            vadListenerOpenRef.current = false;
+            probWindowRef.current = [];
+            if (mutedRef.current) return;
+            finalizeUtterance(audio);
+          },
+          /* Stuck-open recovery. Silero invokes this on every
+           * 32ms frame whether or not speech is currently open;
+           * we only accumulate while the listener is open. If
+           * the rolling average isSpeech probability stays below
+           * VAD_PROB_FLOOR across the full VAD_PROB_WINDOW_MS,
+           * force the listener closed locally and recycle VAD so
+           * the next real utterance starts clean. We deliberately
+           * do NOT ship audio or send utterance-end here: the
+           * daemon's micBuf hasn't received any binary frames yet
+           * (those only flow on the real end-of-utterance path),
+           * so simply dropping the in-progress utterance leaves
+           * the daemon in a consistent state for the next
+           * utterance-start. */
+          onFrameProcessed: (probs: {
+            isSpeech: number;
+            notSpeech: number;
+          }) => {
+            /* Probe counts BEFORE the listener-open gate so they
+             * reflect whether silero receives frames at all and
+             * what it hears during silence. */
+            captureProbe.vadFrames += 1;
+            if (probs.isSpeech > captureProbe.maxProb) {
+              captureProbe.maxProb = probs.isSpeech;
+            }
+            captureProbe.recentProbs.push(probs.isSpeech);
+            if (captureProbe.recentProbs.length > 20) {
+              captureProbe.recentProbs.shift();
+            }
+            if (!vadListenerOpenRef.current) return;
+            /* 2026-07-18 silent-mic FIX (the actual regression):
+             * this recovery used the fixed 1500ms window, and the
+             * rolling average crosses below the 0.4 floor after
+             * only ~915ms of real end-of-utterance silence, while
+             * the FrameProcessor's redemption close needs
+             * redemptionMs (1400ms = 14 legacy frames = 1344ms).
+             * The recovery therefore ALWAYS fired first, and
+             * vad.pause() with vad-web's default
+             * submitUserSpeechOnPause:false runs reset(): the
+             * buffered utterance audio is DISCARDED and SpeechEnd
+             * never fires. Live signature: voice_health cp: rows
+             * with ss>0, se=0, la=0.02 forever; the operator saw
+             * "listening" that never became "transcribing". The
+             * pre-wave client had no such recovery, which is why
+             * the A/B of the old bundle worked. Fix: derive the
+             * evaluation window from the LIVE redemption setting
+             * plus a wide margin so legitimate silence always
+             * closes through redemption first; the recovery only
+             * catches a listener that redemption failed to close
+             * (its original purpose: the stuck-open bug). */
+            const now = Date.now();
+            const recoveryWindowMs = Math.max(
+              VAD_PROB_WINDOW_MS,
+              vadRedemptionRef.current + 1500,
+            );
+            const w = probWindowRef.current;
+            w.push({ t: now, p: probs.isSpeech });
+            while (w.length > 0 && now - w[0]!.t > recoveryWindowMs) {
+              w.shift();
+            }
+            /* Require a full window before evaluating so the
+             * opening stretch of an utterance can't trip the
+             * floor before we've actually heard the speaker. */
+            if (w.length === 0) return;
+            if (
+              now - w[0]!.t <
+              recoveryWindowMs - VAD_PROB_WINDOW_SLOP_MS
+            ) {
+              return;
+            }
+            let sum = 0;
+            for (const x of w) sum += x.p;
+            const avg = sum / w.length;
+            if (avg >= VAD_PROB_FLOOR) return;
+            vadListenerOpenRef.current = false;
+            probWindowRef.current = [];
+            captureCapturingRef.current = false;
+            captureBufRef.current = [];
+            if (utteranceTimerRef.current) {
+              clearInterval(utteranceTimerRef.current);
+              utteranceTimerRef.current = null;
+            }
+            if (utteranceCapRef.current) {
+              clearTimeout(utteranceCapRef.current);
+              utteranceCapRef.current = null;
+            }
+            setUtteranceMs(0);
+            try {
+              vadInstance?.pause?.();
+            } catch {
+              /* ignore */
+            }
+            setStatus((cur) =>
+              cur === "listening" || cur === "transcribing" ? "ready" : cur,
+            );
+            setTimeout(() => {
+              try {
+                vadInstance?.start?.();
+              } catch {
+                /* ignore */
+              }
+            }, 250);
+          },
+          /* ms-based option set: positive/negativeSpeechThreshold
+           * derived from the user-tunable mic sensitivity (0=ignore
+           * noise, 1=fire easily; 0.5 matches the legacy 0.5/0.4
+           * pair), redemptionMs from the pause-tolerance slider,
+           * preSpeechPadMs/minSpeechMs fixed at 256ms. These are the
+           * ONLY keys the installed vad-web (0.0.30) actually reads
+           * off this options object; it builds its internal
+           * FrameProcessor from an explicit
+           * {positiveSpeechThreshold, negativeSpeechThreshold,
+           * redemptionMs, preSpeechPadMs, minSpeechMs,
+           * submitUserSpeechOnPause} literal, not a spread of the
+           * full options (node_modules/@ricky0123/vad-web/dist/
+           * real-time-vad.js). The legacy redemptionFrames /
+           * preSpeechPadFrames / minSpeechFrames keys this used to
+           * pass here were silently dropped and did nothing; see
+           * lib/voice-vad-options.ts for the shared builder also
+           * used by the live setOptions() path below. */
+          ...buildVadOptionSet(
+            vadSensitivityRef.current,
+            vadRedemptionRef.current,
+          ),
+        });
+        vadInstance = vad;
+        vadRef.current = vad;
+        vad.start();
+        /* Arm the capture-probe reporter: 6 snapshots, 5s apart,
+         * shipped to the daemon voice_health table. See the
+         * captureProbe declaration above for field meanings. */
+        captureProbe.timer = setInterval(() => {
+          captureProbe.ticks += 1;
+          if (captureProbe.ticks > 6 || cancelled) {
+            if (captureProbe.timer) clearInterval(captureProbe.timer);
+            captureProbe.timer = null;
+            return;
+          }
+          const rp = captureProbe.recentProbs;
+          const la =
+            rp.length > 0
+              ? rp.reduce((a, b) => a + b, 0) / rp.length
+              : 0;
+          const kind =
+            `cp:w=${captureProbe.workletFrames}` +
+            `,v=${captureProbe.vadFrames}` +
+            `,m=${captureProbe.maxProb.toFixed(2)}` +
+            `,la=${la.toFixed(2)}` +
+            `,ss=${captureProbe.speechStarts}` +
+            `,se=${captureProbe.speechEnds}` +
+            `,mu=${mutedRef.current ? 1 : 0}` +
+            `,rd=${vadRedemptionRef.current}`;
+          void postVoiceHealth([
+            {
+              ts_ms: Date.now(),
+              check_kind: kind.slice(0, 64),
+              status: "probe",
+              heal_attempt: Math.min(9, captureProbe.ticks),
+              recovered: 0,
+            },
+          ]);
+        }, 5_000);
+      } catch (err) {
+        /* Fix 2026-05-25: mic-init OOM recurrence on mobile Safari.
+         * Clear the cached vadModulePromise + vadModuleConfigured
+         * singletons BEFORE surfacing the error so the next Retry
+         * boots a fresh ORT env rather than landing on a poisoned
+         * backend ("previous call to initWasm() failed"). Extends
+         * the 2026-05-16 disable-path reset to the error path.
+         * logVoice lands the failure in the ring buffer + Voice
+         * diagnostics panel; setErrMsg only fires a UI toast and
+         * was invisible to operator + audit. */
+        resetVadModuleCache();
+        logVoice(
+          "vad-error",
+          (err as Error).message,
+          undefined,
+          "error",
+        );
+        /* Silent-mic investigation (2026-07-18): mirror the mic
+         * init failure to the daemon voice_health table so the
+         * exact error name+message is readable server-side
+         * without DevTools on the affected device. */
+        void postVoiceHealth([
+          {
+            ts_ms: Date.now(),
+            check_kind: `vad-err:${(err as Error).name}:${
+              (err as Error).message
+            }`.slice(0, 64),
+            status: "probe",
+            heal_attempt: 0,
+            recovered: 0,
+          },
+        ]);
+        setStatus("error");
+        setErrMsg(`mic init failed: ${(err as Error).message}`);
+      }
+    }
+
+    /* Push-to-talk path. Holds a MediaStream + AudioWorklet that
+     * forwards 16kHz int16 PCM frames into a buffer; flushes the
+     * buffer on talk-button release. No VAD; the user is the gate.
+     * Useful when VAD over-fires on background noise. */
+    let pttCtx: AudioContext | null = null;
+    let pttStream: MediaStream | null = null;
+    let pttBuffer: Int16Array[] = [];
+    let pttCapturing = false;
+
+    async function initPushToTalk(): Promise<void> {
+      try {
+        pttStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+        /* Hold the mic in a disabled state until the user actually
+         * presses talk. getUserMedia activates the OS mic indicator
+         * the moment the stream is granted; flipping enabled=false
+         * on every track immediately dims that indicator on
+         * Chromium/Edge/Firefox and stops the underlying media flow.
+         * __pttStart re-enables before reading frames. */
+        pttStream.getAudioTracks().forEach((t) => {
+          t.enabled = false;
+        });
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const Cls: any =
+          (window as unknown as { AudioContext?: typeof AudioContext })
+            .AudioContext ??
+          (window as unknown as { webkitAudioContext?: typeof AudioContext })
+            .webkitAudioContext;
+        pttCtx = new Cls({ sampleRate: 16000 });
+        if (!pttCtx) throw new Error("no AudioContext");
+        const src = pttCtx.createMediaStreamSource(pttStream);
+        /* Use a ScriptProcessorNode for simplicity: it's deprecated
+         * but universally supported and the data path is short.
+         * AudioWorklet would be cleaner but needs an extra worklet
+         * file deployed to /vad/. */
+        const proc = pttCtx.createScriptProcessor(4096, 1, 1);
+        proc.onaudioprocess = (e) => {
+          if (!pttCapturing) return;
+          /* TTS gate also applies to push-to-talk: holding the
+           * talk button while Lex is speaking should not capture
+           * her audio. The user can still barge in by releasing
+           * the button and pressing again after tts-end. */
+          if (micGatedRef.current) return;
+          const f = e.inputBuffer.getChannelData(0);
+          const gain = micGainRef.current;
+          const i16 = new Int16Array(f.length);
+          for (let i = 0; i < f.length; i++) {
+            const s = Math.max(-1, Math.min(1, (f[i] ?? 0) * gain));
+            i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+          }
+          pttBuffer.push(i16);
+        };
+        src.connect(proc);
+        proc.connect(pttCtx.destination);
+        /* Stash refs on vadRef so the cleanup path tears down. */
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        vadRef.current = {
+          destroy: () => {
+            try {
+              pttStream?.getTracks().forEach((t) => t.stop());
+            } catch {
+              /* ignore */
+            }
+            try {
+              proc.disconnect();
+            } catch {
+              /* ignore */
+            }
+            try {
+              src.disconnect();
+            } catch {
+              /* ignore */
+            }
+            try {
+              if (pttCtx && pttCtx.state !== "closed") void pttCtx.close();
+            } catch {
+              /* ignore */
+            }
+          },
+        } as { destroy: () => void };
+        /* No status flip here (BUG-053). On a fresh connect hello-ack
+         * already set connecting / warming / ready per the brain gate,
+         * and on a live mode switch a mid-turn state (transcribing,
+         * thinking, speaking) must survive; teardownCapture already
+         * returned a dropped "listening" to ready. */
+      } catch (err) {
+        /* Fix 2026-05-25: same reset + log path as the VAD mic-init
+         * catch above. Push-to-talk mode does not hit the wasm OOM
+         * path (no ORT modules) but the cached vadModule state can
+         * still be poisoned from an earlier conversation-mode init
+         * attempt; resetting on every error keeps the next Retry
+         * deterministic regardless of which mode tripped first. */
+        resetVadModuleCache();
+        logVoice(
+          "vad-error",
+          (err as Error).message,
+          undefined,
+          "error",
+        );
+        /* Silent-mic investigation (2026-07-18): mirror the mic
+         * init failure to the daemon voice_health table so the
+         * exact error name+message is readable server-side
+         * without DevTools on the affected device. */
+        void postVoiceHealth([
+          {
+            ts_ms: Date.now(),
+            check_kind: `vad-err:${(err as Error).name}:${
+              (err as Error).message
+            }`.slice(0, 64),
+            status: "probe",
+            heal_attempt: 0,
+            recovered: 0,
+          },
+        ]);
+        setStatus("error");
+        setErrMsg(`mic init failed: ${(err as Error).message}`);
+      }
+    }
+
+    /* Push-to-talk wire helpers exposed through refs so the top-level
+     * component can call them on button mousedown / up. Installed for
+     * every mode (they no-op unless the mode is push-to-talk) and
+     * cleared by teardownCapture with the rest of the capture path. */
+    pttStartRef.current = () => {
+      if (modeRef.current !== "push-to-talk") return;
+      if (mutedRef.current) return;
+      if (speakingRef.current) {
+        sendJson({ t: "barge-in" });
+        resetTtsPlayback();
+      }
+      pttBuffer = [];
+      pttCapturing = true;
+      /* Re-enable the mic tracks before the first onaudioprocess
+       * tick lands. Was set to enabled=false at init + on every
+       * release so the OS mic indicator is dark between presses. */
+      pttStream?.getAudioTracks().forEach((t) => {
+        t.enabled = true;
+      });
+      sendJson({ t: "utterance-start" });
+      setStatus("listening");
+      utteranceStartRef.current = Date.now();
+      if (utteranceTimerRef.current) {
+        clearInterval(utteranceTimerRef.current);
+      }
+      utteranceTimerRef.current = setInterval(() => {
+        setUtteranceMs(Date.now() - utteranceStartRef.current);
+      }, 100);
+    };
+
+    pttStopRef.current = () => {
+      if (modeRef.current !== "push-to-talk") return;
+      if (!pttCapturing) return;
+      pttCapturing = false;
+      /* Disable the mic tracks the moment the user releases so the
+       * OS mic indicator goes dark and the underlying media flow
+       * stops. Stream + AudioContext stay alive so the next press
+       * has no re-grant latency. */
+      pttStream?.getAudioTracks().forEach((t) => {
+        t.enabled = false;
+      });
+      if (utteranceTimerRef.current) {
+        clearInterval(utteranceTimerRef.current);
+        utteranceTimerRef.current = null;
+      }
+      setUtteranceMs(0);
+      const total = pttBuffer.reduce((sum, c) => sum + c.length, 0);
+      const merged = new Int16Array(total);
+      let off = 0;
+      for (const c of pttBuffer) {
+        merged.set(c, off);
+        off += c.length;
+      }
+      pttBuffer = [];
+      if (merged.length > 0) {
+        sendBinary(merged.buffer);
+      }
+      sendJson({ t: "utterance-end" });
+      setStatus("transcribing");
+    };
+
+    void initVad();
+
+    return () => {
+      cancelled = true;
+      if (captureProbe.timer) {
+        clearInterval(captureProbe.timer);
+        captureProbe.timer = null;
+      }
+      teardownCapture();
+    };
+  }, [enabled, mode, ackedSocket]);
 
   /* SESSIONS-VIEW defect 2: rebind on the LIVE socket when the bound
    * PTY changes (a brainstorm switch or an out-of-daemon respawn) without
@@ -3503,34 +3628,41 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
 
   function pttDown(): void {
     setPttHolding(true);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const fn = (wsRef.current as any)?.__pttStart as (() => void) | undefined;
-    fn?.();
+    pttStartRef.current?.();
   }
   function pttUp(): void {
     setPttHolding(false);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const fn = (wsRef.current as any)?.__pttStop as (() => void) | undefined;
-    fn?.();
+    pttStopRef.current?.();
   }
 
-  /* Mode change while voice is active: tear down + bring up the new
-   * pipeline so VAD vs PTT swap cleanly. The dependent useEffect's
-   * deps include mode so this happens automatically; the helper
-   * sends a server-side mode-set so the daemon respects notes-mode
-   * silence. */
+  /* Mode change while voice is active (BUG-053): a live switch. The
+   * socket stays open, no re-hello, no "connecting". The daemon gets a
+   * set-mode frame on the live socket (its handler is a live change on
+   * its own). A socket that is still CONNECTING drops the frame, but
+   * the hello sent on open carries modeRef, so the daemon still ends up
+   * on the right mode; that is why the old warmup lock is gone. setMode
+   * re-keys the capture effect, which tears down only the old mode's
+   * capture path (VAD or push-to-talk) and brings up the new one.
+   * A pending notes finalize (Stop pressed in notes mode, summary not
+   * landed yet) is cancelled, which is what the old full teardown did on
+   * a mode change; the socket stays up so the summary turn still
+   * renders when it lands. */
   function changeMode(next: Mode): void {
-    /* Warmup lock: refuse the switch while the WS is still opening.
-     * Doing it mid-handshake closes a CONNECTING socket (code 1006) and
-     * breaks voice; the button is disabled during this window too, this
-     * is the belt-and-suspenders guard. Tell the operator instead of
-     * silently eating the tap. */
-    if (warmingUp) {
-      showInfoToast("Voice is still warming up. Mode locked until it's ready.");
-      return;
+    if (next === mode) return;
+    if (finalizeTimeoutRef.current) {
+      clearTimeout(finalizeTimeoutRef.current);
+      finalizeTimeoutRef.current = null;
     }
+    awaitingFinalizeRef.current = false;
     setMode(next);
-    sendJson({ t: "set-mode", mode: next });
+    /* The meeting toggle used to ride the next hello (the old switch
+     * reconnected); the socket now stays up, so it rides this frame with
+     * the same explicit-confirm rule the daemon applies to hello. */
+    sendJson({
+      t: "set-mode",
+      mode: next,
+      kind: next === "notes" && meetingKindOnRef.current ? "meeting" : "brainstorm",
+    });
   }
 
   /* Stop button click. In notes mode with a live socket we don't
@@ -3708,17 +3840,11 @@ export function VoiceClient({ children }: { children?: ReactNode }) {
             key={m}
             type="button"
             onClick={() => changeMode(m)}
-            disabled={warmingUp}
-            title={
-              warmingUp
-                ? "Voice is warming up — mode locked until it's ready."
-                : undefined
-            }
             className={`text-nano px-2.5 py-1 rounded-pill hairline font-mono ${
               mode === m
                 ? "bg-brand/20 text-brandSoft ring-1 ring-brand/40"
                 : "bg-surface2 text-txt2 hover:bg-surface3"
-            } ${warmingUp ? "opacity-50 cursor-not-allowed" : ""}`}
+            }`}
           >
             {MODE_LABEL[m]}
           </button>

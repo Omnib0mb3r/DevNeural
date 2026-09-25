@@ -374,6 +374,12 @@ interface VoiceBrainSessionState {
   /** Fired once when this session's warmup succeeds (a standby uses it
    * to schedule the swap on the owner's ask queue). */
   onWarm: (() => void) | null;
+  /** BUG-052 barge: the pty an ask is streaming from right now, so the
+   * voice can send Escape and free the queue when the operator talks
+   * over a delivery. Null between asks. */
+  askInFlightPtyId: string | null;
+  /** Set by interruptVoiceBrainAsk; the tail loop resolves on it. */
+  interruptRequested: boolean;
 }
 
 function initialState(anchorKey: string): VoiceBrainSessionState {
@@ -398,6 +404,8 @@ function initialState(anchorKey: string): VoiceBrainSessionState {
     standby: null,
     rotating: false,
     onWarm: null,
+    askInFlightPtyId: null,
+    interruptRequested: false,
   };
 }
 
@@ -964,9 +972,10 @@ async function waitForVoiceReply(
   deadline: number,
   onPartial: ((text: string) => void) | undefined,
   ptyId: string | null = null,
+  abort: (() => boolean) | null = null,
 ): Promise<
   | { timedOut: true; recordsSeen: number; sawBytes: boolean }
-  | { timedOut: false; text: string }
+  | { timedOut: false; text: string; interrupted?: boolean }
 > {
   let offset = startOffset;
   const parts: string[] = [];
@@ -979,6 +988,12 @@ async function waitForVoiceReply(
    * for the text record before resolving. */
   let emptyEndTurnAt: number | null = null;
   for (;;) {
+    /* BUG-052 barge: the operator talked over a delivery. Escape has
+     * gone to the pty; resolve with what streamed so far and free the
+     * queue for his words. */
+    if (abort && abort()) {
+      return { timedOut: false, text: parts.join('\n'), interrupted: true };
+    }
     let stat: { size: number } | null;
     try {
       stat = deps.statSync(jsonlPath);
@@ -986,17 +1001,15 @@ async function waitForVoiceReply(
       stat = null;
     }
     /* Pty output is a liveness signal too (claude echoes/renders while
-     * generating, before the jsonl record lands). */
+     * generating, before the jsonl record lands), but only once the
+     * transcript has grown at all. BUG-050: before that, the only pty
+     * output is the composer repainting an unsubmitted paste, and
+     * counting it stretched every stuck ask to 21-35 s. */
     const ptyAt = ptyOutputAtMs(ptyId);
-    if (ptyAt !== null && deps.now() - ptyAt < signalQuietMs()) {
+    if (sawBytes && ptyAt !== null && deps.now() - ptyAt < signalQuietMs()) {
       effectiveDeadline = extendOnSignal(effectiveDeadline, wall, ptyAt);
     }
     if (stat && stat.size > offset) {
-      sawBytes = true;
-      /* ANY jsonl growth is a liveness signal - assistant record or
-       * not, streaming or not. The caller timeout bounds
-       * time-to-first-signal; from here silence is what kills. */
-      effectiveDeadline = extendOnSignal(effectiveDeadline, wall, deps.now());
       const chunk = deps.readRange(jsonlPath, offset, stat.size - offset);
       offset = stat.size;
       for (const line of chunk.split(/\r?\n/)) {
@@ -1007,6 +1020,15 @@ async function waitForVoiceReply(
           rec = JSON.parse(trimmed);
         } catch {
           continue;
+        }
+        /* Growth beyond the submit itself is the liveness signal:
+         * assistant record or not, streaming or not. The user record
+         * only proves the prompt submitted (BUG-050) and must not buy
+         * a hung model the quiet window. The caller timeout bounds
+         * time-to-first-signal; from here silence is what kills. */
+        if (rec.type !== 'user') {
+          sawBytes = true;
+          effectiveDeadline = extendOnSignal(effectiveDeadline, wall, deps.now());
         }
         const text = extractAssistantText(rec);
         if (!onPartial) {
@@ -1082,10 +1104,105 @@ export function _shouldCountLivenessStrikeImpl(result: {
   return result.recordsSeen === 0 && !result.sawBytes;
 }
 
+/* BUG-050 (2026-09-25): an ask is confirmed SUBMITTED before it is
+ * waited on. Claude Code writes the user record the moment a prompt
+ * submits, so transcript growth is the proof. Without it, the morning
+ * session's six asks sat in the composer as one growing paste (pty-host
+ * writes body plus CR in one write and fires one bare CR a second
+ * later; when that is eaten, nothing else ever tried), timed out, and
+ * fail-safe-forwarded the raw words to the brain; the pile went out
+ * minutes later as one merged prompt. The L2 forward path has had this
+ * ladder since BUG-036; Layer 1 never did.
+ *
+ * Confirm window: pty-host's nudge fires at 1 s; a submitted prompt has
+ * grown the transcript by 1.6 s. Ladder: a bare CR, then space-Enter
+ * twice (the manual recovery that provably submits a stuck paste; on
+ * the morning session a bare CR alone never did, text plus CR always
+ * did). Still no growth after that means the composer is wedged: the
+ * session is killed for respawn, the ask fail-safes, and the next
+ * utterance gets a fresh session instead of appending to the pile. */
+export const ASK_SUBMIT_CONFIRM_MS = 1_600;
+export const ASK_SUBMIT_LADDER: ReadonlyArray<{ nudge: string; waitMs: number }> = [
+  { nudge: '\r', waitMs: 1_000 },
+  { nudge: ' \r', waitMs: 1_500 },
+  { nudge: ' \r', waitMs: 1_500 },
+];
+
+async function jsonlGrewWithin(
+  s: VoiceBrainSessionState,
+  ptyId: string,
+  jsonlPath: string,
+  sinceOffset: number,
+  waitMs: number,
+): Promise<boolean> {
+  const until = deps.now() + waitMs;
+  for (;;) {
+    if (s.ptyId !== ptyId) return false;
+    let size = 0;
+    try {
+      size = deps.statSync(jsonlPath).size;
+    } catch {
+      size = 0;
+    }
+    if (size > sinceOffset) return true;
+    const remaining = until - deps.now();
+    if (remaining <= 0) return false;
+    await deps.sleep(Math.min(deps.pollIntervalMs, remaining));
+  }
+}
+
+async function waitForSubmit(
+  s: VoiceBrainSessionState,
+  ptyId: string,
+  jsonlPath: string,
+  sinceOffset: number,
+): Promise<'submitted' | 'stuck' | 'gone'> {
+  const injectedAt = deps.now();
+  if (await jsonlGrewWithin(s, ptyId, jsonlPath, sinceOffset, ASK_SUBMIT_CONFIRM_MS)) {
+    return 'submitted';
+  }
+  for (let i = 0; i < ASK_SUBMIT_LADDER.length; i++) {
+    if (s.ptyId !== ptyId) return 'gone';
+    const step = ASK_SUBMIT_LADDER[i]!;
+    deps.log(
+      `[voice-brain] ${tag(s)} ask not submitted ${deps.now() - injectedAt}ms after inject (composer holding the paste, BUG-050); nudge ${i + 1}/${ASK_SUBMIT_LADDER.length}: ${step.nudge === '\r' ? 'bare CR' : 'space then CR'}`,
+    );
+    try {
+      deps.ptyInject(ptyId, step.nudge, false);
+    } catch {
+      /* best-effort; the growth check below is the truth */
+    }
+    if (await jsonlGrewWithin(s, ptyId, jsonlPath, sinceOffset, step.waitMs)) {
+      deps.log(
+        `[voice-brain] ${tag(s)} ask submitted after nudge ${i + 1} (${deps.now() - injectedAt}ms after inject)`,
+      );
+      return 'submitted';
+    }
+  }
+  return s.ptyId === ptyId ? 'stuck' : 'gone';
+}
+
+/** BUG-052 barge: the operator spoke while the voice was delivering.
+ * Escape stops Claude Code's generation; the in-flight ask resolves
+ * with what streamed so far and the anchor's queue is free for his
+ * words. True when an ask was in flight. */
+export function interruptVoiceBrainAsk(anchorId?: string | null): boolean {
+  const s = sessions.get(keyFor(anchorId));
+  if (!s || !s.askInFlightPtyId) return false;
+  s.interruptRequested = true;
+  try {
+    deps.ptyInject(s.askInFlightPtyId, '\x1b', false);
+  } catch {
+    /* best-effort; the tail loop resolves on the flag regardless */
+  }
+  deps.log(`[voice-brain] ${tag(s)} in-flight ask interrupted (barge): Escape sent`);
+  return true;
+}
+
 /* The ask primitive: enable-flag check, lazy spawn, inject,
- * tail-and-wait, liveness bookkeeping. Returns the trimmed reply text
- * or null on any failure. Callers reach it through the anchor's queue
- * in askVoice, never directly. */
+ * submit confirmation, tail-and-wait, liveness bookkeeping. Returns
+ * the trimmed reply text or null on any failure. Callers reach it
+ * through the anchor's queue in askVoice, never directly. */
 async function askVoiceInner(
   s: VoiceBrainSessionState,
   input: AskVoiceInput,
@@ -1093,7 +1210,6 @@ async function askVoiceInner(
   if (!isVoiceBrainSessionEnabled()) return null;
   const timeoutMs = input.timeoutMs ?? defaultAskTimeoutMs();
   const question = buildVoiceQuestion(input.system, input.prompt);
-  const deadline = deps.now() + timeoutMs;
 
   if (!ensureSpawned(s)) return null;
   /* Warmup gate: never inject into a booting session. The ask nulls
@@ -1124,13 +1240,34 @@ async function askVoiceInner(
   }
 
   const askStartedAt = deps.now();
-  const result = await waitForVoiceReply(
-    jsonlPath,
-    sinceOffset,
-    deadline,
-    input.onPartial,
-    ptyId,
-  );
+  const submit = await waitForSubmit(s, ptyId, jsonlPath, sinceOffset);
+  if (submit === 'gone') return null;
+  if (submit === 'stuck') {
+    deps.log(
+      `[voice-brain] ${tag(s)} ASK NEVER SUBMITTED: no transcript growth ${deps.now() - askStartedAt}ms after inject and ${ASK_SUBMIT_LADDER.length} CR nudges; the composer is wedged (BUG-050). Killing the session for respawn; this ask fail-safes.`,
+    );
+    killCurrent(s, 'ask-never-submitted');
+    return null;
+  }
+  /* The timeout bounds time to the first reply signal from the moment
+   * the prompt submitted, not from the inject. */
+  const deadline = deps.now() + timeoutMs;
+  s.askInFlightPtyId = ptyId;
+  s.interruptRequested = false;
+  let result: Awaited<ReturnType<typeof waitForVoiceReply>>;
+  try {
+    result = await waitForVoiceReply(
+      jsonlPath,
+      sinceOffset,
+      deadline,
+      input.onPartial,
+      ptyId,
+      () => s.interruptRequested,
+    );
+  } finally {
+    s.askInFlightPtyId = null;
+    s.interruptRequested = false;
+  }
   if (result.timedOut) {
     if (input.noLivenessStrike) {
       /* Fix #1 (2026-07-18): conversational asks are never an error
@@ -1158,7 +1295,7 @@ async function askVoiceInner(
   /* A reply landed: the session is alive and responsive. Reset the
    * failure streak. */
   deps.log(
-    `[voice-brain] ${tag(s)} ask replied in ${deps.now() - askStartedAt}ms chars=${result.text.length}`,
+    `[voice-brain] ${tag(s)} ask ${result.interrupted ? 'interrupted' : 'replied'} in ${deps.now() - askStartedAt}ms chars=${result.text.length}`,
   );
   s.consecutiveTimeouts = 0;
   /* A degenerate end_turn with zero text blocks concatenates to the

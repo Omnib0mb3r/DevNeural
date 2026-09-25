@@ -61,6 +61,7 @@ import { getLexSession, setLexSessionStatus } from '../lex/lex-session-store.js'
 import {
   isVoiceBrainSessionWarm,
   isVoiceBrainSessionEnabled,
+  interruptVoiceBrainAsk,
   killVoiceBrainSession,
   prewarmVoiceBrainSession,
   voiceBrainJsonlPath,
@@ -2041,32 +2042,58 @@ export function heldTurnFlushMaxHoldMs(): number {
   return smartTurnHoldWindowMs();
 }
 
-/* BUG-048 (2026-09-24): L1 answered IGNORE ("unclear address") to
- * "Next in session." (whisper's rendering of "end session") seconds after
- * its own line, and the operator got silence. IGNORE is for sound that
- * is not Michael talking to Lex. When the reason is not a background
- * category, the words are not a parenthetical noise tag, and the
- * exchange is live (his last exchange within the window), the daemon
- * hands the words back as an [event] so L1 asks him what he meant.
- * Pure and exported for tests. */
-const IGNORE_BACKGROUND_REASON =
-  /noise|tv\b|television|radio|music|echo|other|someone|else|background|crowd|child|kid|dog|phone|speaker|audio|playback|self|myself|own words/i;
-export const IGNORE_CHALLENGE_WINDOW_MS = 90_000;
+/* BUG-053 (2026-09-25): the voice's working memory (the last few
+ * exchanges, the last line it spoke) belongs to the ANCHOR, not to the
+ * socket. It used to live in the connection closure, so every socket
+ * cycle (a mode switch, a reconnect) handed Layer 1 an empty [live]
+ * block: no recent talk, no last line, and the morning session cycled
+ * its socket four times in five minutes. Keyed by anchor id (the
+ * brainstorm), falling back to the bind key, so a switch_project moves
+ * the memory with the call. Also home to the fail-safe repeat guard
+ * (BUG-050): with the voice layer down, "good morning" said twice on two
+ * sockets reached the brain twice. */
+export interface VoiceMemory {
+  recentTalk: Array<{ heard: string; said: string; atMs: number }>;
+  lastSpokenText: string | null;
+  lastFailSafe: { text: string; atMs: number } | null;
+}
 
-export function _shouldChallengeIgnoreImpl(
-  reason: string | null,
-  utterance: string,
-  msSinceLastExchange: number | null,
-): boolean {
-  if (msSinceLastExchange === null || msSinceLastExchange > IGNORE_CHALLENGE_WINDOW_MS) {
-    return false;
+const voiceMemoryByAnchor = new Map<string, VoiceMemory>();
+
+export function voiceMemoryFor(key: string | null | undefined): VoiceMemory {
+  const k = (key ?? '').trim() || 'default';
+  let m = voiceMemoryByAnchor.get(k);
+  if (!m) {
+    m = { recentTalk: [], lastSpokenText: null, lastFailSafe: null };
+    voiceMemoryByAnchor.set(k, m);
   }
-  const u = utterance.trim();
-  if (!u || !/[a-z]/i.test(u)) return false;
-  /* "(water bubbling)", "[laughter]": whisper's own noise tags. */
-  if (/^[([].*[)\]]$/.test(u)) return false;
-  if (reason && IGNORE_BACKGROUND_REASON.test(reason)) return false;
-  return true;
+  return m;
+}
+
+export function _resetVoiceMemoryForTests(): void {
+  voiceMemoryByAnchor.clear();
+}
+
+export const FAIL_SAFE_REPEAT_WINDOW_MS = 60_000;
+
+function normalizeForRepeat(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** True when the same words (ignoring case and punctuation) were
+ * already fail-safe-forwarded to the brain inside the window. */
+export function _isRepeatFailSafeImpl(memory: VoiceMemory, text: string, nowMs: number): boolean {
+  const prev = memory.lastFailSafe;
+  if (!prev) return false;
+  return prev.text === normalizeForRepeat(text) && nowMs - prev.atMs < FAIL_SAFE_REPEAT_WINDOW_MS;
+}
+
+export function _rememberFailSafeImpl(memory: VoiceMemory, text: string, nowMs: number): void {
+  memory.lastFailSafe = { text: normalizeForRepeat(text), atMs: nowMs };
 }
 
 /* Single-mouth invariant 6: a delivery cut mid-stream is FINAL. It is
@@ -2312,9 +2339,13 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     absorbedAsides: [],
   };
 
-  /* Last line actually spoken; the haiku fast lane replays it on
-   * "say that again" without an Opus round-trip. */
-  let lastSpokenText: string | null = null;
+  /* The voice's working memory for the anchor this socket is on: the
+   * last line actually spoken (replayed on "say that again"), the last
+   * few exchanges, the fail-safe repeat guard. Per anchor, not per
+   * socket (BUG-053); currentAnchorId is hoisted. */
+  function memory(): VoiceMemory {
+    return voiceMemoryFor(currentAnchorId() ?? state.bindKey ?? null);
+  }
   /* DRIVE-QUEUE 1b: timestamp of Lex's last turn boundary. The live
    * digest is pushed with this same ms, so isDigestFresh() is true while
    * the digest tracks the latest turn and goes stale (forcing the fast
@@ -3530,12 +3561,12 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     return {
       cut,
       pendingHandover: anchorId && h.pendingHandover ? h.pendingHandover(anchorId) : null,
-      recentTalk: recentTalk.slice(-RECENT_TALK_MAX),
+      recentTalk: memory().recentTalk.slice(-RECENT_TALK_MAX),
       mid: ms.mid,
       midSinceMs: ms.sinceMs,
       midTool: ms.tool,
       worker: workerLine(anchorId),
-      lastSaid: lastSpokenText,
+      lastSaid: memory().lastSpokenText,
       digest: getDigest()?.digest ?? null,
       pendingPlan: anchorId && h.pendingPlan ? h.pendingPlan(anchorId) : null,
       pendingDispatch: anchorId && h.pendingDispatch ? h.pendingDispatch(anchorId) : null,
@@ -3569,16 +3600,16 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     };
   }
 
-  /* The voice's working memory: the last few exchanges, kept here in
-   * the daemon and rendered into every [live] block. Survives a Layer 1
-   * respawn by construction. */
-  const recentTalk: Array<{ heard: string; said: string; atMs: number }> = [];
+  /* The voice's working memory: the last few exchanges, kept in the
+   * daemon per anchor (BUG-053) and rendered into every [live] block.
+   * Survives a Layer 1 respawn and a socket cycle by construction. */
   function rememberTalk(heard: string, said: string): void {
     const h = heard.trim();
     const s = said.trim();
     if (!h && !s) return;
-    recentTalk.push({ heard: h, said: s, atMs: Date.now() });
-    while (recentTalk.length > RECENT_TALK_MAX) recentTalk.shift();
+    const talk = memory().recentTalk;
+    talk.push({ heard: h, said: s, atMs: Date.now() });
+    while (talk.length > RECENT_TALK_MAX) talk.shift();
   }
 
   function clearWarmQueue(): void {
@@ -3686,8 +3717,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         return;
       case 'repeat':
       case 'start_over': {
-        if (lastSpokenText) {
-          for (const seg of splitForSpeech(lastSpokenText)) speak(seg, { continuation: true });
+        const last = memory().lastSpokenText;
+        if (last) {
+          for (const seg of splitForSpeech(last)) speak(seg, { continuation: true });
         }
         return;
       }
@@ -3701,8 +3733,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         logFn(
           `[voice-ws] L1 ${control}: length_scale multiplier now ${speakCtrl.lengthScaleMultiplier().toFixed(2)}`,
         );
-        if (lastSpokenText) {
-          for (const seg of splitForSpeech(lastSpokenText)) speak(seg, { continuation: true });
+        const lastPaced = memory().lastSpokenText;
+        if (lastPaced) {
+          for (const seg of splitForSpeech(lastPaced)) speak(seg, { continuation: true });
         }
         return;
       }
@@ -3711,8 +3744,9 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         ttsGain = Math.min(1, Math.max(0.2, ttsGain + (control === 'louder' ? 0.2 : -0.2)));
         send({ t: 'tts-gain', gain: Number(ttsGain.toFixed(2)) });
         logFn(`[voice-ws] L1 ${control}: tts gain now ${ttsGain.toFixed(2)}`);
-        if (lastSpokenText) {
-          for (const seg of splitForSpeech(lastSpokenText)) speak(seg, { continuation: true });
+        const lastGained = memory().lastSpokenText;
+        if (lastGained) {
+          for (const seg of splitForSpeech(lastGained)) speak(seg, { continuation: true });
         }
         return;
       }
@@ -3920,7 +3954,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * died in spec v2. opts.continuation marks a segment that chains
      * gaplessly onto the audio already scheduled client-side. */
     const spoken = renderForSpeech(text);
-    lastSpokenText = spoken;
+    memory().lastSpokenText = spoken;
     speakCtrl.speak(spoken, opts);
   }
 
@@ -3941,6 +3975,20 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * a pending redelivery, and the operator is never re-read an old
    * reply after the conversation moved on. */
   let deliverySeq = 0;
+  /* BUG-052: true while the anchor's Layer 1 is streaming a delivery,
+   * so real words from the operator can interrupt it (the one voice
+   * stops talking when he talks, on every level) instead of queueing
+   * his turn behind up to thirty seconds of delivery. */
+  let deliveryInFlight = false;
+
+  function interruptDelivery(reason: string): void {
+    if (!deliveryInFlight) return;
+    deliverySeq += 1;
+    const interrupted = interruptVoiceBrainAsk(currentAnchorId());
+    logFn(
+      `[voice-ws] delivery interrupted (${reason}); Escape ${interrupted ? 'sent to' : 'not needed on'} the voice session; tail unspoken, full text in transcript`,
+    );
+  }
 
   function speakViaBrain(text: string, fallbackRaw: boolean): void {
     deliverySeq += 1;
@@ -3955,20 +4003,37 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
     const raw = (): void => {
       for (const s of splitForSpeech(text)) speak(s, { continuation: true });
     };
-    const deliver = (): Promise<'delivered' | 'cut' | 'miss'> =>
-      voiceLexReply(text, {
+    /* BUG-052: one mouth. The delivery runs on the anchor's own Layer 1
+     * with the same [live] block a conversational turn gets (what it
+     * just said, the recent talk), never on a separate default session
+     * that knows nothing. What it says joins the recent talk so the
+     * next turn does not say it again. */
+    const anchorId = currentAnchorId();
+    const deliveredLines: string[] = [];
+    const deliver = (): Promise<'delivered' | 'cut' | 'miss'> => {
+      deliveryInFlight = true;
+      return voiceLexReply(text, {
+        anchorId,
+        live: buildLive(anchorId),
         onSpeech: (line) => {
+          deliveredLines.push(line.trim());
           for (const s of splitForSpeech(line)) {
             speak(s, { continuation: true });
           }
         },
         log: logFn,
+      }).finally(() => {
+        deliveryInFlight = false;
       });
+    };
     void deliver()
       .then((outcome) => {
+        if (deliveredLines.length > 0) {
+          rememberTalk('(the brain answered)', deliveredLines.join(' '));
+        }
         if (deliverySeq !== seq) {
-          /* drop_reply or a newer delivery superseded this one while it
-           * streamed: never speak its raw body after the fact. */
+          /* drop_reply, a barge, or a newer delivery superseded this one
+           * while it streamed: never speak its raw body after the fact. */
           record('miss');
           return;
         }
@@ -5355,6 +5420,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * readable as text; truncating L2 is reserved for the emergency stop
      * and for L1's own cancel_redirect. */
     const anchorId = currentAnchorId();
+    /* BUG-052: his words interrupt a delivery in flight. The audio
+     * already stopped on sound; this frees the voice session so his
+     * turn is answered now, not after the delivery finishes streaming. */
+    interruptDelivery('operator spoke');
     const speaker = makeLineSpeaker();
     const turn = await topLayerTurn(trimmed, {
       live: buildLive(anchorId),
@@ -5362,16 +5431,36 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       anchorId,
       deps: { onSpeech: speaker.speakLine },
     });
+    /* BUG-050: a socket that closed while the voice layer was thinking
+     * cannot speak the answer and must not forward from the grave (the
+     * morning session's first "good morning" reached the brain twice,
+     * once from the socket that had already closed). */
+    if (state.closed) {
+      logFn(
+        `[voice-ws] L1 turn resolved after the socket closed; dropped (heard=${JSON.stringify(trimmed.slice(0, 60))})`,
+      );
+      return;
+    }
     /* One ack per escalated utterance (single-mouth invariant 3): when
      * L1 spoke the handoff, L2's pre-tool ack for this turn stays silent;
      * when L1 said nothing (fail-safe forward) the deep ack is the net. */
     state.topOwnsAck = speaker.streamed() || turn.speech !== null;
     const warming = midState().mid === 'warming';
+    /* BUG-050: with the voice layer down, the same words said again
+     * within the window (he repeats himself because nothing answered)
+     * must not reach the brain twice. */
+    if (turn.failSafe && turn.forward) {
+      const mem = memory();
+      if (_isRepeatFailSafeImpl(mem, turn.forward, Date.now())) {
+        logFn(
+          `[voice-ws] fail-safe forward suppressed: same words already forwarded within ${FAIL_SAFE_REPEAT_WINDOW_MS / 1000}s: ${JSON.stringify(trimmed.slice(0, 80))}`,
+        );
+        turn.forward = null;
+      } else {
+        _rememberFailSafeImpl(mem, turn.forward, Date.now());
+      }
+    }
     const actions = _planTopLayerActionsImpl(turn, warming);
-    /* How live the exchange is, measured BEFORE this turn is recorded:
-     * the IGNORE challenge below needs the gap to the previous one. */
-    const prevExchange = recentTalk[recentTalk.length - 1];
-    const sinceLastExchangeMs = prevExchange ? Date.now() - prevExchange.atMs : null;
     rememberTalk(
       trimmed,
       speaker.lines().join(' ') ||
@@ -5386,26 +5475,16 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
         case 'speak':
           speaker.speakLine(action.text);
           break;
-        case 'ignore': {
-          if (_shouldChallengeIgnoreImpl(action.reason, trimmed, sinceLastExchangeMs)) {
-            const gapS = Math.round((sinceLastExchangeMs ?? 0) / 1000);
-            logFn(
-              `[voice-ws] L1 ignore challenged (${action.reason}): Michael's own voice ${gapS}s after the last exchange, handing it back: ${JSON.stringify(trimmed.slice(0, 80))}`,
-            );
-            const asked = await runTopLayerEventTurn({
-              kind: 'addressed',
-              text: `You answered IGNORE (${action.reason}) to ${JSON.stringify(trimmed)}. That was Michael's own voice, ${gapS}s after the last exchange, not background. If the words do not parse, ask him what he meant, in five words or fewer; if they do, answer them.`,
-            });
-            const last = recentTalk[recentTalk.length - 1];
-            if (last && last.heard === trimmed) last.said = asked || '(asked what he meant)';
-            break;
-          }
+        case 'ignore':
+          /* BUG-051: the model's decision stands. The daemon-side
+           * re-ask ("ask him what he meant, in five words or fewer")
+           * was the daemon scripting her next line; the contract's
+           * rule 4 carries the mishear case on its own. */
           logFn(
             `[voice-ws] L1 ignored (${action.reason}): ${JSON.stringify(trimmed.slice(0, 80))}`,
           );
           send({ t: 'ignored', text: trimmed, reason: action.reason });
           break;
-        }
         case 'control':
           await applyTopLayerControl(action.control, action.arg, turn, trimmed);
           break;
@@ -5453,6 +5532,14 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
    * turn, the warm-queue flush and cancel_redirect share one path. */
   async function forwardToL2(text: string, sttMs: number): Promise<void> {
     let result: { text: string; ms: number } = { text, ms: sttMs };
+    /* BUG-050: a closed socket has no mouth for the reply and no right
+     * to hand the brain a turn. */
+    if (state.closed) {
+      logFn(
+        `[voice-ws] forward to L2 dropped: socket closed (${JSON.stringify(text.slice(0, 80))})`,
+      );
+      return;
+    }
     /* Seamless (2026-09-22): no "to Lex (brain): ..." hop line in the
      * transcript any more. The operator hears / reads Layer 1's own
      * handoff line and then the reply; the routing is plumbing and lives
@@ -5825,6 +5912,13 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
           msg.mode === 'push-to-talk'
         ) {
           state.mode = msg.mode;
+          /* BUG-053 (2026-09-25): a mode switch no longer cycles the
+           * socket, so the meeting toggle that used to ride the next
+           * hello rides this frame instead. Same explicit-confirm rule
+           * as hello: the kind changes only because the client said so. */
+          if (msg.kind === 'meeting' || msg.kind === 'brainstorm') {
+            applyHelloKind(msg.kind);
+          }
           send({ t: 'mode-set', mode: state.mode });
         }
         break;
@@ -5967,7 +6061,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
             logFn(
               `[voice-ws] playback stopped at ${Math.round(playedMs)}ms; context truncated to ${heard.length}/${fullRun.length} chars actually heard`,
             );
-            lastSpokenText = heard || null;
+            memory().lastSpokenText = heard || null;
           }
         }
         break;

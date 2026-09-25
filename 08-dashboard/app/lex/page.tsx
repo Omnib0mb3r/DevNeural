@@ -21,6 +21,7 @@ import { LexSessionList } from "@/components/LexSessionList";
 import { LexArtifactsPanel } from "@/components/LexArtifactsPanel";
 import { LexTranscriptHistoryPanel } from "@/components/LexTranscriptHistoryPanel";
 import { emitTranscriptTurn } from "@/lib/transcript-bus";
+import { sendTextInput } from "@/lib/voice-text-input-bus";
 import {
   emitVoiceAnchorSwitch,
   onVoiceAnchorSwitch,
@@ -186,14 +187,15 @@ export default function LexPage() {
         setSendError(data.error ?? "inject refused");
         return;
       }
-      /* Mirror the voice STT path. VoiceClient pushes every recognised
-       * utterance into the transcript bus so LexTranscriptHistoryPanel
-       * surfaces it; the typed-textarea submit went straight to the
-       * PTY and never emitted, so the panel only ever showed voice
-       * turns. Reaching the same bus here closes the gap. The turn
-       * id is local-only — the daemon doesn't ack a stable id for
-       * typed injects yet, so prefix with "u-typed-" so the panel
-       * can distinguish the source if it ever needs to. */
+      /* HTTP fallback only (BUG-054): a typed line that went out on
+       * the voice socket never lands here, because the daemon echoes
+       * it as a transcript frame that VoiceClient renders. On the HTTP
+       * path nothing echoes, so mirror the voice STT path ourselves:
+       * push the line into the transcript bus so
+       * LexTranscriptHistoryPanel surfaces it. The turn id is
+       * local-only (the daemon does not ack a stable id for HTTP
+       * injects), prefixed "u-typed-" so the panel can distinguish the
+       * source if it ever needs to. */
       const id = `u-typed-${Date.now()}-${Math.random()
         .toString(36)
         .slice(2, 8)}`;
@@ -207,6 +209,25 @@ export default function LexPage() {
       setSendError(payload?.error ?? e.message ?? "send failed");
     },
   });
+
+  /* BUG-054: a typed message prefers the live voice socket. On that
+   * path the daemon echoes the line as a transcript row, injects it,
+   * suppresses speech for the turn and streams the reply back as
+   * assistant-text, so the reply gets a row in the transcript. The
+   * HTTP inject below stays as the fallback when no voice socket is
+   * open (voice off, still connecting, reconnecting): it has no echo
+   * and no reply row, so injectM emits the user row itself. */
+  function submitTyped(): void {
+    if (injectM.isPending) return;
+    const text = pendingText;
+    if (!text.trim()) return;
+    if (sendTextInput(text)) {
+      setPendingText("");
+      setSendError(null);
+      return;
+    }
+    injectM.mutate(text);
+  }
 
   function spliceIntoTextarea(p: string) {
     const ta = textareaRef.current;
@@ -422,9 +443,7 @@ export default function LexPage() {
               <form
                 onSubmit={(e) => {
                   e.preventDefault();
-                  if (injectM.isPending) return;
-                  if (!pendingText.trim()) return;
-                  injectM.mutate(pendingText);
+                  submitTyped();
                 }}
                 className="p-4 space-y-3"
               >
@@ -441,7 +460,7 @@ export default function LexPage() {
                       pendingText.trim()
                     ) {
                       e.preventDefault();
-                      injectM.mutate(pendingText);
+                      submitTyped();
                     }
                   }}
                   placeholder="What's on your mind? (Ctrl+Enter to send, paste a screenshot to attach)"

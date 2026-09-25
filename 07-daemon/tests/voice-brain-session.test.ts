@@ -20,6 +20,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   askVoice,
   defaultVoiceBrainCwd,
+  interruptVoiceBrainAsk,
   isVoiceBrainSessionEnabled,
   isVoiceBrainSessionWarm,
   prewarmVoiceBrainSession,
@@ -70,6 +71,9 @@ function makeVirtualIo(): {
     text: string | null,
     stopReason?: string,
   ) => void;
+  /** BUG-050: the record Claude Code writes the moment a prompt
+   * SUBMITS. Growth without any assistant text. */
+  scheduleUserRecord: (path: string, delayMs: number, text: string) => void;
   advanceClock: (ms: number) => void;
 } {
   let ms = 0;
@@ -127,6 +131,14 @@ function makeVirtualIo(): {
        * already be visible to the pre-inject baseline statSync read
        * and get folded into the baseline offset instead of being seen
        * as new content by the poll loop. */
+      pending.push({
+        path,
+        arrivesAt: ms + Math.max(delayMs, 1),
+        line: `${JSON.stringify(rec)}\n`,
+      });
+    },
+    scheduleUserRecord: (path: string, delayMs: number, text: string) => {
+      const rec = { type: 'user', message: { role: 'user', content: text } };
       pending.push({
         path,
         arrivesAt: ms + Math.max(delayMs, 1),
@@ -638,7 +650,9 @@ describe('timeout: resolves null, never throws', () => {
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
     await warmSession(io, pty, 1);
-    // No record ever scheduled: the poll loop exhausts its deadline.
+    // The prompt submits (BUG-050) and no assistant record ever follows:
+    // the poll loop exhausts its deadline.
+    io.scheduleUserRecord(pathForSession(1), 10, 'anyone home?');
 
     const result = await askVoice({ prompt: 'anyone home?', timeoutMs: 300 });
 
@@ -658,11 +672,13 @@ describe('timeout: resolves null, never throws', () => {
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty, { respawnCooldownMs: 100_000 }));
     await warmSession(io, pty, 1);
-    // No record ever scheduled: both asks exhaust their deadline with
-    // zero life (recordsSeen 0, no jsonl growth) - the exact shape that
-    // used to strike.
-
+    // Both prompts SUBMIT (the user record lands: BUG-050 distinguishes
+    // a submitted-but-unanswered turn from a paste stuck in the
+    // composer) and then the model never answers. Zero assistant
+    // records - the exact shape that used to strike.
+    io.scheduleUserRecord(pathForSession(1), 10, 'q1');
     const t1 = await askVoice({ prompt: 'q1', timeoutMs: 100, noLivenessStrike: true });
+    io.scheduleUserRecord(pathForSession(1), 10, 'q2');
     const t2 = await askVoice({ prompt: 'q2', timeoutMs: 100, noLivenessStrike: true });
 
     expect(t1).toBeNull();
@@ -678,15 +694,17 @@ describe('timeout: resolves null, never throws', () => {
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
     await warmSession(io, pty, 1);
+    io.scheduleUserRecord(pathForSession(1), 10, 'q');
 
     const t0 = io.now();
     const result = await askVoice({ prompt: 'q' });
 
     expect(result).toBeNull();
-    // The poll loop slept exactly up to the 300ms env-configured
-    // deadline (poll interval 50ms divides it evenly), so the virtual
-    // clock pins the default that was actually applied.
-    expect(io.now() - t0).toBe(300);
+    // The deadline runs from the submit (seen on the first 50ms poll,
+    // BUG-050), then the loop sleeps exactly up to the 300ms
+    // env-configured deadline (poll interval 50ms divides it evenly),
+    // so the virtual clock pins the default that was actually applied.
+    expect(io.now() - t0).toBe(350);
   });
 
   it('falls back to the 6000ms built-in default when the env var is unset', async () => {
@@ -694,12 +712,13 @@ describe('timeout: resolves null, never throws', () => {
     const pty = makeFakePtyLayer();
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
     await warmSession(io, pty, 1);
+    io.scheduleUserRecord(pathForSession(1), 10, 'q');
 
     const t0 = io.now();
     const result = await askVoice({ prompt: 'q' });
 
     expect(result).toBeNull();
-    expect(io.now() - t0).toBe(6000);
+    expect(io.now() - t0).toBe(6050);
   });
 
   it('a successful reply after a timeout resets the streak to zero', async () => {
@@ -708,6 +727,7 @@ describe('timeout: resolves null, never throws', () => {
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
     await warmSession(io, pty, 1);
 
+    io.scheduleUserRecord(pathForSession(1), 10, 'q1');
     const missed = await askVoice({ prompt: 'q1', timeoutMs: 200 });
     expect(missed).toBeNull();
     expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(1);
@@ -943,8 +963,12 @@ describe('streaming asks: idle extension + no liveness strike on progress (2026-
     _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
     await warmSession(io, pty, 1);
 
+    /* Both submit (BUG-050) and the model never answers: zero assistant
+     * records on a submitted turn is the dead-session shape. */
+    io.scheduleUserRecord(pathForSession(1), 10, 'q1');
     await askVoice({ prompt: 'q1', timeoutMs: 100, onPartial: () => undefined });
     expect(_voiceBrainSessionSnapshotForTests().consecutiveTimeouts).toBe(1);
+    io.scheduleUserRecord(pathForSession(1), 10, 'q2');
     await askVoice({ prompt: 'q2', timeoutMs: 100, onPartial: () => undefined });
     expect(pty.killCalls.length).toBe(1);
   });
@@ -1281,5 +1305,154 @@ describe('warmup proves the contract landed (BUG-041)', () => {
     await _voiceBrainWarmupForTests();
     expect(_voiceBrainSessionSnapshotForTests().warm).toBe(true);
     expect(pty.killCalls).toEqual([]);
+  });
+});
+
+/* BUG-050 (2026-09-25): six of six conversational asks on the morning
+ * session sat in Claude Code's composer as one growing paste (the user
+ * record never landed), timed out at 21 to 35 s, fail-safe-forwarded
+ * the raw words to the brain, and went out minutes later as one merged
+ * prompt when a later inject's CR pushed the pile through. The ask path
+ * had no delivery confirmation at all: it injected and hoped, trusting
+ * pty-host's single 1 s bare-CR nudge. Now an ask is confirmed
+ * submitted (transcript growth) before it is waited on; a stuck paste
+ * gets a CR ladder (bare CR, then space-Enter twice, the manual
+ * recovery that submits a stuck paste), and a composer that still holds
+ * the paste after the ladder is wedged: the session is killed for
+ * respawn and the ask fail-safes. */
+describe('BUG-050: an ask must submit before it is waited on', () => {
+  function nudgesAfterAsk(
+    pty: ReturnType<typeof makeFakePtyLayer>,
+    askText: string,
+  ): Array<{ text: string; commit?: boolean }> {
+    const i = pty.injectCalls.findIndex((c) => c.text === askText);
+    expect(i).toBeGreaterThanOrEqual(0);
+    return pty.injectCalls.slice(i + 1).map(({ text, commit }) => ({ text, commit }));
+  }
+
+  it('a paste that never submits gets the CR ladder, then the session is killed for respawn', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
+    const before = io.now();
+
+    const r = await askVoice({ prompt: 'Good morning', timeoutMs: 8_000, noLivenessStrike: true });
+
+    expect(r).toBeNull();
+    expect(nudgesAfterAsk(pty, 'Good morning')).toEqual([
+      { text: '\r', commit: false },
+      { text: ' \r', commit: false },
+      { text: ' \r', commit: false },
+    ]);
+    /* Wedged composer: killed well inside the ask's own timeout, so the
+     * next utterance gets a fresh session instead of appending to the
+     * pile. */
+    expect(pty.killCalls).toEqual(['pty-1']);
+    expect(io.now() - before).toBeLessThan(8_000);
+    expect(isVoiceBrainSessionWarm()).toBe(false);
+  });
+
+  it('a paste that submits only after the space-Enter nudge still gets its reply', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    const path1 = pathForSession(1);
+    let spaceEnters = 0;
+    const inject: VoiceBrainSessionDeps['ptyInject'] = (ptyId, text, commit) => {
+      const r = pty.ptyInject(ptyId, text, commit);
+      if (text === ' \r') {
+        spaceEnters += 1;
+        if (spaceEnters === 1) {
+          /* The manual recovery works: the turn submits, the model answers. */
+          io.scheduleUserRecord(path1, 1, 'Good morning');
+          io.scheduleAssistantRecord(path1, 400, 'Morning.', 'end_turn');
+        }
+      }
+      return r;
+    };
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty, { ptyInject: inject }));
+    await warmSession(io, pty, 1);
+
+    const r = await askVoice({ prompt: 'Good morning', timeoutMs: 8_000, noLivenessStrike: true });
+
+    expect(r).toBe('Morning.');
+    expect(nudgesAfterAsk(pty, 'Good morning')).toEqual([
+      { text: '\r', commit: false },
+      { text: ' \r', commit: false },
+    ]);
+    expect(pty.killCalls).toEqual([]);
+    expect(isVoiceBrainSessionWarm()).toBe(true);
+  });
+
+  it('a prompt that submits on its own is waited on with no nudge at all', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
+    io.scheduleUserRecord(pathForSession(1), 200, 'Hello');
+    io.scheduleAssistantRecord(pathForSession(1), 900, 'Hi.', 'end_turn');
+
+    const r = await askVoice({ prompt: 'Hello', timeoutMs: 8_000, noLivenessStrike: true });
+
+    expect(r).toBe('Hi.');
+    expect(nudgesAfterAsk(pty, 'Hello')).toEqual([]);
+  });
+
+  it('composer redraw is not liveness: constant pty output never stretches a never-submitted ask', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    /* The TUI repainting its own unsubmitted paste is pty output. It
+     * stretched the morning asks to 21-35 s; it must not count. */
+    const getPty: VoiceBrainSessionDeps['getPty'] = (ptyId) => ({
+      exited: pty.killedPtys.has(ptyId),
+      lastActivity: io.now(),
+    }) as { exited: boolean };
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty, { getPty }));
+    await warmSession(io, pty, 1);
+    const before = io.now();
+
+    const r = await askVoice({ prompt: 'anyone?', timeoutMs: 8_000, noLivenessStrike: true });
+
+    expect(r).toBeNull();
+    expect(io.now() - before).toBeLessThan(8_000);
+    expect(pty.killCalls).toEqual(['pty-1']);
+  });
+
+  it('interruptVoiceBrainAsk sends Escape and resolves the in-flight ask with what streamed so far (BUG-052 barge)', async () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    await warmSession(io, pty, 1);
+    const path1 = pathForSession(1);
+    io.scheduleUserRecord(path1, 10, 'deliver');
+    io.scheduleAssistantRecord(path1, 300, 'Sentence one.');
+    /* Sentence two would land at 20 s; the operator barges at the first. */
+    io.scheduleAssistantRecord(path1, 20_000, 'Sentence two.', 'end_turn');
+    const before = io.now();
+
+    const partials: string[] = [];
+    const r = await askVoice({
+      prompt: 'deliver',
+      timeoutMs: 8_000,
+      noLivenessStrike: true,
+      onPartial: (t) => {
+        partials.push(t);
+        interruptVoiceBrainAsk(null);
+      },
+    });
+
+    expect(partials).toEqual(['Sentence one.']);
+    expect(r).toBe('Sentence one.');
+    expect(io.now() - before).toBeLessThan(2_000);
+    expect(pty.injectCalls.some((c) => c.text === '\x1b' && c.commit === false)).toBe(true);
+    expect(pty.killCalls).toEqual([]);
+  });
+
+  it('interruptVoiceBrainAsk is a no-op when nothing is in flight', () => {
+    const io = makeVirtualIo();
+    const pty = makeFakePtyLayer();
+    _setVoiceBrainSessionDepsForTests(baseDeps(io, pty));
+    expect(interruptVoiceBrainAsk(null)).toBe(false);
+    expect(pty.injectCalls).toEqual([]);
   });
 });

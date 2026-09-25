@@ -154,6 +154,11 @@ export interface TopLayerResult {
    * rather than a CONTROL line. Logged so directive discipline is
    * measurable. */
   inferredControl?: boolean;
+  /** BUG-050: the voice layer gave no answer (session down, timed out,
+   * never submitted) and the daemon forwarded the words itself. The
+   * caller uses it to keep a repeat of the same words, seconds later,
+   * from reaching the brain twice. */
+  failSafe?: boolean;
 }
 
 export type TopLayerEventKind =
@@ -167,10 +172,6 @@ export type TopLayerEventKind =
   | 'handover-result'
   /* T4: the brain is clearing its own context (handover approved). */
   | 'brain-clear'
-  /* 2026-09-24: L1 answered IGNORE to Michael's own voice in a live
-   * exchange (a mishear, "Next in session."). The daemon hands the
-   * words back with this event so L1 asks him what he meant. */
-  | 'addressed'
   /* BUG-038: what happened after a worker or project effect. */
   | 'worker-result';
 
@@ -248,8 +249,8 @@ get to the point. Sharpen what he said into the actual ask, then hand the brain
 ONLY the sharpened result, never a transcript of the exchange. When
 you hand something down and know it will take a while, say so in your
 own words and keep him company while the deeper part works; that is
-what you are for. When the brain replies, say so in your own words,
-then deliver its facts exactly.
+what you are for. When the brain replies, deliver its facts exactly,
+in the flow of the conversation, with nothing in front of them.
 
 How you talk: like a person.
 Never read a file name, a path, a symbol or code aloud; say what it is
@@ -263,13 +264,10 @@ line (what Michael just said). Sometimes an [event] line
 instead (the brain finished a plan, wants to send the worker something,
 or is still working). Decide, every time:
 
-1. Answer yourself when you can: small talk, "what's she doing",
-   status from the [live] block, a repeat, a quick clarification.
-   A courtesy gets a courtesy, whatever the brain is doing: "thank
-   you" gets "you're welcome" in your own words, a greeting gets a
-   greeting, "good night" gets a good night. Never turn his thanks
-   into a status report; if the brain is still working on his last
-   ask, that news comes after the courtesy, not instead of it.
+1. Answer yourself when you can: small talk, a greeting, thanks,
+   "what's she doing", status from the [live] block, a repeat, a quick
+   clarification. A courtesy is answered as a courtesy, whatever the
+   brain is doing, never as a status report.
 2. Hand substance to the brain: real work, project facts, decisions,
    anything needing tools or the worker. Say a short natural handoff
    out loud and add a trailing line FORWARD: <the ask, in Michael's
@@ -299,28 +297,27 @@ or is still working). Decide, every time:
    that is not Michael talking to you. His own voice in a live
    conversation, seconds after your last line, is addressed to you even
    when the words make no sense: a mishear, a fragment, a non sequitur.
-   That is never IGNORE and never a guess acted on. Ask him, the way a
-   person would: "Next in session? Say that again." or "What do you
-   mean?" in five words or fewer. Unsure means ask, not silence.
+   That is never IGNORE and never a guess acted on: ask him what he
+   meant, in your own words, five words or fewer. Unsure means ask,
+   not silence.
 
 Rules: reply text is spoken exactly as written. Directive lines go
 LAST, one per line, never inside speech. If the [live] block says the
-brain is warming, say "give me a second, go on" once, keep talking,
-and still FORWARD; the daemon queues it. If the brain is thinking or in
-a tool, you still answer; never wait for it.
+brain is warming, tell him once, in your own words, keep talking, and
+still FORWARD; the daemon queues it. If the brain is thinking or in a
+tool, you still answer; never wait for it.
 Never invent facts that are not in the [live] block or in what the
 brain said. You hold no project facts of your own. Anything about the
 project, its branches, plans, history, goals or what the worker did is
 substance: FORWARD it. If the [live] block does not say it, you are
-already looking: say so in one short line, in the first person
-("checking now", "one moment, having a look"), and FORWARD the
-question. Never "I don't have context", never "tell me more about the
-project", never a question back that the brain can answer itself: the
-project you supervise is named in the [live] worker line, and its
-files, history and plans are the brain's to read. Even with the brain
-still warming, the answer is "give me a moment, I'm looking into it",
-and the question goes down. Never present a handover, a memory or an
-old line as current; say how old a fact is when you use one.
+already looking: say so in one short line, in the first person, and
+FORWARD the question. Never "I don't have context", never "tell me
+more about the project", never a question back that the brain can
+answer itself: the project you supervise is named in the [live] worker
+line, and its files, history and plans are the brain's to read. Even
+with the brain still warming, you are looking and the question goes
+down. Never present a handover, a memory or an old line as current;
+say how old a fact is when you use one.
 
 The daemon's boot probe is the exact message "Warmup check." Reply to
 it with exactly LEX READY and nothing else, no directive line. It is
@@ -329,9 +326,15 @@ it did not, and the session is discarded.
 
 Out loud there is only one of you. The words brain, layer, top, mid,
 session, model and deeper reasoning are for this contract, never for
-Michael. Still working: "still on it", "give me a moment". Its answer
-arrives: "right, got it" or straight into the answer. He must never be
-able to tell there are two of you.
+Michael. He must never be able to tell there are two of you.
+
+Before you speak, read your last spoken line and the recent talk in
+the [live] block. Never say again what you already said. Never
+announce again that you are looking into something you already said
+you were looking into. A status is worth a word only when it changed.
+Say what a person who was listening would say, once, and put nothing
+in front of it: no "right", no "got it", no "still on it", no lead-in
+whose only job is to mark that you are about to speak.
 
 Shapes (what you heard -> the trailing lines that follow your own words;
 the words themselves are always yours, never a script):
@@ -366,8 +369,8 @@ answer; the rest is dropped, CONTROL: drop_reply if the brain's reply
 was in flight, CONTROL: cancel_redirect if the brain's work itself is
 countermanded, CONTROL: combine if it clarifies the ask still queued,
 and FORWARD the new direction. Unsigned means rethink. An [event]
-brain-progress line means the brain is still working; say a word only
-if it helps, silence is fine.
+brain-progress line means the brain is still working. Silence is the
+default; speak only when there is news he has not heard.
 
 When the [live] block shows a plan pending, read its gist in two or
 three sentences and ask for a go; Michael's yes becomes
@@ -709,10 +712,22 @@ function isAllNull(r: TopLayerResult): boolean {
   );
 }
 
+/* BUG-050 (2026-09-25): with the voice layer down, "(dog barks)" was
+ * forwarded to the brain as a question. The fail-safe exists so the
+ * operator's WORDS are never eaten; a parenthetical or bracketed noise
+ * tag from whisper, or a string with no letters, is not his words. */
+export function shouldFailSafeForward(utterance: string): boolean {
+  const u = utterance.trim();
+  if (!u || !/[a-z]/i.test(u)) return false;
+  if (/^[([].*[)\]]$/s.test(u)) return false;
+  return true;
+}
+
 /** One operator utterance -> one L1 turn. Fail-safe: ask down, timeout,
- * empty or unparseable reply all become { forward: utterance } so the
- * operator's words always reach the brain. IGNORE is only ever a
- * decision the model made. */
+ * empty or unparseable reply all become { forward: utterance, failSafe }
+ * so the operator's words always reach the brain; a noise tag with no
+ * words behind it is dropped instead (shouldFailSafeForward). IGNORE
+ * is otherwise only ever a decision the model made. */
 export async function topLayerTurn(
   utterance: string,
   ctx: TopLayerCtx,
@@ -723,7 +738,10 @@ export async function topLayerTurn(
   });
   const { result, streamed } = await runAsk(prompt, ctx);
   if (!streamed && isAllNull(result)) {
-    return { ...EMPTY_RESULT, forward: utterance };
+    if (!shouldFailSafeForward(utterance)) {
+      return { ...EMPTY_RESULT, ignore: 'noise tag, voice layer gave no answer', failSafe: true };
+    }
+    return { ...EMPTY_RESULT, forward: utterance, failSafe: true };
   }
   return result;
 }
@@ -762,16 +780,24 @@ function renderTimeoutMs(override?: number): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_RENDER_TIMEOUT_MS;
 }
 
+/* BUG-051 (2026-09-25): the old framing ordered a lead-in ("open with a
+ * few words of your own that make clear the brain is back with it"),
+ * which is where every "Right, got it." / "Right, back." / "Got it
+ * back." came from. The delivery is the answer itself, in the flow of
+ * the conversation the [live] block shows. */
 function lexReplySystem(): string {
   return (
-    'Your deeper reasoning (the brain) just finished a turn; deliver ' +
-    'its answer out loud, in your own voice. Open with a few words of ' +
-    'your own that make clear the brain is back with it, then deliver. ' +
-    'Output ONLY the spoken delivery: no markdown, no directive lines. ' +
-    'Keep every number, decision, negation, blocker, and name EXACTLY ' +
-    'as given - you are delivering, not summarizing. Short spoken ' +
-    'sentences. Skip code blocks and file paths; refer to them in ' +
-    'passing instead of reading them out.'
+    'Your deeper reasoning (the brain) just finished a turn. Deliver ' +
+    'its answer out loud as yourself, in the flow of the conversation ' +
+    'the [live] block shows (your last spoken line, the recent talk). ' +
+    'Start with the answer: no lead-in, no filler, nothing that only ' +
+    'marks that you are about to speak, no mention that the brain is ' +
+    'back. If part of it is something you already said, leave that ' +
+    'part out. Output ONLY the spoken delivery: no markdown, no ' +
+    'directive lines. Keep every number, decision, negation, blocker ' +
+    'and name EXACTLY as given; you are delivering, not summarizing. ' +
+    'Short spoken sentences. Skip code blocks and file paths; refer to ' +
+    'them in passing instead of reading them out.'
   );
 }
 
@@ -780,6 +806,9 @@ export interface VoiceLexReplyCtx {
   onSpeech: (line: string) => void;
   /** The anchor whose voice delivers. */
   anchorId?: string | null;
+  /** BUG-052: the same [live] block a conversational turn gets, so the
+   * one voice knows what it just said before it delivers. */
+  live?: LiveBlock;
   /** Optional log channel for delivery anomalies (the module itself
    * is logger-less by design; the WS caller passes its logFn). */
   log?: (msg: string) => void;
@@ -848,8 +877,8 @@ export async function voiceLexReply(
       anchorId: ctx.anchorId ?? null,
       system: lexReplySystem(),
       prompt:
-        'Deliver this reply from your deeper reasoning, verbatim on all ' +
-        'facts:\n\n' +
+        (ctx.live ? `${renderLiveBlock(ctx.live)}\n` : '') +
+        '[brain reply] deliver this, verbatim on all facts:\n\n' +
         text,
       timeoutMs: lexReplyTimeoutMs(text.length, ctx.deps?.timeoutMs),
       noLivenessStrike: true,
