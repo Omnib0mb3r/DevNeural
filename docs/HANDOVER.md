@@ -72,11 +72,16 @@ the voice says it is looking, the brain answers with the project, what
 its README and recent commits say, and a next move. `daemon.log` must
 show `warm: ... contract confirmed` for the L1 and `[prompt-probe] ok`.
 
-Committed as `b8f9947` (the wave) plus the evening follow-up (BUG-047,
-BUG-048: "thank you" held 7 s and answered as a status prompt; a
-misheard "end session" IGNOREd into silence; OP-7 / OP-8, hold ceiling
-= Smart Turn window, courtesy rule, IGNORE challenge backstop). Still
-owed: delete `08-dashboard/.next-prod/`, and confirm `npm run build` in
+Committed as `b8f9947` (the wave), `47d3f29` (the evening follow-up:
+BUG-047, BUG-048, "thank you" held 7 s and answered as a status prompt;
+a misheard "end session" IGNOREd into silence; OP-7 / OP-8, hold
+ceiling = Smart Turn window, courtesy rule, IGNORE challenge backstop)
+and the probe hardening (BUG-049, OP-9: the boot probe stalled on two
+boots, cause open; every daemon-spawned claude now runs with
+`DISABLE_AUTOUPDATER=1`). The CLI auto-updated twice on 2026-09-24
+(2.1.273 -> 2.1.274 -> 2.1.282, npm shim replaced by the native
+`C:\Users\michael\.local\bin\claude.exe`). Still owed: delete
+`08-dashboard/.next-prod/`, and confirm `npm run build` in
 `08-dashboard` passes with the dev server up (BUG-046 verify). Known
 red in the suite, both pre-existing: BUG-014 (`grooming-routes`) and
 BUG-045 (`sessions-anchor-liveness`). Everything else was green
