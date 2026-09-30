@@ -60,7 +60,7 @@ On daemon boot and on `C:\dev\Projects` filesystem-change events:
 
 - Enumerate top-level subdirectories.
 - Upsert one `project_session` row per subdirectory keyed by `cwd`.
-- Folders removed from disk are NOT auto-deleted from the anchor table. They drop off the Sessions tab via a status filter (`exists_on_disk=false`), but the row stays. Explicit user delete is the only removal path.
+- Folders removed from disk: every seed pass (boot and each `fs.watch` reseed) deletes an anchor that is dormant, sits directly under the projects root, whose folder no longer exists, and that no brainstorm references (`lex_session.supervises_project_anchor_id` or `brainstorm_sessions.project_scope_id`). An anchor a brainstorm still supervises is kept and logged until the operator unbinds or deletes it (BUG-058, 2026-09-30). A slug clash on insert gets a `-<6 hex of sha1(cwd)>` suffix, and one failing folder no longer aborts the pass.
 
 The Projects root path (`C:\dev\Projects`) is configurable via env (`DEVNEURAL_PROJECTS_ROOT`).
 
@@ -150,7 +150,7 @@ Verify against git log + bug-doc Status lines before opening any work item.
 ## Constraints / decisions
 
 - `cwd` is the join key, not `project_slug`. Renaming a folder = new anchor (intentional — old one stays in history as dormant unless explicitly deleted).
-- Anchor delete is user-only. No automatic decay.
+- No automatic decay. The only automatic delete is the missing-folder prune above; everything else is `DELETE /projects/:id`.
 - Bridge connection is authoritative for liveness. Process scan is NOT used.
 - Two VS Code windows on the same cwd dedupe to one tile.
 - Reactivating a dormant anchor reuses the same anchor id; new CC session UUID appended to transcript refs.

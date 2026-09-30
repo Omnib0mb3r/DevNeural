@@ -11,8 +11,10 @@
  * The Projects root is `C:/dev/Projects` by default, overridable via
  * `DEVNEURAL_PROJECTS_ROOT`.
  *
- * Folders removed from disk are NOT auto-deleted from the anchor table
- * (per spec). The cleanup path is explicit user delete.
+ * Folders removed from disk: since BUG-058 (2026-09-30) the seed pass
+ * prunes a dormant, unreferenced anchor directly under the root whose
+ * folder is gone (pruneMissingProjectAnchors). Anything a brainstorm
+ * still supervises stays until the operator unbinds or deletes it.
  *
  * Bridge-presence reconcile calls `ensureAnchorForCwd` inline when a
  * fresh presence file arrives for a cwd that has no seeded anchor.
@@ -22,7 +24,7 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { IndexDb, ProjectSessionRow } from '../store/index-db.js';
 
 export const DEFAULT_PROJECTS_ROOT = 'C:/dev/Projects';
@@ -87,6 +89,9 @@ export function seedProjectAnchors(db: IndexDb, opts: SeedOptions = {}): SeedRes
     return result;
   }
 
+  /* Prune first so a deleted folder frees its slug before the inserts. */
+  pruneMissingProjectAnchors(db, root, opts.log);
+
   const nowMs = now();
   for (const entry of entries) {
     result.scanned++;
@@ -99,15 +104,22 @@ export function seedProjectAnchors(db: IndexDb, opts: SeedOptions = {}): SeedRes
       continue;
     }
     const cwd = normalizeCwd(path.posix.join(root, entry.name));
-    const created = ensureAnchorForCwd(db, cwd, {
-      now: nowMs,
-      projectSlug: entry.name,
-    });
-    if (created) {
-      result.inserted++;
-      result.insertedIds.push(created.id);
-    } else {
+    /* One bad folder must not abort the pass: a UNIQUE throw on "Resume"
+     * (2026-07-21 to 2026-09-30) left every later folder unseeded. */
+    try {
+      const created = ensureAnchorForCwd(db, cwd, {
+        now: nowMs,
+        projectSlug: entry.name,
+      });
+      if (created) {
+        result.inserted++;
+        result.insertedIds.push(created.id);
+      } else {
+        result.skipped++;
+      }
+    } catch (err) {
       result.skipped++;
+      opts.log?.(`[seed-project-anchors] ${cwd} not seeded: ${(err as Error).message}`);
     }
   }
 
@@ -115,6 +127,55 @@ export function seedProjectAnchors(db: IndexDb, opts: SeedOptions = {}): SeedRes
     `[seed-project-anchors] root=${root} scanned=${result.scanned} inserted=${result.inserted} skipped=${result.skipped}`,
   );
   return result;
+}
+
+/**
+ * BUG-058 (2026-09-30): drop anchors whose folder is gone. The JSON
+ * registry was pruned at boot but these rows were not, so a deleted
+ * project stayed in the supervises picker and on the dashboard forever.
+ * Deletes only a row that is dormant, sits directly under the projects
+ * root (a missing OneDrive or other-drive folder may just be offline),
+ * no longer exists on disk, and no brainstorm references. A bound row is
+ * kept and logged: unbinding a brainstorm is the operator's call.
+ * Deleting cascades the row's project_transcript_ref history.
+ */
+export function pruneMissingProjectAnchors(
+  db: IndexDb,
+  root: string,
+  log?: (msg: string) => void,
+): string[] {
+  const normRoot = normalizeCwd(root).toLowerCase();
+  const removed: string[] = [];
+  let rows: ProjectSessionRow[];
+  try {
+    rows = db.listProjectSessions({ status: 'dormant', limit: 10_000 });
+  } catch (err) {
+    log?.(`[seed-project-anchors] prune skipped: ${(err as Error).message}`);
+    return removed;
+  }
+  for (const row of rows) {
+    const cwd = normalizeCwd(row.cwd);
+    if (path.posix.dirname(cwd).toLowerCase() !== normRoot) continue;
+    if (fs.existsSync(cwd)) continue;
+    try {
+      if (db.countProjectAnchorReferences(row.id) > 0) {
+        log?.(
+          `[seed-project-anchors] ${cwd} is gone but a brainstorm still supervises anchor ${row.id}; kept`,
+        );
+        continue;
+      }
+      db.deleteProjectSession(row.id);
+      removed.push(row.id);
+    } catch (err) {
+      log?.(`[seed-project-anchors] prune ${row.id} failed: ${(err as Error).message}`);
+    }
+  }
+  if (removed.length > 0) {
+    log?.(
+      `[seed-project-anchors] pruned ${removed.length} anchor(s) whose folder is gone: ${removed.join(', ')}`,
+    );
+  }
+  return removed;
 }
 
 export interface EnsureAnchorOptions {
@@ -137,7 +198,14 @@ export function ensureAnchorForCwd(
   const existing = db.getProjectSessionByCwd(normalized);
   if (existing) return null;
 
-  const slug = (opts.projectSlug ?? path.posix.basename(normalized)).trim() || 'unknown';
+  const base = (opts.projectSlug ?? path.posix.basename(normalized)).trim() || 'unknown';
+  /* project_slug is UNIQUE. Two folders can share a basename (one in the
+   * projects root, one a bridge opened elsewhere), so a clash gets a
+   * suffix from a hash of its own cwd: stable across boots, distinct
+   * per folder. */
+  const slug = db.getProjectSessionBySlug(base)
+    ? `${base}-${createHash('sha1').update(normalized.toLowerCase()).digest('hex').slice(0, 6)}`
+    : base;
   const nowMs = opts.now ?? Date.now();
   const row: ProjectSessionRow = {
     id: randomUUID(),

@@ -2427,6 +2427,28 @@ export class IndexDb {
     );
   }
 
+  getProjectSessionBySlug(slug: string): ProjectSessionRow | null {
+    return (
+      (this.db
+        .prepare(`SELECT * FROM project_session WHERE project_slug = ?`)
+        .get(slug) as ProjectSessionRow | undefined) ?? null
+    );
+  }
+
+  /* How many brainstorms still point at a project anchor: the
+   * lex_session supervises binding (FK, SET NULL on delete) plus the
+   * legacy brainstorm_sessions.project_scope_id (no FK, would dangle).
+   * The folder prune keeps any anchor with a reference. */
+  countProjectAnchorReferences(anchorId: string): number {
+    const lex = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM lex_session WHERE supervises_project_anchor_id = ?`)
+      .get(anchorId) as { n: number };
+    const bs = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM brainstorm_sessions WHERE project_scope_id = ?`)
+      .get(anchorId) as { n: number };
+    return lex.n + bs.n;
+  }
+
   /* Fix 15 — anchor lookup by CC session uuid.
    *
    * Returns the project_session row whose current_session_id matches
