@@ -80,6 +80,10 @@ import {
   runPromptDeliveryProbe,
   getPromptDeliveryStatus,
 } from './lex/prompt-delivery-probe.js';
+import {
+  runInjectDeliveryProbe,
+  getInjectDeliveryStatus,
+} from './lex/inject-delivery-probe.js';
 import { emitAwarenessEvent } from './lex/awareness.js';
 import fastifyCookie from '@fastify/cookie';
 import fastifyMultipart from '@fastify/multipart';
@@ -1110,6 +1114,9 @@ async function main(): Promise<void> {
       /* BUG-041: does the installed Claude Code still deliver a prompt
        * file to the model? ok | failed | pending | skipped. */
       prompt_delivery: getPromptDeliveryStatus(),
+      /* BUG-059: does a message typed into a Claude Code session still
+       * submit and get answered? ok | failed | pending | skipped. */
+      inject_delivery: getInjectDeliveryStatus(),
       raw_chunks: store.rawChunks.size(),
       wiki_pages: store.wikiPages.size(),
       llm: providerStatus(),
@@ -1504,6 +1511,11 @@ async function main(): Promise<void> {
      * in /health within a minute of boot, not a puzzled operator. Runs
      * in the background; never blocks boot. */
     void runPromptDeliveryProbe({ log: logger });
+    /* BUG-059 (2026-09-30): the same idea for input. Claude Code began
+     * holding typed messages as a paste and every inject sat in the
+     * input box. This probe types a long message into a throwaway
+     * session after boot and checks it was answered. */
+    void runInjectDeliveryProbe({ log: logger });
   } catch (err) {
     logger(`http listen failed: ${(err as Error).message}`);
   }
