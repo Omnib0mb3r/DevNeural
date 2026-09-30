@@ -72,9 +72,13 @@ real bug intentionally parked.
 | BUG-040 | OPEN | Daemon relaunch died once at boot, 2026-09-23 02:10Z (22:10 local): `ERR_MODULE_NOT_FOUND: Cannot find package '@anthropic-ai/sdk' imported from dist/llm/anthropic.js` (`daemon.stderr.prev.log`), after an admin restart requested at 02:10:24Z; the schtasks relauncher's next try booted at 02:13:11Z (PID 4952). Three minutes of outage, in the middle of the overnight closeout. The package is present now and `package.json` still lists it, so `node_modules` was in flux at that moment (hypothesis: an install or prune from the worktree cleanup). Root fix regardless of cause: the anthropic provider is never used on the Lex path (VL-27), so its SDK import should be lazy and a missing optional SDK must never stop the daemon booting. |
 | BUG-055 | SMOKE-TESTING | Lex never sees the name typed for a brainstorm: "new session" writes it to `lex_session.title` (the Stream Deck's source), but `buildVoiceSnapshot` read only `brainstorm_sessions.user_label` (null), so live_state named the brainstorm `cf89f3cd`. STT heard "Peax" as "peaks" and nothing let Lex catch it; the project folder came out `peaks-pipeline-automation` under a brainstorm titled "Peax PipeLine Automation". |
 | BUG-056 | SMOKE-TESTING | Lex read a settings deny (`Bash(rm -rf *)` on the template's own `rm -rf .git` step) as Michael refusing, asked him a nonsense question, then re-ran a bare `git clone` and dropped the detach, commit and repo steps without saying so. The new project's `origin` still pointed at the public `dev-template` repo. |
+| BUG-063 | OPEN | Daemon pid 105888 exited silently at about 2026-09-30T23:32Z, about 2 minutes after boot: no stack in stderr, no shutdown lines, no Windows Application error event; the per-minute `[memory]` line stops after 23:31:43 (rss 1268MB, heap 13%) and the relauncher revived it at 23:35:36. The new inject probe was ruled out by running it standalone (host survived). Cause unknown. |
+| BUG-062 | OPEN | Pre-existing test failure: `07-daemon/tests/lex-voice-ws-speak-queue.test.ts` "a throwing synthesize logs TTS SYNTH FAILED loudly" gets `[voice-mouth] busy (held elsewhere)` instead; fails on clean HEAD `04533b7` (verified by stash on 2026-09-30). The single-mouth lock (`bca72fd`) arrived after the test (`7e8af1f`); not investigated. |
+| BUG-061 | SMOKE-TESTING | Project anchor seed crashed on every run since 2026-07-21 (`UNIQUE constraint failed: project_session.project_slug`, thousands of log lines): folder `C:devProjectsResume` clashed with a bridge-created `Resume` anchor on OneDrive, the throw aborted the loop, and every folder sorting after it (Sawtooth, salem-deploy) never got an anchor. |
+| BUG-060 | SMOKE-TESTING | Brainstorm names drifted: renames (Past Sessions and Lex via `PATCH /lex/anchors/:id`) wrote only `lex_session.title`; `brainstorm_sessions.user_label`, read by about 30 places incl. sibling join keys, kept the old or empty name. |
 | BUG-059 | SMOKE-TESTING | Typed messages to Lex (voice off) land in her terminal input and never submit. Claude Code v2.1.277+ holds a burst that carries its own Enter as a paste ("Removed 1 invisible character · review and press Enter to send"), and the +1s bare-Enter nudge does not release it. `ptyInject`'s one-slab path wrote text+`\r` in one write (Fix 19). Every inject now writes the Enter alone 250ms after the text. |
-| BUG-058 | OPEN | Deleted project folders leave their anchor on the Projects list forever: the boot prune (`pruneMissingProjects`, BUG-016) cleans only `projects.json`; the SQLite `project_session` anchors the dashboard lists are never pruned. Seen 2026-09-30 as two "peax pipeline" projects (stale `peaks-pipeline-automation` anchor `a806218f`, folder deleted 2026-09-28; removed by hand via `DELETE /projects/:id`). |
-| BUG-057 | OPEN | New-project scaffold procedure (global CLAUDE.md, Lex memory `reference_devneural_project_template`) needs `rm -rf .git`, which the global deny list blocks; and the GitHub `dev-template` lags the local copy (uncommitted `CLAUDE.md`, `WORKFLOW.md`, `devneural.jsonc`; untracked `.claude/`, `skills-lock.json`). Replacement flow: `gh repo create <name> --template Omnib0mb3r/dev-template --private --clone`. |
+| BUG-058 | SMOKE-TESTING | Deleted project folders leave their anchor on the Projects list forever: the boot prune (`pruneMissingProjects`, BUG-016) cleans only `projects.json`; the SQLite `project_session` anchors the dashboard lists are never pruned. Seen 2026-09-30 as two "peax pipeline" projects (stale `peaks-pipeline-automation` anchor `a806218f`, folder deleted 2026-09-28; removed by hand via `DELETE /projects/:id`). |
+| BUG-057 | SMOKE-TESTING | New-project scaffold procedure (global CLAUDE.md, Lex memory `reference_devneural_project_template`) needs `rm -rf .git`, which the global deny list blocks; and the GitHub `dev-template` lags the local copy (uncommitted `CLAUDE.md`, `WORKFLOW.md`, `devneural.jsonc`; untracked `.claude/`, `skills-lock.json`). Replacement flow: `gh repo create <name> --template Omnib0mb3r/dev-template --private --clone`. |
 <!-- INDEX END -->
 
 <!-- DETAILS START -->
@@ -579,15 +583,16 @@ real bug intentionally parked.
 - **Fix:** Authority rule: a denial comes from settings, not Michael; find what tripped it, reach the same end state another way, never report a half-done job as done. The bad folder was deleted and recreated as `C:\dev\Projects\peax-pipeline-automation` (`https://github.com/Omnib0mb3r/peax-pipeline-automation`, private) and the brainstorm rebound to it.
 
 ## BUG-057 - Scaffold procedure needs a blocked command; GitHub template lags local
-- **Status:** OPEN
+- **Status:** SMOKE-TESTING
 - **Found:** 2026-09-28
 - **Area:** `~/.claude/CLAUDE.md` (Starting a New Project), `~/.claude/projects/C--dev-data-skill-connections-brainstorm/memory/reference_devneural_project_template.md`, `https://github.com/Omnib0mb3r/dev-template`
 - **Symptom:** see BUG-056. Also, the GitHub clone lacked `.claude/` and `skills-lock.json`, so Lex copied them from the local `C:\dev\Projects\dev-template`, including `settings.local.json` and its permissions.
 - **Root cause:** the documented steps clone, then `rm -rf .git`, which the global deny list blocks on this machine. The local template copy has uncommitted edits the GitHub repo never received.
 - **Fix (pending operator):** dev-template is already a GitHub template repo (`isTemplate: true`), so the flow becomes `gh repo create <name> --template Omnib0mb3r/dev-template --private --clone`, then fill `devneural.jsonc`, commit, push. Both docs live under `~/.claude`, which the agent session could not edit. The operator decides which local template edits go to GitHub; `settings.local.json` stays out.
+- **2026-09-30 update:** GitHub `dev-template` now carries the local edits (`f994f76`, monday.com rules dropped; placeholders kept, the hook-filled values and machine-only files stay local). `createProject` (`POST /projects/new`) now runs `gh repo create <name> --template Omnib0mb3r/dev-template --private --clone`, fills, commits and pushes `devneural.jsonc`, anchors the project and can bind it to a brainstorm (`brainstorm_id`); Lex prompt names it as the only way to start a project. Tests: `projects-new-create.test.ts`. Still pending: the operator pastes the new steps into `~/.claude/CLAUDE.md` and Lex memory `reference_devneural_project_template.md` (the agent session cannot write under `~/.claude`).
 
 ## BUG-058 - Anchors for deleted project folders are never pruned
-- **Status:** OPEN
+- **Status:** SMOKE-TESTING
 - **Found:** 2026-09-30
 - **Area:** `07-daemon/src/identity/registry.ts` (`pruneMissingProjects`), `07-daemon/src/daemon.ts` (boot call), `07-daemon/src/store/index-db.ts` (`project_session`)
 - **Symptom:** the operator saw two "peax pipeline" projects in DevNeural: `peax-pipeline-automation` (`c58dbdd3`, real) and `peaks-pipeline-automation` (`a806218f`, folder deleted 2026-09-28). The daemon had restarted since the deletion, so the BUG-016 prune should have cleared it.
@@ -595,6 +600,7 @@ real bug intentionally parked.
 - **Side finding:** the `peaks` clone kept `origin` = dev-template (BUG-056), so its remote-scoped identity `fafb1872a504` was dev-template's own id. The clone rewrote that entry's root to the peaks folder, and the prune then removed it. `projects/fafb1872a504/project.json` still names the peaks root; dev-template re-registers the next time a session opens there.
 - **Workaround applied:** `DELETE /projects/a806218f-4337-4ce5-b9fb-4284f81178f6`. The brainstorm `cf89f3cd` "Peax PipeLine Automation" supervises `c58dbdd3`, verified via `/lex/anchor-tiles`.
 - **Fix (proposed):** at boot, after the registry prune, delete `project_session` rows whose `cwd` is missing on disk and that no live lex anchor supervises. A supervised one is cleared from its brainstorm with a log line, never silently.
+- **2026-09-30 fix:** `pruneMissingProjectAnchors` runs at the top of every seed pass (boot and each fs.watch reseed): deletes a dormant anchor directly under the projects root whose folder is gone and that no brainstorm references (`countProjectAnchorReferences`); a referenced one is kept and logged. Spec `docs/spec/PROJECT-ANCHORS.md` updated. Tests: `seed-project-anchors.test.ts` "seed prunes anchors whose folder is gone".
 
 ## BUG-059 - Typed messages sit unsubmitted in Lex's terminal
 - **Status:** SMOKE-TESTING
@@ -603,5 +609,37 @@ real bug intentionally parked.
 - **Symptom:** 22:5xZ the operator typed "Go look here Scrapling it's a repo..." into Talk to Lex (voice off) on the Peax brainstorm, then "Test". Both showed in the Layer 2 mirror, stacked in her input box, and she never replied. Her session `1ea70eff` had no transcript at all. One bare Enter sent by hand at 22:57:30Z submitted both lines and she answered.
 - **Root cause:** Claude Code (v2.1.277 on Lex, v2.1.285 now installed) treats a fast burst of text as a paste and strips a `\r` that rides inside it, showing "Removed 1 invisible character · review and press Enter to send". `ptyInject` sent one-slab payloads as text+`\r` in one write (Fix 19, 2026-05-23). Reproduced against a real claude PTY with a 118-char line: atomic write held; atomic plus a bare Enter at +1s or +3s held; text, then Enter as its own write 250ms later, submitted. Short lines (about 40 chars) still went through, and voice injects are long enough to take the multi-slab path, which already wrote the Enter alone, so voice kept working while typed messages broke.
 - **Fix:** `planPtyInjectWrites` builds one schedule for every payload: text slabs 20ms apart, the Enter alone 250ms after the last slab, the bare-Enter nudge 1s later. `ptyInject` runs it as a chain that stops on an exited PTY or a failed write. Tests: `pty-inject-payload.test.ts` "planPtyInjectWrites (BUG-059 held paste)". The built dist schedule submitted the exact operator text in a real claude PTY (held=false, answered=true).
+- **2026-09-30 follow-up:** typing into a session while Claude Code is still drawing (startup frames) is also held, even with the split Enter: the text is buffered and delivered in one burst with the Enter. The inject-delivery probe (`07-daemon/src/lex/inject-delivery-probe.ts`, `/health.inject_delivery`) waits for the input box and a 2 s quiet screen before typing, and now runs after every boot. Under the daemon the prompt glyph renders as `>` not `❯`, so readiness keys on the status line (`shift+tab`). Callers that type into a session right after spawn (cold-start preamble, seed turn) may need the same quiet wait; not changed here.
+
+## BUG-060 - Brainstorm names drift between two tables
+- **Status:** SMOKE-TESTING
+- **Found:** 2026-09-30 · **Fixed:** 2026-09-30 (uncommitted; migration 055 runs on the next daemon boot)
+- **Area:** `07-daemon/src/lex/lex-session-store.ts` (`setLexSessionTitle`), `07-daemon/src/lex/spawn-lex-session.ts` (reopen write-through), `07-daemon/src/lex/brainstorm-store.ts` (dead `setLabel` removed), `07-daemon/scripts/migrations/055-sync-brainstorm-names.sql`
+- **Symptom:** part of BUG-055: the Stream Deck showed "Peax PipeLine Automation" while `brainstorm_sessions.user_label` was null, so every reader of the copy (live_state, handovers, search, graph, sibling preload) saw no name.
+- **Root cause:** a brainstorm is one row in `lex_session` and one in `brainstorm_sessions` with the same id. Both dashboard create paths send no title; every later name arrives through `PATCH /lex/anchors/:id`, which wrote only `lex_session`. The only function that updated `user_label` (`setLabel`) had no callers.
+- **Fix:** `lex_session.title` / `derived_title` are canonical. `setLexSessionTitle`, the one rename path, now writes the copy in the same step; reopening a brainstorm re-syncs it; migration 055 copies the canonical name over rows that drifted; `setLabel` is gone. The copy stays because the sibling join keys and standalone/audit rows (no `lex_session`) still read it. Test: `snapshot-context-scope.test.ts` "a rename writes the canonical title and its brainstorm_sessions copy together".
+
+## BUG-061 - Anchor seed crashed on every run since July on one slug clash
+- **Status:** SMOKE-TESTING
+- **Found:** 2026-09-30 · **Fixed:** 2026-09-30 (uncommitted; verify: no `watcher reseed failed: UNIQUE` lines after the restart, and `Sawtooth`, `salem-deploy`, `Resume` have anchors)
+- **Area:** `07-daemon/src/dashboard/seed-project-anchors.ts` (`seedProjectAnchors`, `ensureAnchorForCwd`), `07-daemon/src/store/index-db.ts` (`getProjectSessionBySlug`)
+- **Symptom:** `[seed-project-anchors] watcher reseed failed: UNIQUE constraint failed: project_session.project_slug` 8,803 times in `daemon.log.1` from 2026-07-21T14:23Z plus every boot; new folders after `Resume` alphabetically never appeared as anchors.
+- **Root cause:** `project_slug` is UNIQUE but the seed used the bare basename. `C:/dev/Projects/Resume` collided with anchor `ac1a6d9b` (a bridge-created `Resume` under OneDrive). The throw escaped the loop, aborting the pass; the non-recursive `fs.watch` on the root fires constantly, so it repeated all day.
+- **Fix:** a clashing slug gets `-<first 6 hex of sha1(lowercased cwd)>`; each folder is seeded in its own try/catch and logged on failure. Test: `seed-project-anchors.test.ts` "seed survives slug clashes".
+
+## BUG-062 - TTS failure-logging test blocked by the mouth lock
+- **Status:** OPEN
+- **Found:** 2026-09-30
+- **Area:** `07-daemon/tests/lex-voice-ws-speak-queue.test.ts`, the voice-mouth ownership lock (`bca72fd`)
+- **Symptom:** `expected '[voice-mouth] busy (held elsewhere); …' to contain 'TTS SYNTH FAILED'`. Fails alone and in the full run, on clean HEAD `04533b7`.
+- **Root cause:** not investigated. Likely the test never takes the mouth before speaking, so the lock refuses before synthesize runs.
+
+## BUG-063 - Daemon exits silently a few minutes after boot
+- **Status:** OPEN
+- **Found:** 2026-09-30
+- **Area:** `07-daemon` process lifetime; relauncher `07-daemon/scripts/start-daemon.ps1`
+- **Symptom:** pid 105888 booted 23:30:40Z, reopened Lex and L1 at 23:31:39, logged `[memory] rss=1268MB` at 23:31:43, then nothing; pid 42384 started 23:35:36. `daemon.stderr.prev.log` holds only the DEP0190 warning, stdout only the cold-start gate line, and `Get-WinEvent` Application shows no node fault. Not an OOM (heap 13%, BUG-017 prints a V8 stack).
+- **Ruled out:** the inject-delivery probe (run standalone against the same dist, the host process lived and exited 0). The next two daemons (42384, 44264) stayed up.
+- **Next:** if it repeats, capture `node --report-on-fatalerror` / `--report-uncaught-exception` and log `process.on('exit')` with the code; check whether something runs `taskkill` against the daemon pid.
 
 <!-- DETAILS END -->
