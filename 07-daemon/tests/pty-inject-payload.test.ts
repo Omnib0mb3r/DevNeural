@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildPtyInjectPayload,
+  planPtyInjectWrites,
   splitInjectPayloadIntoSlabs,
   PTY_INJECT_COMMIT_NUDGE_MS,
   PTY_INJECT_SLAB_CHARS,
@@ -46,6 +47,41 @@ describe('buildPtyInjectPayload (Fix 19 regression)', () => {
 
   it('exposes a positive nudge interval so the belt-and-suspenders bare-\\r fires after the atomic write', () => {
     expect(PTY_INJECT_COMMIT_NUDGE_MS).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * BUG-059 (2026-09-30): Claude Code v2.1.277+ treats a fast burst as a
+ * paste and strips a \r riding inside it ("Removed 1 invisible
+ * character · review and press Enter to send"); a bare \r at +1s or +3s
+ * does not release the held line. Reproduced against a real claude PTY
+ * with a 118-char single-line typed message: text+\r in one write held;
+ * text, then \r as its own write 250ms later, submitted. Every commit
+ * therefore sends the CR as its own write after the settle gap, the
+ * shape the multi-slab path already used.
+ */
+describe('planPtyInjectWrites (BUG-059 held paste)', () => {
+  it('never puts the commit \\r in the same write as the text, even for a one-slab message', () => {
+    const plan = planPtyInjectWrites('Go look here Scrapling its a repo, see if its safe', true);
+    const body = plan.filter((w) => w.data !== '\r');
+    expect(body.every((w) => !w.data.includes('\r'))).toBe(true);
+    expect(body.map((w) => w.data).join('')).toBe(
+      'Go look here Scrapling its a repo, see if its safe',
+    );
+  });
+
+  it('sends the commit \\r alone, at least the settle gap after the last text write', () => {
+    const plan = planPtyInjectWrites('x'.repeat(5000), true);
+    const lastText = Math.max(...plan.filter((w) => w.data !== '\r').map((w) => w.atMs));
+    const crs = plan.filter((w) => w.data === '\r');
+    expect(crs.length).toBe(2);
+    expect(crs[0]!.atMs - lastText).toBeGreaterThanOrEqual(PTY_INJECT_SLAB_SETTLE_MS);
+    expect(crs[1]!.atMs).toBeGreaterThan(crs[0]!.atMs);
+  });
+
+  it('starts with the text at 0ms and sends no \\r at all when commit=false', () => {
+    const plan = planPtyInjectWrites('hello', false);
+    expect(plan).toEqual([{ data: 'hello', atMs: 0 }]);
   });
 });
 

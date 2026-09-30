@@ -962,8 +962,8 @@ export function buildPtyInjectPayload(text: string, commit: boolean): string {
  * Enter by hand - the exact trailing-Enter drop Fix 19 fixed, at slab
  * granularity. The settle delay matches the harness pattern that
  * verified clean submission against a real claude (slabs 20ms apart,
- * CR alone after a gap). Small payloads keep the Fix 19 atomic
- * body+\r single write, which is proven in production. */
+ * CR alone after a gap). Since BUG-059 (2026-09-30) small payloads
+ * use the same shape; see planPtyInjectWrites. */
 export const PTY_INJECT_SLAB_CHARS = 2048;
 export const PTY_INJECT_SLAB_GAP_MS = 20;
 export const PTY_INJECT_SLAB_SETTLE_MS = 250;
@@ -984,6 +984,28 @@ export function splitInjectPayloadIntoSlabs(
   return slabs;
 }
 
+/* Write schedule for one inject (BUG-059, 2026-09-30). Claude Code
+ * v2.1.277+ holds a burst that carries its own \r as a paste ("Removed
+ * 1 invisible character · review and press Enter to send"), and a later
+ * bare \r does not release it; so the Fix 19 atomic body+\r write stopped
+ * submitting typed messages. Every payload now uses the shape the slab
+ * path already proved: text slabs PTY_INJECT_SLAB_GAP_MS apart, the
+ * commit \r alone PTY_INJECT_SLAB_SETTLE_MS after the last slab, then
+ * the bare-\r nudge. Verified against a real claude PTY: a 118-char
+ * line held with the atomic write and submitted with this one. */
+export function planPtyInjectWrites(
+  text: string,
+  commit: boolean,
+): Array<{ data: string; atMs: number }> {
+  const slabs = splitInjectPayloadIntoSlabs(text);
+  const plan = slabs.map((data, i) => ({ data, atMs: i * PTY_INJECT_SLAB_GAP_MS }));
+  if (!commit) return plan;
+  const crAt = (slabs.length - 1) * PTY_INJECT_SLAB_GAP_MS + PTY_INJECT_SLAB_SETTLE_MS;
+  plan.push({ data: '\r', atMs: crAt });
+  plan.push({ data: '\r', atMs: crAt + PTY_INJECT_COMMIT_NUDGE_MS });
+  return plan;
+}
+
 export function ptyInject(
   ptyIdOrSession: string,
   text: string,
@@ -997,84 +1019,45 @@ export function ptyInject(
     const payload = buildPtyInjectPayload(text, commit);
     handle.lastCommandSent = payload.slice(0, 4096);
     handle.lastCommandAt = Date.now();
-    /* Slabs are built from the TEXT, never the payload: the commit \r
-     * must not ride inside a slab (see the slab-contract comment
-     * above the constants). */
-    const slabs = splitInjectPayloadIntoSlabs(text);
-    if (slabs.length === 1) {
-      /* Fix 19 atomic body(+\r) single write, byte-identical legacy
-       * path. */
-      handle.pty.write(payload);
-    } else {
-      handle.pty.write(slabs[0]!);
-      /* Trailing slabs are scheduled, not awaited: callers treat the
-       * return as "accepted", and sequential writes on one PTY stay
-       * ordered. Each tick re-checks liveness; a slab write failure
-       * after the first is logged loudly (the paste is already
-       * partially delivered, so silence here would recreate the
-       * exact bug this fixes). After the final slab, the commit \r
-       * fires as its OWN write once the paste burst has settled. */
-      let slabIndex = 1;
-      const scheduleSlabStep = (fn: () => void, delayMs: number): void => {
-        const t = setTimeout(fn, delayMs);
-        if (typeof (t as { unref?: () => void }).unref === 'function') {
-          (t as { unref: () => void }).unref();
-        }
-      };
-      const fireSettledCommitCr = (): void => {
-        if (handle!.exited) return;
-        try {
-          handle!.pty.write('\r');
-        } catch (err) {
-          logFn(
-            `[pty-host] inject settled-commit CR FAILED pty=${handle!.ptyId}: ${(err as Error).message}`,
-          );
-        }
-      };
-      const writeNextSlab = (): void => {
-        if (handle!.exited) {
-          logFn(
-            `[pty-host] inject slab aborted (pty exited) pty=${handle!.ptyId} slab=${slabIndex}/${slabs.length}`,
-          );
-          return;
-        }
-        try {
-          handle!.pty.write(slabs[slabIndex]!);
-        } catch (err) {
-          logFn(
-            `[pty-host] inject slab write FAILED pty=${handle!.ptyId} slab=${slabIndex}/${slabs.length}: ${(err as Error).message}`,
-          );
-          return;
-        }
-        slabIndex += 1;
-        if (slabIndex < slabs.length) {
-          scheduleSlabStep(writeNextSlab, PTY_INJECT_SLAB_GAP_MS);
-        } else if (commit) {
-          scheduleSlabStep(fireSettledCommitCr, PTY_INJECT_SLAB_SETTLE_MS);
-        }
-      };
-      scheduleSlabStep(writeNextSlab, PTY_INJECT_SLAB_GAP_MS);
-    }
-    if (commit) {
-      /* Anchor the nudge past the LAST slab + the settled commit CR,
-       * so a many-slab payload cannot receive its bare-CR mid-paste. */
-      const nudgeDelayMs =
-        PTY_INJECT_COMMIT_NUDGE_MS +
-        (slabs.length - 1) * PTY_INJECT_SLAB_GAP_MS +
-        (slabs.length > 1 ? PTY_INJECT_SLAB_SETTLE_MS : 0);
+    /* The first text slab goes out now; every later step (more slabs,
+     * the commit \r alone after the settle gap, the nudge) is scheduled
+     * off planPtyInjectWrites, chained so each waits on the one before
+     * and a failed or exited step stops the rest. Callers treat the
+     * return as "accepted"; sequential writes on one PTY stay ordered.
+     * A failure after the first write is logged loudly: the paste is
+     * already partly delivered, so silence would hide a held prompt. */
+    const plan = planPtyInjectWrites(text, commit);
+    handle.pty.write(plan[0]!.data);
+    const runStep = (i: number): void => {
+      if (i >= plan.length) return;
       const t = setTimeout(() => {
-        if (!handle!.exited) {
-          try {
-            handle!.pty.write('\r');
-          } catch {
-            /* nudge is fire-and-forget */
+        const step = plan[i]!;
+        const isNudge = commit && i === plan.length - 1;
+        if (handle!.exited) {
+          if (!isNudge) {
+            logFn(
+              `[pty-host] inject aborted (pty exited) pty=${handle!.ptyId} step=${i + 1}/${plan.length}`,
+            );
           }
+          return;
         }
-      }, nudgeDelayMs);
+        try {
+          handle!.pty.write(step.data);
+        } catch (err) {
+          if (!isNudge) {
+            logFn(
+              `[pty-host] inject write FAILED pty=${handle!.ptyId} step=${i + 1}/${plan.length}: ${(err as Error).message}`,
+            );
+          }
+          return;
+        }
+        runStep(i + 1);
+      }, plan[i]!.atMs - plan[i - 1]!.atMs);
       if (typeof (t as { unref?: () => void }).unref === 'function') {
         (t as { unref: () => void }).unref();
       }
-    }
+    };
+    runStep(1);
     handle.lastActivity = Date.now();
     return { ok: true };
   } catch (err) {
