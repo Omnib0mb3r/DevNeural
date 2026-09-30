@@ -179,6 +179,30 @@ describe('buildVoiceSnapshot worker scope', () => {
     expect(snap).not.toContain('Bridger Brainstorm');
   });
 
+  it('names the own brainstorm by the title typed at creation when the brainstorm row has no user_label', () => {
+    /* Live 2026-09-28: "new session" named "Peax PipeLine Automation"
+     * wrote lex_session.title only; brainstorm_sessions.user_label
+     * stayed null, so Lex saw the bare id and never learned the
+     * spelling that STT had turned into "peaks". */
+    db.insertLexSession({
+      id: 'bs-peax',
+      created_ms: 3,
+      title: 'Peax PipeLine Automation',
+      derived_title: null,
+      status: 'live',
+      current_pty_id: null,
+      cwd: 'C:/dev/data/x/brainstorm',
+      supervises_project_anchor_id: null,
+    });
+    db.insertBrainstorm(
+      brainstormRow('bs-peax', 'unused', { user_label: null }),
+    );
+    const snap = buildVoiceSnapshot({
+      scope: { brainstormId: 'bs-peax', superviseProjectAnchorId: null },
+    });
+    expect(snap).toContain('Peax PipeLine Automation');
+  });
+
   it('names the scope contract in the block', () => {
     const snap = buildVoiceSnapshot({
       scope: {

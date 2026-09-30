@@ -262,11 +262,34 @@ export function buildVoiceSnapshot(opts: VoiceSnapshotOptions = {}): string {
       ? '  (no worker bound to this brainstorm; bind one via the dashboard supervises picker)'
       : '  (none)';
 
+  /* The name the operator typed at "new session" lives on the lex
+   * anchor (lex_session.title, the Stream Deck tile's source), not on
+   * brainstorm_sessions.user_label, which only a Past Sessions rename
+   * sets. Read the anchor first so Lex sees the same name the operator
+   * sees; on 2026-09-28 she saw a bare id and never learned that the
+   * spoken "peaks" was spelled "Peax". */
+  const brainstormLabel = (b: { id: string; user_label: string | null; derived_label: string | null }): string => {
+    const lex = (() => {
+      try {
+        return getStore().db.getLexSession(b.id);
+      } catch {
+        return null;
+      }
+    })();
+    return (
+      lex?.title?.trim() ||
+      b.user_label?.trim() ||
+      lex?.derived_title?.trim() ||
+      b.derived_label?.trim() ||
+      b.id.slice(0, 8)
+    );
+  };
+
   const brainstormLines = brainstorms.length
     ? brainstorms
         .slice(0, 5)
         .map((b) => {
-          const label = b.user_label ?? b.derived_label ?? b.id.slice(0, 8);
+          const label = brainstormLabel(b);
           return `  - ${label} (mode=${b.mode}, started ${ageHuman(b.started_ms)}, turns=${b.turn_count})`;
         })
         .join('\n')
@@ -291,7 +314,7 @@ export function buildVoiceSnapshot(opts: VoiceSnapshotOptions = {}): string {
     if (!store) return null;
     const lines: string[] = [];
     for (const b of brainstorms.slice(0, 5)) {
-      const label = b.user_label ?? b.derived_label ?? b.id.slice(0, 8);
+      const label = brainstormLabel(b);
       try {
         const refs = store.db.listLexTranscriptRefs(b.id);
         const total = refs.length;
@@ -377,7 +400,7 @@ export function buildVoiceSnapshot(opts: VoiceSnapshotOptions = {}): string {
         `<live_state ts="${ts}" scope=worker>`,
         'open_projects (scoped: the only worker this brainstorm may observe or control; other projects belong to other brainstorms and are OUT OF SCOPE):',
         sessionLines,
-        'active_brainstorms (this brainstorm only):',
+        'active_brainstorms (this brainstorm only; the name is the one the operator typed, so its spelling beats speech-to-text for the same words):',
         brainstormLines,
         remLine,
         hostLine,
