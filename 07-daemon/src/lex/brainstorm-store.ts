@@ -353,12 +353,9 @@ export function reapOrphansAgainstLivePtys(
   return touched;
 }
 
-export function setLabel(
-  id: string,
-  patch: { user_label?: string | null; derived_label?: string | null },
-): BrainstormSessionRow | null {
-  return db().updateBrainstorm(id, patch);
-}
+/* Names are written only by setLexSessionTitle (lex-session-store.ts),
+ * which keeps user_label / derived_label in step with the canonical
+ * lex_session title (BUG-060). */
 
 export function setMode(id: string, mode: string): BrainstormSessionRow | null {
   return db().updateBrainstorm(id, { mode });
@@ -369,7 +366,7 @@ export function setMode(id: string, mode: string): BrainstormSessionRow | null {
  * disagrees with the row's current kind. updateBrainstorm's targeted
  * UPDATE (not insertBrainstorm's fixed column list) is what makes a
  * Phase Two column like kind settable outside setBrainstormPhaseTwo
- * too; this thin wrapper just matches the setLabel/setMode shape. */
+ * too; this thin wrapper just matches the setMode shape. */
 export function setKind(
   id: string,
   kind: 'brainstorm' | 'meeting',

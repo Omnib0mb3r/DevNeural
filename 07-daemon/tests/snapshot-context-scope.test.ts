@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { IndexDb } from '../src/store/index-db.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { setStore as setBrainstormStore } from '../src/lex/brainstorm-store.js';
+import { setLexSessionTitle } from '../src/lex/lex-session-store.js';
 import {
   buildVoiceSnapshot,
   resolveLexScope,
@@ -201,6 +202,18 @@ describe('buildVoiceSnapshot worker scope', () => {
       scope: { brainstormId: 'bs-peax', superviseProjectAnchorId: null },
     });
     expect(snap).toContain('Peax PipeLine Automation');
+  });
+
+  it('a rename writes the canonical title and its brainstorm_sessions copy together', () => {
+    /* Every rename (Past Sessions inline edit, Lex via PATCH
+     * /lex/anchors/:id) goes through setLexSessionTitle. It used to
+     * update only lex_session, so ~30 readers of user_label showed
+     * the old or empty name. */
+    setLexSessionTitle('bs-mha', { title: 'Renamed MHA', derivedTitle: 'auto name' });
+    expect(db.getLexSession('bs-mha')?.title).toBe('Renamed MHA');
+    const bs = db.getBrainstorm('bs-mha');
+    expect(bs?.user_label).toBe('Renamed MHA');
+    expect(bs?.derived_label).toBe('auto name');
   });
 
   it('names the scope contract in the block', () => {

@@ -232,6 +232,12 @@ export function writeThroughBrainstormRow(opts: {
      * session id and flip status back to active. kind is left as-is
      * (see the kind option's comment on SpawnLexSessionOptions). */
     bindBrainstormSessionId(opts.lexSession.id, opts.ptyId, opts.ccSessionId);
+    /* Re-sync the name copy from the canonical title (BUG-060), so a
+     * row that drifted before the single-writer fix heals on reopen. */
+    store.db.updateBrainstorm(opts.lexSession.id, {
+      user_label: opts.lexSession.title,
+      derived_label: opts.lexSession.derived_title,
+    });
     return;
   }
   /* Fresh anchor path: insert a legacy row whose id matches the

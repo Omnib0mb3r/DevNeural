@@ -54,14 +54,27 @@ export function listLexSessions(opts: {
   return db().listLexSessions(opts);
 }
 
+/**
+ * The one writer of a brainstorm's name. lex_session.title /
+ * derived_title are canonical; brainstorm_sessions.user_label /
+ * derived_label are a copy that ~30 readers and the sibling join keys
+ * still use, so it is written here in the same step and nowhere else.
+ * Before 2026-09-30 renames reached only lex_session and the copy kept
+ * the old or empty name (BUG-060).
+ */
 export function setLexSessionTitle(
   id: string,
   patch: { title?: string | null; derivedTitle?: string | null },
 ): LexSessionRow | null {
-  return db().updateLexSession(id, {
+  const updated = db().updateLexSession(id, {
     title: patch.title,
     derived_title: patch.derivedTitle,
   });
+  db().updateBrainstorm(id, {
+    user_label: patch.title,
+    derived_label: patch.derivedTitle,
+  });
+  return updated;
 }
 
 export function setLexSessionStatus(
