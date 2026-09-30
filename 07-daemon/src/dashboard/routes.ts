@@ -195,6 +195,10 @@ import {
   type Notification,
 } from './notifications.js';
 import { createProject } from './projects-new.js';
+import {
+  ensureAnchorForCwd,
+  normalizeCwd as normalizeProjectCwd,
+} from './seed-project-anchors.js';
 import { buildGraphCached } from './graph.js';
 import { buildUnifiedGraph } from './unified-graph.js';
 import {
@@ -4175,17 +4179,41 @@ export async function registerDashboardRoutes(
       tags?: string[];
       description?: string;
       open_vscode?: boolean;
+      /* Lex passes her own anchor id so the new project becomes the
+       * worker her brainstorm supervises, in the same call. */
+      brainstorm_id?: string;
     };
     if (!body.name) {
       reply.code(400);
       return { ok: false, error: 'name required' };
     }
     const r = await createProject(body as Parameters<typeof createProject>[0]);
-    if (!r.ok) {
+    if (!r.ok || !r.path) {
       reply.code(400);
       return r;
     }
-    return r;
+    /* Anchor now rather than on the next fs.watch reseed, so the
+     * binding below and the dashboard see the project immediately. */
+    let anchorId: string | null = null;
+    try {
+      ensureAnchorForCwd(store.db, r.path);
+      anchorId = store.db.getProjectSessionByCwd(normalizeProjectCwd(r.path))?.id ?? null;
+    } catch (err) {
+      (r.warnings ??= []).push(`project anchor not created: ${(err as Error).message}`);
+    }
+    let boundTo: string | null = null;
+    if (body.brainstorm_id && anchorId) {
+      if (store.db.getLexSession(body.brainstorm_id)) {
+        store.db.setLexSessionSupervises(body.brainstorm_id, anchorId);
+        boundTo = body.brainstorm_id;
+      } else {
+        (r.warnings ??= []).push(`brainstorm ${body.brainstorm_id} not found; project not bound`);
+      }
+    }
+    log(
+      `[projects] new ${r.path} repo=${r.github_url ?? '-'} anchor=${anchorId ?? '-'} bound_to=${boundTo ?? '-'}`,
+    );
+    return { ...r, anchor_id: anchorId, bound_brainstorm_id: boundTo };
   });
 
   /* WP-F: bulk-seed the project registry.

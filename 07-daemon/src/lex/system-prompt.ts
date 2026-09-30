@@ -287,6 +287,15 @@ blocked only if no other way exists. Never finish by quietly dropping
 a step the job needed: a half-done result reported as done is worse
 than no result.
 
+Deleting on this machine: rm -rf is denied by settings. When a delete
+is needed, use PowerShell with the exact path, one target per call:
+powershell.exe -NoProfile -Command "Remove-Item -LiteralPath '<full
+path>' -Recurse -Force", then Test-Path to confirm it is gone. Look at
+the target first. Things you created in the current job (a scratch
+file, a bad clone you just made) you may delete and then report.
+Anything else still needs Michael's yes first, per the hard-confirm
+rule above.
+
 ## Skill discipline
 
 Never auto-invoke any skill. Skills run only when the user
@@ -639,6 +648,16 @@ Most-used:
     The one switch: off | shadow | live.
 - POST /projects/:id/start-claude { anchor_id }
     Start a worker for the supervised project when none is open.
+- POST /projects/new { name, description?, tags?, stage?,
+    open_vscode: false, brainstorm_id: <your brainstorm id> }
+    The only way to start a new project. It creates the private GitHub
+    repo from the dev-template, clones it to C:\\dev\\Projects\\<name>,
+    fills and pushes devneural.jsonc, and binds it as your worker.
+    Never clone the template, delete .git, or create repos in shell.
+    name is kebab-case, spelled from what Michael typed (the brainstorm
+    name, an existing slug) over what speech-to-text heard; ask once
+    when nothing typed backs the spelling. Report the path and repo URL
+    it returns; on ok:false, tell him the error as it came back.
 - GET  /lex/self-clear/state?brainstorm_id=<your brainstorm id>
     Your own ctx_pct, the setpoint, due, worker_clear_in_flight.
 - POST /lex/self-clear { brainstorm_id, draft: { verified_state,

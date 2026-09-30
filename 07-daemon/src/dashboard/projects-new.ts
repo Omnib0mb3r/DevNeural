@@ -9,7 +9,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { createHash } from 'node:crypto';
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { spawn } from 'node:child_process';
 import { resolveProjectIdentity } from '../identity/project-id.js';
 import { recordIdentity } from '../identity/registry.js';
@@ -251,6 +251,14 @@ const PROJECTS_ROOT = (
   process.env.DEVNEURAL_PROJECTS_ROOT ?? 'C:/dev/Projects'
 ).replace(/\\/g, '/');
 
+/** "owner/repo" for gh from the template URL. */
+export function templateSlug(url: string = TEMPLATE_REPO): string {
+  return url
+    .replace(/^https?:\/\/github\.com\//, '')
+    .replace(/\.git$/, '')
+    .replace(/\/+$/, '');
+}
+
 export interface NewProjectInput {
   name: string;
   stage?: 'alpha' | 'beta' | 'deployed' | 'archived';
@@ -262,6 +270,8 @@ export interface NewProjectInput {
 export interface NewProjectResult {
   ok: boolean;
   path?: string;
+  /** The private GitHub repo created from the template. */
+  github_url?: string;
   error?: string;
   /* Non-fatal warnings the caller (dashboard) can surface so the user
    * knows when a step like "open VS Code" failed silently. The
@@ -270,10 +280,48 @@ export interface NewProjectResult {
   warnings?: string[];
 }
 
+export interface CreateProjectDeps {
+  /** Run a program with an argv array (no shell) and return stdout;
+   * throws on a non-zero exit. */
+  run?: (cmd: string, args: string[], cwd: string) => string;
+  projectsRoot?: string;
+  /** Register the new folder in the project registry. */
+  registerIdentity?: (target: string) => void;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+function defaultRun(cmd: string, args: string[], cwd: string): string {
+  return execFileSync(cmd, args, {
+    cwd,
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 120_000,
+    windowsHide: true,
+  });
+}
+
+function defaultRegisterIdentity(target: string): void {
+  recordIdentity(resolveProjectIdentity(target));
+}
+
 const NAME_RE = /^[a-z0-9][a-z0-9-]+$/;
 
+/**
+ * The one supported way to start a new project (dashboard "+ New
+ * Project" and Lex via POST /projects/new).
+ *
+ * 2026-09-30 (BUG-056, BUG-057): the old flow cloned the template, then
+ * deleted .git and re-inited, and never created a repo or a commit. Lex
+ * improvised the same steps in shell, a settings deny blocked the
+ * delete, and a half-built project kept `origin` = the public template.
+ * Now GitHub does it in one step: `gh repo create <name> --template
+ * <owner/repo> --private --clone` makes a private repo with fresh
+ * history and its own origin, then the metadata is filled, committed
+ * and pushed. Nothing is deleted and git is never re-inited.
+ */
 export async function createProject(
   input: NewProjectInput,
+  deps: CreateProjectDeps = {},
 ): Promise<NewProjectResult> {
   if (!input.name || !NAME_RE.test(input.name)) {
     return {
@@ -282,68 +330,83 @@ export async function createProject(
         'name must be kebab-case (lowercase letters, digits, hyphens; cannot start with hyphen)',
     };
   }
-  const target = path.posix.join(PROJECTS_ROOT, input.name);
+  const run = deps.run ?? defaultRun;
+  const root = (deps.projectsRoot ?? PROJECTS_ROOT).replace(/\\/g, '/');
+  const sleep =
+    deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const target = path.posix.join(root, input.name);
   if (fs.existsSync(target)) {
     return { ok: false, error: `path already exists: ${target}` };
   }
 
-  // Clone the template
+  let githubUrl: string | undefined;
   try {
-    execSync(`git clone --depth 1 ${TEMPLATE_REPO} "${target}"`, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 60_000,
-      windowsHide: true,
-    });
+    const out = run(
+      'gh',
+      ['repo', 'create', input.name, '--template', templateSlug(), '--private', '--clone'],
+      root,
+    );
+    githubUrl = out.split(/\r?\n/).find((l) => /^https:\/\/github\.com\//.test(l.trim()))?.trim();
   } catch (err) {
-    return { ok: false, error: `git clone failed: ${(err as Error).message}` };
+    return { ok: false, error: `gh repo create failed: ${(err as Error).message}` };
   }
 
-  // Detach from the template's history so this is its own repo
-  try {
-    fs.rmSync(path.posix.join(target, '.git'), { recursive: true, force: true });
-    execSync('git init -q', { cwd: target, stdio: 'ignore', windowsHide: true });
-  } catch {
-    /* non-fatal */
-  }
-
-  // Fill devneural.jsonc
+  /* GitHub copies the template into the new repo asynchronously; a
+   * clone that races it comes back empty. Pull until the files land. */
   const configFile = path.posix.join(target, 'devneural.jsonc');
-  if (fs.existsSync(configFile)) {
-    let raw = fs.readFileSync(configFile, 'utf-8');
-    raw = raw
-      .replace(/REPLACE_ME_NAME|"name":\s*"REPLACE_ME"/g, `"name": "${input.name}"`)
-      .replace(
-        /REPLACE_ME_LOCAL_PATH|"localPath":\s*"REPLACE_ME"/g,
-        `"localPath": "${target}"`,
-      )
-      .replace(
-        /"stage":\s*"REPLACE_ME"|REPLACE_ME_STAGE/g,
-        `"stage": "${input.stage ?? 'alpha'}"`,
-      )
-      .replace(
-        /"description":\s*"REPLACE_ME"|REPLACE_ME_DESCRIPTION/g,
-        `"description": "${(input.description ?? '').replace(/"/g, "'")}"`,
-      );
-
-    if (input.tags && input.tags.length > 0) {
-      raw = raw.replace(
-        /"tags":\s*\[\s*\]/,
-        `"tags": [${input.tags.map((t) => `"${t}"`).join(', ')}]`,
-      );
+  for (let i = 0; i < 10 && !fs.existsSync(configFile); i++) {
+    await sleep(2000);
+    try {
+      run('git', ['pull', '--quiet', 'origin', 'HEAD'], target);
+    } catch {
+      /* template not copied yet; retry */
     }
+  }
+  if (!fs.existsSync(configFile)) {
+    return {
+      ok: false,
+      path: target,
+      github_url: githubUrl,
+      error: `repo created but the template files never arrived in ${target}; run "git pull" there`,
+    };
+  }
 
-    fs.writeFileSync(configFile, raw, 'utf-8');
+  let raw = fs.readFileSync(configFile, 'utf-8');
+  raw = raw
+    .replace(/REPLACE_ME_NAME|"name":\s*"REPLACE_ME"/g, `"name": "${input.name}"`)
+    .replace(
+      /"stage":\s*"REPLACE_ME"|REPLACE_ME_STAGE/g,
+      `"stage": "${input.stage ?? 'alpha'}"`,
+    )
+    .replace(
+      /"description":\s*"REPLACE_ME"|REPLACE_ME_DESCRIPTION/g,
+      `"description": "${(input.description ?? '').replace(/"/g, "'")}"`,
+    );
+  if (input.stage) {
+    raw = raw.replace(/"stage":\s*"[a-z-]+"/, `"stage": "${input.stage}"`);
+  }
+  if (input.tags && input.tags.length > 0) {
+    raw = raw.replace(
+      /"tags":\s*\[\s*\]/,
+      `"tags": [${input.tags.map((t) => `"${t.replace(/"/g, "'")}"`).join(', ')}]`,
+    );
+  }
+  fs.writeFileSync(configFile, raw, 'utf-8');
+
+  const warnings: string[] = [];
+  try {
+    run('git', ['add', 'devneural.jsonc'], target);
+    run('git', ['commit', '--quiet', '-m', 'chore: fill devneural.jsonc project metadata'], target);
+    run('git', ['push', '--quiet'], target);
+  } catch (err) {
+    warnings.push(`metadata commit/push failed: ${(err as Error).message}`);
   }
 
   // Seed the project registry so the new project shows up on the
   // dashboard immediately, before any Claude session writes capture
-  // events to register it. resolveProjectIdentity walks the new
-  // folder's git config (which we just init'd above) and falls back
-  // to a path-based id if no remote is set yet.
-  const warnings: string[] = [];
+  // events to register it.
   try {
-    const identity = resolveProjectIdentity(target);
-    recordIdentity(identity);
+    (deps.registerIdentity ?? defaultRegisterIdentity)(target);
   } catch (err) {
     warnings.push(
       `failed to register project in dashboard: ${(err as Error).message}`,
@@ -379,5 +442,10 @@ export async function createProject(
     }
   }
 
-  return { ok: true, path: target, warnings: warnings.length ? warnings : undefined };
+  return {
+    ok: true,
+    path: target,
+    github_url: githubUrl,
+    warnings: warnings.length ? warnings : undefined,
+  };
 }
