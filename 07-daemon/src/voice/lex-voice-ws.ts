@@ -1287,6 +1287,26 @@ export interface _VerifyInjectDeliveryDeps {
  * non-empty lines, bounded, never crossing a newline - the jsonl
  * record preserves the payload's own line structure but probes that
  * span lines would be brittle against any composer normalization. */
+/**
+ * Which Lex a voice client gets when its hello names no brainstorm (the
+ * LEX-CAR app sends only `{t:'hello', mode}`). Before 2026-10-02 this was
+ * the FIRST live brainstorm PTY in the map, so with two brainstorms open
+ * the car could talk to an older one instead of the one Michael just
+ * started. Now: the most recently started live brainstorm PTY, which is
+ * the one he opened last (a reopen spawns a fresh PTY, so it counts as
+ * newest too).
+ */
+export function pickDefaultLexPty<
+  T extends { ptyId: string; cwd: string; exited: boolean; startedAt: number },
+>(ptys: T[]): T | undefined {
+  let best: T | undefined;
+  for (const p of ptys) {
+    if (p.exited || !/[\\/]brainstorm[\\/]?$/i.test(p.cwd)) continue;
+    if (!best || p.startedAt > best.startedAt) best = p;
+  }
+  return best;
+}
+
 export function payloadIntegrityFingerprints(payload: string): {
   head: string;
   tail: string;
@@ -2517,10 +2537,7 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       ? getPty(sessionOrPty) || getPtyBySession(sessionOrPty)
       : undefined;
     if (!handle) {
-      const all = listPtys();
-      const lex = all.find(
-        (p) => !p.exited && /[\\/]brainstorm[\\/]?$/i.test(p.cwd),
-      );
+      const lex = pickDefaultLexPty(listPtys());
       if (lex) {
         handle = getPty(lex.ptyId);
       }

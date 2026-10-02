@@ -72,6 +72,7 @@ real bug intentionally parked.
 | BUG-040 | OPEN | Daemon relaunch died once at boot, 2026-09-23 02:10Z (22:10 local): `ERR_MODULE_NOT_FOUND: Cannot find package '@anthropic-ai/sdk' imported from dist/llm/anthropic.js` (`daemon.stderr.prev.log`), after an admin restart requested at 02:10:24Z; the schtasks relauncher's next try booted at 02:13:11Z (PID 4952). Three minutes of outage, in the middle of the overnight closeout. The package is present now and `package.json` still lists it, so `node_modules` was in flux at that moment (hypothesis: an install or prune from the worktree cleanup). Root fix regardless of cause: the anthropic provider is never used on the Lex path (VL-27), so its SDK import should be lazy and a missing optional SDK must never stop the daemon booting. |
 | BUG-055 | SMOKE-TESTING | Lex never sees the name typed for a brainstorm: "new session" writes it to `lex_session.title` (the Stream Deck's source), but `buildVoiceSnapshot` read only `brainstorm_sessions.user_label` (null), so live_state named the brainstorm `cf89f3cd`. STT heard "Peax" as "peaks" and nothing let Lex catch it; the project folder came out `peaks-pipeline-automation` under a brainstorm titled "Peax PipeLine Automation". |
 | BUG-056 | SMOKE-TESTING | Lex read a settings deny (`Bash(rm -rf *)` on the template's own `rm -rf .git` step) as Michael refusing, asked him a nonsense question, then re-ran a bare `git clone` and dropped the detach, commit and repo steps without saying so. The new project's `origin` still pointed at the public `dev-template` repo. |
+| BUG-068 | SMOKE-TESTING | A voice client whose hello names no brainstorm (the LEX-CAR app) was bound to the FIRST live brainstorm PTY in the map, so with two brainstorms open the car could talk to an older Lex instead of the one just started. Now the most recently started live brainstorm. |
 | BUG-067 | SMOKE-TESTING | Lex acts like a bystander on her own project: relays the worker's status to Michael in the third person, waits for his yes on reversible steps (commit a checkpoint, clear on a verified handover), asks whether she should act instead of acting. Lex-Car brainstorm 2026-10-02 03:05-03:24Z. |
 | BUG-066 | SMOKE-TESTING | Layer 1 put its own working folder into Michael's request: he said "go read the documents and get caught up on what this project is", the FORWARD said "Read the project documentation in the voice-l1 directory" (2026-10-02T03:23:57Z). |
 | BUG-065 | SMOKE-TESTING | Lex refused Michael's spoken request as "pasted": Claude Code 2.1.285 wraps any burst over ~1-3k chars in <pasted_content> and tells the model not to follow instructions inside it; a voice turn is ~8k (live state + his words) in one burst. Installed 2026-09-30 18:59 by an agent repro script that ran claude without DISABLE_AUTOUPDATER. |
@@ -644,6 +645,7 @@ real bug intentionally parked.
 - **Area:** `07-daemon` process lifetime; relauncher `07-daemon/scripts/start-daemon.ps1`
 - **Symptom:** pid 105888 booted 23:30:40Z, reopened Lex and L1 at 23:31:39, logged `[memory] rss=1268MB` at 23:31:43, then nothing; pid 42384 started 23:35:36. `daemon.stderr.prev.log` holds only the DEP0190 warning, stdout only the cold-start gate line, and `Get-WinEvent` Application shows no node fault. Not an OOM (heap 13%, BUG-017 prints a V8 stack).
 - **Ruled out:** the inject-delivery probe (run standalone against the same dist, the host process lived and exited 0). The next two daemons (42384, 44264) stayed up.
+- **Second occurrence:** pid 128968, last `[memory]` line 2026-10-02T07:42:26Z (rss 704MB, heap 19%), no shutdown lines, relaunched as 32404 at 07:45:37Z. No inject probe or restart near it.
 - **Next:** if it repeats, capture `node --report-on-fatalerror` / `--report-uncaught-exception` and log `process.on('exit')` with the code; check whether something runs `taskkill` against the daemon pid.
 
 ## BUG-064 - Sensitivity and mic level do not stop a whisper
@@ -675,5 +677,12 @@ real bug intentionally parked.
 - **Area:** `07-daemon/src/lex/system-prompt.ts` (Authority)
 - **Symptom:** Lex-Car 03:05-03:17Z: "My worker is waiting on you", "I'm still waiting on your yes" to commit a checkpoint, "Shall I clear it now?" after verifying the commit herself.
 - **Fix:** behavior rule (no scripted lines): she is Michael's brain, the voice layer and she are one Lex, the worker is her hands; she handles reversible worker steps herself (verify, commit, answer, unblock, clear on a verified handover) and reports what she did; she asks Michael only for what only he can give.
+
+## BUG-068 - Car voice can attach to the wrong Lex
+- **Status:** SMOKE-TESTING
+- **Found:** 2026-10-02 · **Fixed:** 2026-10-02 (verify: with two brainstorms live, the LEX-CAR screen answers as the one started last)
+- **Area:** `07-daemon/src/voice/lex-voice-ws.ts` (`bind()`, new `pickDefaultLexPty`); client `C:devProjectslex-carapplex-launchersrccomotlclexcarLexVoiceService.java` (hello without brainstorm_id)
+- **Root cause:** `bind(undefined)` took `listPtys().find(...)`, the first live PTY whose cwd is the brainstorm folder: map insertion order, effectively the oldest.
+- **Fix:** `pickDefaultLexPty` picks the live brainstorm PTY with the latest `startedAt`. Clients that name a brainstorm or session are unaffected. Test: `voice-default-lex-pty.test.ts`.
 
 <!-- DETAILS END -->
