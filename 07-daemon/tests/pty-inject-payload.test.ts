@@ -6,6 +6,7 @@ import {
   PTY_INJECT_COMMIT_NUDGE_MS,
   PTY_INJECT_SLAB_CHARS,
   PTY_INJECT_SLAB_SETTLE_MS,
+  PTY_INJECT_WORDS_SETTLE_MS,
 } from '../src/dashboard/pty-host.js';
 
 /**
@@ -77,6 +78,19 @@ describe('planPtyInjectWrites (BUG-059 held paste)', () => {
     expect(crs.length).toBe(2);
     expect(crs[0]!.atMs - lastText).toBeGreaterThanOrEqual(PTY_INJECT_SLAB_SETTLE_MS);
     expect(crs[1]!.atMs).toBeGreaterThan(crs[0]!.atMs);
+  });
+
+  it('BUG-065: with context, types the operator words alone first and the context as a later burst, then Enter', () => {
+    const words = '[voice mode] read the docs and get caught up';
+    const context = 'L'.repeat(8000);
+    const plan = planPtyInjectWrites(words, true, context);
+    expect(plan[0]).toEqual({ data: words, atMs: 0 });
+    const ctx = plan.filter((w) => w.data !== '\r' && w !== plan[0]);
+    expect(ctx.map((w) => w.data).join('')).toBe(`\n\n${context}`);
+    expect(ctx[0]!.atMs).toBeGreaterThanOrEqual(PTY_INJECT_WORDS_SETTLE_MS);
+    const crs = plan.filter((w) => w.data === '\r');
+    expect(crs.length).toBe(2);
+    expect(crs[0]!.atMs - ctx[ctx.length - 1]!.atMs).toBeGreaterThanOrEqual(PTY_INJECT_SLAB_SETTLE_MS);
   });
 
   it('starts with the text at 0ms and sends no \\r at all when commit=false', () => {

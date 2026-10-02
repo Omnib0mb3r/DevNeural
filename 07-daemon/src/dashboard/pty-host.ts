@@ -996,27 +996,56 @@ export function splitInjectPayloadIntoSlabs(
 export function planPtyInjectWrites(
   text: string,
   commit: boolean,
+  context?: string,
 ): Array<{ data: string; atMs: number }> {
-  const slabs = splitInjectPayloadIntoSlabs(text);
-  const plan = slabs.map((data, i) => ({ data, atMs: i * PTY_INJECT_SLAB_GAP_MS }));
+  const plan = splitInjectPayloadIntoSlabs(text).map((data, i) => ({
+    data,
+    atMs: i * PTY_INJECT_SLAB_GAP_MS,
+  }));
+  /* BUG-065 (2026-10-02): Claude Code 2.1.285 wraps a burst over about
+   * 1-3k chars in <pasted_content> and tells the model not to follow
+   * instructions inside it. A voice turn is ~8k (live state + the
+   * operator's words) in one burst, so Lex read Michael's own request as
+   * pasted text and refused it. The operator's words now go in first as
+   * their own short write, and the context follows as a separate burst
+   * after a pause, so only the context is wrapped. Verified on a real
+   * claude PTY: words outside the paste, context inside, submitted. */
+  if (context) {
+    const startAt = plan[plan.length - 1]!.atMs + PTY_INJECT_WORDS_SETTLE_MS;
+    splitInjectPayloadIntoSlabs(`\n\n${context}`).forEach((data, i) => {
+      plan.push({ data, atMs: startAt + i * PTY_INJECT_SLAB_GAP_MS });
+    });
+  }
   if (!commit) return plan;
-  const crAt = (slabs.length - 1) * PTY_INJECT_SLAB_GAP_MS + PTY_INJECT_SLAB_SETTLE_MS;
+  const crAt = plan[plan.length - 1]!.atMs + PTY_INJECT_SLAB_SETTLE_MS;
   plan.push({ data: '\r', atMs: crAt });
   plan.push({ data: '\r', atMs: crAt + PTY_INJECT_COMMIT_NUDGE_MS });
   return plan;
 }
 
+/** Pause between the operator's words and the context burst, so Claude
+ * Code sees them as two inputs and wraps only the context (BUG-065). */
+export const PTY_INJECT_WORDS_SETTLE_MS = 300;
+
+/**
+ * Type into a session. `text` is what the operator said or typed;
+ * `context` (optional) is daemon-built material that rides along (live
+ * state, interrupted replies, asides). With context, the operator's
+ * words are typed first and the context after, so Claude Code never
+ * wraps the operator's own request as pasted content (BUG-065).
+ */
 export function ptyInject(
   ptyIdOrSession: string,
   text: string,
   commit: boolean = true,
+  context?: string,
 ): { ok: true } | { ok: false; error: string } {
   let handle = ptys.get(ptyIdOrSession);
   if (!handle) handle = getPtyBySession(ptyIdOrSession);
   if (!handle) return { ok: false, error: 'pty not found' };
   if (handle.exited) return { ok: false, error: 'pty has exited' };
   try {
-    const payload = buildPtyInjectPayload(text, commit);
+    const payload = buildPtyInjectPayload(context ? `${text}\n\n${context}` : text, commit);
     handle.lastCommandSent = payload.slice(0, 4096);
     handle.lastCommandAt = Date.now();
     /* The first text slab goes out now; every later step (more slabs,
@@ -1026,7 +1055,7 @@ export function ptyInject(
      * return as "accepted"; sequential writes on one PTY stay ordered.
      * A failure after the first write is logged loudly: the paste is
      * already partly delivered, so silence would hide a held prompt. */
-    const plan = planPtyInjectWrites(text, commit);
+    const plan = planPtyInjectWrites(text, commit, context);
     handle.pty.write(plan[0]!.data);
     const runStep = (i: number): void => {
       if (i >= plan.length) return;

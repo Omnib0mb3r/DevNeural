@@ -5778,9 +5778,17 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
       return;
     }
     const preInjectJsonlSize = currentJsonlSize();
-    const injectPayload =
-      asideBlock + snapshotBlock + gateNote + partialChainBlock + voiceTag + result.text;
-    const ir = ptyInject(state.bindKey, injectPayload, true);
+    /* BUG-065: Michael's words first, typed as his own input; the
+     * daemon's context after, as its own burst. One payload used to put
+     * the words at the tail of ~8k of context, Claude Code wrapped all
+     * of it as <pasted_content>, and Lex refused his request as pasted. */
+    const injectContext = (asideBlock + snapshotBlock + gateNote + partialChainBlock).trim();
+    const ir = ptyInject(
+      state.bindKey,
+      voiceTag + result.text,
+      true,
+      injectContext || undefined,
+    );
     if (!ir.ok) {
       send({ t: 'error', code: 'inject', message: ir.error });
       return;
@@ -5791,7 +5799,10 @@ export function attachLexVoiceWs(socket: FastifyWS): void {
      * at the terminal until the operator pressed Enter by hand) AND
      * landed INTACT (third wave: payload lead eaten by the paste path
      * while the daemon-side text was fine; partial landings repaste). */
-    verifyInjectDelivery(result.text.slice(0, 60), preInjectJsonlSize, injectPayload);
+    /* Integrity on Michael's words only: the context now lands wrapped
+     * in <pasted_content>, so its last line is the closing tag, but his
+     * words are typed and land verbatim (BUG-065). */
+    verifyInjectDelivery(result.text.slice(0, 60), preInjectJsonlSize, voiceTag + result.text);
     /* Consume the partial chain only after a successful inject. If
      * inject fails, the chain stays so the retry path on the next
      * utterance still carries the partials. Same contract for the
