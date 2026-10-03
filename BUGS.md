@@ -72,6 +72,7 @@ real bug intentionally parked.
 | BUG-040 | OPEN | Daemon relaunch died once at boot, 2026-09-23 02:10Z (22:10 local): `ERR_MODULE_NOT_FOUND: Cannot find package '@anthropic-ai/sdk' imported from dist/llm/anthropic.js` (`daemon.stderr.prev.log`), after an admin restart requested at 02:10:24Z; the schtasks relauncher's next try booted at 02:13:11Z (PID 4952). Three minutes of outage, in the middle of the overnight closeout. The package is present now and `package.json` still lists it, so `node_modules` was in flux at that moment (hypothesis: an install or prune from the worktree cleanup). Root fix regardless of cause: the anthropic provider is never used on the Lex path (VL-27), so its SDK import should be lazy and a missing optional SDK must never stop the daemon booting. |
 | BUG-055 | SMOKE-TESTING | Lex never sees the name typed for a brainstorm: "new session" writes it to `lex_session.title` (the Stream Deck's source), but `buildVoiceSnapshot` read only `brainstorm_sessions.user_label` (null), so live_state named the brainstorm `cf89f3cd`. STT heard "Peax" as "peaks" and nothing let Lex catch it; the project folder came out `peaks-pipeline-automation` under a brainstorm titled "Peax PipeLine Automation". |
 | BUG-056 | SMOKE-TESTING | Lex read a settings deny (`Bash(rm -rf *)` on the template's own `rm -rf .git` step) as Michael refusing, asked him a nonsense question, then re-ran a bare `git clone` and dropped the detach, commit and repo steps without saying so. The new project's `origin` still pointed at the public `dev-template` repo. |
+| BUG-069 | SMOKE-TESTING | A Claude session in a git worktree (<project>/.claude/worktrees/<agent>) moved its project's registry root to the worktree: same remote, same id, and identity used the worktree's own toplevel. bridger-base-camp and New-Letter-and-TikToks were rooted in worktrees, so their real folders read as not on the dashboard. |
 | BUG-068 | SMOKE-TESTING | A voice client whose hello names no brainstorm (the LEX-CAR app) was bound to the FIRST live brainstorm PTY in the map, so with two brainstorms open the car could talk to an older Lex instead of the one just started. Now the most recently started live brainstorm. |
 | BUG-067 | SMOKE-TESTING | Lex acts like a bystander on her own project: relays the worker's status to Michael in the third person, waits for his yes on reversible steps (commit a checkpoint, clear on a verified handover), asks whether she should act instead of acting. Lex-Car brainstorm 2026-10-02 03:05-03:24Z. |
 | BUG-066 | SMOKE-TESTING | Layer 1 put its own working folder into Michael's request: he said "go read the documents and get caught up on what this project is", the FORWARD said "Read the project documentation in the voice-l1 directory" (2026-10-02T03:23:57Z). |
@@ -646,6 +647,7 @@ real bug intentionally parked.
 - **Symptom:** pid 105888 booted 23:30:40Z, reopened Lex and L1 at 23:31:39, logged `[memory] rss=1268MB` at 23:31:43, then nothing; pid 42384 started 23:35:36. `daemon.stderr.prev.log` holds only the DEP0190 warning, stdout only the cold-start gate line, and `Get-WinEvent` Application shows no node fault. Not an OOM (heap 13%, BUG-017 prints a V8 stack).
 - **Ruled out:** the inject-delivery probe (run standalone against the same dist, the host process lived and exited 0). The next two daemons (42384, 44264) stayed up.
 - **Second occurrence:** pid 128968, last `[memory]` line 2026-10-02T07:42:26Z (rss 704MB, heap 19%), no shutdown lines, relaunched as 32404 at 07:45:37Z. No inject probe or restart near it.
+- **More occurrences:** 2026-10-03 ~11:22Z (last `[memory]` 11:21:47, relaunched 11:25:37); 2026-10-03 ~19:19:25Z (pid 88572; a `GET /manifest.json` took 7517 ms just before, during a dashboard static rebuild; relaunched 19:19:47). Four in four days.
 - **Next:** if it repeats, capture `node --report-on-fatalerror` / `--report-uncaught-exception` and log `process.on('exit')` with the code; check whether something runs `taskkill` against the daemon pid.
 
 ## BUG-064 - Sensitivity and mic level do not stop a whisper
@@ -684,5 +686,13 @@ real bug intentionally parked.
 - **Area:** `07-daemon/src/voice/lex-voice-ws.ts` (`bind()`, new `pickDefaultLexPty`); client `C:devProjectslex-carapplex-launchersrccomotlclexcarLexVoiceService.java` (hello without brainstorm_id)
 - **Root cause:** `bind(undefined)` took `listPtys().find(...)`, the first live PTY whose cwd is the brainstorm folder: map insertion order, effectively the oldest.
 - **Fix:** `pickDefaultLexPty` picks the live brainstorm PTY with the latest `startedAt`. Clients that name a brainstorm or session are unaffected. Test: `voice-default-lex-pty.test.ts`.
+
+## BUG-069 - Worktree sessions move a project's root into the worktree
+- **Status:** SMOKE-TESTING
+- **Found:** 2026-10-03 · **Fixed:** 2026-10-03 (verify: after an agent works in a worktree, `/fs/list` still marks the main folder on the dashboard)
+- **Area:** `07-daemon/src/identity/project-id.ts` (`tryGitToplevel`), `07-daemon/src/identity/registry.ts` (`recordIdentity` rewrites root on capture)
+- **Symptom:** registry entries `a3a053db5c12` (bridger-base-camp) rooted at `.claude/worktrees/agent-a8ae31f8bdb1ed442`, `fbb5700ec28b` (New-Letter-and-TikToks) at `.claude/worktrees/shorts-backend`.
+- **Root cause:** remote-scoped identity hashes the remote, so a worktree resolves to the project's id; the root came from `git rev-parse --show-toplevel`, which in a linked worktree is the worktree, and recordIdentity rewrites the stored root on every capture.
+- **Fix:** root = parent of `--git-common-dir` when that dir is a plain `.git` (the main working tree); otherwise the toplevel. Both entries re-registered through `POST /projects/register-path` and now root at the project folders. Test: `project-id-worktree.test.ts`.
 
 <!-- DETAILS END -->

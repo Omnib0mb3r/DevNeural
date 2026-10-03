@@ -1467,6 +1467,8 @@ export interface FsDir {
   name: string;
   path: string;
   has_git: boolean;
+  /** Already a registered project, i.e. on the dashboard (2026-10-03). */
+  registered?: boolean;
 }
 /* Browse immediate subdirectories of `path` (default C:/dev/Projects on
  * the daemon). Read-only; directory names only. */
@@ -1476,6 +1478,8 @@ export const fsList = (path?: string) => {
     ok: boolean;
     path: string;
     parent: string | null;
+    /** The folder being listed is itself a registered project. */
+    registered?: boolean;
     dirs: FsDir[];
     error?: string;
   }>(`/fs/list${qs}`);

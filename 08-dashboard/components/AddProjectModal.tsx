@@ -28,14 +28,20 @@ export function AddProjectModal({ onClose }: Props) {
   });
 
   const here = listQ.data?.path;
+  const newCount = listQ.data?.dirs.filter((d) => !d.registered).length ?? 0;
+  const [lastAdded, setLastAdded] = useState<string | null>(null);
 
+  /* Stays open after an add (2026-10-03) so several new folders can be
+   * added in one pass; the list refetches and the row flips to "on
+   * dashboard". */
   const addM = useMutation({
     mutationFn: (p: string) => registerProjectPath(p),
-    onSuccess: (r) => {
+    onSuccess: (r, p) => {
       if (r.ok) {
+        setLastAdded(p.split("/").pop() ?? p);
         qc.invalidateQueries({ queryKey: ["projects"] });
         qc.invalidateQueries({ queryKey: ["project-anchor-tiles"] });
-        onClose();
+        qc.invalidateQueries({ queryKey: ["fs-list"] });
       }
     },
   });
@@ -51,7 +57,7 @@ export function AddProjectModal({ onClose }: Props) {
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-4">
-          <h2 className="font-display text-base font-emphasized">
+          <h2 className="font-display text-base font-emphasized text-txt1">
             Add existing project
           </h2>
           <button
@@ -82,6 +88,11 @@ export function AddProjectModal({ onClose }: Props) {
           >
             {here ?? "…"}
           </div>
+          {listQ.data && (
+            <span className="text-nano font-mono text-txt3 shrink-0">
+              {newCount === 0 ? "all on dashboard" : `${newCount} not on dashboard`}
+            </span>
+          )}
         </div>
 
         {/* Folder list */}
@@ -124,31 +135,57 @@ export function AddProjectModal({ onClose }: Props) {
                       size={14}
                       className="text-txt3 shrink-0"
                     />
-                    <span className="truncate">{d.name}</span>
+                    <span
+                      className={`truncate ${d.registered ? "text-txt3" : "font-emphasized"}`}
+                    >
+                      {d.name}
+                    </span>
                     {d.has_git && (
                       <span
                         className="text-nano font-mono text-brandSoft shrink-0"
-                        title="git repo — will auto-tie to its remote"
+                        title="git repo, will auto-tie to its remote"
                       >
                         git
                       </span>
                     )}
+                    {!d.registered && (
+                      <span
+                        className="text-nano font-mono text-warn shrink-0"
+                        title="Not on the dashboard yet"
+                      >
+                        new
+                      </span>
+                    )}
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => addM.mutate(d.path)}
-                    disabled={addM.isPending}
-                    className="text-nano px-2 py-1 rounded-pill bg-brand/10 hairline ring-1 ring-brand/30 text-brandSoft hover:bg-brand/20 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
-                    title="Register this folder as a project"
-                  >
-                    add
-                  </button>
+                  {d.registered ? (
+                    <span
+                      className="text-nano font-mono text-ok shrink-0 inline-flex items-center gap-1"
+                      title="Already a project on the dashboard"
+                    >
+                      <Icon name="Check" size={12} /> on dashboard
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => addM.mutate(d.path)}
+                      disabled={addM.isPending}
+                      className="text-nano px-2 py-1 rounded-pill bg-brand/10 hairline ring-1 ring-brand/30 text-brandSoft hover:bg-brand/20 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                      title="Register this folder as a project"
+                    >
+                      {addM.isPending && addM.variables === d.path ? "adding…" : "add"}
+                    </button>
+                  )}
                 </div>
               ))}
             </>
           )}
         </div>
 
+        {addM.data?.ok && lastAdded && (
+          <div className="mt-3 text-xs text-ok">
+            Added {lastAdded}. Pick another or close.
+          </div>
+        )}
         {addM.data && !addM.data.ok && (
           <div className="mt-3 text-xs text-err font-mono">
             {addM.data.error}
@@ -171,14 +208,18 @@ export function AddProjectModal({ onClose }: Props) {
               onClick={onClose}
               className="h-9 px-4 rounded-input text-txt3 hover:text-txt1 text-sm"
             >
-              Cancel
+              {lastAdded ? "Done" : "Cancel"}
             </button>
             <button
               onClick={() => here && addM.mutate(here)}
-              disabled={!here || addM.isPending}
-              className="h-9 px-4 rounded-input bg-brand hover:bg-brand/90 text-base text-sm font-emphasized disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              disabled={!here || addM.isPending || listQ.data?.registered}
+              className="h-9 px-4 rounded-input bg-brand hover:bg-brand/90 text-base text-sm font-emphasized whitespace-nowrap shrink-0 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             >
-              {addM.isPending ? "adding…" : "add this folder"}
+              {listQ.data?.registered
+                ? "this folder is on the dashboard"
+                : addM.isPending && addM.variables === here
+                  ? "adding…"
+                  : "add this folder"}
             </button>
           </div>
         </div>

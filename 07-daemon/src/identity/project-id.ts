@@ -33,16 +33,34 @@ function tryGitRemote(cwd: string): string | null {
   }
 }
 
+/* The project's working tree. Inside a linked git worktree (Claude puts
+ * them at <project>/.claude/worktrees/<agent>) this is the MAIN working
+ * tree, not the worktree: the worktree shares the project's remote, so
+ * it resolves to the same project id, and returning its own toplevel let
+ * one agent session rewrite the project's registry root to the worktree
+ * (bridger-base-camp, New-Letter-and-TikToks, 2026-10-03). The main tree
+ * is the parent of the common git dir when that dir is a plain `.git`;
+ * anything else (a submodule's .git/modules/x, a bare repo) keeps the
+ * plain toplevel. */
 function tryGitToplevel(cwd: string): string | null {
   try {
-    return execSync('git rev-parse --show-toplevel', {
-      cwd,
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      windowsHide: true,
-    })
+    const [top, common] = execSync(
+      'git rev-parse --show-toplevel --path-format=absolute --git-common-dir',
+      {
+        cwd,
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+      },
+    )
       .trim()
-      .replace(/\\/g, '/');
+      .split(/\r?\n/)
+      .map((l) => l.trim().replace(/\\/g, '/').replace(/\/+$/, ''));
+    if (!top) return null;
+    if (common && path.posix.basename(common) === '.git') {
+      return path.posix.dirname(common);
+    }
+    return top;
   } catch {
     return null;
   }

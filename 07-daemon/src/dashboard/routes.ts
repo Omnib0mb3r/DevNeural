@@ -4270,29 +4270,25 @@ export async function registerDashboardRoutes(
       reply.code(400);
       return { ok: false, error: `path not found: ${target}` };
     }
-    let entries: fs.Dirent[];
+    /* Each folder says whether it is already a registered project, so
+     * the picker can mark what is on the dashboard (2026-10-03). */
+    const { listProjects } = await import('../identity/registry.js');
+    const { listDirsWithRegistration, normalizeForCompare } = await import('./fs-list.js');
+    const roots = listProjects().map((p) => p.root);
+    let dirs;
     try {
-      entries = fs.readdirSync(target, { withFileTypes: true });
+      dirs = listDirsWithRegistration(target, roots);
     } catch (err) {
       reply.code(500);
       return { ok: false, error: `read failed: ${(err as Error).message}` };
     }
-    const dirs = entries
-      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
-      .map((e) => {
-        const full = path.posix.join(target, e.name);
-        return {
-          name: e.name,
-          path: full,
-          has_git: fs.existsSync(path.posix.join(full, '.git')),
-        };
-      })
-      .sort((a, b) => a.name.localeCompare(b.name));
     const parent = path.posix.dirname(target);
+    const here = normalizeForCompare(target);
     return {
       ok: true,
       path: target,
       parent: parent !== target ? parent : null,
+      registered: roots.some((r) => r && normalizeForCompare(r) === here),
       dirs,
     };
   });
