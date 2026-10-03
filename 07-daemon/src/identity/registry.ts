@@ -11,6 +11,10 @@ import type { ProjectIdentity, ProjectRegistryEntry } from '../types.js';
 interface RegistryFile {
   version: 1;
   projects: Record<string, ProjectRegistryEntry>;
+  /** Folders the operator took off the dashboard (2026-10-03), keyed by
+   * normalizeRoot, value = ISO time. Automatic registration and the
+   * boot restore skip these; only an explicit add clears one. */
+  removed?: Record<string, string>;
 }
 
 /* BUG-043 (2026-09-24): the registry kept collapsing to one or two
@@ -157,10 +161,25 @@ function reconcilePathDupes(
   return removed;
 }
 
-export function recordIdentity(identity: ProjectIdentity): void {
+/**
+ * Register or refresh a project. Most callers are automatic (fs watcher,
+ * transcript watcher, session hook, wiki backfill) and must not undo the
+ * operator taking a folder off the dashboard, so a removed folder is
+ * skipped unless `explicit` is set: the Add existing picker and new
+ * project creation pass it, and it clears the removal.
+ */
+export function recordIdentity(
+  identity: ProjectIdentity,
+  opts: { explicit?: boolean } = {},
+): void {
   if (identity.id === 'global') return;
   const now = new Date().toISOString();
   const reg = loadRegistry();
+  const rootKey = normalizeRoot(identity.root);
+  if (reg.removed?.[rootKey]) {
+    if (!opts.explicit) return;
+    delete reg.removed[rootKey];
+  }
   const existing = reg.projects[identity.id];
   if (existing) {
     existing.last_seen = now;
@@ -168,12 +187,21 @@ export function recordIdentity(identity: ProjectIdentity): void {
     if (existing.root !== identity.root) existing.root = identity.root;
     if (existing.remote !== identity.remote) existing.remote = identity.remote;
   } else {
+    /* A project added back after Remove from dashboard keeps its
+     * original first_seen from the per-project meta file. */
+    let firstSeen = now;
+    try {
+      const meta = JSON.parse(fs.readFileSync(projectMetaFile(identity.id), 'utf-8'));
+      if (isEntry(meta) && meta.id === identity.id) firstSeen = meta.first_seen;
+    } catch {
+      /* no prior meta: a genuinely new project */
+    }
     reg.projects[identity.id] = {
       id: identity.id,
       name: identity.name,
       root: identity.root,
       remote: identity.remote,
-      first_seen: now,
+      first_seen: firstSeen,
       last_seen: now,
     };
   }
@@ -289,6 +317,7 @@ export function restoreFromProjectMeta(reg?: RegistryFile): string[] {
     }
     if (!isEntry(parsed) || parsed.id !== id) continue;
     if (!parsed.root || !fs.existsSync(parsed.root)) continue;
+    if (own.removed?.[normalizeRoot(parsed.root)]) continue;
     candidates.push(parsed);
     if (parsed.remote) remoteScopedRoots.add(normalizeRoot(parsed.root));
   }
@@ -314,6 +343,19 @@ export function restoreFromProjectMeta(reg?: RegistryFile): string[] {
   }
   if (!reg && added.length > 0) saveRegistry(own);
   return added;
+}
+
+/** Take a project off the dashboard (2026-10-03). The folder and its
+ * per-project data stay; the root is remembered as removed so automatic
+ * registration does not re-add it. Returns false for an unknown id. */
+export function removeProject(id: string): boolean {
+  const reg = loadRegistry();
+  const entry = reg.projects[id];
+  if (!entry) return false;
+  delete reg.projects[id];
+  reg.removed = { ...(reg.removed ?? {}), [normalizeRoot(entry.root)]: new Date().toISOString() };
+  saveRegistry(reg);
+  return true;
 }
 
 export function getProject(id: string): ProjectRegistryEntry | undefined {

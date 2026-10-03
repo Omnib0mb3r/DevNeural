@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { fsList, registerProjectPath } from "@/lib/daemon-client";
+import { fsList, registerProjectPath, removeProjectPath } from "@/lib/daemon-client";
 import { Icon } from "./Icon";
 
 interface Props {
@@ -34,17 +34,35 @@ export function AddProjectModal({ onClose }: Props) {
   /* Stays open after an add (2026-10-03) so several new folders can be
    * added in one pass; the list refetches and the row flips to "on
    * dashboard". */
+  const [lastRemoved, setLastRemoved] = useState<string | null>(null);
+  const refresh = () => {
+    qc.invalidateQueries({ queryKey: ["projects"] });
+    qc.invalidateQueries({ queryKey: ["project-anchor-tiles"] });
+    qc.invalidateQueries({ queryKey: ["fs-list"] });
+  };
   const addM = useMutation({
     mutationFn: (p: string) => registerProjectPath(p),
     onSuccess: (r, p) => {
       if (r.ok) {
         setLastAdded(p.split("/").pop() ?? p);
-        qc.invalidateQueries({ queryKey: ["projects"] });
-        qc.invalidateQueries({ queryKey: ["project-anchor-tiles"] });
-        qc.invalidateQueries({ queryKey: ["fs-list"] });
+        setLastRemoved(null);
+        refresh();
       }
     },
   });
+  /* Remove from dashboard (2026-10-03): unregisters only; the folder
+   * stays, and add on the same row brings it back. */
+  const removeM = useMutation({
+    mutationFn: (p: string) => removeProjectPath(p),
+    onSuccess: (r, p) => {
+      if (r.ok) {
+        setLastRemoved(p.split("/").pop() ?? p);
+        setLastAdded(null);
+        refresh();
+      }
+    },
+  });
+  const busy = addM.isPending || removeM.isPending;
 
   return (
     <div
@@ -158,17 +176,28 @@ export function AddProjectModal({ onClose }: Props) {
                     )}
                   </button>
                   {d.registered ? (
-                    <span
-                      className="text-nano font-mono text-ok shrink-0 inline-flex items-center gap-1"
-                      title="Already a project on the dashboard"
-                    >
-                      <Icon name="Check" size={12} /> on dashboard
-                    </span>
+                    <>
+                      <span
+                        className="text-nano font-mono text-ok shrink-0 inline-flex items-center gap-1"
+                        title="Already a project on the dashboard"
+                      >
+                        <Icon name="Check" size={12} /> on dashboard
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => removeM.mutate(d.path)}
+                        disabled={busy}
+                        className="text-nano px-2 py-1 rounded-pill hairline text-txt3 hover:text-err hover:bg-err/10 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                        title="Take this project off the dashboard. The folder is not touched."
+                      >
+                        {removeM.isPending && removeM.variables === d.path ? "removing…" : "remove"}
+                      </button>
+                    </>
                   ) : (
                     <button
                       type="button"
                       onClick={() => addM.mutate(d.path)}
-                      disabled={addM.isPending}
+                      disabled={busy}
                       className="text-nano px-2 py-1 rounded-pill bg-brand/10 hairline ring-1 ring-brand/30 text-brandSoft hover:bg-brand/20 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
                       title="Register this folder as a project"
                     >
@@ -184,6 +213,22 @@ export function AddProjectModal({ onClose }: Props) {
         {addM.data?.ok && lastAdded && (
           <div className="mt-3 text-xs text-ok">
             Added {lastAdded}. Pick another or close.
+          </div>
+        )}
+        {removeM.data?.ok && lastRemoved && (
+          <div className="mt-3 text-xs text-txt2">
+            Took {lastRemoved} off the dashboard. The folder is untouched; add
+            brings it back.
+          </div>
+        )}
+        {removeM.data && !removeM.data.ok && (
+          <div className="mt-3 text-xs text-err font-mono">
+            {removeM.data.error}
+          </div>
+        )}
+        {removeM.isError && (
+          <div className="mt-3 text-xs text-err font-mono">
+            Failed: {(removeM.error as Error).message}
           </div>
         )}
         {addM.data && !addM.data.ok && (
@@ -208,7 +253,7 @@ export function AddProjectModal({ onClose }: Props) {
               onClick={onClose}
               className="h-9 px-4 rounded-input text-txt3 hover:text-txt1 text-sm"
             >
-              {lastAdded ? "Done" : "Cancel"}
+              {lastAdded || lastRemoved ? "Done" : "Cancel"}
             </button>
             <button
               onClick={() => here && addM.mutate(here)}

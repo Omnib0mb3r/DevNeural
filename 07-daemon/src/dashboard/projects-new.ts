@@ -301,7 +301,7 @@ function defaultRun(cmd: string, args: string[], cwd: string): string {
 }
 
 function defaultRegisterIdentity(target: string): void {
-  recordIdentity(resolveProjectIdentity(target));
+  recordIdentity(resolveProjectIdentity(target), { explicit: true });
 }
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]+$/;

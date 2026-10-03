@@ -4334,7 +4334,9 @@ export async function registerDashboardRoutes(
       };
     }
     const already = Boolean(getProject(identity.id));
-    recordIdentity(identity);
+    /* explicit: the operator asked for this folder, so it also undoes an
+     * earlier Remove from dashboard. */
+    recordIdentity(identity, { explicit: true });
     log(
       `[dashboard] register-path: ${already ? 'refreshed' : 'registered'} ${identity.name} (${identity.id}) at ${identity.root}`,
     );
@@ -4343,6 +4345,34 @@ export async function registerDashboardRoutes(
       already_registered: already,
       project: getProject(identity.id) ?? null,
     };
+  });
+
+  /* Take a folder's project off the dashboard (2026-10-03). The folder
+   * and its data stay on disk; the registry remembers the removal so the
+   * watchers and the boot restore do not re-add it. Matches every
+   * registry entry rooted at this folder (a path- and a remote-scoped
+   * entry can share one). Undo = Add existing on the same folder. */
+  app.post('/projects/remove-path', async (req, reply) => {
+    const body = (req.body ?? {}) as { path?: string };
+    const target = (body.path ?? '').replace(/\\/g, '/').replace(/\/+$/, '');
+    if (!target) {
+      reply.code(400);
+      return { ok: false, error: 'path required' };
+    }
+    const { listProjects, removeProject } = await import('../identity/registry.js');
+    const key = target.toLowerCase();
+    const matches = listProjects().filter(
+      (p) => (p.root ?? '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase() === key,
+    );
+    if (matches.length === 0) {
+      reply.code(404);
+      return { ok: false, error: `no project on the dashboard at ${target}` };
+    }
+    for (const p of matches) removeProject(p.id);
+    log(
+      `[dashboard] remove-path: took ${matches.map((p) => `${p.name} (${p.id})`).join(', ')} off the dashboard at ${target}`,
+    );
+    return { ok: true, removed: matches.map((p) => p.id) };
   });
 
   /* BUG-043 (2026-09-24): the Claude Code hook process resolves the

@@ -1494,6 +1494,15 @@ export const registerProjectPath = (path: string) =>
     error?: string;
   }>("/projects/register-path", { method: "POST", body: { path } });
 
+/* Take a folder's project off the dashboard. The folder stays on disk and
+ * the daemon remembers the removal so watchers do not re-add it; Add
+ * existing on the same folder undoes it. */
+export const removeProjectPath = (path: string) =>
+  request<{ ok: boolean; removed?: string[]; error?: string }>(
+    "/projects/remove-path",
+    { method: "POST", body: { path } },
+  );
+
 // ── knowledge index (doc browse, DRIVE-QUEUE 2B) ────────────────
 export interface DocChunkPointer {
   heading: string;
