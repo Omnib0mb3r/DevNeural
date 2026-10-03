@@ -8,6 +8,90 @@ reflects what was true at the last update. Previous cursors (2026-07-18
 to 2026-09-22) are in `docs/archive/HANDOVER-history-2026-07-to-09.md`;
 this file holds the current cursor only.
 
+## Cursor (2026-10-03 evening: Claude Code 2.1.285 changed how typed input lands, Lex refused spoken requests as "pasted" and typed messages sat unsubmitted; both fixed with a startup probe that catches the next change; project registry, anchors and names cleaned up; Add existing can now add and remove; BUG-055 to BUG-069 logged; everything committed and pushed, daemon PID 24636 live)
+
+Read first: `BUGS.md` index rows BUG-055 to BUG-069 (details at the
+bottom of the file), then `docs/SMOKE-TEST.md` "Current gate".
+
+### State at handover
+
+- Branch `voice-layers`, in sync with `origin/voice-layers` at
+  `25962fb`. Working tree clean. lex-car repo at `52c855b`.
+- Daemon PID 24636 on the current dist. `/health` shows
+  `prompt_delivery: ok` and the new `inject_delivery: ok`.
+- Claude Code on this box is **2.1.285**. It was installed on
+  2026-09-30 18:59 by an agent repro script that ran `claude` without
+  `DISABLE_AUTOUPDATER=1`. The operator does NOT want update settings
+  changed; any agent script that spawns `claude` must set
+  `DISABLE_AUTOUPDATER=1` on its own process only.
+- Restarts this wave were authorized by the operator in the moment
+  ("restart and push"). The standing rule below still holds for the
+  next session.
+
+### What changed in Claude Code 2.1.285 (measured on real PTYs)
+
+1. A burst that carries its own `\r` is held as a paste ("Removed 1
+   invisible character · review and press Enter to send"); a later bare
+   `\r` at +1 s or +3 s does not release it. Fix: `planPtyInjectWrites`
+   writes the Enter alone 250 ms after the text (BUG-059).
+2. Text typed while the session is still drawing (startup frames) is
+   also held. The probe waits for a 2 s quiet screen; other callers that
+   type right after spawn may need the same (noted under BUG-059).
+3. Any burst over about 1 to 3k chars is wrapped in `<pasted_content>`
+   and the model is told not to follow instructions inside it. 200 and
+   800 chars plain, 3000 and 8000 wrapped. A voice turn (~8k with live
+   state) was refused as pasted. Fix: `ptyInject(id, words, commit,
+   context)` types the operator's words first, then the context as its
+   own burst after 300 ms; only the context is wrapped (BUG-065).
+4. Under the daemon the prompt glyph renders as `>`, not `❯`; readiness
+   checks key on the status line (`shift+tab`).
+
+### What was built (commits `04654c3` to `25962fb`)
+
+- Lex sees the brainstorm's typed name in live_state; prompt rules for
+  denied tools, spoken-vs-typed name spelling, PowerShell deletes,
+  "every turn is Michael or the daemon", and owning the worker instead
+  of narrating it (BUG-055, 056, 065, 067).
+- Layer 1 FORWARD carries his words only, never its own folder (BUG-066).
+- Inject delivery probe after every boot, in `/health` (BUG-059).
+- One writer for brainstorm names, migration 055 (BUG-060).
+- Project anchors for deleted folders pruned on every seed; the July
+  slug-clash crash fixed (BUG-058, BUG-061).
+- `POST /projects/new` = `gh repo create --template` + metadata commit
+  + anchor + optional brainstorm bind; the only scaffold path (BUG-057).
+- A voice client with no brainstorm id (the LEX-CAR app) binds to the
+  most recently started Lex (BUG-068).
+- Add existing picker: marks "on dashboard", tags NEW, counts, add and
+  remove; removals are remembered so watchers and the boot restore do
+  not re-add (registry `removed`, `recordIdentity(..., {explicit})`).
+- Worktree sessions no longer move a project's root (BUG-069).
+
+### Open, in priority order
+
+1. **BUG-064 mic (waiting on operator's go):** a whisper still triggers a
+   turn whatever sensitivity and mic level say. Root cause chain and the
+   5-part fix are in the BUG-064 detail (raw detector mic with
+   autoGainControl off, loudness floor tied to Mic input level, two-bar
+   tuner, cross-device settings push, per-turn log). Preview:
+   scratchpad `mic-tuner-preview.svg` (rebuild from the detail if gone).
+2. **BUG-063 silent daemon exits:** four in four days (09-30 23:32,
+   10-02 07:42, 10-03 11:22, 10-03 19:19), no stack, no shutdown lines,
+   no Windows event; the relauncher revives it. Recommended next step:
+   `--report-on-fatalerror` / `--report-uncaught-exception` and a
+   `process.on('exit')` code log in `start-daemon.ps1` / `daemon.ts`.
+   Not yet approved.
+3. **`~/.claude` edits blocked** by the session's don't-ask permission
+   mode: the scaffold steps in `~/.claude/CLAUDE.md` and Lex memory
+   `reference_devneural_project_template.md` still describe the old
+   clone + `rm -rf .git` flow. New text is in BUG-057. Needs the
+   operator to allow `Edit(//c/Users/michael/.claude/**)` or edit by hand.
+4. Offered, not done: the Stream Deck "Lex: context unknown" label
+   should read "no messages yet" when her transcript does not exist yet
+   (`07-daemon/src/lex/anchor-tiles.ts`, `08-dashboard/components/StreamDeck.tsx`).
+5. Pre-existing test failures, not caused by this wave: BUG-014
+   (grooming), BUG-045 (sessions liveness; the same file's identity-dir
+   test also fails on this box), BUG-062 (TTS mouth lock, flaky).
+
 ## Cursor (2026-09-25 morning: Layer 1 asks were never submitting, so every word went to the brain late and twice; the voice was parroting scripted lines from its own contract; deliveries ran on a second mouth; BUG-050 to BUG-054 logged and fixed, daemon restart pending)
 
 Read first: `BUGS.md` BUG-050 to BUG-054, `FIXES.md` OP-10 to OP-15,

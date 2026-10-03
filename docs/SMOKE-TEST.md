@@ -5,13 +5,52 @@ end on real hardware. Refresh as items get verified or new code lands.
 Source of truth for the daily smoke gate; the rolling cursor for the
 rest of the state lives in `docs/HANDOVER.md`.
 
-Last refreshed: 2026-09-23. Earlier batches (2026-05-29 to 2026-07-19)
+Last refreshed: 2026-10-03. Earlier batches (2026-05-29 to 2026-07-19)
 with their pass marks are in `docs/archive/SMOKE-TEST-2026-05-to-07.md`;
 their open items are tracked in `BUGS.md`, not here. What is already
 verified on the live daemon is recorded under the cursor in
 `docs/HANDOVER.md`.
 
 ## Current gate
+
+### 2026-09-28 to 10-03 wave (Claude Code 2.1.285, projects, names)
+
+- [ ] **Spoken request acted on (BUG-065, BUG-066).** Voice on, say a
+  real ask ("go read the docs and get caught up"). Lex does it, says
+  nothing about "pasted". Her transcript shows your `[voice mode]`
+  words BEFORE the `<pasted_content>` block. `daemon.log` FORWARD line
+  carries your words with no folder you did not say.
+- [ ] **Typed message submits (BUG-059).** Voice off, type to Lex in the
+  Talk to Lex box. She answers with no manual Enter.
+- [ ] **Probes green after a restart.** `/health` shows
+  `prompt_delivery.status = ok` and `inject_delivery.status = ok`
+  about 2 to 3 minutes after boot; `daemon.log` has `[inject-probe] ok`.
+- [ ] **Lex owns the worker (BUG-067).** When the worker reports a
+  checkpoint, Lex verifies and commits / clears herself and reports what
+  she did; she asks you only for files, product calls or destructive steps.
+- [ ] **Typed brainstorm name used (BUG-055, BUG-060).** New session named
+  with an unusual spelling; ask Lex to create a project for it. The
+  folder uses your typed spelling. Rename it in Past Sessions; the new
+  name shows on the Stream Deck tile and in Lex's live_state.
+- [ ] **New project by Lex (BUG-056, BUG-057).** Ask Lex for a new
+  project. She calls `POST /projects/new`: private repo from
+  dev-template, metadata committed and pushed, project bound to her
+  brainstorm, path and repo URL reported. No `rm -rf`, no shell clone.
+- [ ] **Deleted folder leaves the dashboard (BUG-058, BUG-061).** Delete
+  a scratch project folder; within one seed pass its anchor is gone from
+  the supervises picker. No `UNIQUE constraint failed` lines in
+  `daemon.log`.
+- [ ] **Add existing picker.** Projects > add existing: count of folders
+  not on the dashboard, `on dashboard` rows with remove, NEW rows with
+  add. Add one, it flips; remove one, it flips back and stays off after
+  you touch a file in it; add it back.
+- [ ] **Worktree root (BUG-069).** After an agent works in a
+  `.claude/worktrees/<agent>` folder, the project's tile and the picker
+  still show the main project folder.
+- [ ] **Car binds the newest Lex (BUG-068).** Two brainstorms live; the
+  LEX-CAR screen answers as the one started or reopened last.
+
+### Earlier gate (2026-09-23)
 
 - [ ] The spoken list, items 1 to 10, in `docs/spec/LAYER-1-CONTROL.md`
   "Testing", on the live daemon. Item 9 covers BUG-030 (mute, stand by,
